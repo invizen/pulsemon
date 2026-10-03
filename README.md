@@ -55,7 +55,7 @@ Open http://localhost:8080 and add sensors from the **new sensor** button.
 ### Alert behavior
 
 - A sensor's status is derived from its last 60 probes:
-  - **down** — N consecutive losses (per-sensor `down after`, default 3)
+  - **down** — N consecutive losses (per-sensor `down after`, default 2)
   - **degraded** — loss % above `loss warn`, or latest ping > `spike ×` the 60-probe average
   - **up** — everything else
 - Alerts fire on every **state transition** (including recovery).

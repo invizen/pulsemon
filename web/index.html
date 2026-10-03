@@ -68,6 +68,14 @@ tailwind.config = {
   </div>
 </header>
 
+<div id="probe-banner" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pt-4">
+  <div class="text-xs font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+    <i class="ph-bold ph-warning"></i>
+    <span id="probe-banner-text">probing is broken</span>
+    <span class="text-warn/70 font-normal ml-1">— statuses below are unreliable until this clears</span>
+  </div>
+</div>
+
 <main class="max-w-[1700px] mx-auto px-4 sm:px-6 py-6 flex flex-col gap-5">
 
   <!-- ============ TOOLBAR ============ -->
@@ -170,19 +178,19 @@ tailwind.config = {
       </label>
       <div class="grid grid-cols-5 gap-3">
         <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
-          <input id="f-interval" type="number" min="1" max="3600" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-interval" type="number" min="1" max="3600" value="30" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
-          <input id="f-timeout" type="number" min="100" max="30000" value="2000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
           <input id="f-loss" type="number" min="1" max="100" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Down after
-          <input id="f-down" type="number" min="1" max="30" value="3" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-down" type="number" min="1" max="30" value="2" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
-          <input id="f-spike" type="number" min="2" max="10" value="5" title="Degraded when latest ping exceeds this multiple of the 60-probe average" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-spike" type="number" min="2" max="10" value="3" title="Degraded when latest ping exceeds this multiple of the 60-probe average" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
       <div id="form-err" class="hidden text-xs text-bad font-mono"></div>
@@ -346,8 +354,20 @@ async function api(path, opts) {
 
 async function refresh() {
   try {
-    const [s, e] = await Promise.all([api('/api/sensors'), api('/api/events?n=20')]);
+    const [s, e, hz] = await Promise.all([
+      api('/api/sensors'),
+      api('/api/events?n=20'),
+      api('/api/healthz').catch(() => null)
+    ]);
     SENSORS = s; EVENTS = e || [];
+    const banner = document.getElementById('probe-banner');
+    if (hz && hz.probe_error) {
+      document.getElementById('probe-banner-text').textContent =
+        'probing is broken: ' + hz.probe_error;
+      banner.classList.remove('hidden');
+    } else {
+      banner.classList.add('hidden');
+    }
     render();
   } catch (err) { console.error('refresh failed', err); }
 }
@@ -656,12 +676,12 @@ function openSensorModal(id) {
     $('f-id').value = s.id; $('f-name').value = s.name; $('f-target').value = s.target;
     formTagsCache = (s.tags || []).slice();
     renderFormTags(formTagsCache);
-    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 5;
+    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 3;
   } else {
     $('modal-title').textContent = 'New sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
     renderFormTags([]);
-    $('f-interval').value = 5; $('f-timeout').value = 2000; $('f-loss').value = 5; $('f-down').value = 3; $('f-spike').value = 5;
+    $('f-interval').value = 30; $('f-timeout').value = 1000; $('f-loss').value = 5; $('f-down').value = 2; $('f-spike').value = 3;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);
@@ -877,7 +897,7 @@ async function loadInspector() {
     $('insp-name').textContent = s.name;
     $('insp-tag').textContent = (s.tags && s.tags.length) ? s.tags.join(' · ') : '—';
     $('insp-target').textContent = s.target + (s.state === 'paused' ? '   ·   PAUSED' : '');
-    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · down after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 5) + '×';
+    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · down after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 3) + '×';
     const g1 = document.getElementById('grange-1h');
     const g2 = document.getElementById('grange-24h');
     if (g1) g1.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');

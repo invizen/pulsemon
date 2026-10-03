@@ -117,12 +117,16 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusServiceUnavailable, "db unreachable: "+err.Error())
 		return
 	}
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	hz := map[string]interface{}{
 		"status":   "ok",
 		"sensors":  n,
 		"probing":  s.probeWorker.ActiveCount(),
 		"time":     time.Now().UTC().Format(time.RFC3339),
-	})
+	}
+	if e := LastProbeError(); e != "" {
+		hz["probe_error"] = e
+	}
+	respondWithJSON(w, http.StatusOK, hz)
 }
 
 // sensorStats computes a 60-probe window summary for one sensor.
@@ -252,14 +256,14 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Tags = cleanTags(req.Tags)
 		if req.IntervalS <= 0 {
-			req.IntervalS = 5
+			req.IntervalS = 30
 		}
 		if req.IntervalS < 1 || req.IntervalS > 3600 {
 			respondWithError(w, http.StatusBadRequest, "interval_s must be 1-3600")
 			return
 		}
 		if req.TimeoutMS <= 0 {
-			req.TimeoutMS = 2000
+			req.TimeoutMS = 1000
 		}
 		if req.TimeoutMS < 100 || req.TimeoutMS > 30000 {
 			respondWithError(w, http.StatusBadRequest, "timeout_ms must be 100-30000")
@@ -269,10 +273,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			req.LossWarn = 5
 		}
 		if req.DownAfter <= 0 {
-			req.DownAfter = 3
+			req.DownAfter = 2
 		}
 		if req.SpikeMult <= 0 {
-			req.SpikeMult = 5
+			req.SpikeMult = 3
 		}
 		if req.SpikeMult < 2 || req.SpikeMult > 10 {
 			respondWithError(w, http.StatusBadRequest, "spike_mult must be 2-10")

@@ -30,10 +30,24 @@ var (
 	sharedConn   *icmp.PacketConn
 	sharedConnErr error
 
+	// probeErrCount grows on every probe attempt that hit a socket-level
+	// error (e.g. the ICMP socket cannot be created). deriveStatus uses
+	// the delta to flag "degraded" instead of silently defaulting to up.
+	probeErrCount atomic.Int64
+
 	pendingMu sync.Mutex
 	pending   = map[int]*pendingProbe{}
 	seqCtr    atomic.Int32
 )
+
+// LastProbeError returns the shared-socket error if one exists ("" when
+// healthy) — surfaced in /api/healthz so the dashboard can show a banner.
+func LastProbeError() string {
+	if sharedConnErr != nil {
+		return sharedConnErr.Error()
+	}
+	return ""
+}
 
 type pendingProbe struct {
 	dst   net.IP
@@ -96,6 +110,7 @@ func replyReader(conn *icmp.PacketConn) {
 func pingHost(target string, timeout time.Duration) PingResult {
 	conn, err := getSharedConn()
 	if err != nil {
+		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err}
 	}
 	dst, err := net.ResolveIPAddr("ip4", target)

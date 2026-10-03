@@ -31,6 +31,9 @@ type sensorConfig struct {
 	lossWarn  int
 	downAfter int
 	spikeMult int
+	// lastErrCount is the global ICMP-socket error counter as of the last
+	// probe; deriveStatus compares against it to detect "probing is broken".
+	lastErrCount int64
 }
 
 type ProbeWorker struct {
@@ -58,6 +61,11 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	defer retention.Stop()
 
 	pw.syncSensors(ctx) // immediate first pass
+	// Warm the shared ICMP socket now so a socket-level failure is visible
+	// in healthz immediately instead of after the first probe tick.
+	if _, err := getSharedConn(); err != nil {
+		log.Printf("ProbeWorker: ICMP socket init: %v", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -195,6 +203,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 }
 
 func (pw *ProbeWorker) doProbe(c sensorConfig) {
+	c.lastErrCount = probeErrCount.Load()
 	res := pingHost(c.target, time.Duration(c.timeoutMS)*time.Millisecond)
 
 	var rttVal interface{}
@@ -360,6 +369,13 @@ func (pw *ProbeWorker) ResetAlertStates() {
 // deriveStatus computes up/degraded/down from the 60-probe window (SPEC §3).
 // Precedence: down (N consecutive losses) > degraded (loss% or latency spike) > up.
 func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
+	// Broken probe path (e.g. ICMP socket cannot be created): probes never
+	// land, so the window would be empty and every sensor would silently
+	// read "up". Any socket-level error since the last probe means we
+	// cannot know the real state — flag degraded, never up.
+	if probeErrCount.Load() > c.lastErrCount {
+		return "degraded"
+	}
 	// Consecutive losses from newest: down after N in a row. This is the
 	// highest-priority rule — sustained unreachability is down, full stop.
 	consec := 0
