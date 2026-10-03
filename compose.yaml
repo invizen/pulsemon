@@ -1,0 +1,18 @@
+services:
+  zenmon:
+    build: .
+    container_name: zenmon
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data
+    environment:
+      - ZENMON_DB=/data/zenmon.db
+      - GOOGLE_CHAT_WEBHOOK_URL=${GOOGLE_CHAT_WEBHOOK_URL:-}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/zenmon", "-healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s

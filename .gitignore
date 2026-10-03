@@ -1,0 +1,14 @@
+# local database + runtime state
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets — never commit
+.env
+
+# build artifacts
+zenmon
+zenmon-bin
+pingmon
+bin/

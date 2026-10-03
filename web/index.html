@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>zenmon</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@phosphor-icons/web"></script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script>
+tailwind.config = {
+  theme: { extend: {
+    fontFamily: { sans: ['"Plus Jakarta Sans"','sans-serif'], mono: ['"JetBrains Mono"','monospace'] },
+    colors: { surface: {950:'#07090e',900:'#0b0f17',850:'#101622',800:'#161f30',700:'#222f47',600:'#334466'},
+      ok:'#10b981', warn:'#f59e0b', bad:'#f43f5e', jit:'#818cf8' }
+  } }
+};
+</script>
+<style>
+  ::-webkit-scrollbar{width:6px;height:6px}
+  ::-webkit-scrollbar-track{background:#0b0f17}
+  ::-webkit-scrollbar-thumb{background:#222f47;border-radius:3px}
+  .glow-ok{box-shadow:0 0 10px rgba(16,185,129,.55)}
+  .glow-warn{box-shadow:0 0 10px rgba(245,158,11,.55)}
+  .glow-bad{box-shadow:0 0 10px rgba(244,63,94,.6)}
+  .spark-bar{transition:height .25s ease, background-color .25s ease}
+  .modal-backdrop{animation:fadein .12s ease}
+  @keyframes fadein{from{opacity:0}to{opacity:1}}
+</style>
+</head>
+<body class="bg-surface-950 text-slate-200 font-sans min-h-screen antialiased">
+
+<!-- ============ HEADER ============ -->
+<header class="border-b border-surface-800 bg-surface-900/80 backdrop-blur sticky top-0 z-30">
+  <div class="max-w-[1700px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
+    <div class="flex items-center gap-3">
+      <div class="h-9 w-9 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok">
+        <i class="ph-bold ph-activity text-lg"></i>
+      </div>
+      <div>
+        <div class="flex items-center gap-2">
+          <span class="font-bold tracking-tight"><span class="text-[#98a1b0]">zen</span><span class="text-[#f02020]">mon</span></span>
+          <span class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">ICMP</span>
+        </div>
+        <p class="text-[11px] text-slate-500 hidden sm:block">network sensor monitor</p>
+      </div>
+    </div>
+
+    <div id="status-pill" class="hidden md:flex items-center gap-5 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-xs">
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-ok glow-ok"></span><span class="text-slate-400">UP</span><span id="c-up" class="text-ok font-semibold">0</span></span>
+      <span class="h-3 w-px bg-surface-700"></span>
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-warn glow-warn"></span><span class="text-slate-400">DEG</span><span id="c-deg" class="text-warn font-semibold">0</span></span>
+      <span class="h-3 w-px bg-surface-700"></span>
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-bad glow-bad"></span><span class="text-slate-400">DOWN</span><span id="c-down" class="text-bad font-semibold">0</span></span>
+      <span class="h-3 w-px bg-surface-700"></span>
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-slate-500"></span><span class="text-slate-400">PAUSED</span><span id="c-paused" class="text-slate-400 font-semibold">0</span></span>
+    </div>
+
+    <div class="flex items-center gap-2">
+      <button onclick="openSettings()" title="Settings (webhook)" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+        <i class="ph-bold ph-gear text-lg"></i>
+      </button>
+      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-xs font-semibold">
+        <i class="ph-bold ph-plus text-sm"></i> New sensor
+      </button>
+    </div>
+  </div>
+</header>
+
+<main class="max-w-[1700px] mx-auto px-4 sm:px-6 py-6 flex flex-col gap-5">
+
+  <!-- ============ TOOLBAR ============ -->
+  <section class="bg-surface-900 border border-surface-800 rounded-xl p-3 flex flex-col lg:flex-row lg:items-center gap-3">
+    <div class="relative w-full lg:w-72">
+      <i class="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm"></i>
+      <input id="q" type="text" placeholder="filter name, target, tag…" oninput="render()"
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60 font-mono">
+    </div>
+    <div id="tag-chips" class="flex items-center gap-1.5 overflow-x-auto text-xs font-mono py-1 flex-1"></div>
+    <div class="flex items-center gap-2 shrink-0">
+      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 font-mono text-xs">
+        <span class="text-slate-500 mr-1.5">SORT</span>
+        <select id="sort" onchange="render()" class="bg-transparent text-slate-300 focus:outline-none cursor-pointer">
+          <option value="severity">Severity</option>
+          <option value="name">Name A–Z</option>
+          <option value="rtt-desc">Ping high→low</option>
+          <option value="rtt-asc">Ping low→high</option>
+          <option value="loss">Loss %</option>
+        </select>
+      </div>
+      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg p-0.5">
+        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800"><i class="ph-bold ph-squares-four text-sm"></i></button>
+        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white"><i class="ph-bold ph-rows text-sm"></i></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ SENSOR GRID ============ -->
+  <section id="grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4"></section>
+
+  <!-- ============ SENSOR TABLE ============ -->
+  <section id="table-wrap" class="hidden bg-surface-900 border border-surface-800 rounded-xl overflow-hidden">
+    <table class="w-full text-base font-mono">
+      <thead>
+        <tr class="text-xs text-slate-500 uppercase tracking-wider border-b border-surface-800 bg-surface-850/50">
+          <th class="text-left py-3.5 px-4">Status</th>
+          <th class="text-left py-3.5 px-4">Sensor</th>
+          <th class="text-left py-3.5 px-4 hidden sm:table-cell">Target</th>
+          <th class="text-left py-3.5 px-4">Tag</th>
+          <th class="text-right py-3.5 px-4">Ping</th>
+          <th class="text-right py-3.5 px-4">Jitter</th>
+          <th class="text-right py-3.5 px-4">Loss</th>
+          <th class="text-right py-3.5 px-4">Uptime 24h</th>
+          <th class="text-left py-3.5 px-4 hidden lg:table-cell">Trend</th>
+          <th class="text-right py-3.5 px-4">Actions</th>
+        </tr>
+      </thead>
+      <tbody id="table-body" class="divide-y divide-surface-800/60"></tbody>
+    </table>
+  </section>
+
+  <div id="empty" class="hidden py-16 text-center">
+    <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-3xl"></i></div>
+    <h3 class="text-sm font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
+    <p class="text-xs text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
+    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-xs font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto"><i class="ph-bold ph-plus"></i> Add your first sensor</button>
+  </div>
+
+  <!-- ============ ACTIVITY FEED ============ -->
+  <section class="bg-surface-900 border border-surface-800 rounded-xl">
+    <div class="px-4 py-2.5 border-b border-surface-800 flex items-center gap-2">
+      <i class="ph ph-list-bullets text-slate-500 text-sm"></i>
+      <span class="text-xs font-semibold text-slate-300 tracking-wide">ACTIVITY</span>
+      <span class="text-[11px] text-slate-600 font-mono">state transitions</span>
+      <button onclick="clearActivity()" title="Clear activity log"
+        class="ml-auto px-2 py-0.5 rounded-md text-[11px] font-mono text-slate-500 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1"><i class="ph ph-trash-simple"></i> clear</button>
+    </div>
+    <ul id="feed" class="divide-y divide-surface-800/60 max-h-56 overflow-y-auto text-xs font-mono"></ul>
+  </section>
+</main>
+
+<!-- ============ SENSOR MODAL (create / edit) ============ -->
+<div id="modal-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4" onclick="if(event.target===this)closeModal()">
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-3xl rounded-2xl shadow-2xl overflow-hidden">
+    <div class="px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <h2 id="modal-title" class="text-sm font-bold text-white">New sensor</h2>
+      <button onclick="closeModal()" class="text-slate-500 hover:text-white"><i class="ph ph-x-lg"></i></button>
+    </div>
+    <form id="sensor-form" onsubmit="submitSensor(event)" class="p-5 space-y-3">
+      <input type="hidden" id="f-id">
+      <div class="grid grid-cols-2 gap-3">
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
+          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="router">
+        </label>
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Target <span class="text-slate-600">IP or hostname</span>
+          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="192.168.1.1">
+        </label>
+      </div>
+      <label class="text-xs text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
+        <div id="f-tagchips" class="flex flex-wrap items-center gap-1.5 min-h-[2.2rem] bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5"></div>
+        <div class="flex items-center gap-2 mt-1">
+          <select id="f-tagpick" onchange="addFormTag(this.value);this.value=''" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+            <option value="">+ add existing tag…</option>
+          </select>
+          <input id="f-tagnew" maxlength="30" placeholder="or type new tag ↵"
+            onkeydown="if(event.key==='Enter'){event.preventDefault();addFormTag(this.value.trim());this.value=''}"
+            class="w-36 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+        </div>
+      </label>
+      <div class="grid grid-cols-5 gap-3">
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
+          <input id="f-interval" type="number" min="1" max="3600" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
+          <input id="f-timeout" type="number" min="100" max="30000" value="2000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
+          <input id="f-loss" type="number" min="1" max="100" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Down after
+          <input id="f-down" type="number" min="1" max="30" value="3" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
+          <input id="f-spike" type="number" min="2" max="10" value="5" title="Degraded when latest ping exceeds this multiple of the 60-probe average" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+      </div>
+      <div id="form-err" class="hidden text-xs text-bad font-mono"></div>
+      <div class="flex justify-end gap-2 pt-1">
+        <button type="button" onclick="closeModal()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Cancel</button>
+        <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save sensor</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+<!-- ============ SETTINGS MODAL ============ -->
+<div id="settings-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4" onclick="if(event.target===this)closeSettings()">
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-lg rounded-2xl shadow-2xl overflow-hidden">
+    <div class="px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <h2 class="text-sm font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
+      <button onclick="closeSettings()" class="text-slate-500 hover:text-white"><i class="ph ph-x-lg"></i></button>
+    </div>
+    <div class="p-5 space-y-4">
+      <div id="maint-banner" class="hidden text-xs font-mono px-3 py-2 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+        <i class="ph-bold ph-warning"></i> Maintenance mode is ON — no alerts are being sent.
+      </div>
+      <div class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-warn/5">
+        <span class="text-xs font-semibold text-slate-300">
+          <i class="ph-bold ph-wrench text-warn"></i> Maintenance mode
+          <span class="block text-[11px] font-normal text-slate-600 mt-0.5">silence all alerts (sensors keep probing)</span>
+        </span>
+        <button type="button" id="maint-toggle" onclick="toggleMaint()" class="relative w-10 h-6 rounded-full bg-surface-800 border border-surface-700 transition-colors" title="Toggle maintenance mode">
+          <span id="maint-knob" class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-slate-400 transition-transform"></span>
+        </button>
+      </div>
+      <div class="flex items-center justify-between text-xs font-mono">
+        <span class="text-slate-400">Alerts → Google Chat webhook</span>
+        <span id="set-source" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+      </div>
+      <label class="text-xs text-slate-400 flex flex-col gap-1">Webhook URL
+        <div class="flex items-center gap-2">
+          <input id="f-webhook" type="text" placeholder="https://chat.googleapis.com/v1/spaces/…/messages?key=…"
+            class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <button type="button" id="btn-test" onclick="testWebhook()" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-xs font-semibold whitespace-nowrap">
+            <i class="ph-bold ph-paper-plane-tilt"></i> Send test
+          </button>
+          <button type="button" id="btn-clear" onclick="clearWebhook()" title="Clear the dashboard URL — falls back to the container env URL (or disables if that is empty)" class="px-3 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-xs font-mono whitespace-nowrap">
+            Clear
+          </button>
+        </div>
+        <span class="text-[11px] text-slate-600 mt-1">Paste the full URL to update. “Clear” removes the dashboard URL — alerts fall back to the container's env URL (or are disabled if that is empty).</span>
+      </label>
+      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/50 space-y-3">
+        <div class="flex items-center justify-between">
+          <span class="text-xs font-semibold text-slate-300">Alert routing</span>
+          <span class="text-[11px] text-slate-600 font-mono">which sensors can fire alerts</span>
+        </div>
+        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="all">All sensors</option>
+          <option value="tags">Only sensors with selected tags</option>
+          <option value="sensors">Only selected sensors</option>
+        </select>
+        <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
+        <label class="text-xs text-slate-400 flex items-center justify-between gap-3">
+          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still down/degraded — 0 = alert once only</span></span>
+          <span class="flex items-center gap-1.5 font-mono">
+            <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-ok/60"> min
+          </span>
+        </label>
+        <label class="text-xs text-slate-400 flex items-center justify-between gap-3 cursor-pointer" title="When off, degraded sensors appear in the dashboard but never send an alert">
+          <span class="flex flex-col">Alert on degraded <span class="text-[11px] text-slate-600">off = down &amp; recovery alerts only</span></span>
+          <input id="f-alertdeg" type="checkbox" checked class="w-4 h-4 accent-emerald-500">
+        </label>
+      </div>
+      <div id="set-msg" class="hidden text-xs font-mono px-3 py-2 rounded-lg border"></div>
+      <div class="text-[11px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
+        <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
+        Sent when a sensor transitions between up / degraded / down — including a *recovered* message. While a sensor stays in a bad state, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
+      </div>
+    </div>
+    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+      <span class="text-[11px] text-slate-500 font-mono">stored in the zenmon database</span>
+      <div class="flex gap-2">
+        <button onclick="closeSettings()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Cancel</button>
+        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ INSPECTOR MODAL ============ -->
+<div id="insp-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4" onclick="if(event.target===this)closeInspector()">
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden">
+    <div class="px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <div class="flex items-center gap-3">
+        <span id="insp-dot" class="w-3 h-3 rounded-full"></span>
+        <div>
+          <div class="flex items-center gap-2">
+            <h2 id="insp-name" class="text-base font-bold text-white font-mono">—</h2>
+            <span id="insp-tag" class="px-2 py-0.5 rounded text-[11px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
+          </div>
+          <p id="insp-target" class="text-xs text-slate-500 font-mono mt-0.5"></p>
+        </div>
+      </div>
+      <button onclick="closeInspector()" class="text-slate-500 hover:text-white"><i class="ph ph-x-lg"></i></button>
+    </div>
+    <div class="p-5 space-y-5">
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono">
+        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Ping last</div>
+          <div id="insp-rtt" class="text-lg font-bold text-white mt-1">—</div>
+        </div>
+        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+          <div class="text-[11px] text-slate-500 uppercase tracking-wider">min / avg / max</div>
+          <div id="insp-minavgmax" class="text-xs font-semibold text-slate-200 mt-1.5">—</div>
+        </div>
+        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Loss (60p)</div>
+          <div id="insp-loss" class="text-lg font-bold text-ok mt-1">—</div>
+          <div id="insp-losssub" class="text-[11px] text-slate-500 mt-0.5"></div>
+        </div>
+        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Jitter</div>
+          <div id="insp-jitter" class="text-lg font-bold text-jit mt-1">—</div>
+        </div>
+      </div>
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <span class="text-xs font-semibold text-slate-300 flex items-center gap-3">
+            Ping over time
+            <span id="insp-graph-up" class="text-[11px] font-mono text-slate-500"></span>
+          </span>
+          <div class="flex items-center gap-1">
+            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
+            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
+          </div>
+        </div>
+        <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
+      </div>
+    </div>
+    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
+      <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono">Close</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let SENSORS = [], EVENTS = [], SETTINGS = {};
+let activeTag = 'ALL', searchQ = '', inspectId = null, graphRange = '1h';
+let viewMode = localStorage.getItem('zenmon_view') || 'cards';
+
+const $ = id => document.getElementById(id);
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  if (!r.ok) {
+    let msg = r.status + ' ' + r.statusText;
+    try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
+    throw new Error(msg);
+  }
+  if (r.status === 204) return null;
+  return r.json();
+}
+
+async function refresh() {
+  try {
+    const [s, e] = await Promise.all([api('/api/sensors'), api('/api/events?n=20')]);
+    SENSORS = s; EVENTS = e || [];
+    render();
+  } catch (err) { console.error('refresh failed', err); }
+}
+
+function fmtRtt(v) {
+  if (v == null) return '—';
+  return Math.round(v) + ' ms';
+}
+
+function jitterOf(s) {
+  const r = (s.stats && s.stats.recent || []).filter(x => x != null);
+  if (r.length < 2) return null;
+  let sum = 0;
+  for (let i = 1; i < r.length; i++) sum += Math.abs(r[i-1] - r[i]);
+  return sum / (r.length - 1);
+}
+
+function statusMeta(s) {
+  if (s.state === 'paused') return { label: 'PAUSED', cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', dot: 'bg-slate-500', glow: '' };
+  switch (s.status) {
+    case 'up': return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
+    case 'degraded': return { label: 'DEGRADED', cls: 'text-warn bg-warn/10 border-warn/25', dot: 'bg-warn', glow: 'glow-warn' };
+    case 'down': return { label: 'DOWN', cls: 'text-bad bg-bad/10 border-bad/25', dot: 'bg-bad', glow: 'glow-bad' };
+    default: return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
+  }
+}
+
+function severityRank(s) {
+  if (s.state === 'paused') return 3;
+  return { down: 0, degraded: 1, up: 2 }[s.status] ?? 1;
+}
+
+function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function sparklineBars(recent, maxBars) {
+  const arr = (recent || []).slice(0, maxBars || 30); // newest first
+  const vals = arr.filter(x => x != null);
+  const maxVal = Math.max(...(vals.length ? vals : [0]), 40);
+  return arr.slice().reverse().map(v => { // oldest → newest, left → right
+    if (v == null) return '<div class="spark-bar w-[3px] h-full bg-bad/80 rounded-sm" title="lost"></div>';
+    const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
+    let cls = 'bg-ok/80';
+    if (v > 140) cls = 'bg-bad'; else if (v > 50) cls = 'bg-warn';
+    return '<div class="spark-bar w-[3px] rounded-sm ' + cls + '" style="height:' + h + '%" title="' + fmtRtt(v) + '"></div>';
+  }).join('');
+}
+
+function render() {
+  const up = SENSORS.filter(s => s.state === 'active' && s.status === 'up').length;
+  const deg = SENSORS.filter(s => s.state === 'active' && s.status === 'degraded').length;
+  const down = SENSORS.filter(s => s.state === 'active' && s.status === 'down').length;
+  const paused = SENSORS.filter(s => s.state === 'paused').length;
+  $('c-up').textContent = up; $('c-deg').textContent = deg; $('c-down').textContent = down; $('c-paused').textContent = paused;
+
+  const tags = ['ALL'].concat([...new Set(SENSORS.flatMap(s => s.tags || []))]);
+  $('tag-chips').innerHTML = tags.map(t => {
+    if (t === 'ALL') {
+      return '<button onclick="setTag(\'ALL\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
+        (t === activeTag ? 'bg-surface-700 text-white font-semibold border border-surface-600' : 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800') + '">ALL</button>';
+    }
+    return '<button onclick="setTag(\'' + t.replace(/'/g, "\\'") + '\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
+      (t === activeTag ? 'bg-surface-700 text-white font-semibold border border-surface-600' : 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800') + '">' +
+      esc(t) + '</button>';
+  }).join('');
+
+  let list = SENSORS.filter(s => (activeTag === 'ALL' || (s.tags || []).includes(activeTag)) &&
+    (!searchQ || s.name.toLowerCase().includes(searchQ) || s.target.toLowerCase().includes(searchQ) || (s.tags || []).join(' ').toLowerCase().includes(searchQ)));
+  const sort = $('sort').value;
+  list.sort((a, b) => {
+    if (sort === 'severity') return severityRank(a) - severityRank(b) || a.name.localeCompare(b.name);
+    if (sort === 'name') return a.name.localeCompare(b.name);
+    const ra = a.stats ? (a.stats.rtt_last != null ? a.stats.rtt_last : 99999) : 99999;
+    const rb = b.stats ? (b.stats.rtt_last != null ? b.stats.rtt_last : 99999) : 99999;
+    if (sort === 'rtt-desc') return rb - ra;
+    if (sort === 'rtt-asc') return ra - rb;
+    if (sort === 'loss') return (b.stats && b.stats.loss_pct || 0) - (a.stats && a.stats.loss_pct || 0);
+    return 0;
+  });
+
+  const grid = $('grid'), empty = $('empty'), tableWrap = $('table-wrap');
+  if (SENSORS.length === 0) {
+    grid.innerHTML = ''; tableWrap.classList.add('hidden'); empty.classList.remove('hidden');
+    $('empty-title').textContent = 'No sensors yet';
+    $('empty-sub').textContent = 'Add your first sensor to start monitoring.';
+  } else if (list.length === 0) {
+    grid.innerHTML = ''; tableWrap.classList.add('hidden'); empty.classList.remove('hidden');
+    $('empty-title').textContent = 'No sensors match your filter';
+    $('empty-sub').textContent = 'Clear the search or tag filter.';
+  } else {
+    empty.classList.add('hidden');
+    if (viewMode === 'table') {
+      grid.innerHTML = '';
+      tableWrap.classList.remove('hidden');
+      renderTable(list);
+    } else {
+      tableWrap.classList.add('hidden');
+      grid.innerHTML = list.map(cardHtml).join('');
+    }
+  }
+
+  $('feed').innerHTML = EVENTS.length ? EVENTS.map(ev => {
+    const icon = ev.to === 'down' ? 'ph-arrow-down text-bad' : ev.to === 'degraded' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
+    const t = new Date(ev.ts).toLocaleTimeString([], { hour12: false });
+    return '<li class="px-4 py-2 flex items-center gap-2.5">' +
+      '<i class="ph ' + icon + '"></i>' +
+      '<span class="text-slate-300">' + esc(ev.sensor) + '</span>' +
+      '<span class="text-slate-500">' + esc(ev.from) + ' → <span class="text-slate-300">' + esc(ev.to) + '</span></span>' +
+      '<span class="ml-auto text-slate-600">' + t + '</span></li>';
+  }).join('') : '<li class="px-4 py-3 text-slate-600">no state transitions yet</li>';
+}
+
+function cardHtml(s) {
+  const m = statusMeta(s);
+  const st = s.stats;
+  const paused = s.state === 'paused';
+  const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : 'no data');
+  const loss = paused ? '—' : (st ? st.loss_pct.toFixed(1) + '%' : '—');
+  const j = jitterOf(s);
+  const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
+  const border = paused ? 'border-surface-700' : s.status === 'down' ? 'border-bad/40' : s.status === 'degraded' ? 'border-warn/30' : 'border-surface-800';
+  const n = st && st.recent ? st.recent.length : 0;
+  return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-4 flex flex-col gap-3 transition-all hover:shadow-lg hover:shadow-black/30 ' + (paused ? 'opacity-70' : '') + '">' +
+    '<div class="flex items-start justify-between gap-2">' +
+      '<div class="flex items-center gap-2.5 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
+        '<span class="w-2.5 h-2.5 rounded-full shrink-0 ' + m.dot + ' ' + m.glow + '"></span>' +
+        '<div class="min-w-0">' +
+          '<h3 class="text-sm font-semibold text-slate-100 font-mono truncate">' + esc(s.name) + '</h3>' +
+          '<div class="flex flex-wrap items-center gap-1 mt-0.5">' +
+            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join(' ') : '') +
+          '</div>' +
+        '</div>' +
+      '</div>' +
+      '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-semibold border ' + m.cls + '">' + m.label + '</span>' +
+    '</div>' +
+    '<div class="grid grid-cols-3 gap-2 p-2.5 bg-surface-950/80 rounded-lg border border-surface-800/80 font-mono text-center">' +
+      '<div><div class="text-[11px] text-slate-500 uppercase">Ping</div><div class="text-sm font-bold text-slate-100 mt-0.5">' + rtt + '</div></div>' +
+      '<div class="border-x border-surface-800"><div class="text-[11px] text-slate-500 uppercase">Jitter</div><div class="text-sm font-bold text-jit mt-0.5">' + jit + '</div></div>' +
+      '<div><div class="text-[11px] text-slate-500 uppercase">Loss</div><div class="text-sm font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div></div>' +
+    '</div>' +
+    '<div>' +
+      '<div class="flex items-center justify-between text-[11px] text-slate-600 font-mono mb-1">' +
+        '<span>last ' + n + ' probes</span>' +
+        (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (st.rtt_avg != null ? ' · avg ' + fmtRtt(st.rtt_avg) : '') + '</span>' : '') +
+      '</div>' +
+      '<div class="h-7 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+        (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused — probing stopped</span>'
+          : (n ? sparklineBars(st.recent) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
+      '</div>' +
+    '</div>' +
+    '<div class="flex items-center justify-between pt-2 border-t border-surface-800/60">' +
+      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now (single probe, not recorded)" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+      '<div class="flex items-center gap-1">' +
+        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause for maintenance') + '" class="p-1.5 rounded-md hover:bg-surface-800 ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy"></i></button>' +
+        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash"></i></button>' +
+      '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function setTag(t) { activeTag = t; render(); }
+
+async function clearActivity() {
+  if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
+  if (!confirm('Clear the ACTIVITY log? This removes all ' + EVENTS.length + ' state-transition entries (probe history and graphs are untouched).')) return;
+  try {
+    const r = await api('/api/events', { method: 'DELETE' });
+    EVENTS = [];
+    render();
+    toast('activity log cleared' + (r && r.events_deleted != null ? ' (' + r.events_deleted + ' entries)' : ''), 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+function setViewMode(m) {
+  viewMode = m;
+  localStorage.setItem('zenmon_view', m);
+  $('view-cards-btn').className = 'p-1.5 rounded ' + (m === 'cards' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
+  $('view-table-btn').className = 'p-1.5 rounded ' + (m === 'table' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
+  render();
+}
+
+function miniSpark(recent) {
+  const arr = (recent || []).slice(0, 20).reverse();
+  const vals = arr.filter(x => x != null);
+  const maxVal = Math.max(...(vals.length ? vals : [0]), 20);
+  return arr.map(v => {
+    if (v == null) return '<div class="w-[3px] h-5 bg-bad/70 rounded-sm"></div>';
+    const h = Math.min(20, Math.max(3, (v / maxVal) * 20));
+    let cls = 'bg-ok/70';
+    if (v > 140) cls = 'bg-bad'; else if (v > 50) cls = 'bg-warn';
+    return '<div class="w-[3px] rounded-sm ' + cls + '" style="height:' + h + 'px"></div>';
+  }).join('');
+}
+
+function renderTable(list) {
+  $('table-body').innerHTML = list.map(s => {
+    const m = statusMeta(s);
+    const st = s.stats;
+    const paused = s.state === 'paused';
+    const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—');
+    const j = jitterOf(s);
+    const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
+    const loss = paused ? '—' : (st ? st.loss_pct.toFixed(1) + '%' : '—');
+    const up24 = paused ? '—' : (st && st.total ? st.uptime_24h.toFixed(2) + '%' : '—');
+    return '<tr class="hover:bg-surface-850/60 transition-colors">' +
+      '<td class="py-3.5 px-4"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2.5 h-2.5 rounded-full ' + m.dot + ' ' + m.glow + '"></span>' + m.label + '</span></td>' +
+      '<td class="py-3.5 px-4 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span></td>' +
+      '<td class="py-3.5 px-4 text-slate-400 hidden sm:table-cell">' + esc(s.target) + '</td>' +
+      '<td class="py-3.5 px-4">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-2.5 py-1 rounded text-xs bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-700">—</span>') + '</td>' +
+      '<td class="py-3.5 px-4 text-right ' + (st && st.rtt_last != null ? 'text-slate-100 font-bold' : 'text-slate-500') + '">' + rtt + '</td>' +
+      '<td class="py-3.5 px-4 text-right text-jit">' + jit + '</td>' +
+      '<td class="py-3.5 px-4 text-right ' + (!paused && st && st.loss_pct > 0 ? 'text-warn font-bold' : 'text-slate-400') + '">' + loss + '</td>' +
+      '<td class="py-3.5 px-4 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-bold' : 'text-ok') + '">' + up24 + '</td>' +
+      '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-xs text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
+      '<td class="py-3.5 px-4 text-right"><div class="flex items-center justify-end gap-0.5">' +
+        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
+        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
+      '</div></td></tr>';
+  }).join('');
+}
+document.addEventListener('input', e => { if (e.target.id === 'q') searchQ = e.target.value.trim().toLowerCase(); render(); });
+
+let echoBusy = false;
+async function echoPing(id, btn) {
+  if (echoBusy) return; echoBusy = true; if (btn) btn.disabled = true;
+  try {
+    const r = await api('/api/sensors/' + id + '/ping', { method: 'POST' });
+    if (btn) { btn.classList.add(r.lost ? 'text-bad' : 'text-ok'); setTimeout(() => { btn.classList.remove('text-bad','text-ok'); btn.disabled = false; }, 1500); }
+    toast(r.lost ? 'no reply from ' + id : 'echo: ' + fmtRtt(r.rtt_ms), r.lost ? 'bad' : 'ok');
+  } catch (e) { toast('echo failed: ' + e.message, 'bad'); }
+  echoBusy = false;
+}
+
+async function togglePause(id) {
+  const s = SENSORS.find(x => x.id === id); if (!s) return;
+  const next = s.state === 'paused' ? 'active' : 'paused';
+  try {
+    await api('/api/sensors/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: next }) });
+    toast(s.name + (next === 'paused' ? ' paused (maintenance)' : ' resumed'), 'ok');
+    await refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function cloneSensor(id) {
+  try {
+    const c = await api('/api/sensors/' + id + '/clone', { method: 'POST' });
+    toast('cloned → ' + c.name, 'ok');
+    await refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+async function deleteSensor(id, name) {
+  if (!confirm('Delete sensor "' + name + '"?\nThis purges its history and events.')) return;
+  try {
+    await api('/api/sensors/' + id, { method: 'DELETE' });
+    toast(name + ' deleted', 'ok');
+    if (inspectId === id) closeInspector();
+    await refresh();
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+// ---------- sensor form tag picker ----------
+function allExistingTags() { return [...new Set(SENSORS.flatMap(s => s.tags || []))].sort(); }
+
+function renderFormTags(selected) {
+  const box = $('f-tagchips');
+  if (!selected.length) {
+    box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no tags — pick or type one below</span>';
+  } else {
+    box.innerHTML = selected.map(t =>
+      '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-800 border border-surface-700 text-[11px] font-mono text-slate-200">' +
+      esc(t) + '<button type="button" onclick="removeFormTag(\'' + t.replace(/'/g, "\\'") + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[11px]"></i></button></span>').join('');
+  }
+  // dropdown: existing tags not already selected
+  const pick = $('f-tagpick');
+  const cur = pick.value;
+  pick.innerHTML = '<option value="">+ add existing tag…</option>' +
+    allExistingTags().filter(t => !selected.includes(t)).map(t => '<option value="' + esc(t) + '">' + esc(t) + '</option>').join('');
+  if ([...pick.options].some(o => o.value === cur)) pick.value = cur;
+}
+
+function addFormTag(t) {
+  if (!t) return;
+  if (formTagsCache.includes(t)) return;
+  formTagsCache.push(t);
+  renderFormTags(formTagsCache);
+}
+
+function removeFormTag(t) {
+  formTagsCache = formTagsCache.filter(x => x !== t);
+  renderFormTags(formTagsCache);
+}
+
+function selectedFormTags() { return formTagsCache.slice(); }
+
+function openSensorModal(id) {
+  $('form-err').classList.add('hidden');
+  formTagsCache = [];
+  if (id) {
+    const s = SENSORS.find(x => x.id === id); if (!s) return;
+    $('modal-title').textContent = 'Edit sensor';
+    $('f-id').value = s.id; $('f-name').value = s.name; $('f-target').value = s.target;
+    formTagsCache = (s.tags || []).slice();
+    renderFormTags(formTagsCache);
+    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 5;
+  } else {
+    $('modal-title').textContent = 'New sensor';
+    $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
+    renderFormTags([]);
+    $('f-interval').value = 5; $('f-timeout').value = 2000; $('f-loss').value = 5; $('f-down').value = 3; $('f-spike').value = 5;
+  }
+  $('modal-backdrop').classList.remove('hidden');
+  setTimeout(() => $('f-name').focus(), 50);
+}
+function closeModal() { $('modal-backdrop').classList.add('hidden'); }
+
+async function submitSensor(ev) {
+  ev.preventDefault();
+  const id = $('f-id').value;
+  const body = {
+    name: $('f-name').value.trim(), target: $('f-target').value.trim(), tags: selectedFormTags(),
+    interval_s: +$('f-interval').value, timeout_ms: +$('f-timeout').value,
+    loss_warn: +$('f-loss').value, down_after: +$('f-down').value, spike_mult: +$('f-spike').value
+  };
+  try {
+    if (id) {
+      await api('/api/sensors/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      toast('sensor updated', 'ok');
+    } else {
+      await api('/api/sensors', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+      toast('sensor created', 'ok');
+    }
+    closeModal();
+    await refresh();
+  } catch (e) {
+    $('form-err').textContent = e.message; $('form-err').classList.remove('hidden');
+  }
+}
+
+// ---------- settings ----------
+async function openSettings() {
+  $('set-msg').classList.add('hidden');
+  $('set-source').textContent = 'loading…';
+  $('settings-backdrop').classList.remove('hidden');
+  try {
+    const s = await api('/api/settings');
+    SETTINGS = s;
+    $('f-webhook').value = s.webhook_url && s.webhook_url.includes('***') ? '' : (s.webhook_url || '');
+    $('set-source').textContent = s.webhook_configured ? ('configured via ' + s.source) : 'not configured';
+    $('f-scope').value = s.alert_scope || 'all';
+    $('f-realert').value = s.realert_min ?? 30;
+    $('f-alertdeg').checked = s.alert_degraded !== false;
+    setMaintUI(!!s.maintenance_mode);
+    renderScopeOptions(s.alert_filter || []);
+  } catch (e) {
+    $('set-source').textContent = 'error';
+  }
+  setTimeout(() => $('f-webhook').focus(), 50);
+}
+function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
+
+function setMaintUI(on) {
+  const track = $('maint-toggle'), knob = $('maint-knob');
+  track.className = 'relative w-10 h-6 rounded-full border transition-colors ' + (on ? 'bg-warn/40 border-warn/60' : 'bg-surface-800 border-surface-700');
+  knob.className = 'absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform ' + (on ? 'translate-x-4 bg-warn' : 'translate-x-0 bg-slate-400');
+  $('maint-banner').classList.toggle('hidden', !on);
+}
+
+async function toggleMaint() {
+  const next = !(SETTINGS.maintenance_mode === true);
+  setMaintUI(next); // optimistic
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maintenance_mode: next }) });
+    SETTINGS = r;
+    setMaintUI(!!r.maintenance_mode);
+    setMsg(next ? 'maintenance mode ON — alerts silenced (sensors keep probing). Re-alert timers reset on turn-off.' : 'maintenance mode off — alerts active again', 'ok');
+  } catch (e) {
+    setMaintUI(SETTINGS.maintenance_mode === true);
+    setMsg('failed to update maintenance mode: ' + e.message, 'bad');
+  }
+}
+
+function renderScopeOptions(selected) {
+  const scope = $('f-scope').value;
+  const box = $('scope-options');
+  if (!selected) selected = SETTINGS.alert_filter || [];
+  if (scope === 'all') { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">every sensor can fire an alert</span>'; return; }
+  const items = scope === 'tags'
+    ? [...new Set(SENSORS.flatMap(s => s.tags || []))]
+    : SENSORS.map(s => s.id + '||' + s.name);
+  if (!items.length) { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no ' + (scope === 'tags' ? 'tags' : 'sensors') + ' yet</span>'; return; }
+  box.innerHTML = items.map(v => {
+    const val = scope === 'tags' ? v : v.split('||')[0];
+    const label = scope === 'tags' ? v : v.split('||')[1];
+    const on = selected.includes(val);
+    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2.5 py-1 rounded-lg text-[11px] font-mono border transition-colors ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
+  }).join('');
+}
+
+function toggleScopeItem(btn) {
+  const cur = selectedFilterItems();
+  const v = btn.dataset.val;
+  const next = cur.includes(v) ? cur.filter(x => x !== v) : cur.concat(v);
+  renderScopeOptions(next);
+}
+
+function selectedFilterItems() {
+  const scope = $('f-scope').value;
+  if (scope === 'all') return [];
+  return [...document.querySelectorAll('#scope-options [data-val]')]
+    .filter(b => b.classList.contains('bg-ok/15'))
+    .map(b => b.dataset.val);
+}
+
+function setMsg(text, kind) {
+  const el = $('set-msg');
+  el.textContent = text;
+  el.className = 'text-xs font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
+  el.classList.remove('hidden');
+}
+
+async function clearWebhook() {
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhook_url: '' }) });
+    SETTINGS = r;
+    $('f-webhook').value = '';
+    $('set-source').textContent = r.webhook_configured ? ('configured via ' + r.source) : 'not configured';
+    setMsg(r.webhook_configured ? 'reset — using the container env URL' : 'reset — no env URL found, alerts disabled', 'ok');
+  } catch (e) { setMsg(e.message, 'bad'); }
+}
+
+async function saveSettings() {
+  const url = $('f-webhook').value.trim();
+  const body = {
+    alert_scope: $('f-scope').value,
+    alert_filter: selectedFilterItems(),
+    realert_min: +$('f-realert').value,
+    maintenance_mode: SETTINGS.maintenance_mode === true,
+    alert_degraded: $('f-alertdeg').checked
+  };
+  if (url) body.webhook_url = url;
+  if (body.alert_scope !== 'all' && body.alert_filter.length === 0) {
+    setMsg('pick at least one ' + (body.alert_scope === 'tags' ? 'tag' : 'sensor') + ' — otherwise no alerts will fire', 'bad');
+    return;
+  }
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    SETTINGS = r;
+    $('set-source').textContent = r.webhook_configured ? ('configured via ' + r.source) : 'not configured';
+    $('f-webhook').value = '';
+    setMsg('settings saved', 'ok');
+  } catch (e) { setMsg(e.message, 'bad'); }
+}
+
+async function testWebhook() {
+  const url = $('f-webhook').value.trim();
+  if (url && !url.includes('***')) {
+    try {
+      await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhook_url: url }) });
+      $('f-webhook').value = '';
+    } catch (e) { setMsg('save failed: ' + e.message, 'bad'); return; }
+  }
+  const btn = $('btn-test'); btn.disabled = true; btn.textContent = 'sending…';
+  try {
+    const r = await api('/api/settings/test', { method: 'POST' });
+    if (r.ok) { setMsg('✓ ' + r.detail, 'ok'); } else { setMsg(r.detail, 'bad'); }
+  } catch (e) { setMsg(e.message, 'bad'); }
+  btn.disabled = false;
+  btn.innerHTML = '<i class="ph-bold ph-paper-plane-tilt"></i> Send test';
+  setTimeout(openSettings, 800);
+}
+
+async function openInspector(id) {
+  inspectId = id;
+  $('insp-backdrop').classList.remove('hidden');
+  await loadInspector();
+}
+function closeInspector() { inspectId = null; $('insp-backdrop').classList.add('hidden'); }
+
+// graph: SVG line/area of avg RTT per bucket, red ticks for loss
+function renderGraph(el, data) {
+  const pts = (data.points || []).filter(p => p.total > 0);
+  if (!pts.length) {
+    el.innerHTML = '<div class="flex items-center justify-center h-28 text-[11px] text-slate-600 font-mono">no data in this range yet</div>';
+    return;
+  }
+  const W = 760, H = 120, padL = 8, padR = 8, padT = 8, padB = 14;
+  const maxAvg = Math.max(...pts.map(p => p.avg || 0), 20);
+  const x = i => padL + (i / Math.max(pts.length - 1, 1)) * (W - padL - padR);
+  const y = v => padT + (1 - v / maxAvg) * (H - padT - padB);
+  const path = pts.map((p, i) => p.avg == null ? '' : (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + (p.avg != null ? y(p.avg).toFixed(1) : y(0).toFixed(1))).join(' ');
+  const area = path ? path + ' L' + x(pts.length - 1).toFixed(1) + ' ' + (H - padB) + ' L' + x(0).toFixed(1) + ' ' + (H - padB) + ' Z' : '';
+  // loss ticks
+  const ticks = pts.map((p, i) => p.lost > 0
+    ? '<line x1="' + x(i).toFixed(1) + '" y1="' + (H - padB) + '" x2="' + x(i).toFixed(1) + '" y2="' + (H - padB + 7) + '" stroke="#f43f5e" stroke-width="2" opacity="' + Math.min(1, p.lost / p.total * 1.5) + '"/>'
+    : '').join('');
+  // axis labels: start / middle / end time
+  const t0 = new Date(pts[0].t * 1000), t1 = new Date(pts[pts.length - 1].t * 1000);
+  const fmtT = t => t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  const mid = pts[Math.floor(pts.length / 2)];
+  el.innerHTML =
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" class="w-full" preserveAspectRatio="none">' +
+      '<path d="' + area + '" fill="#10b981" opacity="0.12"/>' +
+      '<path d="' + path + '" fill="none" stroke="#10b981" stroke-width="1.5"/>' +
+      '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#161f30" stroke-width="1"/>' +
+      ticks +
+      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
+      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
+      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
+    '</svg>' +
+    '<div class="flex items-center justify-between text-[11px] font-mono text-slate-600 mt-1">' +
+      '<span>peak avg ' + fmtRtt(maxAvg) + '</span>' +
+      '<span>red ticks = packet loss in bucket</span>' +
+    '</div>';
+}
+
+async function loadInspector() {
+  if (!inspectId) return;
+  try {
+    const [s, g] = await Promise.all([api('/api/sensors/' + inspectId), api('/api/sensors/' + inspectId + '/graph?range=' + graphRange)]);
+    const m = statusMeta(s);
+    $('insp-dot').className = 'w-3 h-3 rounded-full ' + m.dot + ' ' + m.glow;
+    $('insp-name').textContent = s.name;
+    $('insp-tag').textContent = (s.tags && s.tags.length) ? s.tags.join(' · ') : '—';
+    $('insp-target').textContent = s.target + (s.state === 'paused' ? '   ·   PAUSED' : '');
+    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · down after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 5) + '×';
+    const g1 = document.getElementById('grange-1h');
+    const g2 = document.getElementById('grange-24h');
+    if (g1) g1.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+    if (g2) g2.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+    $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime over ' + graphRange : 'no data in ' + graphRange;
+    renderGraph($('insp-graph'), g);
+    const st = s.stats;
+    $('insp-rtt').textContent = (st && st.rtt_last != null) ? fmtRtt(st.rtt_last) : '—';
+    $('insp-minavgmax').textContent = (st && st.rtt_min != null) ? fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max) : '—';
+    $('insp-loss').textContent = st ? st.loss_pct.toFixed(1) + '%' : '—';
+    $('insp-loss').className = 'text-lg font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');
+    $('insp-losssub').textContent = st ? st.lost_count + ' / ' + st.total + ' dropped (60p)' : '';
+    const j = jitterOf(s); $('insp-jitter').textContent = j != null ? '±' + fmtRtt(j) : '—';
+  } catch (e) { console.error(e); }
+}
+
+let toastTimer = null;
+function toast(msg, kind) {
+  let el = $('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    document.body.appendChild(el);
+  }
+  const color = kind === 'bad' ? 'text-bad border-bad/40 bg-surface-900' : 'text-ok border-ok/40 bg-surface-900';
+  el.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg border text-xs font-mono shadow-xl ' + color;
+  el.textContent = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.remove(), 2500);
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeInspector(); closeSettings(); } });
+
+refresh();
+setInterval(refresh, 5000);
+setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+</script>
+</body>
+</html>
