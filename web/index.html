@@ -18,6 +18,8 @@ tailwind.config = {
 };
 </script>
 <style>
+  :root{color-scheme:dark}
+  select,option{color-scheme:dark;background-color:#0b0f17;color:#f1f5f9}
   ::-webkit-scrollbar{width:6px;height:6px}
   ::-webkit-scrollbar-track{background:#0b0f17}
   ::-webkit-scrollbar-thumb{background:#222f47;border-radius:3px}
@@ -89,12 +91,12 @@ tailwind.config = {
     <div class="flex items-center gap-2 shrink-0">
       <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 font-mono text-xs">
         <span class="text-slate-500 mr-1.5">SORT</span>
-        <select id="sort" onchange="render()" class="bg-transparent text-slate-300 focus:outline-none cursor-pointer">
-          <option value="severity">Severity</option>
-          <option value="name">Name A–Z</option>
-          <option value="rtt-desc">Ping high→low</option>
-          <option value="rtt-asc">Ping low→high</option>
-          <option value="loss">Loss %</option>
+        <select id="sort" onchange="render()" class="bg-surface-900 text-slate-100 focus:outline-none cursor-pointer rounded">
+          <option value="severity" class="bg-surface-900 text-slate-100">Severity</option>
+          <option value="name" class="bg-surface-900 text-slate-100">Name A–Z</option>
+          <option value="rtt-desc" class="bg-surface-900 text-slate-100">Ping high→low</option>
+          <option value="rtt-asc" class="bg-surface-900 text-slate-100">Ping low→high</option>
+          <option value="loss" class="bg-surface-900 text-slate-100">Loss %</option>
         </select>
       </div>
       <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg p-0.5">
@@ -327,13 +329,13 @@ tailwind.config = {
         <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
       </div>
     </div>
-    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between gap-3">
+    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex flex-col gap-3">
       <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
-      <div class="flex items-center gap-2">
-        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-400 hover:text-bad text-xs font-mono transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
+      <div class="flex items-center justify-end gap-2">
+        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-xs font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
           <i class="ph ph-trash"></i> Clear history
         </button>
-        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono">Close</button>
+        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono whitespace-nowrap">Close</button>
       </div>
     </div>
   </div>
