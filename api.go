@@ -102,6 +102,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/sensors/{id}/clone", s.handleSensorClone)
 	s.mux.HandleFunc("GET /api/sensors/{id}/history", s.handleSensorHistory)
 	s.mux.HandleFunc("GET /api/sensors/{id}/graph", s.handleSensorGraph)
+	s.mux.HandleFunc("DELETE /api/sensors/{id}/history", s.handleSensorClearHistory)
+	s.mux.HandleFunc("DELETE /api/history", s.handleClearAllHistory)
 	s.mux.HandleFunc("/api/tags", s.handleTags)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
@@ -555,6 +557,64 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 		"sensor_id": id,
 		"count":     len(out),
 		"probes":    out, // newest first
+	})
+}
+
+// handleSensorClearHistory wipes one sensor's probe history, events, and
+// alert state and resets its status to up — the next probe tick rebuilds
+// the 60-probe window from scratch. Use after changing a sensor's target,
+// or to flush bad data (e.g. from a period when probing was broken).
+func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	id := r.PathValue("id")
+
+	var name string
+	if err := s.db.QueryRow("SELECT name FROM sensors WHERE id = ?", id).Scan(&name); err != nil {
+		respondWithError(w, http.StatusNotFound, "sensor not found")
+		return
+	}
+
+	var probes, events int64
+	if res, err := s.db.Exec("DELETE FROM probes WHERE sensor_id = ?", id); err == nil {
+		probes, _ = res.RowsAffected()
+	}
+	if res, err := s.db.Exec("DELETE FROM events WHERE sensor_id = ?", id); err == nil {
+		events, _ = res.RowsAffected()
+	}
+	_, _ = s.db.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id)
+	_, _ = s.db.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id)
+
+	log.Printf("API: cleared history for %s (%d probes, %d events)", name, probes, events)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"sensor":  name,
+		"cleared": map[string]int64{"probes": probes, "events": events},
+	})
+}
+
+// handleClearAllHistory is the bulk version of handleSensorClearHistory:
+// every sensor's probes/events/alert_state are wiped and statuses reset,
+// so the whole fleet rebuilds its windows from the next probe tick.
+func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var probes, events int64
+	if res, err := s.db.Exec("DELETE FROM probes"); err == nil {
+		probes, _ = res.RowsAffected()
+	}
+	if res, err := s.db.Exec("DELETE FROM events"); err == nil {
+		events, _ = res.RowsAffected()
+	}
+	_, _ = s.db.Exec("DELETE FROM alert_state")
+	_, _ = s.db.Exec("UPDATE sensors SET status = 'up'")
+
+	log.Printf("API: cleared ALL history (%d probes, %d events)", probes, events)
+	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+		"cleared": map[string]int64{"probes": probes, "events": events},
 	})
 }
 

@@ -327,9 +327,14 @@ tailwind.config = {
         <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
       </div>
     </div>
-    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+    <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between gap-3">
       <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
-      <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono">Close</button>
+      <div class="flex items-center gap-2">
+        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-400 hover:text-bad text-xs font-mono transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
+          <i class="ph ph-trash"></i> Clear history
+        </button>
+        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono">Close</button>
+      </div>
     </div>
   </div>
 </div>
@@ -850,6 +855,19 @@ async function openInspector(id) {
   await loadInspector();
 }
 function closeInspector() { inspectId = null; $('insp-backdrop').classList.add('hidden'); }
+
+async function clearHistory() {
+  const id = inspectId;
+  if (!id) return;
+  const s = (SENSORS || []).find(x => x.id === id);
+  const label = s ? s.name : 'sensor';
+  if (!confirm('Clear all probe history for "' + label + '"?\nThe 60-probe window rebuilds from the next probe.')) return;
+  try {
+    await api('/api/sensors/' + id + '/history', { method: 'DELETE' });
+    toast('history cleared — ' + label, 'ok');
+    await Promise.all([refresh(), loadInspector()]);
+  } catch (e) { toast('clear failed: ' + e.message, 'bad'); }
+}
 
 // graph: SVG line/area of avg RTT per bucket, red ticks for loss
 function renderGraph(el, data) {
