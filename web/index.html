@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>zenmon</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
+<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -161,10 +166,10 @@ tailwind.config = {
       <input type="hidden" id="f-id">
       <div class="grid grid-cols-2 gap-3">
         <label class="text-xs text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
-          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="router">
+          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="hostname">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Target <span class="text-slate-600">IP or hostname</span>
-          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="192.168.1.1">
+          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
         </label>
       </div>
       <label class="text-xs text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
@@ -330,7 +335,7 @@ tailwind.config = {
 
 <script>
 let SENSORS = [], EVENTS = [], SETTINGS = {};
-let activeTag = 'ALL', searchQ = '', inspectId = null, graphRange = '1h';
+let activeTags = new Set(), searchQ = '', inspectId = null, graphRange = '1h';
 let viewMode = localStorage.getItem('zenmon_view') || 'cards';
 
 const $ = id => document.getElementById(id);
@@ -419,17 +424,19 @@ function render() {
   $('c-up').textContent = up; $('c-warn').textContent = warn; $('c-error').textContent = err; $('c-paused').textContent = paused;
 
   const tags = ['ALL'].concat([...new Set(SENSORS.flatMap(s => s.tags || []))]);
+  const on = 'bg-surface-700 text-white font-semibold border border-surface-600';
+  const off = 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800';
   $('tag-chips').innerHTML = tags.map(t => {
     if (t === 'ALL') {
-      return '<button onclick="setTag(\'ALL\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
-        (t === activeTag ? 'bg-surface-700 text-white font-semibold border border-surface-600' : 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800') + '">ALL</button>';
+      return '<button onclick="setTag(\'ALL\')" title="Clear tag selection" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
+        (activeTags.size === 0 ? on : off) + '">ALL</button>';
     }
     return '<button onclick="setTag(\'' + t.replace(/'/g, "\\'") + '\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
-      (t === activeTag ? 'bg-surface-700 text-white font-semibold border border-surface-600' : 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800') + '">' +
+      (activeTags.has(t) ? on : off) + '">' +
       esc(t) + '</button>';
   }).join('');
 
-  let list = SENSORS.filter(s => (activeTag === 'ALL' || (s.tags || []).includes(activeTag)) &&
+  let list = SENSORS.filter(s => (activeTags.size === 0 || [...activeTags].some(t => (s.tags || []).includes(t))) &&
     (!searchQ || s.name.toLowerCase().includes(searchQ) || s.target.toLowerCase().includes(searchQ) || (s.tags || []).join(' ').toLowerCase().includes(searchQ)));
   const sort = $('sort').value;
   list.sort((a, b) => {
@@ -525,7 +532,12 @@ function cardHtml(s) {
   '</div>';
 }
 
-function setTag(t) { activeTag = t; render(); }
+function setTag(t) {
+  if (t === 'ALL') activeTags.clear();
+  else if (activeTags.has(t)) activeTags.delete(t);
+  else activeTags.add(t);
+  render();
+}
 
 async function clearActivity() {
   if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
