@@ -6,7 +6,7 @@ something that pings exactly what you care about and says nothing until
 something changes.
 
 ```
-zenmon = zen (your fleet) + mon (itor)
+zenmon
 ```
 
 ## Features
