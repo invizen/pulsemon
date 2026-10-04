@@ -175,7 +175,7 @@ tailwind.config = {
           </select>
           <input id="f-tagnew" maxlength="30" placeholder="or type new tag ↵"
             onkeydown="if(event.key==='Enter'){event.preventDefault();addFormTag(this.value.trim());this.value=''}"
-            class="w-1/3 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+            class="w-1/3 text-right bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
         </div>
       </label>
       <div class="grid grid-cols-5 gap-3">
@@ -410,16 +410,17 @@ function severityRank(s) {
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 
-function sparklineBars(recent, maxBars) {
-  const arr = (recent || []).slice(0, maxBars || 30); // newest first
-  const vals = arr.filter(x => x != null);
-  const maxVal = Math.max(...(vals.length ? vals : [0]), 40);
-  return arr.slice().reverse().map(v => { // oldest → newest, left → right
-    if (v == null) return '<div class="spark-bar w-[3px] h-full bg-bad/80 rounded-sm" title="lost"></div>';
+function sparklineBars(hour) {
+  const arr = (hour || []).slice(0, 60); // 60 one-minute buckets, oldest → newest
+  const vals = arr.filter(x => typeof x === 'number' && x >= 0);
+  const maxVal = Math.max(...(vals.length ? vals : [0]), 100);
+  return arr.map(v => {
+    if (v === null) return '<div class="spark-bar flex-1 h-full bg-bad/80 rounded-sm" title="lost"></div>';
+    if (v === -2)   return '<div class="spark-bar flex-1 h-[8%] bg-surface-700/40 rounded-sm" title="no data"></div>';
     const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
     let cls = 'bg-ok/80';
-    if (v > 140) cls = 'bg-bad'; else if (v > 50) cls = 'bg-warn';
-    return '<div class="spark-bar w-[3px] rounded-sm ' + cls + '" style="height:' + h + '%" title="' + fmtRtt(v) + '"></div>';
+    if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
+    return '<div class="spark-bar flex-1 rounded-sm ' + cls + '" style="height:' + h + '%" title="' + fmtRtt(v) + '"></div>';
   }).join('');
 }
 
@@ -492,7 +493,7 @@ function cardHtml(s) {
   const st = s.stats;
   const paused = s.state === 'paused';
   const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : 'no data');
-  const loss = paused ? '—' : (st ? st.loss_pct.toFixed(1) + '%' : '—');
+  const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
   const j = jitterOf(s);
   const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
   const border = paused ? 'border-surface-700' : s.status === 'down' ? 'border-bad/40' : s.status === 'degraded' ? 'border-warn/30' : 'border-surface-800';
@@ -517,12 +518,12 @@ function cardHtml(s) {
     '</div>' +
     '<div>' +
       '<div class="flex items-center justify-between text-[11px] text-slate-600 font-mono mb-1">' +
-        '<span>last ' + n + ' probes</span>' +
-        (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (st.rtt_avg != null ? ' · avg ' + fmtRtt(st.rtt_avg) : '') + '</span>' : '') +
+        '<span>past hour</span>' +
+        (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (((st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) != null) ? ' · avg ' + fmtRtt(st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) : '') + '</span>' : '') +
       '</div>' +
       '<div class="h-7 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused — probing stopped</span>'
-          : (n ? sparklineBars(st.recent) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
+          : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
     '<div class="flex items-center justify-between pt-2 border-t border-surface-800/60">' +
@@ -566,7 +567,7 @@ function miniSpark(recent) {
     if (v == null) return '<div class="w-[3px] h-5 bg-bad/70 rounded-sm"></div>';
     const h = Math.min(20, Math.max(3, (v / maxVal) * 20));
     let cls = 'bg-ok/70';
-    if (v > 140) cls = 'bg-bad'; else if (v > 50) cls = 'bg-warn';
+    if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
     return '<div class="w-[3px] rounded-sm ' + cls + '" style="height:' + h + 'px"></div>';
   }).join('');
 }
@@ -579,7 +580,7 @@ function renderTable(list) {
     const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—');
     const j = jitterOf(s);
     const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
-    const loss = paused ? '—' : (st ? st.loss_pct.toFixed(1) + '%' : '—');
+    const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
     const up24 = paused ? '—' : (st && st.total ? st.uptime_24h.toFixed(2) + '%' : '—');
     return '<tr class="hover:bg-surface-850/60 transition-colors">' +
       '<td class="py-3.5 px-4"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2.5 h-2.5 rounded-full ' + m.dot + ' ' + m.glow + '"></span>' + m.label + '</span></td>' +
@@ -588,7 +589,7 @@ function renderTable(list) {
       '<td class="py-3.5 px-4">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-2.5 py-1 rounded text-xs bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-700">—</span>') + '</td>' +
       '<td class="py-3.5 px-4 text-right ' + (st && st.rtt_last != null ? 'text-slate-100 font-bold' : 'text-slate-500') + '">' + rtt + '</td>' +
       '<td class="py-3.5 px-4 text-right text-jit">' + jit + '</td>' +
-      '<td class="py-3.5 px-4 text-right ' + (!paused && st && st.loss_pct > 0 ? 'text-warn font-bold' : 'text-slate-400') + '">' + loss + '</td>' +
+      '<td class="py-3.5 px-4 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-bold' : 'text-slate-400') + '">' + loss + '</td>' +
       '<td class="py-3.5 px-4 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-bold' : 'text-ok') + '">' + up24 + '</td>' +
       '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-xs text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-3.5 px-4 text-right"><div class="flex items-center justify-end gap-0.5">' +

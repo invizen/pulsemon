@@ -46,7 +46,10 @@ type SensorStats struct {
 	LossPct   float64    `json:"loss_pct"`
 	LostCount int        `json:"lost_count"`
 	Total     int        `json:"total"`
-	Recent    []*float64 `json:"recent"`       // last 30 probes, newest first, null = lost (sparkline)
+	Recent    []*float64 `json:"recent"`       // last 30 probes, newest first, null = lost (kept for compat)
+	Hour      []*float64 `json:"hour"`         // 60 one-minute buckets, oldest->newest: min RTT ms, null = lost, -2 = no data
+	HourLossPct float64 `json:"hour_loss_pct"` // % of past-hour probes that were lost
+	HourRTTAvg  *float64 `json:"hour_rtt_avg"` // avg RTT ms over the past hour
 	Uptime24h float64    `json:"uptime_24h"`   // % of last-24h probes that replied
 }
 
@@ -185,11 +188,54 @@ func (s *Server) sensorStats(id string) *SensorStats {
 		mn, mx, avg := min, max, sum / float64(st.Total-st.LostCount)
 		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
 	}
+	// Past-1-hour loss % + avg RTT (the card's Loss and avg now reflect the
+	// same past-hour window as the sparkline, not the old 60-probe window).
+	var h1, l1 int
+	var h1avg *float64
+	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0), AVG(rtt_ms)
+		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 hour')`, id).Scan(&h1, &l1, &h1avg); err == nil && h1 > 0 {
+		st.HourLossPct = float64(l1) / float64(h1) * 100
+		st.HourRTTAvg = h1avg
+	}
+
 	// 24h uptime (independent of the 60-probe stats window).
 	var d24, l24 int
 	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
 		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 day')`, id).Scan(&d24, &l24); err == nil && d24 > 0 {
 		st.Uptime24h = float64(d24-l24) / float64(d24) * 100
+	}
+
+	// Past-1-hour sparkline: 60 fixed one-minute buckets (oldest -> newest) so
+	// the card graph always spans the full width. Each bucket = the min RTT in
+	// that minute; null = every probe in the minute was lost (outage); the -2
+	// sentinel marks a minute with no probes yet (e.g. a sensor newer than 1h).
+	nd := -2.0
+	st.Hour = make([]*float64, 60)
+	for i := range st.Hour {
+		st.Hour[i] = &nd
+	}
+	if rows, err := s.db.Query(`SELECT (strftime('%s', ts) / 60) * 60 AS bucket,
+			MIN(rtt_ms) AS min_rtt
+		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 hour')
+		GROUP BY bucket`, id); err == nil {
+		defer rows.Close()
+		nowMin := time.Now().Unix() / 60 * 60
+		for rows.Next() {
+			var bucket int64
+			var minRTT *float64
+			if err := rows.Scan(&bucket, &minRTT); err != nil {
+				continue
+			}
+			pos := 59 - int((nowMin-bucket)/60)
+			if pos < 0 || pos > 59 {
+				continue
+			}
+			if minRTT != nil {
+				st.Hour[pos] = minRTT   // at least one reply this minute
+			} else {
+				st.Hour[pos] = nil       // probes existed, all lost
+			}
+		}
 	}
 
 	if st.Total == 0 {

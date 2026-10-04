@@ -233,10 +233,8 @@ func (db *DB) SeedSensors() error {
 	sensors := []struct {
 		name, target, tags string
 	}{
-		{"router", "192.168.1.1", "Core"},
-		{"zenai", "192.168.1.19", "Servers"},
-		{"zensrv", "192.168.1.9", "Servers"},
-		{"zentest", "192.168.1.206", "Servers"},
+		{"router", "192.168.1.1", "Networking"},
+		{"server", "192.168.1.10", "Servers"},
 	}
 
 	for _, s := range sensors {
