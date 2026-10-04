@@ -253,7 +253,7 @@ tailwind.config = {
         </select>
         <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
         <label class="text-xs text-slate-400 flex items-center justify-between gap-3">
-          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still down/degraded — 0 = alert once only</span></span>
+          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still down/degraded — 0 = one alert per outage (recovery still alerts)</span></span>
           <span class="flex items-center gap-1.5 font-mono">
             <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-ok/60"> min
           </span>

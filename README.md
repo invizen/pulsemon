@@ -95,7 +95,8 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 - New sensors default to: interval 15s, timeout 1000ms, loss warn 25%, down after 4, spike 3×. New and cloned sensors start **paused** so a fresh target can't fire alerts before you review it — resume it from the dashboard.
 - Alerts fire on every **state transition** (including recovery).
 - While a sensor stays in a bad state it re-alerts at the configured
-  interval; set the interval to **0** to alert exactly once.
+  interval; set the interval to **0** to alert exactly once per outage
+  (one "down" alert; the "recovered" alert still fires when it comes back).
 - **Maintenance mode** (Settings) silences all alerts without stopping
   probes; re-alert timers reset when it's turned off.
 

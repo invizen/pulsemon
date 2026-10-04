@@ -359,6 +359,14 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 		pw.setAlertState(c.id, status, now)
 		return
 	}
+	if pw.realertMin() == 0 {
+		// 0 = "alert once only": no periodic re-alerts while the sensor
+		// stays in the same non-up state. (Without this guard the
+		// interval check below degenerates to "elapsed < 0", i.e. a
+		// re-alert fired on EVERY probe tick.) State transitions and
+		// recoveries still alert via doProbe.
+		return
+	}
 	t, err := time.Parse(time.RFC3339, lastTs)
 	if err != nil {
 		pw.setAlertState(c.id, status, now)
