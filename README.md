@@ -16,14 +16,15 @@ zenmon
   the access model.
 - **Single container** — static Go binary, `FROM scratch` image, SQLite storage
 - **Sensors with multiple tags** — group and filter however you like
-- **Per-sensor tuning** — interval, timeout, loss threshold, down-after count,
-  latency-spike multiplier
-- **Status derivation** — `up` / `degraded` / `down` from the sensor's most
+- **Per-sensor tuning** — interval, timeout, loss threshold, error-after count,
+  latency-spike multiplier (informational)
+- **Status derivation** — `up` / `warning` / `error` from the sensor's most
   recent probes (see *Alert behavior*)
 - **1h / 24h latency graphs** with whole-ms display
-- **Google Chat alerts** — state transitions + re-alerts, configurable
+- **Alerts** — Google Chat + Discord, fan-out to every enabled destination,
+  re-alerts, one-click test from Settings
 - **Alert controls** — routing (all / by tag / by sensor), re-alert interval
-  (0 = alert once only), degraded-only mute, one-click **maintenance mode**
+  (0 = alert once only), one-click **maintenance mode**
 - **Dashboard** — card ⇄ table views, inspector with history, activity feed,
   optimized for 1080p and up
 
@@ -115,21 +116,33 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 
 | Where | What |
 |---|---|
-| `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — default alert webhook |
-| Dashboard → Settings | Webhook URL (overrides `.env`), alert routing, re-alert interval, maintenance mode, degraded-alert toggle |
-| Per sensor | Interval, timeout, loss %, down-after, spike multiplier, tags |
+| `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
+| Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode |
+| Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
 
 ### Alert behavior
 
-- A sensor's status is derived from its **last `down after` probes** (4 at the default), checked in this order:
-  - **down** — `down after` consecutive losses from the newest probe
-  - **up** — the newest 2 probes both succeeded (a brand-new sensor with 1 successful probe reads up)
-  - **degraded** — anything in between: a loss is in the recent window, but it's neither fully down nor 2 clean in a row
-- New sensors default to: interval 15s, timeout 1000ms, loss warn 25%, down after 4, spike 3×. New and cloned sensors start **paused** so a fresh target can't fire alerts before you review it — resume it from the dashboard.
-- Alerts fire on every **state transition** (including recovery).
-- While a sensor stays in a bad state it re-alerts at the configured
+Statuses are `up`, `warning`, and `error`. A sensor's status is derived from
+its recent probe window (the last 60 probes), checked in this order:
+
+- **error** — `error after` consecutive losses (4 at the default)
+- **warning** — window packet loss ≥ the sensor's loss threshold (25% at
+  the default). The spike multiplier is **informational** — shown in the
+  dashboard, but it never changes status.
+- **up** — anything else (a brand-new sensor with 1 successful probe reads up)
+
+- New sensors default to: interval 15s, timeout 1000ms, loss warn 25%,
+  error after 4, spike 3×. New and cloned sensors start **paused** so a fresh
+  target can't fire alerts before you review it — resume it from the dashboard.
+- Alerts fire on **error transitions**: up → error, warning → error, and
+  recovery (→ up). **Warning transitions (up ↔ warning) never alert** — loss
+  flapping is shown in the dashboard, not pushed to you.
+- While a sensor stays in error it re-alerts at the configured
   interval; set the interval to **0** to alert exactly once per outage
-  (one "down" alert; the "recovered" alert still fires when it comes back).
+  (one "error" alert; the "recovered" alert still fires when it comes back).
+- Alerts fan out to **every enabled destination** with a configured URL
+  (Google Chat and Discord). A fresh install has none configured — nothing
+  sends until you add a URL in Settings.
 - **Maintenance mode** (Settings) silences all alerts without stopping
   probes; re-alert timers reset when it's turned off.
 
