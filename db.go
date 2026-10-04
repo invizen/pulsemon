@@ -168,6 +168,10 @@ func (db *DB) InitSchema() error {
 		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE status END`); err != nil {
 		return err
 	}
+	// Cosmetic: old event notes read "up -> degraded" / "down -> up".
+	if _, err := db.Exec(`UPDATE events SET note = replace(replace(replace(note, 'degraded', 'warning'), 'down', 'error'), 'warning -> up', 'recovered') WHERE note LIKE '%degraded%' OR note LIKE '%down%'`); err != nil {
+		return err
+	}
 	return nil
 }
 

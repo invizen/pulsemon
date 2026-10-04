@@ -75,6 +75,21 @@ func TestStatusRenameMigration(t *testing.T) {
 		t.Errorf("events s2 = %s -> %s, want up -> warning", from, to)
 	}
 
+	// Historical notes ("up -> degraded", "down -> up") get the same rename.
+	var note1, note2 string
+	if err := db.QueryRow(`SELECT note FROM events WHERE sensor_id = 's1'`).Scan(&note1); err != nil {
+		t.Fatalf("events s1 note: %v", err)
+	}
+	if note1 != "recovered" { // "down -> up" -> "error -> up" -> "recovered"
+		t.Errorf("events s1 note = %q, want %q", note1, "recovered")
+	}
+	if err := db.QueryRow(`SELECT note FROM events WHERE sensor_id = 's2'`).Scan(&note2); err != nil {
+		t.Fatalf("events s2 note: %v", err)
+	}
+	if note2 != "up -> warning" {
+		t.Errorf("events s2 note = %q, want %q", note2, "up -> warning")
+	}
+
 	check("alert_state", "status", "s1", "error")
 	check("alert_state", "status", "s2", "warning")
 
