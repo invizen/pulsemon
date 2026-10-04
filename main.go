@@ -12,6 +12,15 @@ import (
 )
 
 func main() {
+	// Self-update: `zenmon update` (works from any directory — it finds the
+	// running binary via os.Executable). See update.go. runUpdate only
+	// returns on success paths (errors exit itself), so return here to keep
+	// the server from starting afterwards.
+	if len(os.Args) > 1 && os.Args[1] == "update" {
+		runUpdate(os.Args[2:])
+		return
+	}
+
 	// Real healthcheck (SPEC fix #5): the flag actually opens the database and
 	// runs a query. Exits 0 only when the store is usable.
 	if len(os.Args) > 1 && os.Args[1] == "-healthz" {
