@@ -31,7 +31,7 @@ zenmon
 ## Requirements
 
 - Docker (with Compose v2)
-- Port 8080 free on the host (change in `compose.yaml`)
+- Port 9299 free on the host (change in `compose.yaml`, or set `ZENMON_ADDR`)
 
 ## Quick start
 
@@ -43,7 +43,7 @@ mkdir -p data && chmod 0777 data  # pre-create the data dir (see note below)
 docker compose up -d --build
 ```
 
-Open http://localhost:8080 and add sensors from the **new sensor** button.
+Open http://localhost:9299 and add sensors from the **new sensor** button.
 
 > **First boot:** the database is created automatically on first run
 > (`data/zenmon.db`). If you want seeded example sensors, see `db.go`
@@ -117,6 +117,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | Where | What |
 |---|---|
 | `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
+| env | `ZENMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
 | Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode |
 | Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
 

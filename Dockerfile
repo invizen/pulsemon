@@ -17,7 +17,7 @@ COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=alpine:latest /lib/ld-musl-x86_64.so.1 /lib/ld-musl-x86_64.so.1
 WORKDIR /
 ENV ZENMON_DB=/data/zenmon.db
-EXPOSE 8080
+EXPOSE 9299
 # Run unprivileged. The ICMP path uses the datagram ping socket, which is
 # gated by the host's ping_group_range (no CAP_NET_RAW / root needed). The
 # /data volume must be writable by uid 1000 (the SQLite WAL needs write

@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// listenAddr is the HTTP listen address. Override with ZENMON_ADDR — a full
+// "host:port" (e.g. ":9299" for all interfaces on 9299, "127.0.0.1:9299" for
+// localhost only, or "10.0.0.5:9299" for a specific interface). Port 8080 was
+// the original default but is heavily claimed on homelab boxes (Traefik,
+// Pi-hole, reverse proxies); 9299 is the new default.
+func listenAddr() string {
+	if a := os.Getenv("ZENMON_ADDR"); a != "" {
+		return a
+	}
+	return ":9299"
+}
+
 func main() {
 	// Self-update: `zenmon update` (works from any directory — it finds the
 	// running binary via os.Executable). See update.go. runUpdate only
@@ -67,14 +79,15 @@ func main() {
 	go pw.Run(ctx)
 
 	server := NewServer(db, pw)
+	addr := listenAddr()
 	srv := &http.Server{
-		Addr:              ":8080",
+		Addr:              addr,
 		Handler:           server.Mux(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
 	go func() {
-		log.Println("Starting server on :8080")
+		log.Println("Starting server on " + addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Listen: %v", err)
 		}

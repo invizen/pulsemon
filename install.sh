@@ -20,6 +20,9 @@ BIN="$PREFIX/zenmon"
 UNIT_DIR="$HOME/.config/systemd/user"
 UNIT="$UNIT_DIR/zenmon.service"
 VERSION="${1:-latest}"
+# ZENMON_ADDR is a full "host:port" (e.g. ":9299", "127.0.0.1:9299"). The
+# default matches the binary's own default (all interfaces on 9299).
+ZENMON_ADDR="${ZENMON_ADDR:-:9299}"
 
 if [ "$(id -u)" = "0" ]; then
   echo "zenmon: do not run as root — zenmon is designed to run unprivileged" >&2
@@ -68,6 +71,7 @@ Wants=network-online.target
 [Service]
 ExecStart=$BIN
 Environment=ZENMON_DB=$PREFIX/data/zenmon.db
+Environment=ZENMON_ADDR=$ZENMON_ADDR
 Restart=on-failure
 RestartSec=5
 
@@ -113,9 +117,19 @@ fi
 
 # --- 6. health ----------------------------------------------------------------
 sleep 3
-if curl -sf localhost:8080/api/healthz >/dev/null 2>&1; then
-  echo "zenmon: healthy — open http://localhost:8080"
+# Derive the host:port to healthcheck from ZENMON_ADDR:
+#   ":9299"          -> localhost:9299  (all-interface bind)
+#   "127.0.0.1:9299" -> 127.0.0.1:9299
+#   "9299" (bare)    -> localhost:9299
+case "$ZENMON_ADDR" in
+  :*)  HOST="localhost" ;;
+  *:*) HOST="${ZENMON_ADDR%:*}" ;;
+  *)   HOST="localhost"; ZENMON_ADDR=":$ZENMON_ADDR" ;;
+esac
+PORT="${ZENMON_ADDR##*:}"
+if curl -sf "http://$HOST:$PORT/api/healthz" >/dev/null 2>&1; then
+  echo "zenmon: healthy — open http://$HOST:$PORT"
 else
-  echo "zenmon: warning: service started but http://localhost:8080 is not answering yet."
+  echo "zenmon: warning: service started but http://$HOST:$PORT is not answering yet."
   echo "       Check: journalctl --user -u zenmon"
 fi

@@ -3,7 +3,7 @@ services:
     build: .
     container_name: zenmon
     ports:
-      - "8080:8080"
+      - "9299:9299"
     volumes:
       - ./data:/data
     environment:
