@@ -292,13 +292,39 @@ func (e *Engine) readRaw() {
 
 // Ping sends one ICMP echo to dst and waits for the reply.
 func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
+	// Sequence is 16-bit (the ICMP field width, RFC 792) and unique among
+	// in-flight probes: normally the counter's next value is free, but if a
+	// stale probe (latency > timeout) still occupies that seq, skip to the
+	// next free slot — up to 16 tries. Overwriting an occupied slot would
+	// let the stale reply deliver its RTT into the NEW probe's channel
+	// (misattribution); the source-IP check in deliver() already stops the
+	// cross-sensor variant, this closes the same-sensor one. The loop is
+	// bounded so a (physically implausible) full table can never deadlock
+	// on the lock — after 16 misses we fall through and take the next
+	// counter value unconditionally.
 	seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
-	key := uint32(seq) // seq is unique per in-flight probe (raw path also
-	// filters by our constant ID, so no id is needed in the key)
+	key := uint32(seq)
 	p := &pendingPing{dst: dst, start: time.Now(), ch: make(chan time.Duration, 1)}
-	pendingMu.Lock()
-	pending[key] = p
-	pendingMu.Unlock()
+	tries := 0
+	for ; tries < 16; tries++ {
+		pendingMu.Lock()
+		if _, busy := pending[key]; !busy {
+			pending[key] = p
+			pendingMu.Unlock()
+			break
+		}
+		pendingMu.Unlock()
+		seq = uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
+		key = uint32(seq)
+	}
+	if tries == 16 {
+		// Table full of in-flight probes: no free slot in 16 tries. Take
+		// the next counter value anyway (overwrite is the least-bad option
+		// here — deliver() still guards against cross-destination replies).
+		pendingMu.Lock()
+		pending[key] = p
+		pendingMu.Unlock()
+	}
 	defer func() {
 		pendingMu.Lock()
 		if cur, ok := pending[key]; ok && cur == p {
