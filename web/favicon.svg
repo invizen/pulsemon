@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="30" height="30" viewBox="0 0 30 30" fill="none">
+  <clipPath id="c"><circle cx="15" cy="15" r="11"/></clipPath>
+  <circle cx="15" cy="15" r="12" stroke="#10b981" stroke-width="2"/>
+  <path clip-path="url(#c)" d="M3 15h6l2.5-6 4 12 2.5-6h9" stroke="#10b981" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
