@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"log"
 	"net/http"
 	"os"
@@ -23,6 +22,15 @@ func listenAddr() string {
 	return ":9299"
 }
 
+// dbPathFromEnv returns the database path: ZENMON_DB if set, else the
+// Docker default.
+func dbPathFromEnv() string {
+	if p := os.Getenv("ZENMON_DB"); p != "" {
+		return p
+	}
+	return "/data/zenmon.db"
+}
+
 func main() {
 	// Self-update: `zenmon update` (works from any directory — it finds the
 	// running binary via os.Executable). See update.go. runUpdate only
@@ -33,14 +41,14 @@ func main() {
 		return
 	}
 
-	// Real healthcheck (SPEC fix #5): the flag actually opens the database and
-	// runs a query. Exits 0 only when the store is usable.
+	// Healthcheck (Docker HEALTHCHECK / systemd ExecStartPre): open the store
+	// via NewDB so the pragmas (busy_timeout, WAL, foreign_keys) apply — the
+	// old code used a bare sql.Open with a 0 ms busy_timeout, which failed
+	// with SQLITE_BUSY the instant a probe write or WAL checkpoint was in
+	// flight. NewDB's SELECT 1 already verifies reachability; the COUNT
+	// additionally proves the schema exists.
 	if len(os.Args) > 1 && os.Args[1] == "-healthz" {
-		dbPath := os.Getenv("ZENMON_DB")
-		if dbPath == "" {
-			dbPath = "/data/zenmon.db"
-		}
-		db, err := sql.Open("sqlite", dbPath)
+		db, err := NewDB(dbPathFromEnv())
 		if err != nil {
 			log.Printf("healthz: open: %v", err)
 			os.Exit(1)
@@ -54,12 +62,7 @@ func main() {
 		return
 	}
 
-	dbPath := os.Getenv("ZENMON_DB")
-	if dbPath == "" {
-		dbPath = "/data/zenmon.db"
-	}
-
-	db, err := NewDB(dbPath)
+	db, err := NewDB(dbPathFromEnv())
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}
