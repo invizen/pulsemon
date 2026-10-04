@@ -258,7 +258,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Tags = cleanTags(req.Tags)
 		if req.IntervalS <= 0 {
-			req.IntervalS = 30
+			req.IntervalS = 15
 		}
 		if req.IntervalS < 1 || req.IntervalS > 3600 {
 			respondWithError(w, http.StatusBadRequest, "interval_s must be 1-3600")
@@ -272,10 +272,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if req.LossWarn <= 0 {
-			req.LossWarn = 5
+			req.LossWarn = 25
 		}
 		if req.DownAfter <= 0 {
-			req.DownAfter = 2
+			req.DownAfter = 4
 		}
 		if req.SpikeMult <= 0 {
 			req.SpikeMult = 3
@@ -287,8 +287,11 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 
 		id := newID()
 		now := time.Now().UTC().Format(time.RFC3339Nano)
+		// New sensors start PAUSED (no probing) so a freshly-added, possibly
+		// mistyped, target can't fire down alerts before the user has a chance
+		// to review it. The user resumes it from the dashboard.
 		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 'up')`,
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
 			id, req.Name, req.Target, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
@@ -303,12 +306,12 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 				log.Printf("API: failed to set tags for %s: %v", req.Name, err)
 			}
 		}
-		log.Printf("API: created sensor %s (%s)", req.Name, id)
+		log.Printf("API: created sensor %s (%s) [paused]", req.Name, id)
 		respondWithJSON(w, http.StatusCreated, Sensor{
 			ID: id, Name: req.Name, Target: req.Target, Tags: req.Tags,
 			IntervalS: req.IntervalS, TimeoutMS: req.TimeoutMS,
 			LossWarn: req.LossWarn, DownAfter: req.DownAfter, SpikeMult: req.SpikeMult,
-			State: "active", Status: "up", CreatedAt: now,
+			State: "paused", Status: "up", CreatedAt: now,
 		})
 
 	default:
@@ -619,7 +622,7 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleSensorClone creates a copy of a sensor with a new unique name
-// (name-copy, name-copy2, ...). The clone starts active.
+// (name-copy, name-copy2, ...). The clone starts PAUSED, like a new sensor.
 func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -653,8 +656,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 
 	newID := newID()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	// Clone starts PAUSED, matching new-sensor behavior.
 	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, 'up')`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
 		newID, name, src.Target, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "failed to clone sensor: "+err.Error())
@@ -669,7 +673,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		ID: newID, Name: name, Target: src.Target, Tags: src.Tags,
 		IntervalS: src.IntervalS, TimeoutMS: src.TimeoutMS,
 		LossWarn: src.LossWarn, DownAfter: src.DownAfter, SpikeMult: src.SpikeMult,
-		State: "active", Status: "up", CreatedAt: now,
+		State: "paused", Status: "up", CreatedAt: now,
 	})
 }
 

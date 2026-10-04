@@ -180,16 +180,16 @@ tailwind.config = {
       </label>
       <div class="grid grid-cols-5 gap-3">
         <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
-          <input id="f-interval" type="number" min="1" max="3600" value="30" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-interval" type="number" min="1" max="3600" value="15" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
           <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
-          <input id="f-loss" type="number" min="1" max="100" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Down after
-          <input id="f-down" type="number" min="1" max="30" value="2" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-down" type="number" min="1" max="30" value="4" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
           <input id="f-spike" type="number" min="2" max="10" value="3" title="Degraded when latest ping exceeds this multiple of the 60-probe average" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
@@ -330,7 +330,7 @@ tailwind.config = {
       </div>
     </div>
     <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex flex-col gap-3">
-      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
+      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono text-center"></span>
       <div class="flex items-center justify-end gap-2">
         <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-xs font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
           <i class="ph ph-trash"></i> Clear history
@@ -688,7 +688,7 @@ function openSensorModal(id) {
     $('modal-title').textContent = 'New sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
     renderFormTags([]);
-    $('f-interval').value = 30; $('f-timeout').value = 1000; $('f-loss').value = 5; $('f-down').value = 2; $('f-spike').value = 3;
+    $('f-interval').value = 15; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 4; $('f-spike').value = 3;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);

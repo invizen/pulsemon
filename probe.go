@@ -177,29 +177,61 @@ func (pw *ProbeWorker) ActiveCount() int {
 }
 
 func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
-	ticker := time.NewTicker(time.Duration(c.intervalS) * time.Second)
+	interval := time.Duration(c.intervalS) * time.Second
+
+	// Stagger the first tick by a deterministic per-sensor phase (hash of the
+	// id, 0 .. interval). Without this, every sensor added at the same time —
+	// or every sensor sharing an interval — fires on the same wall-clock second,
+	// producing a write thundering-herd against SQLite. Spreading the phases
+	// turns N simultaneous writes into N writes spread across the interval.
+	phase := time.Duration(fnvHash([]byte(c.id))) % time.Duration(interval)
+	if phase < 250*time.Millisecond {
+		phase += 250 * time.Millisecond // never probe in the first instant
+	}
+
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	// First probe after the staggered phase; subsequent probes every interval.
+	first := time.NewTimer(phase)
+	defer first.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-first.C:
 		case <-ticker.C:
-			pw.mu.Lock()
-			ps, ok := pw.sensors[c.id]
-			if !ok {
-				pw.mu.Unlock()
-				return
-			}
-			paused := ps.isPaused
-			pw.mu.Unlock()
-
-			if paused {
-				continue // paused = no packets, no rows, no alerts
-			}
-			pw.doProbe(c)
 		}
+		pw.mu.Lock()
+		ps, ok := pw.sensors[c.id]
+		if !ok {
+			pw.mu.Unlock()
+			return
+		}
+		paused := ps.isPaused
+		pw.mu.Unlock()
+
+		if paused {
+			continue // paused = no packets, no rows, no alerts
+		}
+		pw.doProbe(c)
 	}
+}
+
+// fnvHash is a 64-bit FNV-1a over the byte slice — cheap, deterministic, and
+// only used to derive a stable stagger phase per sensor id.
+func fnvHash(b []byte) uint64 {
+	const (
+		offset64 = 14695981039346656037
+		prime64  = 1099511628211
+	)
+	var h uint64 = offset64
+	for _, c := range b {
+		h ^= uint64(c)
+		h *= prime64
+	}
+	return h
 }
 
 func (pw *ProbeWorker) doProbe(c sensorConfig) {
@@ -214,7 +246,7 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 		rttMs = ms
 	}
 
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, ?)", c.id, time.Now().UTC().Format(time.RFC3339Nano), rttVal); err != nil {
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)", c.id, time.Now().UTC().Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -366,81 +398,64 @@ func (pw *ProbeWorker) ResetAlertStates() {
 	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, now)
 }
 
-// deriveStatus computes up/degraded/down from the 60-probe window (SPEC §3).
-// Precedence: down (N consecutive losses) > degraded (loss% or latency spike) > up.
+// Status is derived from the sensor's most recent probes (last `down_after`,
+// a 4-probe window at the default) with fixed precedence:
+//
+//	down      — `down_after` consecutive losses from the newest probe
+//	up        — the newest 2 probes both succeeded (a sensor with only one
+//	            probe recorded is up if that single probe succeeded)
+//	degraded  — anything else: a loss is present in the recent window but it
+//	            is neither fully down nor 2 clean in a row
+//
+// A probe-level ICMP error (broken socket) forces degraded so a dead probe
+// path never reads as "up".
 func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	// Broken probe path (e.g. ICMP socket cannot be created): probes never
-	// land, so the window would be empty and every sensor would silently
-	// read "up". Any socket-level error since the last probe means we
-	// cannot know the real state — flag degraded, never up.
+	// land, so we cannot know the real state — flag degraded, never up.
 	if probeErrCount.Load() > c.lastErrCount {
 		return "degraded"
 	}
-	// Consecutive losses from newest: down after N in a row. This is the
-	// highest-priority rule — sustained unreachability is down, full stop.
+
+	// Fetch the last `down_after` probes, newest first. This window is enough
+	// to test both "all losses in a row" (down) and "2 successes in a row" (up).
+	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, c.downAfter)
+	if err != nil {
+		return "up"
+	}
+	var recent []*float64 // index 0 = newest; nil = lost, non-nil = rtt
+	for rows.Next() {
+		var rtt *float64
+		if rows.Scan(&rtt) == nil {
+			recent = append(recent, rtt)
+		}
+	}
+	rows.Close()
+
+	if len(recent) == 0 {
+		return "up" // no data yet
+	}
+
+	// DOWN: down_after consecutive losses from the newest probe.
 	consec := 0
-	var latest *float64
-	{
-		r2, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, c.downAfter)
-		if err == nil {
-			for r2.Next() {
-				var rtt *float64
-				if r2.Scan(&rtt) == nil {
-					if rtt == nil {
-						consec++
-					} else {
-						latest = rtt
-						break
-					}
-				}
-			}
-			r2.Close()
+	for _, r := range recent {
+		if r == nil {
+			consec++
+		} else {
+			break
 		}
 	}
 	if consec >= c.downAfter {
 		return "down"
 	}
 
-	rows, err := pw.db.Query(`SELECT rtt_ms FROM (SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT 60)`, c.id)
-	if err != nil {
-		return "up"
-	}
-	var rtts []float64
-	lostCount, totalCount := 0, 0
-	for rows.Next() {
-		var rtt *float64
-		if err := rows.Scan(&rtt); err != nil {
-			continue
-		}
-		totalCount++
-		if rtt == nil {
-			lostCount++
-		} else {
-			rtts = append(rtts, *rtt)
-		}
-	}
-	rows.Close()
-
-	if totalCount == 0 {
+	// UP: the newest 2 probes both succeeded. With only one probe recorded,
+	// a single success is enough (new-sensor grace).
+	if recent[0] != nil && (len(recent) == 1 || recent[1] != nil) {
 		return "up"
 	}
 
-	lossPct := float64(lostCount) / float64(totalCount) * 100
-	if lossPct > float64(c.lossWarn) {
-		return "degraded"
-	}
-
-	if len(rtts) > 1 && latest != nil {
-		sum := 0.0
-		for _, r := range rtts {
-			sum += r
-		}
-		avg := sum / float64(len(rtts))
-		if avg > 0 && *latest > float64(c.spikeMult)*avg {
-			return "degraded"
-		}
-	}
-	return "up"
+	// DEGRADED: a loss is in the recent window but it's not down and not up.
+	return "degraded"
 }
 
 // purgeOld enforces 14-day retention on probes/events (SPEC §3).

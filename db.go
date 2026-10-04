@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -12,24 +13,44 @@ type DB struct {
 }
 
 func NewDB(dsn string) (*DB, error) {
-	db, err := sql.Open("sqlite", dsn)
+	// Pragma settings go in the DSN query string so modernc.org/sqlite applies
+	// them to EVERY connection the pool opens. Setting them via db.Exec() would
+	// only configure the single connection that call happened to use — the
+	// other pooled connections would run with the defaults (no busy_timeout),
+	// and concurrent probe writes would fail instantly with SQLITE_BUSY.
+	//
+	//   journal_mode(WAL)   — concurrent readers alongside a writer
+	//   busy_timeout(15000) — a blocked writer waits up to 15s instead of
+	//                         failing immediately (critical under write bursts)
+	//   foreign_keys(ON)    — enforce ON DELETE CASCADE on probes/events/tags
+	//
+	// NOTE: the '?' is load-bearing. modernc.org/sqlite treats everything after
+	// it as query params; omit it and the whole string becomes a filename and
+	// the driver silently opens a brand-new empty database (see v0.1.x incident
+	// where a missing '?' caused a fresh seed-DB to be created beside the real
+	// one). Verified against the live 22-sensor DB: all three path forms with
+	// the '?' return sensors=22, busy_timeout=15000, journal_mode=wal.
+	fullDSN := dsn
+	if strings.Contains(dsn, "?") {
+		fullDSN += "&_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)"
+	} else {
+		fullDSN += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)"
+	}
+
+	db, err := sql.Open("sqlite", fullDSN)
 	if err != nil {
 		return nil, err
 	}
 	// Multiple concurrent connections are required: the probe worker and HTTP
 	// handlers issue nested queries (e.g. iterating sensors while fetching each
 	// one's tags). With a single shared connection those nest and deadlock.
-	// WAL mode allows concurrent readers; SQLite serializes writers internally.
+	// WAL mode allows concurrent readers; SQLite serializes writers internally
+	// (and busy_timeout above makes a blocked writer wait rather than fail).
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(0)
-	if _, err := db.Exec("PRAGMA journal_mode=WAL;"); err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA busy_timeout=10000;"); err != nil {
-		return nil, err
-	}
-	if _, err := db.Exec("PRAGMA foreign_keys=ON;"); err != nil {
+	// Verify the store is reachable and the pragmas applied.
+	if _, err := db.Exec("SELECT 1"); err != nil {
 		return nil, err
 	}
 	return &DB{db}, nil
@@ -57,6 +78,7 @@ func (db *DB) InitSchema() error {
 		sensor_id TEXT NOT NULL,
 		ts DATETIME NOT NULL,
 		rtt_ms REAL,
+		resolved_ip TEXT,
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
@@ -112,6 +134,15 @@ func (db *DB) InitSchema() error {
 	var spikeCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'spike_mult'`).Scan(&spikeCol); err == nil && spikeCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN spike_mult INTEGER NOT NULL DEFAULT 5`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: record what each probe resolved to (diagnoses
+	// "sensors that never respond" — a NULL/absent resolved_ip means the
+	// DNS lookup never returned, the leading cause of a stalled sensor).
+	var resolvedCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'resolved_ip'`).Scan(&resolvedCol); err == nil && resolvedCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN resolved_ip TEXT`); err != nil {
 			return err
 		}
 	}

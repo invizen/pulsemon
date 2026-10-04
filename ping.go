@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -13,9 +14,10 @@ import (
 )
 
 type PingResult struct {
-	RTT   time.Duration
-	Lost  bool
-	Error error
+	RTT        time.Duration
+	Lost       bool
+	Error      error
+	ResolvedIP string // "" when the lookup failed/timed out
 }
 
 // All probes share ONE ICMP socket. With many sensors probing concurrently,
@@ -47,6 +49,29 @@ func LastProbeError() string {
 		return sharedConnErr.Error()
 	}
 	return ""
+}
+
+// resolveIPAddrWithTimeout runs net.ResolveIPAddr in a goroutine and returns
+// if it finishes or the deadline passes — whichever comes first. DNS lookups
+// via the container's 127.0.0.11 resolver can hang indefinitely when the
+// upstream (host systemd-resolved) is slow or a zone has no answer; an
+// unbounded call would stall the sensor's probe goroutine forever.
+func resolveIPAddrWithTimeout(network, host string, d time.Duration) (*net.IPAddr, error) {
+	type result struct {
+		ip  *net.IPAddr
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ip, err := net.ResolveIPAddr(network, host)
+		ch <- result{ip, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.ip, r.err
+	case <-time.After(d):
+		return nil, fmt.Errorf("dns: %s timed out after %s", host, d)
+	}
 }
 
 type pendingProbe struct {
@@ -113,8 +138,13 @@ func pingHost(target string, timeout time.Duration) PingResult {
 		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err}
 	}
-	dst, err := net.ResolveIPAddr("ip4", target)
+	// Resolve with a timeout: an unbounded net.ResolveIPAddr would wedge the
+	// sensor's probe goroutine forever if a DNS lookup hangs (the reply-wait
+	// below is capped at `timeout`, but resolution is not). A hung lookup must
+	// become a loss row, not a permanent stall.
+	dst, err := resolveIPAddrWithTimeout("ip4", target, 5*time.Second)
 	if err != nil {
+		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err}
 	}
 
@@ -151,8 +181,10 @@ func pingHost(target string, timeout time.Duration) PingResult {
 
 	select {
 	case res := <-p.ch:
+		res.ResolvedIP = dst.String()
 		return res
 	case <-time.After(timeout):
-		return PingResult{Lost: true}
+		// Resolved fine but no echo reply within the timeout.
+		return PingResult{Lost: true, ResolvedIP: dst.String()}
 	}
 }
