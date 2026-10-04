@@ -805,7 +805,7 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 		// recoveries still alert via doProbe.
 		return
 	}
-	t, err := time.Parse(time.RFC3339, lastTs)
+	t, err := parseTSForRealert(lastTs)
 	if err != nil {
 		pw.setAlertState(c.id, status, now)
 		return
@@ -822,7 +822,7 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
 	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES (?, ?, ?)
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		id, status, ts.Format(time.RFC3339))
+		id, status, ts.Format(time.RFC3339Nano))
 }
 
 // realertMin returns the re-alert interval in minutes. 0 means alert
@@ -840,8 +840,17 @@ func (pw *ProbeWorker) realertMin() int {
 // sensors already in a bad state do not immediately re-alert right after
 // maintenance mode is turned off.
 func (pw *ProbeWorker) ResetAlertStates() {
-	now := time.Now().UTC().Format(time.RFC3339)
-	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, now)
+	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, tsNow())
+}
+
+// parseTSForRealert reads an alert_state.last_ts back into a time.Time for
+// the re-alert interval check. It accepts BOTH formats this column has held:
+// the new RFC3339Nano writer output (fractional seconds) and the integer-
+// second rows older versions stored. Verified: stdlib time.Parse accepts a
+// fractional string under the RFC3339Nano layout and an integer-second string
+// under the same layout, so one layout covers both.
+func parseTSForRealert(ts string) (time.Time, error) {
+	return time.Parse(time.RFC3339Nano, ts)
 }
 
 // statusWindow is the fixed probe count used for loss% detection.
@@ -933,6 +942,17 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 // 24h is the longest window the dashboard reads (24h graph / uptime 24h), so
 // nothing on screen ever needs older data. Revisit if historical reporting
 // is added later.
+//
+// The comparison is a string compare, but that is EXACT here because both
+// sides use the same format: the stored ts is RFC3339Nano (written by the
+// probe loop) and the cutoff is built in the same format, so the
+// lexicographic order matches the chronological order for all real instants.
+// (The v0.1.18 window bug was different: it compared RFC3339 against
+// datetime('now')'s space-separated output — two DIFFERENT formats — which
+// is what made the string compare wrong. Same-format string compares are
+// safe; mixed-format ones are not.) An epoch compare was considered and
+// rejected: strftime('%s') truncates fractional seconds, introducing a
+// 1-second boundary error that the same-format string compare does not have.
 func (pw *ProbeWorker) purgeOld() {
 	cutoff := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	for _, table := range []string{"probes", "events"} {

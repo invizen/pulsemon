@@ -339,10 +339,21 @@ func (db *DB) GetSetting(key string) string {
 	return v
 }
 
+// tsNow is the single writer-side timestamp format for every column this app
+// writes: RFC3339Nano UTC. The two string-sorted columns (probes.ts,
+// events.ts) are already 100% RFC3339Nano in every live DB, so standardizing
+// on that (rather than integer-second RFC3339) keeps them uniform — and keeps
+// their sub-second precision. Columns that are only parsed (alert_state
+// .last_ts) or never read (settings.updated_at, sensors.created_at) now
+// match too, so a future ORDER BY on any of them is well-defined.
+func tsNow() string {
+	return time.Now().UTC().Format(time.RFC3339Nano)
+}
+
 func (db *DB) SetSetting(key, value string) error {
 	_, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		key, value, time.Now().UTC().Format(time.RFC3339))
+		key, value, tsNow())
 	return err
 }
 
