@@ -108,6 +108,7 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 	if err != nil {
 		t.Fatalf("q1: %v", err)
 	}
+	defer r1.Close()
 	for r1.Next() {
 		var rtt *float64
 		var rn int64
@@ -136,7 +137,6 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 			}
 		}
 	}
-	r1.Close()
 	if st.Total > 0 {
 		st.LossPct = float64(st.LostCount) / float64(st.Total) * 100
 	}
@@ -180,6 +180,7 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 	if err != nil {
 		t.Fatalf("q4: %v", err)
 	}
+	defer r4.Close()
 	nowMin := testNowUnix / 60 * 60
 	for r4.Next() {
 		var bucket int64
@@ -193,7 +194,6 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 		}
 		st.Hour[pos] = minRTT
 	}
-	r4.Close()
 
 	if st.Total == 0 {
 		return nil

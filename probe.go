@@ -168,6 +168,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
 		return
 	}
+	defer rows.Close() // top-level: closed on every return path, not just the happy one
 	type activeCfg struct {
 		sensorConfig
 		state string
@@ -183,7 +184,6 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		}
 		configs = append(configs, c)
 	}
-	rows.Close()
 
 	// ONE batched tag query after the loop — never a per-sensor query inside
 	// rows.Next(): the outer iteration holds a pooled connection, and nested
@@ -291,6 +291,7 @@ func (pw *ProbeWorker) warmStats() {
 		log.Printf("stats warm: failed to list sensors: %v", err)
 		return
 	}
+	defer ids.Close()
 	var idList []string
 	for ids.Next() {
 		var id string
@@ -298,7 +299,6 @@ func (pw *ProbeWorker) warmStats() {
 			idList = append(idList, id)
 		}
 	}
-	ids.Close()
 
 	// One batched fetch for all sensors (never a per-sensor query in a loop —
 	// same pool-starvation rule as SensorTagsFor), oldest-first, so each
@@ -868,6 +868,9 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	if err != nil {
 		return "up"
 	}
+	defer rows.Close() // top-level: this function has a post-Query return ("up"),
+	// so a bare rows.Close() below the loop would leak the pooled connection
+	// on that path — the hang under SetMaxOpenConns(10) the issue describes.
 	var recent []*float64 // index 0 = newest; nil = lost, non-nil = rtt
 	for rows.Next() {
 		var rtt *float64
@@ -875,7 +878,6 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 			recent = append(recent, rtt)
 		}
 	}
-	rows.Close()
 
 	if len(recent) == 0 {
 		return "up" // no data yet

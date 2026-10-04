@@ -469,11 +469,24 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res := pingHost(target, 2*time.Second)
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"rtt_ms": rttMillis(res.RTT), // float ms, 0 when lost
+	respondWithJSON(w, http.StatusOK, pingResponse(res))
+}
+
+// pingResponse shapes an "Echo Now" diagnostic result. rtt_ms is null (not 0)
+// for a dropped probe: 0 ms is a real (if implausible) RTT, and a lost probe
+// has NO measured round-trip — reporting 0 would read as "instant". The
+// dashboard already keys off `lost` for the toast, so null is safe.
+func pingResponse(res PingResult) map[string]interface{} {
+	var rttMs *float64
+	if !res.Lost {
+		v := rttMillis(res.RTT)
+		rttMs = &v
+	}
+	return map[string]interface{}{
+		"rtt_ms": rttMs, // null when lost
 		"lost":   res.Lost,
 		"error":  errText(res.Error),
-	})
+	}
 }
 
 // handleSensorHistory returns the last N probe records (SPEC §4, fix #4).
