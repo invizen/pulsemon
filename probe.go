@@ -110,6 +110,14 @@ type ProbeWorker struct {
 	loops   map[string]context.CancelFunc
 	db      *DB
 
+	// wg tracks every spawned sensorLoop so Run can't return (and thus the
+	// process's db.Close() can't run) while a loop is still mid-probe. Without
+	// this, cancelling the context makes Run return the instant it sees
+	// ctx.Done() while N sensor loops are still alive — one of them may be
+	// inside doProbe, between its INSERT and its status UPDATE. See
+	// shutdown_probe_test.go for the regression this guards.
+	wg sync.WaitGroup
+
 	// stats cache: the in-memory source of truth for the dashboard's
 	// per-sensor stats (v0.1.18). Written by doProbe (one append per probe)
 	// and by the startup warm-up; read by GetStats, which the API serves
@@ -133,6 +141,10 @@ func NewProbeWorker(db *DB) *ProbeWorker {
 }
 
 // Run reconciles the probe set from the DB every 5s, plus hourly retention.
+// It does NOT return until every spawned sensorLoop has also exited — a
+// cancelled ctx makes this loop exit, but the per-sensor loops it spawned
+// must be waited on first (wg.Wait), so the caller can treat Run's return as
+// "no probe is in flight" and safely close the database.
 func (pw *ProbeWorker) Run(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -152,6 +164,12 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			// Wait for every in-flight probe to finish before returning, so
+			// the caller can close the DB without aborting a write. Each
+			// loop's context derives from ctx (cancelled above), so each one
+			// exits at its next select; wg.Wait bounds that to the slowest
+			// in-flight ping + one DB round-trip.
+			pw.wg.Wait()
 			return
 		case <-ticker.C:
 			pw.syncSensors(ctx)
@@ -215,7 +233,11 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
 			cfg := c.sensorConfig
-			go pw.sensorLoop(lctx, cfg)
+			pw.wg.Add(1)
+			go func() {
+				defer pw.wg.Done()
+				pw.sensorLoop(lctx, cfg)
+			}()
 			cancel = lcancel
 		}
 		_ = cancel

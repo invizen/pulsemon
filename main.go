@@ -78,8 +78,14 @@ func main() {
 
 	pw := NewProbeWorker(db)
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go pw.Run(ctx)
+	// Track the worker so shutdown can wait for it: Run returns only after
+	// every per-sensor probe loop has exited (see ProbeWorker.Run), which is
+	// the guarantee that no probe write is in flight when we close the DB.
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		pw.Run(ctx)
+	}()
 
 	server := NewServer(db, pw)
 	addr := listenAddr()
@@ -100,8 +106,22 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	<-stop
-	log.Println("Shutting down server...")
+	log.Println("Shutting down...")
 
+	// 1. Stop background probing FIRST so no new probe writes start, and wait
+	// for in-flight probes to finish (Run blocks until its sensor loops exit).
+	cancel()
+	select {
+	case <-workerDone:
+		log.Println("Probe worker stopped")
+	case <-time.After(10 * time.Second):
+		// Each in-flight probe is bounded by its own timeout (default 1s),
+		// so this is effectively unreachable; if it ever fires, the DB close
+		// below would abort an in-flight write — log it loudly.
+		log.Println("WARNING: probe worker did not stop in 10s; in-flight probes may be aborted")
+	}
+
+	// 2. Drain active HTTP connections.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
