@@ -4,7 +4,11 @@ RUN apk add --no-cache git
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o zenmon .
+# Stamp the running version for the dashboard (healthz -> header badge).
+# Read from the VERSION file that ships in the repo (kept in sync with the
+# latest release tag); falls back to "dev" if the file is missing.
+RUN V=$(cat VERSION 2>/dev/null | head -1 | tr -d '[:space:]'); \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w -X main.Version=${V:-dev}" -o zenmon .
 
 FROM scratch
 COPY --from=builder /app/zenmon /zenmon
