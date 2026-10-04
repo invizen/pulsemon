@@ -137,111 +137,11 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, hz)
 }
 
-// sensorStats computes a 60-probe window summary for one sensor.
-func (s *Server) sensorStats(id string) *SensorStats {
-	const q = `SELECT rtt_ms,
-			COUNT(*) OVER () AS total,
-			SUM(CASE WHEN rtt_ms IS NULL THEN 1 ELSE 0 END) OVER () AS lost,
-			ROW_NUMBER() OVER (ORDER BY ts DESC) AS rn
-		FROM (SELECT rtt_ms, ts FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT 60)`
-	rows, err := s.db.Query(q, id)
-	if err != nil {
-		return nil
-	}
-	defer rows.Close()
-
-	var st SensorStats
-	var min, max, sum float64
-	have := false
-	for rows.Next() {
-		var rtt *float64
-		var rn int64
-		if err := rows.Scan(&rtt, &st.Total, &st.LostCount, &rn); err != nil {
-			continue
-		}
-		if rn <= 30 {
-			st.Recent = append(st.Recent, rtt) // newest first
-		}
-		if rtt != nil {
-			if !have {
-				min, max, have = *rtt, *rtt, true
-			} else {
-				if *rtt < min {
-					min = *rtt
-				}
-				if *rtt > max {
-					max = *rtt
-				}
-			}
-			sum += *rtt
-			if st.RTTLast == nil { // first row = newest
-				v := *rtt
-				st.RTTLast = &v
-			}
-		}
-	}
-	if st.Total > 0 {
-		st.LossPct = float64(st.LostCount) / float64(st.Total) * 100
-	}
-	if have {
-		mn, mx, avg := min, max, sum/float64(st.Total-st.LostCount)
-		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
-	}
-	// Past-1-hour loss % + avg RTT (the card's Loss and avg now reflect the
-	// same past-hour window as the sparkline, not the old 60-probe window).
-	var h1, l1 int
-	var h1avg *float64
-	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0), AVG(rtt_ms)
-		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 hour')`, id).Scan(&h1, &l1, &h1avg); err == nil && h1 > 0 {
-		st.HourLossPct = float64(l1) / float64(h1) * 100
-		st.HourRTTAvg = h1avg
-	}
-
-	// 24h uptime (independent of the 60-probe stats window).
-	var d24, l24 int
-	if err := s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 day')`, id).Scan(&d24, &l24); err == nil && d24 > 0 {
-		st.Uptime24h = float64(d24-l24) / float64(d24) * 100
-	}
-
-	// Past-1-hour sparkline: 60 fixed one-minute buckets (oldest -> newest) so
-	// the card graph always spans the full width. Each bucket = the min RTT in
-	// that minute; null = every probe in the minute was lost (outage); the -2
-	// sentinel marks a minute with no probes yet (e.g. a sensor newer than 1h).
-	nd := -2.0
-	st.Hour = make([]*float64, 60)
-	for i := range st.Hour {
-		st.Hour[i] = &nd
-	}
-	if rows, err := s.db.Query(`SELECT (strftime('%s', ts) / 60) * 60 AS bucket,
-			MIN(rtt_ms) AS min_rtt
-		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', '-1 hour')
-		GROUP BY bucket`, id); err == nil {
-		defer rows.Close()
-		nowMin := time.Now().Unix() / 60 * 60
-		for rows.Next() {
-			var bucket int64
-			var minRTT *float64
-			if err := rows.Scan(&bucket, &minRTT); err != nil {
-				continue
-			}
-			pos := 59 - int((nowMin-bucket)/60)
-			if pos < 0 || pos > 59 {
-				continue
-			}
-			if minRTT != nil {
-				st.Hour[pos] = minRTT // at least one reply this minute
-			} else {
-				st.Hour[pos] = nil // probes existed, all lost
-			}
-		}
-	}
-
-	if st.Total == 0 {
-		return nil
-	}
-	return &st
-}
+// sensorStats was the pre-v0.1.18 per-sensor SQL aggregator (4 queries per
+// call: 60-probe window, 1h loss/avg, 24h uptime, 1h sparkline). It is
+// superseded by ProbeWorker.GetStats, which computes the identical
+// SensorStats from the in-memory cache with zero DB round-trips. Kept in
+// git history for reference; do not call.
 
 func (s *Server) fetchSensors() []Sensor {
 	rows, err := s.db.Query("SELECT id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name")
@@ -285,7 +185,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		for _, sn := range sensors {
 			v := SensorView{Sensor: sn}
 			if sn.State == "active" {
-				v.Stats = s.sensorStats(sn.ID)
+				// In-memory stats (v0.1.18): one map lookup, no per-sensor
+				// SQLite queries. This was 4 queries per sensor per poll —
+				// the N+1 load this release eliminates.
+				v.Stats = s.probeWorker.GetStats(sn.ID)
 			}
 			views = append(views, v)
 		}
@@ -416,7 +319,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		sn.Tags = s.db.SensorTags(id)
 		v := SensorView{Sensor: sn}
 		if sn.State == "active" {
-			v.Stats = s.sensorStats(id)
+			v.Stats = s.probeWorker.GetStats(id)
 		}
 		respondWithJSON(w, http.StatusOK, v)
 
@@ -649,6 +552,10 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	}
 	_, _ = s.db.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id)
 	_, _ = s.db.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id)
+	// Keep the in-memory stats cache in step with the DB: the cleared sensor's
+	// series is gone, so its cache must be too (else the card would show the
+	// just-deleted history until the next probe).
+	s.probeWorker.ResetStatsFor(id)
 
 	log.Printf("API: cleared history for %s (%d probes, %d events)", name, probes, events)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -674,6 +581,7 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = s.db.Exec("DELETE FROM alert_state")
 	_, _ = s.db.Exec("UPDATE sensors SET status = 'up'")
+	s.probeWorker.ResetStatsAll() // wipe the whole in-memory stats cache too
 
 	log.Printf("API: cleared ALL history (%d probes, %d events)", probes, events)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
@@ -795,12 +703,19 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Time windows MUST compare epoch values, not raw strings: ts is stored
+	// as RFC3339 ('2026-10-04T20:47:28.530Z') while datetime('now', ?)
+	// returns space-separated ('2026-10-04 19:47:28'), so a plain
+	// `ts >= datetime('now', ?)` string comparison matched nearly every row
+	// and the "1h"/"24h" graphs silently showed the ENTIRE history.
+	// CAST(strftime('%s', ...)) normalizes both sides to epoch seconds.
 	rows, err := s.db.Query(`SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
 		AVG(rtt_ms) AS avg_rtt,
 		MAX(rtt_ms) AS max_rtt
-		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', ?)
+		FROM probes WHERE sensor_id = ?
+			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)
 		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, from)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -822,7 +737,8 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 
 	var total, lostTotal int
 	_ = s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM probes WHERE sensor_id = ? AND ts >= datetime('now', ?)`, id, from).Scan(&total, &lostTotal)
+		FROM probes WHERE sensor_id = ?
+			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)`, id, from).Scan(&total, &lostTotal)
 	uptime := 0.0
 	if total > 0 {
 		uptime = float64(total-lostTotal) / float64(total) * 100

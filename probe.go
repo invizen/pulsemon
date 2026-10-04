@@ -11,6 +11,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +21,72 @@ import (
 type ProbeState struct {
 	id       string
 	isPaused bool
+}
+
+// probeEntry is one probe in the in-memory stats series: its UTC epoch second
+// and its RTT in ms (nil = packet lost). The series is what makes the
+// dashboard read path (GetStats) an O(1) map lookup instead of 4 SQLite
+// queries per sensor — the whole point of v0.1.18.
+type probeEntry struct {
+	ts  int64 // UTC epoch seconds (matches CAST(strftime('%s', ts)))
+	rtt *float64
+}
+
+// probeSeries is an append-only, oldest-first log of probeEntry with a
+// logical `start` offset. Appending is amortized O(1); entries older than the
+// 24h retention are evicted by advancing `start`, and the backing array is
+// compacted only occasionally (when `start` grows large) so the common
+// append path never pays an O(n) memmove.
+type probeSeries struct {
+	data  []probeEntry
+	start int // index (into data) of the oldest live entry
+}
+
+func (ps *probeSeries) len() int { return len(ps.data) - ps.start }
+
+// append adds a new (newest) entry and evicts entries the dashboard can never
+// need. The retention is the UNION of the two windows the stats read:
+//   - the 60-probe stats window keeps the LAST 60 probes even if a sensor's
+//     long interval pushes them past 24h (a 1h-interval sensor's 60 probes
+//     span 60h) — this is what `ORDER BY ts DESC LIMIT 60` reads;
+//   - the 24h time window keeps everything within retentionSeconds for the
+//     uptime/sparkline/hour fields — what `ts >= now-24h` reads.
+//
+// An entry is evicted only when it is BOTH beyond the last 60 AND older than
+// the 24h cutoff, so the series always holds exactly the union the DB path
+// returns (never fewer), and memory is bounded for fast-interval sensors.
+func (ps *probeSeries) append(e probeEntry) {
+	if ps.start > 0 && (ps.start >= 4096 || ps.start*2 >= len(ps.data)) {
+		// Reclaim front space so future appends reuse the backing array
+		// instead of reallocating every time (the classic "resliced slice
+		// grows unbounded" trap).
+		n := copy(ps.data, ps.data[ps.start:])
+		for i := n; i < len(ps.data); i++ {
+			ps.data[i] = probeEntry{} // drop *float64 refs so they can GC
+		}
+		ps.data = ps.data[:n]
+		ps.start = 0
+	}
+	ps.data = append(ps.data, e)
+	keep := ps.len() - 60 // everything beyond the last 60 is a candidate
+	if keep < 0 {
+		keep = 0
+	}
+	cutoff := e.ts - retentionSeconds
+	for ps.start < keep && ps.data[ps.start].ts < cutoff {
+		ps.data[ps.start] = probeEntry{} // release the *float64
+		ps.start++
+	}
+}
+
+// snapshot copies the live entries (oldest-first) into a fresh slice so a
+// reader can compute stats off the shared lock without the series mutating
+// mid-read.
+func (ps *probeSeries) snapshot() []probeEntry {
+	n := ps.len()
+	out := make([]probeEntry, n)
+	copy(out, ps.data[ps.start:])
+	return out
 }
 
 type sensorConfig struct {
@@ -42,13 +109,26 @@ type ProbeWorker struct {
 	mu      sync.Mutex
 	loops   map[string]context.CancelFunc
 	db      *DB
+
+	// stats cache: the in-memory source of truth for the dashboard's
+	// per-sensor stats (v0.1.18). Written by doProbe (one append per probe)
+	// and by the startup warm-up; read by GetStats, which the API serves
+	// instead of running 4 SQLite queries per sensor per poll.
+	statsMu    sync.RWMutex
+	statsCache map[string]*probeSeries
 }
+
+// retentionSeconds is how long of a probe history the in-memory series keeps.
+// It must be >= the longest window the dashboard reads (24h uptime), so the
+// cache never goes stale relative to a DB read. Mirrors purgeOld's 24h.
+const retentionSeconds int64 = 24 * 3600
 
 func NewProbeWorker(db *DB) *ProbeWorker {
 	return &ProbeWorker{
-		sensors: make(map[string]*ProbeState),
-		loops:   make(map[string]context.CancelFunc),
-		db:      db,
+		sensors:    make(map[string]*ProbeState),
+		loops:      make(map[string]context.CancelFunc),
+		db:         db,
+		statsCache: make(map[string]*probeSeries),
 	}
 }
 
@@ -65,6 +145,10 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	if _, err := getSharedConn(); err != nil {
 		log.Printf("ProbeWorker: ICMP socket init: %v", err)
 	}
+	// Populate the stats cache from the DB so the first dashboard poll after a
+	// restart serves populated cards (RTT, sparkline, 24h uptime) instead of
+	// blanking them for up to an interval while probes re-accumulate.
+	pw.warmStats()
 	for {
 		select {
 		case <-ctx.Done():
@@ -186,6 +270,328 @@ func (pw *ProbeWorker) ActiveCount() int {
 	return len(pw.loops)
 }
 
+// ---------- in-memory stats cache (v0.1.18) ----------
+//
+// The dashboard polls GET /api/sensors every 5s. Pre-v0.1.18 each poll ran
+// 4 SQLite queries PER sensor (60-probe window, 1h loss/avg, 24h uptime, 1h
+// sparkline) — 2 + 4N round-trips per poll, contending with the probe write
+// transactions. The cache moves that load out of the read path: doProbe
+// appends each result to a per-sensor in-memory series, and GetStats computes
+// the same SensorStats from that series in a single map lookup + in-memory
+// scan. The DB stays the durable source of truth (probe INSERT is unchanged);
+// the cache is a read model, rebuilt from the DB at startup.
+
+// warmStats loads every active sensor's 24h probe history into the cache so a
+// fresh process (deploy/restart) serves populated cards immediately instead of
+// blanking them until each sensor re-accumulates a window. Runs once, before
+// probing starts.
+func (pw *ProbeWorker) warmStats() {
+	ids, err := pw.db.Query("SELECT id FROM sensors WHERE state = 'active'")
+	if err != nil {
+		log.Printf("stats warm: failed to list sensors: %v", err)
+		return
+	}
+	var idList []string
+	for ids.Next() {
+		var id string
+		if ids.Scan(&id) == nil {
+			idList = append(idList, id)
+		}
+	}
+	ids.Close()
+
+	// One batched fetch for all sensors (never a per-sensor query in a loop —
+	// same pool-starvation rule as SensorTagsFor), oldest-first, so each
+	// series is built in append order. The load is the UNION of the two
+	// windows the stats read: the last 60 probes PER sensor (a slow-interval
+	// sensor's window can span >24h) plus the full 24h retention — matching
+	// exactly what the live series will hold, so a fresh process serves the
+	// same window the DB path would have.
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
+	q := make([]string, len(idList))
+	for i := range q {
+		q[i] = "?"
+	}
+	// The query has two IN-clauses (last-60 part + 24h part), so the id list
+	// appears twice, followed by the 24h cutoff.
+	args := make([]any, 0, len(idList)*2+1)
+	for _, id := range idList {
+		args = append(args, id)
+	}
+	for _, id := range idList {
+		args = append(args, id)
+	}
+	args = append(args, cutoff.Format(time.RFC3339Nano))
+	// Part A is the last 60 probes per sensor computed over ALL rows (a
+	// slow-interval sensor's 60-probe window can span more than 24h, so it
+	// must NOT be pre-filtered to the 24h window). Part B is the full 24h
+	// retention for the uptime/sparkline/hour fields. UNION (dedup) = exactly
+	// the set the live series holds. Window functions are confirmed to work
+	// with the modernc.org/sqlite driver (the old sensorStats used them).
+	rows, err := pw.db.Query(
+		`SELECT sensor_id, ts, rtt_ms FROM (
+			SELECT sensor_id, ts, rtt_ms,
+			       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
+			FROM probes WHERE sensor_id IN (`+strings.Join(q, ",")+`)
+		) WHERE rn <= 60
+		UNION
+		SELECT sensor_id, ts, rtt_ms FROM probes
+		WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
+		ORDER BY sensor_id, ts`, args...)
+	if err != nil {
+		log.Printf("stats warm: fetch failed: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	type acc struct {
+		series *probeSeries
+	}
+	byID := make(map[string]*acc, len(idList))
+	var built int
+	for rows.Next() {
+		var sid string
+		var ts time.Time
+		var rtt *float64
+		if err := rows.Scan(&sid, &ts, &rtt); err != nil {
+			continue
+		}
+		a, ok := byID[sid]
+		if !ok {
+			a = &acc{series: &probeSeries{}}
+			byID[sid] = a
+		}
+		a.series.append(probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
+		built++
+	}
+	pw.statsMu.Lock()
+	for sid, a := range byID {
+		pw.statsCache[sid] = a.series
+	}
+	pw.statsMu.Unlock()
+	log.Printf("stats warm: loaded %d probes for %d sensors", built, len(byID))
+}
+
+// recordProbe appends a fresh probe result to the cache. Called from doProbe
+// right after the DB insert succeeds, so cache and DB stay in lockstep. The
+// map is created lazily so a ProbeWorker built by a test without
+// NewProbeWorker (which leaves statsCache nil) can't panic.
+func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
+	pw.statsMu.RLock()
+	s, ok := pw.statsCache[id]
+	pw.statsMu.RUnlock()
+	if !ok {
+		// Sensor isn't in the cache yet (added after warm-up). Create it.
+		pw.statsMu.Lock()
+		if pw.statsCache == nil {
+			pw.statsCache = make(map[string]*probeSeries)
+		}
+		if s, ok = pw.statsCache[id]; !ok {
+			s = &probeSeries{}
+			pw.statsCache[id] = s
+		}
+		pw.statsMu.Unlock()
+	}
+	pw.statsMu.Lock()
+	s.append(e)
+	pw.statsMu.Unlock()
+}
+
+// statsFor computes a sensor's SensorStats from the in-memory series,
+// anchored at nowUnix. GetStats calls it with time.Now().Unix(); tests call
+// it directly with a fixed now so the time-window fields (1h, 24h, sparkline)
+// compare deterministically against the DB reference.
+func (pw *ProbeWorker) statsFor(id string, nowUnix int64) *SensorStats {
+	pw.statsMu.RLock()
+	s, ok := pw.statsCache[id]
+	var entries []probeEntry
+	if ok {
+		entries = s.snapshot()
+	}
+	pw.statsMu.RUnlock()
+	if len(entries) == 0 {
+		return nil
+	}
+	return computeSensorStats(entries, nowUnix)
+}
+
+// GetStats computes a sensor's SensorStats from the in-memory series,
+// anchored to the wall clock. Returns nil when the sensor has no data
+// (matches the DB path, which returns nil for a zero-probe window).
+// Pure read — no DB.
+func (pw *ProbeWorker) GetStats(id string) *SensorStats {
+	return pw.statsFor(id, time.Now().Unix())
+}
+
+// ResetStatsFor empties one sensor's cached series (used by the clear-history
+// endpoint so the cache doesn't outlive the DB rows it mirrors).
+func (pw *ProbeWorker) ResetStatsFor(id string) {
+	pw.statsMu.Lock()
+	delete(pw.statsCache, id)
+	pw.statsMu.Unlock()
+}
+
+// ResetStatsAll empties every sensor's cached series (clear-all-history).
+func (pw *ProbeWorker) ResetStatsAll() {
+	pw.statsMu.Lock()
+	pw.statsCache = make(map[string]*probeSeries)
+	pw.statsMu.Unlock()
+}
+
+// computeSensorStats turns a sensor's probe history (oldest-first) into the
+// dashboard's SensorStats. This is the single source of truth for the stats
+// math — the in-memory read path (GetStats) and the differential test both go
+// through it, and it mirrors the field semantics of the pre-v0.1.18 SQL
+// queries exactly:
+//
+//   - the 60-probe window (total/loss/rtt min/avg/max/recent) is the LAST 60
+//     probes regardless of age, matching `ORDER BY ts DESC LIMIT 60`;
+//   - the past-hour (hour_loss_pct, hour_rtt_avg, sparkline) and 24h uptime
+//     fields use time windows relative to nowUnix, matching the SQL
+//     `ts >= datetime('now', '-1 hour' / '-1 day')` filters.
+//
+// nowUnix (epoch seconds) is the "current time" the time windows anchor to.
+// GetStats passes time.Now().Unix(); the differential test passes a fixed
+// value to both the SQL and in-memory paths so they compare deterministically
+// (no flake from a minute-boundary crossing mid-test). A nil rtt is a lost
+// probe (matches SQL `rtt_ms IS NULL`).
+func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
+	if len(entries) == 0 {
+		return nil
+	}
+	var st SensorStats
+	var min, max, sum float64
+	have := false
+
+	// 60-probe window: the last 60 probes (oldest-first slice), then scanned
+	// newest-first to match the original ROW_NUMBER() ordering.
+	window := entries
+	if len(window) > 60 {
+		window = window[len(window)-60:]
+	}
+	st.Total = len(window)
+	for i := len(window) - 1; i >= 0; i-- {
+		rtt := window[i].rtt
+		if st.RTTLast == nil && rtt != nil { // first non-lost from the newest
+			v := *rtt
+			st.RTTLast = &v
+		}
+		if len(st.Recent) < 30 {
+			st.Recent = append(st.Recent, rtt)
+		}
+		if rtt == nil {
+			st.LostCount++
+			continue
+		}
+		v := *rtt
+		if !have {
+			min, max, have = v, v, true
+		} else {
+			if v < min {
+				min = v
+			}
+			if v > max {
+				max = v
+			}
+		}
+		sum += v
+	}
+	if st.Total > 0 {
+		st.LossPct = float64(st.LostCount) / float64(st.Total) * 100
+	}
+	if have {
+		mn, mx, avg := min, max, sum/float64(st.Total-st.LostCount)
+		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
+	}
+
+	// Past-hour loss % + avg RTT.
+	h1, l1 := 0, 0
+	var h1sum float64
+	for _, e := range entries {
+		if e.ts >= nowUnix-3600 {
+			h1++
+			if e.rtt == nil {
+				l1++
+			} else {
+				h1sum += *e.rtt
+			}
+		}
+	}
+	if h1 > 0 {
+		st.HourLossPct = float64(l1) / float64(h1) * 100
+		if h1-l1 > 0 {
+			avg := h1sum / float64(h1-l1)
+			st.HourRTTAvg = &avg
+		}
+	}
+
+	// 24h uptime.
+	d24, l24 := 0, 0
+	for _, e := range entries {
+		if e.ts >= nowUnix-86400 {
+			d24++
+			if e.rtt == nil {
+				l24++
+			}
+		}
+	}
+	if d24 > 0 {
+		st.Uptime24h = float64(d24-l24) / float64(d24) * 100
+	}
+
+	// Past-1-hour sparkline: 60 fixed one-minute buckets, oldest -> newest.
+	// Bucket = min RTT in that minute; nil = probes existed, all lost; the -2
+	// sentinel marks a minute with no probes (a sensor newer than 1h).
+	nd := -2.0
+	st.Hour = make([]*float64, 60)
+	for i := range st.Hour {
+		st.Hour[i] = &nd
+	}
+	type bmin struct {
+		minRTT float64
+		hasRTT bool
+		hasAny bool
+	}
+	buckets := make([]bmin, 60)
+	nowMin := nowUnix / 60 * 60
+	for _, e := range entries {
+		if e.ts < nowUnix-3600 || e.ts > nowUnix {
+			continue
+		}
+		// Floor the probe to its minute FIRST (matching SQL's
+		// strftime('%s',ts)/60*60), then offset from the now-minute. Skipping
+		// the floor would put a probe 30s before a minute boundary into the
+		// following minute's bucket.
+		bucket := e.ts / 60 * 60
+		pos := 59 - int((nowMin-bucket)/60)
+		if pos < 0 || pos > 59 {
+			continue
+		}
+		b := &buckets[pos]
+		b.hasAny = true
+		if e.rtt != nil {
+			v := *e.rtt
+			if !b.hasRTT || v < b.minRTT {
+				b.minRTT = v
+				b.hasRTT = true
+			}
+		}
+	}
+	for i := range buckets {
+		if buckets[i].hasRTT {
+			v := buckets[i].minRTT
+			st.Hour[i] = &v // at least one reply this minute
+		} else if buckets[i].hasAny {
+			st.Hour[i] = nil // probes existed, all lost
+		}
+	}
+
+	if st.Total == 0 {
+		return nil
+	}
+	return &st
+}
+
 func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 	interval := time.Duration(c.intervalS) * time.Second
 
@@ -256,10 +662,19 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 		rttMs = ms
 	}
 
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)", c.id, time.Now().UTC().Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
+	now := time.Now().UTC()
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)", c.id, now.Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
+	// Keep the in-memory stats cache in lockstep with the DB row so the
+	// dashboard read path stays O(1) (no per-poll SQLite queries).
+	var rttPtr *float64
+	if !res.Lost {
+		v := rttMs
+		rttPtr = &v
+	}
+	pw.recordProbe(c.id, probeEntry{ts: now.Unix(), rtt: rttPtr})
 
 	newStatus := pw.deriveStatus(c)
 
