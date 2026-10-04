@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -31,35 +33,78 @@ func dbPathFromEnv() string {
 	return "/data/zenmon.db"
 }
 
-func main() {
-	// Self-update: `zenmon update` (works from any directory — it finds the
-	// running binary via os.Executable). See update.go. runUpdate only
-	// returns on success paths (errors exit itself), so return here to keep
-	// the server from starting afterwards.
-	if len(os.Args) > 1 && os.Args[1] == "update" {
-		runUpdate(os.Args[2:])
-		return
-	}
+// dispatchKind is the outcome of dispatching os.Args.
+type dispatchKind int
 
-	// Healthcheck (Docker HEALTHCHECK / systemd ExecStartPre): open the store
-	// via NewDB so the pragmas (busy_timeout, WAL, foreign_keys) apply — the
-	// old code used a bare sql.Open with a 0 ms busy_timeout, which failed
-	// with SQLITE_BUSY the instant a probe write or WAL checkpoint was in
-	// flight. NewDB's SELECT 1 already verifies reachability; the COUNT
-	// additionally proves the schema exists.
-	if len(os.Args) > 1 && os.Args[1] == "-healthz" {
-		db, err := NewDB(dbPathFromEnv())
-		if err != nil {
-			log.Printf("healthz: open: %v", err)
+const (
+	dRunServer dispatchKind = iota
+	dExit0
+	dExit1
+)
+
+// dispatch parses the command line and executes any non-server command.
+// Only dRunServer means "fall through and start the HTTP server". Keeping it
+// out of main() makes the arg handling testable (see cli_test.go); the one
+// side effect that must live in main is os.Exit, so the caller exits with the
+// kind's status.
+func dispatch(args []string) dispatchKind {
+	if len(args) <= 1 {
+		return dRunServer
+	}
+	switch args[1] {
+	case "update":
+		// runUpdate only returns on success paths (errors exit itself).
+		runUpdate(args[2:])
+		return dExit0
+	case "-healthz", "--healthz":
+		return runHealthcheck()
+	case "-v", "-version", "--version", "version":
+		fmt.Println("zenmon", Version)
+		return dExit0
+	}
+	// Anything else must be a known flag. Unknown flags (zenmon -invalid,
+	// zenmon --foo) previously fell through to a normal server start — the
+	// operator's typo silently booted a dashboard instead of surfacing an
+	// error.
+	if strings.HasPrefix(args[1], "-") {
+		fmt.Fprintf(os.Stderr, "zenmon: unknown flag %q\n\n", args[1])
+		fmt.Fprint(os.Stderr, "Usage:\n  zenmon            start the monitor + dashboard\n  zenmon update [check|VERSION]  self-update (check only, or pin a version)\n  zenmon -healthz     verify the store is usable (container healthcheck)\n  zenmon -version     print the build version and exit\n")
+		if os.Getenv("ZENMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
-		defer db.Close()
-		var n int
-		if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
-			log.Printf("healthz: query: %v", err)
-			os.Exit(1)
-		}
+		return dExit1
+	}
+	return dRunServer
+}
+
+// runHealthcheck opens the store via NewDB so the pragmas (busy_timeout,
+// WAL, foreign_keys) apply — a bare sql.Open runs with a 0 ms busy_timeout
+// and fails with SQLITE_BUSY the instant a probe write or WAL checkpoint is
+// in flight, which would crash-loop a container. NewDB's SELECT 1 already
+// verifies reachability; the COUNT additionally proves the schema exists.
+func runHealthcheck() dispatchKind {
+	db, err := NewDB(dbPathFromEnv())
+	if err != nil {
+		log.Printf("healthz: open: %v", err)
+		return dExit1
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
+		log.Printf("healthz: query: %v", err)
+		return dExit1
+	}
+	return dExit0
+}
+
+func main() {
+	// Self-update, healthcheck, and version are dispatched before the server
+	// starts; unknown flags are rejected there (see dispatch).
+	switch dispatch(os.Args) {
+	case dExit0:
 		return
+	case dExit1:
+		os.Exit(1)
 	}
 
 	db, err := NewDB(dbPathFromEnv())
