@@ -258,8 +258,9 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 		return
 	}
 	if newStatus == oldStatus {
-		// No transition: if still not up, a sustained re-alert may be due.
-		if newStatus != "up" {
+		// No transition: a sustained ERROR may be due for a re-alert.
+		// Warning is never re-alerted (loss flapping is dashboard noise).
+		if newStatus == "error" {
 			pw.maybeRealert(c, newStatus, rttMs)
 		}
 		return
@@ -272,7 +273,7 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 
 	note := fmt.Sprintf("%s -> %s", oldStatus, newStatus)
 	if newStatus == "up" {
-		note = "recovered" // first transition back to up after down/degraded
+		note = "recovered" // first transition back to up after warning/error
 	}
 	if _, err := pw.db.Exec("INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES (?, ?, ?, ?, ?)",
 		c.id, time.Now().UTC().Format(time.RFC3339Nano), oldStatus, newStatus, note); err != nil {
@@ -280,6 +281,8 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	}
 
 	pw.setAlertState(c.id, newStatus, time.Now().UTC())
+	// Warning (loss) is dashboard-only; error transitions and recoveries
+	// alert.
 	if pw.shouldAlertNow(c, newStatus) {
 		go pw.sendAlert(c.id, c.name, c.target, newStatus, rttMs)
 	}
@@ -291,19 +294,20 @@ func (pw *ProbeWorker) alertsEnabled() bool {
 	return pw.db.GetSetting("maintenance_mode") != "1"
 }
 
-// alertDegraded reports whether degraded-state alerts fire (default true).
-func (pw *ProbeWorker) alertDegraded() bool {
-	return pw.db.GetSetting("alert_degraded") != "0"
-}
+// alertable reports whether a transition INTO this status sends an alert.
+// Warning (packet loss) is dashboard-only by design — loss flapping was
+// alert noise. Error and recovery (up) alert.
+func alertable(status string) bool { return status != "warning" }
 
-// shouldAlertNow applies the maintenance/degraded gates and the global
-// alert routing rule (settings table): "all", "tags" (any of the sensor's
-// tags in filter list), or "sensors" (id in filter list).
+// shouldAlertNow applies the maintenance gate, the status gate (warning is
+// dashboard-only — see alertable), and the global alert routing rule
+// (settings table): "all", "tags" (any of the sensor's tags in filter list),
+// or "sensors" (id in filter list).
 func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, status string) bool {
 	if !pw.alertsEnabled() {
 		return false
 	}
-	if status == "degraded" && !pw.alertDegraded() {
+	if !alertable(status) {
 		return false
 	}
 	return pw.shouldAlert(c.id, c.tags)
@@ -406,33 +410,30 @@ func (pw *ProbeWorker) ResetAlertStates() {
 	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, now)
 }
 
-// statusWindow is the fixed probe count used for loss% and spike detection.
-// At the default 15s interval it is ~15 min of history; the past-hour card
-// stats use a separate window in api.go.
+// statusWindow is the fixed probe count used for loss% detection.
+// At the default 15s interval it is ~15 min of history.
 const statusWindow = 60
 
 // Status is derived from the sensor's most recent probes with fixed precedence:
 //
-//	down      — `down_after` consecutive losses from the newest probe
-//	degraded  — any of:
-//	             • window loss% (last `statusWindow` probes) >= loss_warn
-//	             • newest probe RTT >= spike_mult x the window-average RTT
-//	             • a loss is in the recent window but neither down nor up
-//	up        — the newest 2 probes both succeeded, loss% and spike checks
-//	            pass (a sensor with only one probe is up if that probe succeeded)
+//	error     — `down_after` consecutive losses from the newest probe
+//	warning   — window loss% (last `statusWindow` probes) >= loss_warn
+//	up        — the newest 2 probes both succeeded and loss% is below
+//	            loss_warn (a sensor with only one probe is up if that
+//	            probe succeeded)
 //
 // The window read is max(statusWindow, down_after) rows so that a sensor
 // configured with down_after > statusWindow still has enough history for the
 // consecutive-loss test. A probe-level ICMP error (broken socket) forces
-// degraded so a dead probe path never reads as "up".
+// warning so a dead probe path never reads as "up".
 func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	// Broken probe path (e.g. ICMP socket cannot be created): probes never
-	// land, so we cannot know the real state — flag degraded, never up.
+	// land, so we cannot know the real state — flag warning, never up.
 	if probeErrCount.Load() > c.lastErrCount {
-		return "degraded"
+		return "warning"
 	}
 
-	// Fetch enough history for the loss%/spike window AND the consecutive-loss
+	// Fetch enough history for the loss% window AND the consecutive-loss
 	// test, newest first.
 	limit := statusWindow
 	if c.downAfter > limit {
@@ -455,7 +456,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		return "up" // no data yet
 	}
 
-	// DOWN: down_after consecutive losses from the newest probe.
+	// ERROR: down_after consecutive losses from the newest probe.
 	consec := 0
 	for _, r := range recent {
 		if r == nil {
@@ -465,10 +466,10 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		}
 	}
 	if consec >= c.downAfter {
-		return "down"
+		return "error"
 	}
 
-	// DEGRADED (loss): loss% over the status window meets loss_warn.
+	// WARNING: loss% over the status window meets loss_warn.
 	totalLost := 0
 	for _, r := range recent {
 		if r == nil {
@@ -478,27 +479,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	if c.lossWarn > 0 {
 		lossPct := float64(totalLost) / float64(len(recent)) * 100
 		if lossPct >= float64(c.lossWarn) {
-			return "degraded"
-		}
-	}
-
-	// DEGRADED (spike): newest probe RTT is spike_mult x the window average.
-	// The average is computed over all OTHER successful probes in the window
-	// (excluding the newest) so a single spike isn't comparing against itself.
-	if c.spikeMult > 1 && recent[0] != nil {
-		var sumRTT float64
-		nOthers := 0
-		for _, r := range recent[1:] {
-			if r != nil {
-				sumRTT += *r
-				nOthers++
-			}
-		}
-		if nOthers > 0 && sumRTT > 0 {
-			avgRTT := sumRTT / float64(nOthers)
-			if *recent[0] >= avgRTT*float64(c.spikeMult) {
-				return "degraded"
-			}
+			return "warning"
 		}
 	}
 
@@ -508,8 +489,8 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		return "up"
 	}
 
-	// DEGRADED: a loss is in the recent window but it's not down and not up.
-	return "degraded"
+	// WARNING: a loss is in the recent window but it's not error and not up.
+	return "warning"
 }
 
 // purgeOld enforces 24-hour retention on probes/events (SPEC §3).
@@ -592,7 +573,7 @@ func (pw *ProbeWorker) TestWebhook() (bool, string) {
 }
 
 func cardFor(state, name, target string, rttMs float64) string {
-	icon := map[string]string{"up": "🟢", "degraded": "🟡", "down": "🔴"}[state]
+	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
 	if icon == "" {
 		icon = "🟢"
 	}
@@ -609,7 +590,7 @@ func cardFor(state, name, target string, rttMs float64) string {
 }
 
 func cardForRe(state, name, target string, rttMs float64) string {
-	icon := map[string]string{"degraded": "🟡", "down": "🔴"}[state]
+	icon := map[string]string{"warning": "🟡", "error": "🔴"}[state]
 	if icon == "" {
 		icon = "🟢"
 	}

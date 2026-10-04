@@ -52,9 +52,9 @@ tailwind.config = {
     <div id="status-pill" class="hidden md:flex items-center gap-5 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-xs">
       <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-ok glow-ok"></span><span class="text-slate-400">UP</span><span id="c-up" class="text-ok font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-warn glow-warn"></span><span class="text-slate-400">DEG</span><span id="c-deg" class="text-warn font-semibold">0</span></span>
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-warn glow-warn"></span><span class="text-slate-400">WARN</span><span id="c-warn" class="text-warn font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-bad glow-bad"></span><span class="text-slate-400">DOWN</span><span id="c-down" class="text-bad font-semibold">0</span></span>
+      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-bad glow-bad"></span><span class="text-slate-400">ERROR</span><span id="c-error" class="text-bad font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
       <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-slate-500"></span><span class="text-slate-400">PAUSED</span><span id="c-paused" class="text-slate-400 font-semibold">0</span></span>
     </div>
@@ -188,11 +188,11 @@ tailwind.config = {
         <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
           <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Down after
-          <input id="f-down" type="number" min="1" max="30" value="4" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-xs text-slate-400 flex flex-col gap-1">Error after
+          <input id="f-down" type="number" min="1" max="30" value="4" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
-          <input id="f-spike" type="number" min="2" max="10" value="3" title="Degraded when latest ping exceeds this multiple of the 60-probe average" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-spike" type="number" min="2" max="10" value="3" title="Informational — shown in the dashboard. Does not change status." class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
       <div id="form-err" class="hidden text-xs text-bad font-mono"></div>
@@ -253,20 +253,16 @@ tailwind.config = {
         </select>
         <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
         <label class="text-xs text-slate-400 flex items-center justify-between gap-3">
-          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still down/degraded — 0 = one alert per outage (recovery still alerts)</span></span>
+          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still error — 0 = one alert per outage (recovery still alerts)</span></span>
           <span class="flex items-center gap-1.5 font-mono">
             <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-ok/60"> min
           </span>
-        </label>
-        <label class="text-xs text-slate-400 flex items-center justify-between gap-3 cursor-pointer" title="When off, degraded sensors appear in the dashboard but never send an alert">
-          <span class="flex flex-col">Alert on degraded <span class="text-[11px] text-slate-600">off = down &amp; recovery alerts only</span></span>
-          <input id="f-alertdeg" type="checkbox" checked class="w-4 h-4 accent-emerald-500">
         </label>
       </div>
       <div id="set-msg" class="hidden text-xs font-mono px-3 py-2 rounded-lg border"></div>
       <div class="text-[11px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
         <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
-        Sent when a sensor transitions between up / degraded / down — including a *recovered* message. While a sensor stays in a bad state, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
+        Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning. Warning (packet loss) is shown in the dashboard but does not send an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
       </div>
     </div>
     <div class="px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
@@ -397,15 +393,15 @@ function statusMeta(s) {
   if (s.state === 'paused') return { label: 'PAUSED', cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', dot: 'bg-slate-500', glow: '' };
   switch (s.status) {
     case 'up': return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
-    case 'degraded': return { label: 'DEGRADED', cls: 'text-warn bg-warn/10 border-warn/25', dot: 'bg-warn', glow: 'glow-warn' };
-    case 'down': return { label: 'DOWN', cls: 'text-bad bg-bad/10 border-bad/25', dot: 'bg-bad', glow: 'glow-bad' };
+    case 'warning': return { label: 'WARNING', cls: 'text-warn bg-warn/10 border-warn/25', dot: 'bg-warn', glow: 'glow-warn' };
+    case 'error': return { label: 'ERROR', cls: 'text-bad bg-bad/10 border-bad/25', dot: 'bg-bad', glow: 'glow-bad' };
     default: return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
   }
 }
 
 function severityRank(s) {
   if (s.state === 'paused') return 3;
-  return { down: 0, degraded: 1, up: 2 }[s.status] ?? 1;
+  return { error: 0, warning: 1, up: 2 }[s.status] ?? 1;
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -426,10 +422,10 @@ function sparklineBars(hour) {
 
 function render() {
   const up = SENSORS.filter(s => s.state === 'active' && s.status === 'up').length;
-  const deg = SENSORS.filter(s => s.state === 'active' && s.status === 'degraded').length;
-  const down = SENSORS.filter(s => s.state === 'active' && s.status === 'down').length;
+  const warn = SENSORS.filter(s => s.state === 'active' && s.status === 'warning').length;
+  const err = SENSORS.filter(s => s.state === 'active' && s.status === 'error').length;
   const paused = SENSORS.filter(s => s.state === 'paused').length;
-  $('c-up').textContent = up; $('c-deg').textContent = deg; $('c-down').textContent = down; $('c-paused').textContent = paused;
+  $('c-up').textContent = up; $('c-warn').textContent = warn; $('c-error').textContent = err; $('c-paused').textContent = paused;
 
   const tags = ['ALL'].concat([...new Set(SENSORS.flatMap(s => s.tags || []))]);
   $('tag-chips').innerHTML = tags.map(t => {
@@ -478,7 +474,7 @@ function render() {
   }
 
   $('feed').innerHTML = EVENTS.length ? EVENTS.map(ev => {
-    const icon = ev.to === 'down' ? 'ph-arrow-down text-bad' : ev.to === 'degraded' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
+    const icon = ev.to === 'error' ? 'ph-arrow-down text-bad' : ev.to === 'warning' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
     const t = new Date(ev.ts).toLocaleTimeString([], { hour12: false });
     return '<li class="px-4 py-2 flex items-center gap-2.5">' +
       '<i class="ph ' + icon + '"></i>' +
@@ -496,7 +492,7 @@ function cardHtml(s) {
   const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
   const j = jitterOf(s);
   const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
-  const border = paused ? 'border-surface-700' : s.status === 'down' ? 'border-bad/40' : s.status === 'degraded' ? 'border-warn/30' : 'border-surface-800';
+  const border = paused ? 'border-surface-700' : s.status === 'error' ? 'border-bad/40' : s.status === 'warning' ? 'border-warn/30' : 'border-surface-800';
   const n = st && st.recent ? st.recent.length : 0;
   return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-4 flex flex-col gap-3 transition-all hover:shadow-lg hover:shadow-black/30 ' + (paused ? 'opacity-70' : '') + '">' +
     '<div class="flex items-start justify-between gap-2">' +
@@ -732,7 +728,6 @@ async function openSettings() {
     $('set-source').textContent = s.webhook_configured ? ('configured via ' + s.source) : 'not configured';
     $('f-scope').value = s.alert_scope || 'all';
     $('f-realert').value = s.realert_min ?? 30;
-    $('f-alertdeg').checked = s.alert_degraded !== false;
     setMaintUI(!!s.maintenance_mode);
     renderScopeOptions(s.alert_filter || []);
   } catch (e) {
@@ -818,8 +813,7 @@ async function saveSettings() {
     alert_scope: $('f-scope').value,
     alert_filter: selectedFilterItems(),
     realert_min: +$('f-realert').value,
-    maintenance_mode: SETTINGS.maintenance_mode === true,
-    alert_degraded: $('f-alertdeg').checked
+    maintenance_mode: SETTINGS.maintenance_mode === true
   };
   if (url) body.webhook_url = url;
   if (body.alert_scope !== 'all' && body.alert_filter.length === 0) {
@@ -919,7 +913,7 @@ async function loadInspector() {
     $('insp-name').textContent = s.name;
     $('insp-tag').textContent = (s.tags && s.tags.length) ? s.tags.join(' · ') : '—';
     $('insp-target').textContent = s.target + (s.state === 'paused' ? '   ·   PAUSED' : '');
-    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · down after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 3) + '×';
+    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · error after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 3) + '×';
     const g1 = document.getElementById('grange-1h');
     const g2 = document.getElementById('grange-24h');
     if (g1) g1.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');

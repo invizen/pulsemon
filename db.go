@@ -146,6 +146,28 @@ func (db *DB) InitSchema() error {
 			return err
 		}
 	}
+	// One-time migration (v0.1.13): rename stored statuses. "down" was the
+	// old name for error and "degraded" for warning; without this, the first
+	// probe after upgrade would log a spurious transition and fire a one-time
+	// alert on every already-affected sensor.
+	if _, err := db.Exec(`UPDATE sensors SET status = CASE status
+		WHEN 'down' THEN 'error'
+		WHEN 'degraded' THEN 'warning'
+		ELSE status END`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE events SET from_status = CASE from_status
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE from_status END`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE events SET to_status = CASE to_status
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE to_status END`); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`UPDATE alert_state SET status = CASE status
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE status END`); err != nil {
+		return err
+	}
 	return nil
 }
 

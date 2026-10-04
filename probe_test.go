@@ -90,7 +90,7 @@ func TestDeriveStatus(t *testing.T) {
 				f64(10), nil, f64(10), f64(10),
 				nil, nil,
 			},
-			want: "degraded",
+			want: "warning",
 		},
 		{
 			id: "loss-boundary", lossWarn: 25, downAfter: 4, spikeMult: 3,
@@ -100,7 +100,7 @@ func TestDeriveStatus(t *testing.T) {
 				f64(10), f64(10), f64(10), f64(10),
 				nil, nil, f64(10), f64(10),
 			},
-			want: "degraded",
+			want: "warning",
 		},
 		{
 			id: "loss-below", lossWarn: 25, downAfter: 4, spikeMult: 3,
@@ -113,42 +113,37 @@ func TestDeriveStatus(t *testing.T) {
 			want: "up",
 		},
 		{
-			id: "down", lossWarn: 25, downAfter: 4, spikeMult: 3,
+			id: "error", lossWarn: 25, downAfter: 4, spikeMult: 3,
 			// 4 consecutive losses from the newest probe
 			rtt: []*float64{
 				f64(10), f64(10), f64(10), f64(10),
 				nil, nil, nil, nil,
 			},
-			want: "down",
+			want: "error",
 		},
 		{
-			id: "down-beats-loss", lossWarn: 1, downAfter: 4, spikeMult: 3,
-			// loss_warn=1 would flag any loss, but 4 consecutive losses -> down
+			id: "error-beats-loss", lossWarn: 1, downAfter: 4, spikeMult: 3,
+			// loss_warn=1 would flag any loss, but 4 consecutive losses -> error
 			rtt: []*float64{
 				f64(10), f64(10), f64(10), f64(10),
 				nil, nil, nil, nil,
 			},
-			want: "down",
+			want: "error",
 		},
 		{
-			id: "spike", lossWarn: 25, downAfter: 4, spikeMult: 3,
-			// newest 40ms vs avg(10x9)=10ms -> 40 >= 30 -> spike
+			id: "spike-no-status", lossWarn: 25, downAfter: 4, spikeMult: 3,
+			// newest 40ms vs avg(10x9)=10ms is a 4x spike, but spike no longer
+			// changes status (dashboard-only); 0% loss, newest 2 OK -> up
 			rtt: f(10, 10, 10, 10, 10, 10, 10, 10, 10, 40),
-			want: "degraded",
-		},
-		{
-			id: "spike-below", lossWarn: 25, downAfter: 4, spikeMult: 3,
-			// newest 20ms vs avg 10ms -> 20 < 30, no spike
-			rtt: f(10, 10, 10, 10, 10, 10, 10, 10, 10, 20),
 			want: "up",
 		},
 		{
-			id: "down-after-large", lossWarn: 25, downAfter: 50, spikeMult: 3,
+			id: "error-after-large", lossWarn: 25, downAfter: 50, spikeMult: 3,
 			// 50 consecutive losses with down_after=50: the window read must be
 			// max(statusWindow, down_after)=60 rows, not a fixed 60 that would
 			// truncate the consecutive run.
 			rtt: append(f(10, 10, 10, 10), make([]*float64, 50)...),
-			want: "down",
+			want: "error",
 		},
 		{
 			id: "no-data", lossWarn: 25, downAfter: 4, spikeMult: 3,
@@ -164,7 +159,7 @@ func TestDeriveStatus(t *testing.T) {
 			id: "alternating", lossWarn: 25, downAfter: 4, spikeMult: 3,
 			// L U L U ... L U (newest OK): 50% loss >= 25%
 			rtt: []*float64{nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10)},
-			want: "degraded",
+			want: "warning",
 		},
 	}
 
@@ -176,5 +171,55 @@ func TestDeriveStatus(t *testing.T) {
 				t.Errorf("deriveStatus(%s): got %q, want %q", tt.id, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestAlertPolicy locks which transitions send an alert: warning (loss) is
+// dashboard-only, error (and recovery) alert. This is the noise-reduction
+// policy — up<->warning flapping must never fire an alert.
+func TestAlertPolicy(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "policy.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// alertable() is the unit test: warning never alerts, everything else does.
+	for status, want := range map[string]bool{
+		"warning": false,
+		"error":   true,
+		"up":      true, // recovery
+	} {
+		if got := alertable(status); got != want {
+			t.Errorf("alertable(%q) = %v, want %v", status, got, want)
+		}
+	}
+
+	// shouldAlertNow: with default routing (all sensors, maintenance off),
+	// only the status gate distinguishes warning from the rest.
+	pw := &ProbeWorker{
+		sensors: make(map[string]*ProbeState),
+		loops:   make(map[string]context.CancelFunc),
+		db:      db,
+	}
+	c := sensorConfig{id: "policy-sensor"}
+	if pw.shouldAlertNow(c, "warning") {
+		t.Error("shouldAlertNow(warning) = true, want false (loss is dashboard-only)")
+	}
+	for _, st := range []string{"error", "up"} {
+		if !pw.shouldAlertNow(c, st) {
+			t.Errorf("shouldAlertNow(%q) = false, want true", st)
+		}
+	}
+
+	// Maintenance mode silences even error alerts.
+	if err := db.SetSetting("maintenance_mode", "1"); err != nil {
+		t.Fatalf("SetSetting: %v", err)
+	}
+	if pw.shouldAlertNow(c, "error") {
+		t.Error("shouldAlertNow(error) = true while maintenance ON, want false")
 	}
 }

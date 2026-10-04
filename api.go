@@ -27,7 +27,7 @@ type Sensor struct {
 	DownAfter int      `json:"down_after"`
 	SpikeMult int      `json:"spike_mult"`
 	State     string   `json:"state"`    // active | paused
-	Status    string   `json:"status"`   // up | degraded | down
+	Status    string   `json:"status"`   // up | warning | error
 	CreatedAt string   `json:"created_at"`
 }
 
@@ -920,7 +920,6 @@ func (s *Server) settingsPayload() map[string]interface{} {
 		"alert_filter":       filter,
 		"realert_min":        realert,
 		"maintenance_mode":   s.db.GetSetting("maintenance_mode") == "1",
-		"alert_degraded":     s.db.GetSetting("alert_degraded") != "0",
 	}
 }
 
@@ -938,12 +937,11 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		WebhookURL    *string  `json:"webhook_url"` // nil = keep existing
-		AlertScope    string   `json:"alert_scope"`
-		AlertFilter   []string `json:"alert_filter"`
-		RealertMin    *int     `json:"realert_min"` // nil = keep; 0 = alert once only
-		MaintMode     *bool    `json:"maintenance_mode"`
-		AlertDegraded *bool    `json:"alert_degraded"`
+		WebhookURL  *string  `json:"webhook_url"` // nil = keep existing
+		AlertScope  string   `json:"alert_scope"`
+		AlertFilter []string `json:"alert_filter"`
+		RealertMin  *int     `json:"realert_min"` // nil = keep; 0 = alert once only
+		MaintMode   *bool    `json:"maintenance_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
@@ -1007,16 +1005,6 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			s.probeWorker.ResetAlertStates()
 		}
 		log.Printf("API: maintenance mode %s", map[string]string{"1": "ON", "0": "off"}[val])
-	}
-	if req.AlertDegraded != nil {
-		val := "1"
-		if !*req.AlertDegraded {
-			val = "0"
-		}
-		if err := s.db.SetSetting("alert_degraded", val); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-			return
-		}
 	}
 	realertLog := 30
 	if v := s.db.GetSetting("realert_min"); v != "" {
