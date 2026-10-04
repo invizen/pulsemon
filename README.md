@@ -38,6 +38,7 @@ zenmon
 git clone https://github.com/invizen/zenmon zenmon && cd zenmon
 cp .env.example .env          # optional: put a Google Chat webhook URL in .env
 chmod 600 .env
+mkdir -p data && chmod 0777 data  # pre-create the data dir (see note below)
 docker compose up -d --build
 ```
 
@@ -46,6 +47,13 @@ Open http://localhost:8080 and add sensors from the **new sensor** button.
 > **First boot:** the database is created automatically on first run
 > (`data/zenmon.db`). If you want seeded example sensors, see `db.go`
 > (`seedSensors`) — it runs only on an empty database.
+>
+> **Why pre-create `data/`?** The container runs as uid 1000 (unprivileged).
+> If the bind-mount source doesn't exist, Docker creates it **root-owned**
+> and the container crash-loops with `Failed to open DB: unable to open
+> database file`. Pre-creating the directory yourself (any ownership works —
+> `chmod 0777` is the no-sudo option) avoids that. If it already happened,
+> `sudo chown -R 1000:1000 data` fixes it.
 
 ## ICMP & privileges
 
@@ -70,7 +78,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 
 | Deployment | Result | How |
 |---|---|---|
-| Docker (default image) | ✅ unprivileged | The container runs as **uid 1000** (see `USER` in `Dockerfile`); the datagram socket works off `ping_group_range`. The `/data` volume must be writable by uid 1000 (`chown -R 1000:1000 <data dir>`). |
+| Docker (default image) | ✅ unprivileged | The container runs as **uid 1000** (see `USER` in `Dockerfile`); the datagram socket works off `ping_group_range`. Pre-create the `data/` bind-mount dir (or `chown -R 1000:1000` it) — see Quick start. |
 | Bare / systemd as a normal user | ✅ if in range | Works when the user's uid is inside `ping_group_range` (the datagram socket); otherwise it falls back to the raw socket, which needs `CAP_NET_RAW`/root. |
 
 > **Why not just `"udp4"`?** x/net/icmp's `ListenPacket("udp4", …)` is **not**
