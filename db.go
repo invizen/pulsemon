@@ -223,16 +223,27 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 	return out
 }
 
+// SetSensorTags atomically replaces a sensor's tags: DELETE then INSERTs in
+// ONE transaction, so a mid-loop error (or a crash) rolls back cleanly and
+// the sensor is never left with a partial/empty tag set. A torn tag set is
+// worse than stale tags: with alert_scope='tags' it silently changes which
+// sensors alert.
 func (db *DB) SetSensorTags(id string, tags []string) error {
-	if _, err := db.Exec("DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+
+	if _, err := tx.Exec("DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
 		return err
 	}
 	for _, t := range tags {
-		if _, err := db.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, t); err != nil {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, t); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 // AllTags returns each distinct tag with the number of sensors using it.

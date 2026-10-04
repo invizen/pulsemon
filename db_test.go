@@ -65,6 +65,60 @@ func equalTags(got, want []string) bool {
 	return true
 }
 
+// TestSetSensorTagsAtomic locks the transactional tag replacement: when an
+// insert fails MID-LOOP (simulated with a BEFORE-INSERT trigger that
+// RAISE(ABORT)s on one specific tag), the whole operation rolls back — the
+// sensor keeps its ORIGINAL tags, never an empty or partial set. A torn set
+// is the real-world harm: with alert_scope='tags' it silently changes which
+// sensors alert. This test fails against the old delete-then-insert code
+// (delete committed, partial/empty set left behind).
+func TestSetSensorTagsAtomic(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "atomic.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at)
+		VALUES ("a","a","127.0.0.1",5,1000,25,4,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensor: %v", err)
+	}
+	original := []string{"one", "two"}
+	if err := db.SetSensorTags("a", original); err != nil {
+		t.Fatalf("initial SetSensorTags: %v", err)
+	}
+
+	// Force a mid-loop failure: any insert of tag "bad" aborts.
+	if _, err := db.Exec(`CREATE TRIGGER tagblock BEFORE INSERT ON sensor_tags
+		FOR EACH ROW WHEN NEW.tag = 'bad'
+		BEGIN SELECT RAISE(ABORT, 'boom'); END`); err != nil {
+		t.Fatalf("create trigger: %v", err)
+	}
+	defer db.Exec(`DROP TRIGGER IF EXISTS tagblock`)
+
+	// Replace [one, two] with [three, bad, four]: "bad" is the 2nd insert,
+	// so the delete and the "three" insert have already run when it fires.
+	err = db.SetSensorTags("a", []string{"three", "bad", "four"})
+	if err == nil {
+		t.Fatal("SetSensorTags with failing insert: expected an error")
+	}
+
+	got := db.SensorTags("a")
+	if !equalTags(got, original) {
+		t.Errorf("after rolled-back replacement, tags = %v, want original %v (must not be empty or partial)", got, original)
+	}
+
+	// The trigger must NOT leak into later successful updates.
+	if err := db.SetSensorTags("a", []string{"three", "four"}); err != nil {
+		t.Fatalf("post-rollback SetSensorTags: %v", err)
+	}
+	if got := db.SensorTags("a"); !equalTags(got, []string{"four", "three"}) {
+		t.Errorf("replacement tags = %v, want [four three] (sorted)", got)
+	}
+}
+
 // TestStatusRenameMigration locks the one-time v0.1.13 migration: existing
 // databases store "down"/"degraded" in sensors, events, and alert_state.
 // After InitSchema, all must be renamed to "error"/"warning" so the first
