@@ -307,62 +307,71 @@ func (pw *ProbeWorker) warmStats() {
 	// sensor's window can span >24h) plus the full 24h retention — matching
 	// exactly what the live series will hold, so a fresh process serves the
 	// same window the DB path would have.
-	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-	q := make([]string, len(idList))
-	for i := range q {
-		q[i] = "?"
-	}
 	// The query has two IN-clauses (last-60 part + 24h part), so the id list
-	// appears twice, followed by the 24h cutoff.
-	args := make([]any, 0, len(idList)*2+1)
-	for _, id := range idList {
-		args = append(args, id)
-	}
-	for _, id := range idList {
-		args = append(args, id)
-	}
-	args = append(args, cutoff.Format(time.RFC3339Nano))
-	// Part A is the last 60 probes per sensor computed over ALL rows (a
-	// slow-interval sensor's 60-probe window can span more than 24h, so it
-	// must NOT be pre-filtered to the 24h window). Part B is the full 24h
-	// retention for the uptime/sparkline/hour fields. UNION (dedup) = exactly
-	// the set the live series holds. Window functions are confirmed to work
-	// with the modernc.org/sqlite driver (the old sensorStats used them).
-	rows, err := pw.db.Query(
-		`SELECT sensor_id, ts, rtt_ms FROM (
-			SELECT sensor_id, ts, rtt_ms,
-			       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
-			FROM probes WHERE sensor_id IN (`+strings.Join(q, ",")+`)
-		) WHERE rn <= 60
-		UNION
-		SELECT sensor_id, ts, rtt_ms FROM probes
-		WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
-		ORDER BY sensor_id, ts`, args...)
-	if err != nil {
-		log.Printf("stats warm: fetch failed: %v", err)
-		return
-	}
-	defer rows.Close()
-
+	// appears twice, followed by the 24h cutoff. It runs in inQueryChunk
+	// batches (see db.go): 2*inQueryChunk+1 params per chunk stays far under
+	// the driver's 32,766 host-parameter limit, so a very large fleet can't
+	// fail the warm-up with "too many SQL variables". Partitioning by sensor
+	// id keeps each sensor's rows in exactly one chunk, so per-sensor order is
+	// preserved. The closure defers the cursor close per chunk — top-level
+	// defer, not a bare close below a loop — so no pooled connection is held
+	// across chunks.
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	type acc struct {
 		series *probeSeries
 	}
 	byID := make(map[string]*acc, len(idList))
 	var built int
-	for rows.Next() {
-		var sid string
-		var ts time.Time
-		var rtt *float64
-		if err := rows.Scan(&sid, &ts, &rtt); err != nil {
-			continue
+	fetchChunk := func(chunk []string) {
+		q := make([]string, len(chunk))
+		for i := range q {
+			q[i] = "?"
 		}
-		a, ok := byID[sid]
-		if !ok {
-			a = &acc{series: &probeSeries{}}
-			byID[sid] = a
+		args := make([]any, 0, len(chunk)*2+1)
+		for _, id := range chunk {
+			args = append(args, id)
 		}
-		a.series.append(probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
-		built++
+		for _, id := range chunk {
+			args = append(args, id)
+		}
+		args = append(args, cutoff.Format(time.RFC3339Nano))
+		rows, err := pw.db.Query(
+			`SELECT sensor_id, ts, rtt_ms FROM (
+				SELECT sensor_id, ts, rtt_ms,
+				       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
+				FROM probes WHERE sensor_id IN (`+strings.Join(q, ",")+`)
+			) WHERE rn <= 60
+			UNION
+			SELECT sensor_id, ts, rtt_ms FROM probes
+			WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
+			ORDER BY sensor_id, ts`, args...)
+		if err != nil {
+			log.Printf("stats warm: chunk fetch failed: %v", err)
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var sid string
+			var ts time.Time
+			var rtt *float64
+			if err := rows.Scan(&sid, &ts, &rtt); err != nil {
+				continue
+			}
+			a, ok := byID[sid]
+			if !ok {
+				a = &acc{series: &probeSeries{}}
+				byID[sid] = a
+			}
+			a.series.append(probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
+			built++
+		}
+	}
+	for i := 0; i < len(idList); i += inQueryChunk {
+		end := i + inQueryChunk
+		if end > len(idList) {
+			end = len(idList)
+		}
+		fetchChunk(idList[i:end])
 	}
 	pw.statsMu.Lock()
 	for sid, a := range byID {

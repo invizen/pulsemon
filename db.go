@@ -224,33 +224,58 @@ func (db *DB) SensorTags(id string) []string {
 	return out
 }
 
-// SensorTagsFor fetches the sorted tag lists for a batch of sensors in ONE
-// query. Batch callers (fetchSensors, syncSensors) must not run a per-row
-// SensorTags() inside a rows.Next() loop: the outer iteration holds a pooled
-// connection, and per-row queries starve the pool under concurrent load.
-// Empty ids → empty map; ids are internal UUIDs (no user string injection).
+// inQueryChunk is the max number of ids per IN(...) chunk for batch queries.
+// modernc.org/sqlite (v1.29.1) accepts up to 32,766 bound parameters
+// (verified against the real driver: 32,766 binds, 32,767 fails with "too
+// many SQL variables"). A query that repeats an id list N times needs
+// N*chunk params, so a fixed 500 stays far under the limit with headroom for
+// the repeated lists (warmStats uses its id list twice, once per UNION arm).
+// A realistic homelab fleet runs on a single chunk; the cap only engages if
+// the fleet ever grows to thousands of sensors, where it prevents the query
+// from failing outright with "too many SQL variables".
+const inQueryChunk = 500
+
+// SensorTagsFor fetches the sorted tag lists for a batch of sensors. It runs
+// in inQueryChunk-sized batches so an unbounded id list can't exceed the
+// SQLite host-parameter limit. Batch callers (fetchSensors, syncSensors) must
+// not run a per-row SensorTags() inside a rows.Next() loop: the outer
+// iteration holds a pooled connection, and per-row queries starve the pool
+// under concurrent load. Empty ids → empty map; ids are internal UUIDs (no
+// user string injection).
 func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 	out := make(map[string][]string, len(ids))
 	if len(ids) == 0 {
 		return out
 	}
-	q := make([]string, len(ids))
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		q[i] = "?"
-		args[i] = id
-	}
-	rows, err := db.Query("SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
-		strings.Join(q, ",")+") ORDER BY tag", args...)
-	if err != nil {
-		return out
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var id, tag string
-		if rows.Scan(&id, &tag) == nil {
-			out[id] = append(out[id], tag)
+	// Closure per chunk: defer closes this chunk's cursor when the chunk
+	// finishes, before the next chunk's query runs — top-level defer, not a
+	// bare close below a loop, so no pooled connection is held across chunks.
+	fetchChunk := func(chunk []string) {
+		q := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			q[j] = "?"
+			args[j] = id
 		}
+		rows, err := db.Query("SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
+			strings.Join(q, ",")+") ORDER BY tag", args...)
+		if err != nil {
+			return
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, tag string
+			if rows.Scan(&id, &tag) == nil {
+				out[id] = append(out[id], tag)
+			}
+		}
+	}
+	for i := 0; i < len(ids); i += inQueryChunk {
+		end := i + inQueryChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		fetchChunk(ids[i:end])
 	}
 	return out
 }
