@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -94,4 +96,61 @@ func TestDeliverSameSeqDifferentDsts(t *testing.T) {
 		t.Error("probe B entry not removed")
 	}
 	pendingMu.Unlock()
+}
+
+// TestResolveIPAddrWithTimeout locks the context-based resolver: literal IPs
+// pass through, and a lookup that exceeds the deadline is CANCELLED — the
+// function returns on time AND the resolver work does not keep running
+// (the old goroutine+net.ResolveIPAddr pattern leaked one goroutine per
+// timed-out probe).
+func TestResolveIPAddrWithTimeout(t *testing.T) {
+	// Literal IP: no DNS involved.
+	ip, err := resolveIPAddrWithTimeout(context.Background(), "10.1.2.3", 5*time.Second)
+	if err != nil {
+		t.Fatalf("literal IP: %v", err)
+	}
+	if ip == nil || ip.IP.String() != "10.1.2.3" {
+		t.Fatalf("literal IP: got %v, want 10.1.2.3", ip)
+	}
+
+	// Non-existent hostname: must fail (NXDOMAIN or no address), not hang.
+	_, err = resolveIPAddrWithTimeout(context.Background(), "nonexistent-host-zenmon-test.invalid", 5*time.Second)
+	if err == nil {
+		t.Fatal("unresolvable host: got nil error, want a failure")
+	}
+
+	// Hanging resolver: a custom Dial that blocks until its context is done
+	// (simulates a blackholed nameserver). With the old goroutine +
+	// net.ResolveIPAddr pattern, that dial would never see the 150ms
+	// deadline and the goroutine would leak. The context-based implementation
+	// must return on the deadline with the dial cancelled, and no goroutines
+	// left behind.
+	old := net.DefaultResolver
+	defer func() { net.DefaultResolver = old }()
+	hangDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	net.DefaultResolver = &net.Resolver{PreferGo: true, Dial: hangDial}
+	base := runtime.NumGoroutine()
+	start := time.Now()
+	ip, err = resolveIPAddrWithTimeout(context.Background(), "hanging-host-zenmon-test.invalid", 150*time.Millisecond)
+	elapsed := time.Since(start)
+	if ip != nil {
+		t.Fatal("hanging resolver: expected nil IP")
+	}
+	if err == nil {
+		t.Fatal("hanging resolver: expected timeout error")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("hanging resolver: took %v, want ~150ms deadline", elapsed)
+	}
+
+	// Give any leaked resolver goroutines a beat to show up, then confirm
+	// the count has settled (small margin for scheduler noise).
+	time.Sleep(500 * time.Millisecond)
+	now := runtime.NumGoroutine()
+	if now > base+5 {
+		t.Errorf("resolver leak: goroutines %d -> %d after timed-out lookup", base, now)
+	}
 }

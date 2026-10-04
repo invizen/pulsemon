@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -424,7 +426,7 @@ func EngineMode() string {
 // pingHost is the probe worker's entry point: resolve the target, then
 // ping the resolved IP through the shared engine.
 func pingHost(target string, timeout time.Duration) PingResult {
-	ip, err := resolveIPAddrWithTimeout("ip4", target, 5*time.Second)
+	ip, err := resolveIPAddrWithTimeout(context.Background(), target, 5*time.Second)
 	if err != nil {
 		return PingResult{Lost: true, Error: err}
 	}
@@ -444,22 +446,25 @@ func pingHost(target string, timeout time.Duration) PingResult {
 }
 
 // resolveIPAddrWithTimeout resolves an IP with a hard deadline so a hung
-// DNS lookup can't wedge a sensor's goroutine forever (it becomes a loss
-// row instead of a permanent block).
-func resolveIPAddrWithTimeout(network, host string, timeout time.Duration) (*net.IPAddr, error) {
-	type result struct {
-		ip  *net.IPAddr
-		err error
+// DNS lookup can't wedge a sensor's probe (it becomes a loss row instead of
+// a permanent block). Uses a context so the lookup is CANCELLED on timeout —
+// the old pattern (goroutine + net.ResolveIPAddr) returned on time but left
+// the un-cancellable resolver goroutine behind, leaking one per probe.
+func resolveIPAddrWithTimeout(ctx context.Context, host string, timeout time.Duration) (*net.IPAddr, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return nil, fmt.Errorf("DNS resolution of %q timed out after %s", host, timeout)
+		}
+		return nil, err
 	}
-	ch := make(chan result, 1)
-	go func() {
-		ip, err := net.ResolveIPAddr(network, host)
-		ch <- result{ip, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.ip, r.err
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("DNS resolution of %q timed out after %s", host, timeout)
+	for _, ip := range ips {
+		if ip.IP.To4() != nil {
+			return &ip, nil
+		}
 	}
+	return nil, fmt.Errorf("no IPv4 address found for %s", host)
 }
