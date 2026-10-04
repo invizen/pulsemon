@@ -406,17 +406,25 @@ func (pw *ProbeWorker) ResetAlertStates() {
 	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, now)
 }
 
-// Status is derived from the sensor's most recent probes (last `down_after`,
-// a 4-probe window at the default) with fixed precedence:
+// statusWindow is the fixed probe count used for loss% and spike detection.
+// At the default 15s interval it is ~15 min of history; the past-hour card
+// stats use a separate window in api.go.
+const statusWindow = 60
+
+// Status is derived from the sensor's most recent probes with fixed precedence:
 //
 //	down      — `down_after` consecutive losses from the newest probe
-//	up        — the newest 2 probes both succeeded (a sensor with only one
-//	            probe recorded is up if that single probe succeeded)
-//	degraded  — anything else: a loss is present in the recent window but it
-//	            is neither fully down nor 2 clean in a row
+//	degraded  — any of:
+//	             • window loss% (last `statusWindow` probes) >= loss_warn
+//	             • newest probe RTT >= spike_mult x the window-average RTT
+//	             • a loss is in the recent window but neither down nor up
+//	up        — the newest 2 probes both succeeded, loss% and spike checks
+//	            pass (a sensor with only one probe is up if that probe succeeded)
 //
-// A probe-level ICMP error (broken socket) forces degraded so a dead probe
-// path never reads as "up".
+// The window read is max(statusWindow, down_after) rows so that a sensor
+// configured with down_after > statusWindow still has enough history for the
+// consecutive-loss test. A probe-level ICMP error (broken socket) forces
+// degraded so a dead probe path never reads as "up".
 func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	// Broken probe path (e.g. ICMP socket cannot be created): probes never
 	// land, so we cannot know the real state — flag degraded, never up.
@@ -424,9 +432,13 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		return "degraded"
 	}
 
-	// Fetch the last `down_after` probes, newest first. This window is enough
-	// to test both "all losses in a row" (down) and "2 successes in a row" (up).
-	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, c.downAfter)
+	// Fetch enough history for the loss%/spike window AND the consecutive-loss
+	// test, newest first.
+	limit := statusWindow
+	if c.downAfter > limit {
+		limit = c.downAfter
+	}
+	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, limit)
 	if err != nil {
 		return "up"
 	}
@@ -454,6 +466,40 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	}
 	if consec >= c.downAfter {
 		return "down"
+	}
+
+	// DEGRADED (loss): loss% over the status window meets loss_warn.
+	totalLost := 0
+	for _, r := range recent {
+		if r == nil {
+			totalLost++
+		}
+	}
+	if c.lossWarn > 0 {
+		lossPct := float64(totalLost) / float64(len(recent)) * 100
+		if lossPct >= float64(c.lossWarn) {
+			return "degraded"
+		}
+	}
+
+	// DEGRADED (spike): newest probe RTT is spike_mult x the window average.
+	// The average is computed over all OTHER successful probes in the window
+	// (excluding the newest) so a single spike isn't comparing against itself.
+	if c.spikeMult > 1 && recent[0] != nil {
+		var sumRTT float64
+		nOthers := 0
+		for _, r := range recent[1:] {
+			if r != nil {
+				sumRTT += *r
+				nOthers++
+			}
+		}
+		if nOthers > 0 && sumRTT > 0 {
+			avgRTT := sumRTT / float64(nOthers)
+			if *recent[0] >= avgRTT*float64(c.spikeMult) {
+				return "degraded"
+			}
+		}
 	}
 
 	// UP: the newest 2 probes both succeeded. With only one probe recorded,

@@ -55,9 +55,33 @@ type pendingPing struct {
 	ch    chan time.Duration
 }
 
+// pingKey uniquely identifies an in-flight probe. The sequence number alone
+// is not enough: a 16-bit seq recycles every 65536 pings, and a stale reply
+// (latency > timeout) arriving after the slot was handed to a NEW probe
+// would, with a seq-only key, be looked up against the new probe and —
+// because deliver() removed the entry before its source-IP check ran —
+// prematurely evict the new probe's slot, dropping its genuine reply as a
+// false loss. Keying by seq + destination makes a reply only ever match the
+// probe that actually sent to that destination.
+type pingKey struct {
+	seq uint16
+	dst string // normalized 4-byte IP string (see mkKey)
+}
+
+// mkKey builds the map key, normalizing the IP to its 4-byte form so a
+// 16-byte IPv4-in-IPv6 source (possible from the raw transport) matches the
+// 4-byte destination stored at send time. IPv6 (To4() nil) falls back to the
+// full string, which never collides with a 4-byte key.
+func mkKey(seq uint16, ip net.IP) pingKey {
+	if v4 := ip.To4(); v4 != nil {
+		return pingKey{seq: seq, dst: v4.String()}
+	}
+	return pingKey{seq: seq, dst: ip.String()}
+}
+
 var (
 	pendingMu sync.Mutex
-	pending   = map[uint32]*pendingPing{}
+	pending   = map[pingKey]*pendingPing{}
 
 	// Monotonic counter of send errors since start.
 	probeErrCount atomic.Int64
@@ -204,20 +228,29 @@ func (e *Engine) Close() {
 	}
 }
 
-// deliver hands a reply's RTT to its waiting probe (keyed, source-IP
-// verified). Called by the reader goroutine.
-func (e *Engine) deliver(key uint32, src net.IP) {
+// deliver hands a reply's RTT to its waiting probe (keyed by seq +
+// destination, source-IP verified). Called by the reader goroutine.
+//
+// The destination check runs BEFORE the map delete: a stale reply from a
+// previous probe that reused this seq must be dropped WITHOUT removing the
+// new probe's entry, or the new probe's genuine reply would later be
+// discarded as untracked (false loss).
+func (e *Engine) deliver(seq uint16, src net.IP) {
+	key := mkKey(seq, src)
 	pendingMu.Lock()
 	p, ok := pending[key]
+	if ok && !p.dst.Equal(src) {
+		// Entry exists but is for a different destination: this reply is
+		// stale (belongs to a prior probe that recycled the seq). Drop it
+		// and keep the new probe's entry intact.
+		pendingMu.Unlock()
+		return
+	}
 	if ok {
 		delete(pending, key)
 	}
 	pendingMu.Unlock()
 	if !ok {
-		return
-	}
-	// Reject replies that don't come from the probe's own destination.
-	if !p.dst.Equal(src) {
 		return
 	}
 	select {
@@ -258,7 +291,7 @@ func (e *Engine) readDgram() {
 		}
 		src := make(net.IP, 4)
 		copy(src, sa.Addr[:])
-		e.deliver(uint32(seq), src)
+		e.deliver(seq, src)
 	}
 }
 
@@ -286,24 +319,24 @@ func (e *Engine) readRaw() {
 		if !ok {
 			continue
 		}
-		e.deliver(uint32(em.Seq), ipAddr.IP)
+		e.deliver(uint16(em.Seq), ipAddr.IP)
 	}
 }
 
 // Ping sends one ICMP echo to dst and waits for the reply.
 func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
-	// Sequence is 16-bit (the ICMP field width, RFC 792) and unique among
-	// in-flight probes: normally the counter's next value is free, but if a
-	// stale probe (latency > timeout) still occupies that seq, skip to the
-	// next free slot — up to 16 tries. Overwriting an occupied slot would
-	// let the stale reply deliver its RTT into the NEW probe's channel
-	// (misattribution); the source-IP check in deliver() already stops the
-	// cross-sensor variant, this closes the same-sensor one. The loop is
-	// bounded so a (physically implausible) full table can never deadlock
-	// on the lock — after 16 misses we fall through and take the next
-	// counter value unconditionally.
+	// Sequence is 16-bit (the ICMP field width, RFC 792). The pending map is
+	// keyed by (seq, destination), so a reply only ever matches the probe
+	// that sent to that destination. Normally the counter's next value is
+	// free for this destination, but if a stale probe to the SAME destination
+	// (latency > timeout) still occupies that (seq, dst) slot, skip to the
+	// next free value — up to 16 tries. Overwriting it would let the stale
+	// reply deliver its RTT into the NEW probe's channel (a false success);
+	// the destination in the key stops the cross-destination variant. The
+	// loop is bounded so a full table can never deadlock on the lock — after
+	// 16 misses we fall through and take the next counter value unconditionally.
 	seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
-	key := uint32(seq)
+	key := mkKey(seq, dst)
 	p := &pendingPing{dst: dst, start: time.Now(), ch: make(chan time.Duration, 1)}
 	tries := 0
 	for ; tries < 16; tries++ {
@@ -315,12 +348,11 @@ func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
 		}
 		pendingMu.Unlock()
 		seq = uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
-		key = uint32(seq)
+		key = mkKey(seq, dst)
 	}
 	if tries == 16 {
-		// Table full of in-flight probes: no free slot in 16 tries. Take
-		// the next counter value anyway (overwrite is the least-bad option
-		// here — deliver() still guards against cross-destination replies).
+		// Table full: no free (seq, dst) slot in 16 tries. Take the next
+		// counter value anyway (least-bad option here).
 		pendingMu.Lock()
 		pending[key] = p
 		pendingMu.Unlock()
