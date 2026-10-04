@@ -466,9 +466,12 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	return "degraded"
 }
 
-// purgeOld enforces 14-day retention on probes/events (SPEC §3).
+// purgeOld enforces 24-hour retention on probes/events (SPEC §3).
+// 24h is the longest window the dashboard reads (24h graph / uptime 24h), so
+// nothing on screen ever needs older data. Revisit if historical reporting
+// is added later.
 func (pw *ProbeWorker) purgeOld() {
-	cutoff := time.Now().AddDate(0, 0, -14).UTC().Format(time.RFC3339Nano)
+	cutoff := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	for _, table := range []string{"probes", "events"} {
 		res, err := pw.db.Exec("DELETE FROM "+table+" WHERE ts < ?", cutoff)
 		if err != nil {
