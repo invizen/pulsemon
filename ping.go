@@ -1,104 +1,274 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 )
 
+// One shared ICMP socket for the whole process.
+//
+// TWO TRANSPORTS, same architecture (one socket, one reader goroutine,
+// seq-dispatched replies, source-IP verification — the fix that stopped
+// replies being attributed to the wrong sensor under load):
+//
+//  1. "unprivileged-datagram" (preferred): a SOCK_DGRAM / IPPROTO_ICMP
+//     socket — the same kind the `ping` binary uses as a normal user.
+//     Gated by the kernel's `ping_group_range` (readable as non-root),
+//     NO CAP_NET_RAW, NO root. On Linux the kernel overwrites the ICMP
+//     identifier with a per-socket value and only delivers replies for
+//     OUR socket, so on this path we dispatch by sequence number +
+//     source IP (no constant-ID filter).
+//
+//  2. "raw" (fallback): icmp.ListenPacket("ip4:icmp") — SOCK_RAW, needs
+//     root or CAP_NET_RAW. Kept so the tool also works where the
+//     datagram socket is unavailable (ping_group_range not configured).
+//
+// EngineMode() reports which transport is active (shown in /api/healthz).
+
+const (
+	probeID     = 0x5a11
+	payloadSize = 32
+)
+
+var probePayload = []byte("ZENMON-PING-0123456789ABCDEF") // 24 bytes, fits payloadSize
+
 type PingResult struct {
 	RTT        time.Duration
 	Lost       bool
 	Error      error
-	ResolvedIP string // "" when the lookup failed/timed out
+	ResolvedIP string
 }
 
-// All probes share ONE ICMP socket. With many sensors probing concurrently,
-// per-probe sockets bound to 0.0.0.0 let the kernel deliver a reply to the
-// wrong socket, so a probe timed another sensor's reply — producing
-// sub-millisecond "RTTs" to hosts that are 18ms away. A single socket plus
-// per-probe sequence numbers makes every reply unambiguous.
-var (
-	probeID = os.Getpid() & 0xffff
-
-	connOnce     sync.Once
-	sharedConn   *icmp.PacketConn
-	sharedConnErr error
-
-	// probeErrCount grows on every probe attempt that hit a socket-level
-	// error (e.g. the ICMP socket cannot be created). deriveStatus uses
-	// the delta to flag "degraded" instead of silently defaulting to up.
-	probeErrCount atomic.Int64
-
-	pendingMu sync.Mutex
-	pending   = map[int]*pendingProbe{}
-	seqCtr    atomic.Int32
-)
-
-// LastProbeError returns the shared-socket error if one exists ("" when
-// healthy) — surfaced in /api/healthz so the dashboard can show a banner.
-func LastProbeError() string {
-	if sharedConnErr != nil {
-		return sharedConnErr.Error()
-	}
-	return ""
-}
-
-// resolveIPAddrWithTimeout runs net.ResolveIPAddr in a goroutine and returns
-// if it finishes or the deadline passes — whichever comes first. DNS lookups
-// via the container's 127.0.0.11 resolver can hang indefinitely when the
-// upstream (host systemd-resolved) is slow or a zone has no answer; an
-// unbounded call would stall the sensor's probe goroutine forever.
-func resolveIPAddrWithTimeout(network, host string, d time.Duration) (*net.IPAddr, error) {
-	type result struct {
-		ip  *net.IPAddr
-		err error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		ip, err := net.ResolveIPAddr(network, host)
-		ch <- result{ip, err}
-	}()
-	select {
-	case r := <-ch:
-		return r.ip, r.err
-	case <-time.After(d):
-		return nil, fmt.Errorf("dns: %s timed out after %s", host, d)
-	}
-}
-
-type pendingProbe struct {
+// pendingPing is one in-flight probe; the reader delivers its RTT by key.
+type pendingPing struct {
 	dst   net.IP
 	start time.Time
-	ch    chan PingResult
+	ch    chan time.Duration
 }
 
-func getSharedConn() (*icmp.PacketConn, error) {
-	connOnce.Do(func() {
-		sharedConn, sharedConnErr = icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-		if sharedConnErr == nil {
-			go replyReader(sharedConn)
-		}
-	})
-	return sharedConn, sharedConnErr
+var (
+	pendingMu sync.Mutex
+	pending   = map[uint32]*pendingPing{}
+
+	// Monotonic counter of send errors since start.
+	probeErrCount atomic.Int64
+)
+
+// LastProbeError returns a human-readable description of the most recent
+// shared-socket send error, or "" if none. A persistent non-empty value
+// means ICMP is not working at all (e.g. no CAP_NET_RAW and no
+// ping_group_range) rather than any sensor being down.
+func LastProbeError() string {
+	if probeErrCount.Load() == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%d probe send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
+		probeErrCount.Load())
 }
 
-// replyReader dispatches every echo reply to the probe that owns its seq.
-// Replies from other hosts, other tools (wrong ID), or already-timed-out
-// probes are dropped.
-func replyReader(conn *icmp.PacketConn) {
+// ---------------------------------------------------------------------------
+// Transports
+// ---------------------------------------------------------------------------
+
+type sendFunc func(dst net.IP, seq uint16) error
+type closeFunc func() error
+
+// dgramTransport: unprivileged SOCK_DGRAM ICMP. The kernel fills in the
+// ICMP identifier itself, so callers must not assume a constant ID in
+// replies (dispatch is by seq).
+type dgramTransport struct {
+	fd int
+}
+
+func newDgramTransport() (*dgramTransport, error) {
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: 0}); err != nil {
+		syscall.Close(fd)
+		return nil, err
+	}
+	return &dgramTransport{fd: fd}, nil
+}
+
+func (t *dgramTransport) send(dst net.IP, seq uint16) error {
+	// Full ICMP echo request: 8-byte header + payload, incl. checksum.
+	msg := make([]byte, 8+len(probePayload))
+	msg[0] = 8 // ICMPTypeEcho
+	// msg[2:4] checksum, msg[4:6] ID (kernel overwrites), msg[6:8] seq
+	binary.BigEndian.PutUint16(msg[6:], seq)
+	copy(msg[8:], probePayload)
+	binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
+
+	addr := &syscall.SockaddrInet4{Port: 0}
+	copy(addr.Addr[:], dst.To4())
+	return syscall.Sendto(t.fd, msg, 0, addr)
+}
+
+func (t *dgramTransport) close() error { return syscall.Close(t.fd) }
+
+// rawTransport: SOCK_RAW via x/net/icmp (root / CAP_NET_RAW).
+type rawTransport struct {
+	conn *icmp.PacketConn
+}
+
+func newRawTransport() (*rawTransport, error) {
+	c, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+	if err != nil {
+		return nil, err
+	}
+	return &rawTransport{conn: c}, nil
+}
+
+func (t *rawTransport) send(dst net.IP, seq uint16) error {
+	// x/net/icmp: marshal a full message (we control ID + seq), then write
+	// to the destination.
+	msg := icmp.Message{
+		Type: ipv4.ICMPTypeEcho,
+		Code: 0,
+		Body: &icmp.Echo{ID: probeID, Seq: int(seq), Data: probePayload},
+	}
+	wb, err := msg.Marshal(nil)
+	if err != nil {
+		return err
+	}
+	_, err = t.conn.WriteTo(wb, &net.IPAddr{IP: dst})
+	return err
+}
+
+func (t *rawTransport) close() error { return t.conn.Close() }
+
+// icmpChecksum computes the ICMP one's-complement checksum over a message.
+func icmpChecksum(b []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i:]))
+	}
+	if len(b)%2 == 1 {
+		sum += uint32(b[len(b)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+// ---------------------------------------------------------------------------
+// Engine
+// ---------------------------------------------------------------------------
+
+type Engine struct {
+	send    sendFunc
+	closeFn closeFunc
+	isDgram bool
+	mode    string
+
+	// Concrete handles for the reader goroutine (exactly one is set).
+	dgramFd  int
+	rawConn  *icmp.PacketConn
+}
+
+// NewEngine opens the shared ICMP socket: datagram (unprivileged) first,
+// raw (root/CAP_NET_RAW) as fallback. Failing both means ICMP cannot work
+// on this host at all.
+func NewEngine() (*Engine, error) {
+	if t, err := newDgramTransport(); err == nil {
+		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd}, nil
+	} else {
+		fmt.Fprintf(os.Stderr, "zenmon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
+	}
+	if t, err := newRawTransport(); err == nil {
+		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn}, nil
+	} else {
+		return nil, fmt.Errorf("icmp: cannot open socket (need root/CAP_NET_RAW or ping_group_range): %w", err)
+	}
+}
+
+// Mode reports the active transport: "unprivileged-datagram" or "raw".
+func (e *Engine) Mode() string { return e.mode }
+
+// Close releases the shared socket.
+func (e *Engine) Close() {
+	if e.closeFn != nil {
+		e.closeFn()
+	}
+}
+
+// deliver hands a reply's RTT to its waiting probe (keyed, source-IP
+// verified). Called by the reader goroutine.
+func (e *Engine) deliver(key uint32, src net.IP) {
+	pendingMu.Lock()
+	p, ok := pending[key]
+	if ok {
+		delete(pending, key)
+	}
+	pendingMu.Unlock()
+	if !ok {
+		return
+	}
+	// Reject replies that don't come from the probe's own destination.
+	if !p.dst.Equal(src) {
+		return
+	}
+	select {
+	case p.ch <- time.Since(p.start):
+	default:
+	}
+}
+
+// run starts the single reply-reader goroutine for the active transport.
+func (e *Engine) run() {
+	if e.isDgram {
+		go e.readDgram()
+	} else {
+		go e.readRaw()
+	}
+}
+
+// readDgram is the reader for the datagram socket. The kernel strips the
+// IP header and delivers the ICMP message directly, and has already
+// demuxed by its per-socket identifier — we dispatch by seq only.
+func (e *Engine) readDgram() {
 	buf := make([]byte, 1500)
 	for {
-		n, src, err := conn.ReadFrom(buf)
+		n, from, err := syscall.Recvfrom(e.dgramFd, buf, 0)
 		if err != nil {
-			log.Printf("ping: reader closed: %v", err)
+			return
+		}
+		if n < 8 {
+			continue
+		}
+		if buf[0] != 0 { // ICMPTypeEchoReply
+			continue
+		}
+		seq := binary.BigEndian.Uint16(buf[6:])
+		sa, isSA := from.(*syscall.SockaddrInet4)
+		if !isSA {
+			continue
+		}
+		src := make(net.IP, 4)
+		copy(src, sa.Addr[:])
+		e.deliver(uint32(seq), src)
+	}
+}
+
+// readRaw is the reader for the raw socket: parse IP/ICMP, filter by our
+// constant ID, dispatch by seq (source-IP verified in deliver).
+func (e *Engine) readRaw() {
+	buf := make([]byte, 1500)
+	for {
+		n, src, err := e.rawConn.ReadFrom(buf)
+		if err != nil {
 			return
 		}
 		rm, err := icmp.ParseMessage(1, buf[:n])
@@ -112,79 +282,126 @@ func replyReader(conn *icmp.PacketConn) {
 		if src == nil {
 			continue
 		}
-		pendingMu.Lock()
-		p, found := pending[em.Seq]
-		if found {
-			delete(pending, em.Seq)
+		ipAddr, ok := src.(*net.IPAddr)
+		if !ok {
+			continue
 		}
-		pendingMu.Unlock()
-		if !found {
-			continue // timed out or duplicate
-		}
-		if !src.(*net.IPAddr).IP.Equal(p.dst) {
-			continue // reply from somewhere other than the target
-		}
-		select {
-		case p.ch <- PingResult{RTT: time.Since(p.start), Lost: false}:
-		default:
-		}
+		e.deliver(uint32(em.Seq), ipAddr.IP)
 	}
 }
 
-// pingHost sends one echo to target and waits up to timeout for its reply.
-func pingHost(target string, timeout time.Duration) PingResult {
-	conn, err := getSharedConn()
-	if err != nil {
-		probeErrCount.Add(1)
-		return PingResult{Lost: true, Error: err}
-	}
-	// Resolve with a timeout: an unbounded net.ResolveIPAddr would wedge the
-	// sensor's probe goroutine forever if a DNS lookup hangs (the reply-wait
-	// below is capped at `timeout`, but resolution is not). A hung lookup must
-	// become a loss row, not a permanent stall.
-	dst, err := resolveIPAddrWithTimeout("ip4", target, 5*time.Second)
-	if err != nil {
-		probeErrCount.Add(1)
-		return PingResult{Lost: true, Error: err}
-	}
-
-	seq := int(seqCtr.Add(1) & 0xffffff)
-	p := &pendingProbe{dst: dst.IP, start: time.Now(), ch: make(chan PingResult, 1)}
-
+// Ping sends one ICMP echo to dst and waits for the reply.
+func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
+	seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
+	key := uint32(seq) // seq is unique per in-flight probe (raw path also
+	// filters by our constant ID, so no id is needed in the key)
+	p := &pendingPing{dst: dst, start: time.Now(), ch: make(chan time.Duration, 1)}
 	pendingMu.Lock()
-	pending[seq] = p
+	pending[key] = p
 	pendingMu.Unlock()
 	defer func() {
 		pendingMu.Lock()
-		if cur, ok := pending[seq]; ok && cur == p {
-			delete(pending, seq)
+		if cur, ok := pending[key]; ok && cur == p {
+			delete(pending, key)
 		}
 		pendingMu.Unlock()
 	}()
 
-	msg := icmp.Message{
-		Type: ipv4.ICMPTypeEcho,
-		Code: 0,
-		Body: &icmp.Echo{
-			ID:   probeID,
-			Seq:  seq,
-			Data: []byte("ZENMON-PROBE"),
-		},
+	if err := e.send(dst, seq); err != nil {
+		probeErrCount.Add(1)
+		return PingResult{Lost: true, Error: err}
 	}
-	wb, err := msg.Marshal(nil)
+	select {
+	case d := <-p.ch:
+		return PingResult{RTT: d, Lost: false}
+	case <-time.After(timeout):
+		return PingResult{Lost: true}
+	}
+}
+
+var seqCounter uint32
+
+var (
+	sharedEngineInst *Engine
+	sharedEngineErr  error
+	sharedEngineOnce sync.Once
+)
+
+// SharedEngine returns the process-wide ICMP engine, opening it on first use.
+func SharedEngine() (*Engine, error) {
+	sharedEngineOnce.Do(func() {
+		e, err := NewEngine()
+		if err != nil {
+			sharedEngineErr = err
+			return
+		}
+		sharedEngineInst = e
+		e.run()
+	})
+	return sharedEngineInst, sharedEngineErr
+}
+
+// getSharedConn is kept for the probe worker's startup warm-up. It ensures
+// the shared engine (and its reader) is open; in raw mode it returns the
+// underlying *icmp.PacketConn, in unprivileged-datagram mode nil with a nil
+// error. Callers should only inspect the error.
+func getSharedConn() (*icmp.PacketConn, error) {
+	e, err := SharedEngine()
+	if err != nil {
+		return nil, err
+	}
+	return e.rawConn, nil
+}
+
+// EngineMode reports which ICMP transport the shared engine is using
+// ("unprivileged-datagram", "raw", or "" if the engine has not started).
+// Shown in /api/healthz.
+func EngineMode() string {
+	if sharedEngineInst != nil {
+		return sharedEngineInst.mode
+	}
+	return ""
+}
+
+// pingHost is the probe worker's entry point: resolve the target, then
+// ping the resolved IP through the shared engine.
+func pingHost(target string, timeout time.Duration) PingResult {
+	ip, err := resolveIPAddrWithTimeout("ip4", target, 5*time.Second)
 	if err != nil {
 		return PingResult{Lost: true, Error: err}
 	}
-	if _, err := conn.WriteTo(wb, dst); err != nil {
-		return PingResult{Lost: true, Error: err}
+	dst := ip.IP.To4()
+	if dst == nil {
+		// IPv6-only result — ICMP is IPv4-only by design; count as loss.
+		return PingResult{Lost: true, ResolvedIP: ip.IP.String()}
 	}
+	e, err := SharedEngine()
+	if err != nil {
+		probeErrCount.Add(1)
+		return PingResult{Lost: true, Error: err, ResolvedIP: dst.String()}
+	}
+	res := e.Ping(dst, timeout)
+	res.ResolvedIP = dst.String()
+	return res
+}
 
+// resolveIPAddrWithTimeout resolves an IP with a hard deadline so a hung
+// DNS lookup can't wedge a sensor's goroutine forever (it becomes a loss
+// row instead of a permanent block).
+func resolveIPAddrWithTimeout(network, host string, timeout time.Duration) (*net.IPAddr, error) {
+	type result struct {
+		ip  *net.IPAddr
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		ip, err := net.ResolveIPAddr(network, host)
+		ch <- result{ip, err}
+	}()
 	select {
-	case res := <-p.ch:
-		res.ResolvedIP = dst.String()
-		return res
+	case r := <-ch:
+		return r.ip, r.err
 	case <-time.After(timeout):
-		// Resolved fine but no echo reply within the timeout.
-		return PingResult{Lost: true, ResolvedIP: dst.String()}
+		return nil, fmt.Errorf("DNS resolution of %q timed out after %s", host, timeout)
 	}
 }

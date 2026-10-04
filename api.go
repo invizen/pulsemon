@@ -125,6 +125,9 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"probing":  s.probeWorker.ActiveCount(),
 		"time":     time.Now().UTC().Format(time.RFC3339),
 	}
+	if m := EngineMode(); m != "" {
+		hz["icmp_mode"] = m
+	}
 	if e := LastProbeError(); e != "" {
 		hz["probe_error"] = e
 	}

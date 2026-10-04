@@ -51,24 +51,27 @@ Open http://localhost:8080 and add sensors from the **new sensor** button.
 
 zenmon opens a single shared ICMP socket and dispatches replies by sequence
 number (so RTTs stay accurate when many sensors probe at once). On Linux there
-are two ways to send ICMP:
+are two ways to send ICMP, and zenmon tries them in order at startup:
 
-- **Raw socket** (`SOCK_RAW` + `IPPROTO_ICMP`) — what zenmon uses **today** via
-  `icmp.ListenPacket("ip4:icmp", …)`. It requires the process to be **root or
-  to hold `CAP_NET_RAW`**, regardless of `ping_group_range`.
-- **Datagram ping socket** (`socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`) — the
-  socket the `ping` binary uses when run by an ordinary user. It does **not**
-  need root or `CAP_NET_RAW`; instead the process's uid must fall inside
-  `net.ipv4.ping_group_range` (check with
-  `sysctl net.ipv4.ping_group_range`). This is the *intended* unprivileged
-  path and is the fix being prototyped for an upcoming release.
+1. **Datagram ping socket** (`socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`) —
+   preferred. This is the socket the `ping` binary uses as an ordinary user.
+   It needs **no root and no `CAP_NET_RAW`**; instead the process's uid must
+   fall inside `net.ipv4.ping_group_range` (check with
+   `sysctl net.ipv4.ping_group_range`). On Linux the kernel overwrites the
+   ICMP identifier with a per-socket value and delivers only that socket's
+   replies, so zenmon dispatches by sequence + source IP on this path.
+2. **Raw socket** (`SOCK_RAW` + `IPPROTO_ICMP`) via
+   `icmp.ListenPacket("ip4:icmp", …)` — fallback. It requires **root or
+   `CAP_NET_RAW`**, regardless of `ping_group_range`. Used automatically when
+   the datagram socket isn't available.
 
-How that plays out right now:
+Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
+(`"unprivileged-datagram"` or `"raw"`).
 
-| Deployment | Works today? | How |
+| Deployment | Result | How |
 |---|---|---|
-| Docker (default image) | ✅ | Container runs as **root**, so the raw socket succeeds. |
-| Bare / systemd as a normal user | ⚠️ only if privileged | Works only if the user has `CAP_NET_RAW` or the process runs as root; otherwise the datagram socket (upcoming) or a widened `ping_group_range` is required. |
+| Docker (default image) | ✅ unprivileged | The container runs as **uid 1000** (see `USER` in `Dockerfile`); the datagram socket works off `ping_group_range`. The `/data` volume must be writable by uid 1000 (`chown -R 1000:1000 <data dir>`). |
+| Bare / systemd as a normal user | ✅ if in range | Works when the user's uid is inside `ping_group_range` (the datagram socket); otherwise it falls back to the raw socket, which needs `CAP_NET_RAW`/root. |
 
 > **Why not just `"udp4"`?** x/net/icmp's `ListenPacket("udp4", …)` is **not**
 > an unprivileged ICMP socket — it creates a plain UDP socket and cannot send
@@ -132,7 +135,7 @@ ZENMON_DB=./data/zenmon.db ./zenmon
 ```
 api.go      REST API + sensor CRUD + settings
 probe.go    probe worker, status derivation, alerting, webhooks
-ping.go     ICMP ping (single shared raw socket, seq dispatch)
+ping.go     ICMP ping (shared socket: unprivileged datagram socket, raw fallback; seq dispatch)
 db.go       SQLite schema, migrations, seed
 main.go     entrypoint, -healthz flag
 web/        single-page dashboard (no build step)
