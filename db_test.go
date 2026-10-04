@@ -214,3 +214,95 @@ func TestStatusRenameMigration(t *testing.T) {
 	check("sensors", "status", "s1", "error")
 	check("sensors", "status", "s2", "warning")
 }
+
+// TestStatusRenameMigrationIsNoOpWhenMigrated locks the WHERE-filter fix on
+// the v0.1.13 status-rename migration. The old code ran
+// `UPDATE ... SET col = CASE ... ELSE col END` with NO WHERE, so it matched
+// EVERY row and — in SQLite — re-assigned+re-wrote each one even where the
+// value was unchanged. On a fully-migrated DB that forced a full-table WAL
+// write on every single boot, churning pages and blocking active probe writes
+// (WAL has one writer). This test proves the fix: after a migration has
+// already run, a re-InitSchema (a fresh process boot) must write ZERO rows.
+//
+// It uses SQLite's total_changes() counter (rows modified since connection
+// open) as a delta around the re-InitSchema. Against the old unfiltered
+// UPDATEs the delta is > 0 (every row rewritten); with the WHERE filter it
+// is exactly 0.
+func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "noop.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// Seed rows the way a pre-v0.1.13 install would have left them: legacy
+	// statuses in all four tables plus a legacy note, so the FIRST re-run
+	// below genuinely has work to do.
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at)
+		VALUES ('s1','s1','127.0.0.1',15,1000,25,4,'active','down','2026-01-01T00:00:00Z'),
+		       ('s2','s2','127.0.0.1',15,1000,25,4,'active','degraded','2026-01-01T00:00:00Z'),
+		       ('s3','s3','127.0.0.1',15,1000,25,4,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensors: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES
+		('s1','2026-01-01T00:01:00Z','up','down','up -> down'),
+		('s2','2026-01-01T00:02:00Z','up','degraded','up -> degraded')`); err != nil {
+		t.Fatalf("seed events: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES
+		('s1','down','2026-01-01T00:01:00Z'),('s2','degraded','2026-01-01T00:02:00Z')`); err != nil {
+		t.Fatalf("seed alert_state: %v", err)
+	}
+
+	changes := func() (int64, error) {
+		var n int64
+		return n, db.QueryRow(`SELECT total_changes()`).Scan(&n)
+	}
+
+	// FIRST re-run: the migration must actually do work (rename the legacy
+	// rows). This guards that adding the WHERE didn't accidentally skip the
+	// real migration.
+	before, err := changes()
+	if err != nil {
+		t.Fatalf("total_changes: %v", err)
+	}
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("migration InitSchema: %v", err)
+	}
+	after, err := changes()
+	if err != nil {
+		t.Fatalf("total_changes: %v", err)
+	}
+	if after <= before {
+		t.Fatalf("migration re-run wrote %d rows, want > 0 (the rename must actually apply on first run)", after-before)
+	}
+	// Sanity: the rename did happen.
+	var st1 string
+	if err := db.QueryRow(`SELECT status FROM sensors WHERE id='s1'`).Scan(&st1); err != nil {
+		t.Fatalf("s1 status: %v", err)
+	}
+	if st1 != "error" {
+		t.Fatalf("after migration s1 = %q, want error", st1)
+	}
+
+	// SECOND re-run (a boot on an already-migrated DB): must write ZERO rows.
+	// Old unfiltered code rewrites every row here (delta > 0) — this is the
+	// regression the fix eliminates.
+	before2, err := changes()
+	if err != nil {
+		t.Fatalf("total_changes: %v", err)
+	}
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("second InitSchema: %v", err)
+	}
+	after2, err := changes()
+	if err != nil {
+		t.Fatalf("total_changes: %v", err)
+	}
+	if delta := after2 - before2; delta != 0 {
+		t.Errorf("re-InitSchema on migrated DB wrote %d rows, want 0 (unfiltered UPDATEs rewrite the whole table every boot)", delta)
+	}
+}

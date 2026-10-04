@@ -150,22 +150,34 @@ func (db *DB) InitSchema() error {
 	// old name for error and "degraded" for warning; without this, the first
 	// probe after upgrade would log a spurious transition and fire a one-time
 	// alert on every already-affected sensor.
+	//
+	// Each UPDATE is filtered to the legacy rows it actually rewrites. An
+	// unfiltered `UPDATE ... SET col = CASE ... ELSE col END` matches EVERY
+	// row and, in SQLite, re-assigns+re-writes each one even where the value
+	// is unchanged — so on a fully-migrated DB this forced a full-table WAL
+	// write on every boot, churning pages and blocking active probe writes
+	// (WAL has a single writer). With the WHERE, a no-op boot touches zero
+	// rows, so this is a true one-time migration.
 	if _, err := db.Exec(`UPDATE sensors SET status = CASE status
 		WHEN 'down' THEN 'error'
 		WHEN 'degraded' THEN 'warning'
-		ELSE status END`); err != nil {
+		ELSE status END
+		WHERE status IN ('down', 'degraded')`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`UPDATE events SET from_status = CASE from_status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE from_status END`); err != nil {
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE from_status END
+		WHERE from_status IN ('down', 'degraded')`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`UPDATE events SET to_status = CASE to_status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE to_status END`); err != nil {
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE to_status END
+		WHERE to_status IN ('down', 'degraded')`); err != nil {
 		return err
 	}
 	if _, err := db.Exec(`UPDATE alert_state SET status = CASE status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE status END`); err != nil {
+		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE status END
+		WHERE status IN ('down', 'degraded')`); err != nil {
 		return err
 	}
 	// Cosmetic: old event notes read "up -> degraded" / "down -> up".
