@@ -58,8 +58,8 @@ Open http://localhost:8080 and add sensors from the **new sensor** button.
 ## Bare install (no Docker, user-level systemd)
 
 ```bash
-git clone https://github.com/invizen/zenmon zenmon && cd zenmon
-./install.sh              # latest release, or ./install.sh v0.1.7 to pin
+curl -sfL https://github.com/invizen/zenmon/releases/latest/download/install.sh -o /tmp/zenmon-install.sh
+bash /tmp/zenmon-install.sh              # latest release, or: bash /tmp/zenmon-install.sh v0.1.7
 ```
 
 The installer (no sudo required) downloads and **SHA-256-verifies** the

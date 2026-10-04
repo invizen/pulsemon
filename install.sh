@@ -41,18 +41,17 @@ BASE="https://github.com/$REPO/releases/download/$VERSION"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-curl -sfL -o "$TMP/zenmon" "$BASE/zenmon-linux-amd64"
-curl -sfL -o "$TMP/zenmon.sha256" "$BASE/zenmon-linux-amd64.sha256" || true
-if [ -s "$TMP/zenmon.sha256" ]; then
-  ( cd "$TMP" && sha256sum -c zenmon.sha256 ) || {
-    echo "zenmon: SHA-256 verification FAILED — aborting" >&2; exit 1; }
-  echo "zenmon: sha256 ok"
-else
-  echo "zenmon: warning: no .sha256 published for $VERSION — skipped verification" >&2
-fi
+curl -sfL -o "$TMP/zenmon-linux-amd64" "$BASE/zenmon-linux-amd64"
+curl -sfL -o "$TMP/zenmon-linux-amd64.sha256" "$BASE/zenmon-linux-amd64.sha256" || {
+  echo "zenmon: release $VERSION has no published sha256 digest — refusing to install" >&2
+  echo "        (an unverified binary is worse than no update; check github.com/$REPO/releases/$VERSION)" >&2
+  exit 1; }
+( cd "$TMP" && sha256sum -c zenmon-linux-amd64.sha256 ) || {
+  echo "zenmon: SHA-256 verification FAILED — aborting" >&2; exit 1; }
+echo "zenmon: sha256 ok"
 
 # --- 2. install binary --------------------------------------------------------
-install -m 0755 "$TMP/zenmon" "$BIN"
+install -m 0755 "$TMP/zenmon-linux-amd64" "$BIN"
 echo "zenmon: installed $BIN"
 
 # --- 3. systemd user service (only if absent) ---------------------------------
