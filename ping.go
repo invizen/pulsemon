@@ -116,7 +116,15 @@ type dgramTransport struct {
 }
 
 func newDgramTransport() (*dgramTransport, error) {
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_ICMP)
+	// SOCK_CLOEXEC: the fd is auto-closed if this process ever execs a child,
+	// so the raw ICMP descriptor can never leak into a subprocess's fd table.
+	// The stdlib net package sets CLOEXEC on every socket it creates; this
+	// hand-rolled syscall should match. It's defensive, not a fix for a live
+	// bug: zenmon update does not fork/exec (installBinary renames the file in
+	// place and asks for a manual restart), and the socket binds to port 0, so
+	// there is no port to "reuse" — but any future subprocess would inherit a
+	// raw ICMP fd without this.
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_ICMP)
 	if err != nil {
 		return nil, err
 	}
