@@ -528,11 +528,14 @@ func (pw *ProbeWorker) TestWebhook() (bool, string) {
 	body, _ := json.Marshal(map[string]string{
 		"text": "🟢 *zenmon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your Google Chat webhook works.",
 	})
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return false, err.Error()
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		return false, "endpoint redirected (refused to follow — possible misconfiguration)"
+	}
 	if resp.StatusCode >= 300 {
 		return false, fmt.Sprintf("endpoint returned HTTP %d", resp.StatusCode)
 	}
@@ -571,12 +574,16 @@ func cardForRe(state, name, target string, rttMs float64) string {
 
 func (pw *ProbeWorker) postCard(url, card string) {
 	payload, _ := json.Marshal(map[string]string{"text": card})
-	resp, err := http.Post(url, "application/json", bytes.NewReader(payload))
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
 	if err != nil {
 		log.Printf("webhook: send failed: %v", err)
 		return
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+		log.Printf("webhook: endpoint redirected (refused to follow — possible misconfiguration)")
+		return
+	}
 	if resp.StatusCode >= 300 {
 		log.Printf("webhook: endpoint returned %d", resp.StatusCode)
 	}

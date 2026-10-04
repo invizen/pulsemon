@@ -904,9 +904,11 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.WebhookURL != nil {
 		*req.WebhookURL = strings.TrimSpace(*req.WebhookURL)
-		if *req.WebhookURL != "" && !strings.HasPrefix(*req.WebhookURL, "https://") {
-			respondWithError(w, http.StatusBadRequest, "webhook_url must be an https:// URL")
-			return
+		if *req.WebhookURL != "" {
+			if err := validateWebhookURL(*req.WebhookURL); err != nil {
+				respondWithError(w, http.StatusBadRequest, "webhook_url: "+err.Error())
+				return
+			}
 		}
 		if err := s.db.SetSetting("webhook_url", *req.WebhookURL); err != nil {
 			respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
