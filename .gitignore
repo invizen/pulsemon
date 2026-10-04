@@ -12,3 +12,6 @@ zenmon
 zenmon-bin
 pingmon
 bin/
+
+# test files stay local (zenai + zentest QA harness) — never in the public repo
+*_test.go
