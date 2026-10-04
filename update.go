@@ -82,14 +82,17 @@ func newerRelease(releaseTag, running string) bool {
 	return rpat > pat
 }
 
+// releaseAsset is one asset of a GitHub release.
+type releaseAsset struct {
+	Name               string `json:"name"`
+	BrowserDownloadURL string `json:"browser_download_url"` // the actual binary URL
+	URL                string `json:"url"`                  // API endpoint — JSON unless Accept: application/octet-stream
+	Digest             string `json:"digest"`               // GitHub-computed "sha256:<hex>"; empty for pre-2025 uploads
+}
+
 type ghRelease struct {
 	TagName string `json:"tag_name"`
-	Assets  []struct {
-		Name               string `json:"name"`
-		URL                string `json:"url"` // API endpoint — returns JSON unless Accept: application/octet-stream
-		BrowserDownloadURL string `json:"browser_download_url"` // the actual binary URL
-		Digest             string `json:"digest"` // "sha256:<hex>"
-	} `json:"assets"`
+	Assets  []releaseAsset `json:"assets"`
 }
 
 // runUpdate implements `zenmon update`. Works from any directory: it
@@ -177,21 +180,36 @@ func runUpdate(args []string) {
 	}
 	defer os.Remove(tmp)
 
-	if sha != "" {
-		got, err := fileSHA256(tmp)
+	// Mandatory verification (security): the update must never install an
+	// unverified binary. Primary source is the GitHub-computed asset digest
+	// from the release API; if that is absent (pre-2025 uploads) we fall
+	// back to the published zenmon-linux-amd64.sha256 sidecar asset. If
+	// NEITHER exists we refuse the update — an unverifiable binary is worse
+	// than no update (guards against DNS poisoning, MITM, or a compromised
+	// release pipeline).
+	verifySHA := strings.TrimPrefix(sha, "sha256:")
+	if verifySHA == "" {
+		sidecarURL := strings.TrimSuffix(assetURL, "zenmon-linux-amd64") + "zenmon-linux-amd64.sha256"
+		sidecar, err := fetchChecksumSidecar(client, sidecarURL)
 		if err != nil {
-			uErr("verify: "+err.Error())
+			uErr("refusing to update: no trusted SHA-256 available for " + rel.TagName)
+			uErr("  (GitHub API digest absent and sidecar fetch failed: " + err.Error() + ")")
 			os.Exit(1)
 		}
-		if got != sha {
-			uErr("SHA-256 MISMATCH — release asset digest " + sha + ", got " + got)
-			uErr("refusing to install. (GitHub API digest unavailable or asset changed; abort.)")
-			os.Exit(1)
-		}
-		uInfo("sha256:  " + got + " ✓")
-	} else {
-		uWarn("no sha256 digest published for this release — installing without verification")
+		verifySHA = sidecar
+		uInfo("sha256 source: release sidecar asset (API digest unavailable)")
 	}
+	got, err := fileSHA256(tmp)
+	if err != nil {
+		uErr("verify: " + err.Error())
+		os.Exit(1)
+	}
+	if got != verifySHA {
+		uErr("SHA-256 MISMATCH — expected " + verifySHA + ", got " + got)
+		uErr("refusing to install.")
+		os.Exit(1)
+	}
+	uInfo("sha256:  " + got + " ✓")
 
 	if err := installBinary(tmp, exe); err != nil {
 		uErr("install: " + err.Error())
@@ -234,6 +252,43 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 		return nil, err
 	}
 	return &rel, nil
+}
+
+// fetchChecksumSidecar downloads the published .sha256 sidecar asset and
+// returns the bare 64-hex digest. Accepts both "sha256sum" format
+// ("<hex>  <name>") and a bare hex line.
+func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", err
+	}
+	fields := strings.Fields(strings.TrimSpace(string(body)))
+	if len(fields) == 0 {
+		return "", fmt.Errorf("empty sidecar")
+	}
+	hexd := fields[0]
+	if len(hexd) != 64 {
+		return "", fmt.Errorf("malformed sidecar: %q", hexd)
+	}
+	for _, c := range hexd {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return "", fmt.Errorf("sidecar digest is not lowercase hex: %q", hexd)
+		}
+	}
+	return hexd, nil
 }
 
 func downloadAsset(client *http.Client, url string) (string, error) {
