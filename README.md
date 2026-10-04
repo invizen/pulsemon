@@ -35,7 +35,7 @@ zenmon = zen (your fleet) + mon (itor)
 ## Quick start
 
 ```bash
-git clone <your-repo-url> zenmon && cd zenmon
+git clone https://github.com/invizen/zenmon zenmon && cd zenmon
 cp .env.example .env          # optional: put a Google Chat webhook URL in .env
 chmod 600 .env
 docker compose up -d --build
