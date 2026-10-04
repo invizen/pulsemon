@@ -46,7 +46,6 @@ func main() {
 	if dbPath == "" {
 		dbPath = "/data/zenmon.db"
 	}
-	webhookURL := os.Getenv("GOOGLE_CHAT_WEBHOOK_URL")
 
 	db, err := NewDB(dbPath)
 	if err != nil {
@@ -62,12 +61,12 @@ func main() {
 		log.Printf("Warning: failed to seed sensors: %v", err)
 	}
 
-	pw := NewProbeWorker(db, webhookURL)
+	pw := NewProbeWorker(db)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go pw.Run(ctx)
 
-	server := NewServer(db, pw, webhookURL)
+	server := NewServer(db, pw)
 	srv := &http.Server{
 		Addr:              ":8080",
 		Handler:           server.Mux(),

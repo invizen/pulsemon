@@ -172,6 +172,26 @@ func (db *DB) InitSchema() error {
 	if _, err := db.Exec(`UPDATE events SET note = replace(replace(replace(note, 'degraded', 'warning'), 'down', 'error'), 'warning -> up', 'recovered') WHERE note LIKE '%degraded%' OR note LIKE '%down%'`); err != nil {
 		return err
 	}
+	// One-time migration (v0.1.14): the settings table gained per-provider
+	// keys. The single legacy "webhook_url" was the Google Chat URL, so move
+	// it to google_chat_url (idempotent — skipped if a google_chat_url is
+	// already set). Without this, existing installs would silently lose their
+	// configured alert webhook on upgrade.
+	if _, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at)
+		SELECT 'google_chat_url', value, COALESCE(updated_at, datetime('now'))
+		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
+		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_url' AND TRIM(value) <> '')`); err != nil {
+		return err
+	}
+	// Mark the migrated Google Chat provider explicitly enabled, so the new
+	// per-provider toggle reflects the pre-existing active config (and a
+	// fresh install, which has no legacy row, leaves it unset → off).
+	if _, err := db.Exec(`INSERT OR REPLACE INTO settings (setting_key, value, updated_at)
+		SELECT 'google_chat_enabled', '1', COALESCE(updated_at, datetime('now'))
+		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
+		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_enabled')`); err != nil {
+		return err
+	}
 	return nil
 }
 

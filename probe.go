@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"sync"
@@ -37,19 +38,17 @@ type sensorConfig struct {
 }
 
 type ProbeWorker struct {
-	mu         sync.Mutex
-	sensors    map[string]*ProbeState
-	loops      map[string]context.CancelFunc
-	db         *DB
-	webhookURL string
+	sensors map[string]*ProbeState
+	mu      sync.Mutex
+	loops   map[string]context.CancelFunc
+	db      *DB
 }
 
-func NewProbeWorker(db *DB, webhookURL string) *ProbeWorker {
+func NewProbeWorker(db *DB) *ProbeWorker {
 	return &ProbeWorker{
-		sensors:    make(map[string]*ProbeState),
-		loops:      make(map[string]context.CancelFunc),
-		db:         db,
-		webhookURL: webhookURL,
+		sensors: make(map[string]*ProbeState),
+		loops:   make(map[string]context.CancelFunc),
+		db:      db,
 	}
 }
 
@@ -522,54 +521,179 @@ func (pw *ProbeWorker) purgeOld() {
 	}
 }
 
-// resolveWebhookURL returns the alert webhook URL: the settings table
-// (editable from the dashboard) wins over the GOOGLE_CHAT_WEBHOOK_URL env.
-func (pw *ProbeWorker) resolveWebhookURL() string {
-	if u := pw.db.GetSetting("webhook_url"); u != "" {
-		return u
-	}
-	return pw.webhookURL
+// ---------- alert destinations (multi-provider) ----------
+//
+// Each provider (google_chat, discord) has its own URL setting and an
+// explicit enable flag. Alerts fan out to EVERY active provider. The
+// registry is the single source of truth for "which providers exist", so a
+// future provider (Slack, ntfy, …) is one entry in this slice plus a card
+// builder — the send path, migration, and UI all derive from it.
+//
+// google_chat is the legacy provider: before this it was THE webhook. Its
+// enable flag defaults to ON when a URL is present (dashboard or the
+// GOOGLE_CHAT_WEBHOOK_URL env) so existing installs keep alerting with zero
+// config; a fresh install has no URL and no flag, so it stays off.
+
+type providerMeta struct {
+	Kind        string // settings key prefix: google_chat, discord
+	Label       string // display name
+	URLField    string // JSON field the settings payload uses
+	Placeholder string // input placeholder
+	EnvFallback string // env var that supplies a URL when the dashboard one is empty ("") = none
+	Enabled     func(db *DB) bool
+	HasURL      func(db *DB) bool
 }
 
-// ResolveWebhookURL is the API-facing read of the effective webhook URL.
-func (pw *ProbeWorker) ResolveWebhookURL() string { return pw.resolveWebhookURL() }
-
-// HasWebhook reports whether any webhook URL is configured.
-func (pw *ProbeWorker) HasWebhook() bool { return pw.resolveWebhookURL() != "" }
-
-// WebhookSource says where the effective URL comes from: "dashboard"
-// (settings table) or "env" (container environment).
-func (pw *ProbeWorker) WebhookSource() string {
-	if pw.db.GetSetting("webhook_url") != "" {
-		return "dashboard"
-	}
-	return "env"
+var providerList = []providerMeta{
+	{
+		Kind: "google_chat", Label: "Google Chat", URLField: "google_chat_url",
+		Placeholder: "https://chat.googleapis.com/v1/spaces/…/messages?key=…",
+		EnvFallback: "GOOGLE_CHAT_WEBHOOK_URL",
+		Enabled:     chatEnabled,
+		HasURL:      chatHasURL,
+	},
+	{
+		Kind: "discord", Label: "Discord", URLField: "discord_url",
+		Placeholder: "https://discord.com/api/webhooks/…/…",
+		EnvFallback: "",
+		Enabled:     flagEnabled("discord"),
+		HasURL:      flagHasURL("discord"),
+	},
 }
 
-func (pw *ProbeWorker) sendAlert(id, name, target, state string, rttMs float64) {
-	if url := pw.resolveWebhookURL(); url != "" {
-		pw.postCard(url, cardFor(state, name, target, rttMs))
+func providerByKey(kind string) (providerMeta, bool) {
+	for _, p := range providerList {
+		if p.Kind == kind {
+			return p, true
+		}
+	}
+	return providerMeta{}, false
+}
+
+// chatEnabled: google_chat's legacy default. Explicitly enabled ("1") wins;
+// explicitly disabled ("0") wins; with no flag, a present URL (dashboard or
+// env) keeps it active so an upgrade changes nothing. Fresh install: no URL,
+// no flag → off.
+func chatEnabled(db *DB) bool {
+	switch db.GetSetting("google_chat_enabled") {
+	case "1":
+		return true
+	case "0":
+		return false
+	}
+	return chatHasURL(db)
+}
+
+// chatHasURL: the dashboard URL, falling back to the GOOGLE_CHAT_WEBHOOK_URL
+// env (the pre-multi-provider mechanism, kept working).
+func chatHasURL(db *DB) bool {
+	if db.GetSetting("google_chat_url") != "" {
+		return true
+	}
+	return os.Getenv("GOOGLE_CHAT_WEBHOOK_URL") != ""
+}
+
+// flagEnabled / flagHasURL: a generic provider — explicit "1" flag and a
+// non-empty URL. No env fallback, no legacy default. Built as closures over
+// the provider kind so each entry is self-contained.
+func flagEnabled(kind string) func(db *DB) bool {
+	return func(db *DB) bool { return db.GetSetting(kind+"_enabled") == "1" }
+}
+func flagHasURL(kind string) func(db *DB) bool {
+	return func(db *DB) bool { return db.GetSetting(kind+"_url") != "" }
+}
+
+// activeProviders returns every provider currently receiving alerts.
+func (pw *ProbeWorker) activeProviders() []providerMeta {
+	var out []providerMeta
+	for _, p := range providerList {
+		if p.Enabled(pw.db) && p.HasURL(pw.db) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// providerStatus is the per-provider read the settings API returns to the
+// dashboard.
+type providerStatus struct {
+	Kind    string `json:"kind"`
+	Enabled bool   `json:"enabled"`
+	HasURL  bool   `json:"has_url"`
+	URL     string `json:"url"` // masked; empty when none
+	Source  string `json:"source"`
+}
+
+func (pw *ProbeWorker) providerStatuses() []providerStatus {
+	out := []providerStatus{}
+	for _, p := range providerList {
+		url := pw.db.GetSetting(p.Kind + "_url")
+		source := "none"
+		if url != "" {
+			source = "dashboard"
+		} else if p.EnvFallback != "" && os.Getenv(p.EnvFallback) != "" {
+			url = os.Getenv(p.EnvFallback)
+			source = "env"
+		}
+		out = append(out, providerStatus{
+			Kind:    p.Kind,
+			Enabled: p.Enabled(pw.db),
+			HasURL:  url != "",
+			URL:     webhookMasked(url),
+			Source:  source,
+		})
+	}
+	return out
+}
+
+func (pw *ProbeWorker) sendWebhook(id, name, target, state string, rttMs float64, reAlert bool) {
+	for _, p := range pw.activeProviders() {
+		url := pw.db.GetSetting(p.Kind + "_url")
+		if url == "" && p.EnvFallback != "" {
+			url = os.Getenv(p.EnvFallback)
+		}
+		if url == "" {
+			continue
+		}
+		switch p.Kind {
+		case "google_chat":
+			card := cardFor(state, name, target, rttMs)
+			if reAlert {
+				card = cardForRe(state, name, target, rttMs)
+			}
+			pw.postJSON(url, map[string]string{"text": card})
+		case "discord":
+			card := discordCard(state, name, target, rttMs)
+			if reAlert {
+				card = discordCardRe(state, name, target, rttMs)
+			}
+			pw.postJSON(url, map[string]string{"content": card})
+		}
 	}
 }
 
-// sendRealert notifies that a sensor has stayed in the same non-up state.
-func (pw *ProbeWorker) sendRealert(id, name, target, state string, rttMs float64) {
-	if url := pw.resolveWebhookURL(); url != "" {
-		pw.postCard(url, cardForRe(state, name, target, rttMs))
+// TestWebhook sends a test message to ONE provider and reports whether it
+// accepted it. kind is required (the dashboard tests the provider whose URL
+// is being verified).
+func (pw *ProbeWorker) TestWebhook(kind string) (bool, string) {
+	p, ok := providerByKey(kind)
+	if !ok {
+		return false, "unknown provider"
 	}
-}
-
-// TestWebhook sends a test alert card to the currently configured webhook
-// and reports whether the endpoint accepted it.
-func (pw *ProbeWorker) TestWebhook() (bool, string) {
-	url := pw.resolveWebhookURL()
+	url := pw.db.GetSetting(p.Kind + "_url")
+	if url == "" && p.EnvFallback != "" {
+		url = os.Getenv(p.EnvFallback)
+	}
 	if url == "" {
-		return false, "no webhook URL configured"
+		return false, "no " + p.Label + " webhook URL configured"
 	}
-	body, _ := json.Marshal(map[string]string{
-		"text": "🟢 *zenmon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your Google Chat webhook works.",
-	})
-	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
+	var body map[string]string
+	if p.Kind == "discord" {
+		body = map[string]string{"content": "🟢 **zenmon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
+	} else {
+		body = map[string]string{"text": "🟢 *zenmon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
+	}
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(mustJSON(body)))
 	if err != nil {
 		return false, err.Error()
 	}
@@ -580,7 +704,22 @@ func (pw *ProbeWorker) TestWebhook() (bool, string) {
 	if resp.StatusCode >= 300 {
 		return false, fmt.Sprintf("endpoint returned HTTP %d", resp.StatusCode)
 	}
-	return true, "test alert sent (HTTP " + http.StatusText(resp.StatusCode) + ")"
+	return true, "test alert sent via " + p.Label + " (HTTP " + http.StatusText(resp.StatusCode) + ")"
+}
+
+func mustJSON(v interface{}) []byte {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// sendAlert dispatches a state-transition alert to every active provider.
+func (pw *ProbeWorker) sendAlert(id, name, target, state string, rttMs float64) {
+	pw.sendWebhook(id, name, target, state, rttMs, false)
+}
+
+// sendRealert notifies that a sensor has stayed in the same non-up state.
+func (pw *ProbeWorker) sendRealert(id, name, target, state string, rttMs float64) {
+	pw.sendWebhook(id, name, target, state, rttMs, true)
 }
 
 func cardFor(state, name, target string, rttMs float64) string {
@@ -613,9 +752,41 @@ func cardForRe(state, name, target string, rttMs float64) string {
 	return card
 }
 
-func (pw *ProbeWorker) postCard(url, card string) {
-	payload, _ := json.Marshal(map[string]string{"text": card})
-	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(payload))
+// Discord uses Markdown (**bold**, no *italic* emphasis); the card is plain
+// content. Same information, Discord-flavored.
+func discordCard(state, name, target string, rttMs float64) string {
+	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
+	if icon == "" {
+		icon = "🟢"
+	}
+	title := state
+	if state == "up" {
+		title = "recovered"
+	}
+	card := fmt.Sprintf("%s **zenmon: %s**\n**Sensor:** %s\n**Target:** %s\n**State:** %s", icon, title, name, target, state)
+	if rttMs > 0 {
+		card += fmt.Sprintf("\n**Ping:** %d ms", int(rttMs+0.5))
+	}
+	return card
+}
+
+func discordCardRe(state, name, target string, rttMs float64) string {
+	icon := map[string]string{"warning": "🟡", "error": "🔴"}[state]
+	if icon == "" {
+		icon = "🟢"
+	}
+	card := fmt.Sprintf("%s **zenmon: still %s (re-alert)**\n**Sensor:** %s\n**Target:** %s\n**State:** %s — no change, re-notifying", icon, state, name, target, state)
+	if rttMs > 0 {
+		card += fmt.Sprintf("\n**Ping:** %d ms", int(rttMs+0.5))
+	}
+	return card
+}
+
+// postJSON delivers a JSON payload to a webhook with the shared hardened
+// client (10s timeout, no redirects).
+func (pw *ProbeWorker) postJSON(url string, payload map[string]string) {
+	body, _ := json.Marshal(payload)
+	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("webhook: send failed: %v", err)
 		return

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -78,15 +79,13 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 type Server struct {
 	db          *DB
 	probeWorker *ProbeWorker
-	webhookURL  string
 	mux         *http.ServeMux
 }
 
-func NewServer(db *DB, pw *ProbeWorker, webhookURL string) *Server {
+func NewServer(db *DB, pw *ProbeWorker) *Server {
 	s := &Server{
 		db:          db,
 		probeWorker: pw,
-		webhookURL:  webhookURL,
 		mux:         http.NewServeMux(),
 	}
 	s.routes()
@@ -891,17 +890,23 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, events)
 }
 
-// webhookMasked shows the URL with the key/token query params masked so the
-// dashboard can display it without exposing credentials.
+// webhookMasked shows the URL with the secret masked so the dashboard and
+// the settings API never echo credentials. Google Chat keeps its key in a
+// query string (mask the query); Discord embeds the token in the path
+// (mask the last path segment). Without the path mask a Discord webhook
+// would be fully exposed — the token in the path is the credential.
 func webhookMasked(url string) string {
 	if url == "" {
 		return ""
 	}
-	i := strings.Index(url, "?")
-	if i < 0 {
-		return url
+	if i := strings.Index(url, "?"); i >= 0 {
+		return url[:i] + "?***"
 	}
-	return url[:i] + "?***"
+	slash := strings.LastIndex(url, "/")
+	if slash >= 0 && slash < len(url)-1 {
+		return url[:slash] + "/***"
+	}
+	return url
 }
 
 // settingsPayload is the shared GET/PUT response shape for /api/settings.
@@ -923,10 +928,22 @@ func (s *Server) settingsPayload() map[string]interface{} {
 			realert = n
 		}
 	}
+	// Legacy single-webhook fields stay for backward compat with older
+	// dashboards (and the env-configured Google Chat URL, which has no
+	// settings row). The multi-provider "providers" array is the real data.
+	chatURL := s.db.GetSetting("google_chat_url")
+	chatSource := "none"
+	if chatURL != "" {
+		chatSource = "dashboard"
+	} else if os.Getenv("GOOGLE_CHAT_WEBHOOK_URL") != "" {
+		chatURL = os.Getenv("GOOGLE_CHAT_WEBHOOK_URL")
+		chatSource = "env"
+	}
 	return map[string]interface{}{
-		"webhook_url":        webhookMasked(s.probeWorker.ResolveWebhookURL()),
-		"webhook_configured": s.probeWorker.HasWebhook(),
-		"source":             s.probeWorker.WebhookSource(),
+		"webhook_url":        webhookMasked(chatURL),
+		"webhook_configured": chatURL != "",
+		"source":             chatSource,
+		"providers":          s.probeWorker.providerStatuses(),
 		"alert_scope":        scope,
 		"alert_filter":       filter,
 		"realert_min":        realert,
@@ -948,7 +965,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		WebhookURL  *string  `json:"webhook_url"` // nil = keep existing
+		WebhookURL *string `json:"webhook_url"` // legacy alias for the google_chat URL
+		Providers  []struct {
+			Kind    string  `json:"kind"`
+			URL     *string `json:"url"`     // nil = keep existing; "" = clear; full URL = set
+			Enabled *bool   `json:"enabled"` // nil = keep; else set
+		} `json:"providers"`
 		AlertScope  string   `json:"alert_scope"`
 		AlertFilter []string `json:"alert_filter"`
 		RealertMin  *int     `json:"realert_min"` // nil = keep; 0 = alert once only
@@ -958,16 +980,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return
 	}
-	if req.WebhookURL != nil {
-		*req.WebhookURL = strings.TrimSpace(*req.WebhookURL)
-		if *req.WebhookURL != "" {
-			if err := validateWebhookURL(*req.WebhookURL); err != nil {
-				respondWithError(w, http.StatusBadRequest, "webhook_url: "+err.Error())
-				return
-			}
+	// Per-provider updates. The legacy top-level webhook_url maps to the
+	// google_chat provider so an older dashboard keeps working.
+	for _, prov := range req.Providers {
+		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled); err != nil {
+			respondWithError(w, http.StatusBadRequest, err.Error())
+			return
 		}
-		if err := s.db.SetSetting("webhook_url", *req.WebhookURL); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+	}
+	if req.WebhookURL != nil {
+		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil); err != nil {
+			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
@@ -1027,12 +1050,50 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, s.settingsPayload())
 }
 
+// applyProviderUpdate persists one provider's URL / enabled flag. URL is a
+// pointer so nil = "don't touch this field" (the dashboard only sends what
+// changed); an empty string clears; a non-empty value is validated first.
+// This is the single write path for provider config, so the validation and
+// key-naming stay consistent no matter how many providers exist.
+func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool) error {
+	if _, ok := providerByKey(kind); !ok {
+		return fmt.Errorf("unknown alert provider: %q", kind)
+	}
+	if url != nil {
+		u := strings.TrimSpace(*url)
+		if u != "" {
+			if err := validateWebhookURL(u); err != nil {
+				return fmt.Errorf("%s url: %s", kind, err.Error())
+			}
+		}
+		if err := s.db.SetSetting(kind+"_url", u); err != nil {
+			return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
+		}
+	}
+	if enabled != nil {
+		val := "0"
+		if *enabled {
+			val = "1"
+		}
+		if err := s.db.SetSetting(kind+"_enabled", val); err != nil {
+			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
+		}
+	}
+	return nil
+}
+
 func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	ok, detail := s.probeWorker.TestWebhook()
+	// Body: {"kind":"google_chat"|"discord"}. The dashboard tests the provider
+	// whose URL is being verified, so kind is required.
+	var req struct {
+		Kind string `json:"kind"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	ok, detail := s.probeWorker.TestWebhook(req.Kind)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":     ok,
 		"detail": detail,

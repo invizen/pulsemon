@@ -225,22 +225,13 @@ tailwind.config = {
         </button>
       </div>
       <div class="flex items-center justify-between text-xs font-mono">
-        <span class="text-slate-400">Alerts → Google Chat webhook</span>
-        <span id="set-source" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+        <span class="text-slate-400">Alert destinations</span>
+        <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
       </div>
-      <label class="text-xs text-slate-400 flex flex-col gap-1">Webhook URL
-        <div class="flex items-center gap-2">
-          <input id="f-webhook" type="text" placeholder="https://chat.googleapis.com/v1/spaces/…/messages?key=…"
-            class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60">
-          <button type="button" id="btn-test" onclick="testWebhook()" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-xs font-semibold whitespace-nowrap">
-            <i class="ph-bold ph-paper-plane-tilt"></i> Send test
-          </button>
-          <button type="button" id="btn-clear" onclick="clearWebhook()" title="Clear the dashboard URL — falls back to the container env URL (or disables if that is empty)" class="px-3 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-xs font-mono whitespace-nowrap">
-            Clear
-          </button>
-        </div>
-        <span class="text-[11px] text-slate-600 mt-1">Paste the full URL to update. “Clear” removes the dashboard URL — alerts fall back to the container's env URL (or are disabled if that is empty).</span>
-      </label>
+      <div class="space-y-2.5">
+        <p class="text-[11px] text-slate-600 font-mono">Each destination you enable receives every alert. A destination sends only when it's toggled on <em>and</em> has a URL.</p>
+        <div id="provider-list" class="space-y-2.5"></div>
+      </div>
       <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/50 space-y-3">
         <div class="flex items-center justify-between">
           <span class="text-xs font-semibold text-slate-300">Alert routing</span>
@@ -717,23 +708,30 @@ async function submitSensor(ev) {
 }
 
 // ---------- settings ----------
+// Per-provider display metadata (labels/icons). The actual list comes from
+// the API's `providers` array, so a new backend provider shows up here
+// automatically — only the cosmetic label/icon needs a line added.
+const PROVIDER_META = {
+  google_chat: { icon: '💬', name: 'Google Chat' },
+  discord:     { icon: '🎮', name: 'Discord' }
+};
+function providerMeta(kind) { return PROVIDER_META[kind] || { icon: '📡', name: kind.replace(/_/g, ' ') }; }
+
 async function openSettings() {
   $('set-msg').classList.add('hidden');
-  $('set-source').textContent = 'loading…';
+  $('set-summary').textContent = 'loading…';
   $('settings-backdrop').classList.remove('hidden');
   try {
     const s = await api('/api/settings');
     SETTINGS = s;
-    $('f-webhook').value = s.webhook_url && s.webhook_url.includes('***') ? '' : (s.webhook_url || '');
-    $('set-source').textContent = s.webhook_configured ? ('configured via ' + s.source) : 'not configured';
+    renderProviderList(s.providers || []);
     $('f-scope').value = s.alert_scope || 'all';
     $('f-realert').value = s.realert_min ?? 30;
-    setMaintUI(!!s.maintenance_mode);
-    renderScopeOptions(s.alert_filter || []);
+    renderScopeOptions();
+    setMaintUI(SETTINGS.maintenance_mode === true);
   } catch (e) {
-    $('set-source').textContent = 'error';
+    $('set-summary').textContent = 'error';
   }
-  setTimeout(() => $('f-webhook').focus(), 50);
 }
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
 
@@ -797,25 +795,92 @@ function setMsg(text, kind) {
   el.classList.remove('hidden');
 }
 
-async function clearWebhook() {
+// ---------- provider destinations ----------
+// Render one row per provider from the API's `providers` array. Each row:
+// enable toggle + URL field (masked value shown read-only until edited) +
+// Test button. The URL input is seeded with '' when the stored value is
+// masked so a plain save never clobbers the real URL.
+function renderProviderList(providers) {
+  const box = $('provider-list');
+  if (!box) return;
+  box.innerHTML = '';
+  providers.forEach(p => {
+    const meta = providerMeta(p.kind);
+    const masked = p.url && p.url.includes('***');
+    const urlVal = masked ? '' : (p.url || '');
+    const statusText = p.enabled
+      ? (p.has_url ? (p.source === 'env' ? 'active (env)' : 'active') : 'on, no URL')
+      : (p.has_url ? 'off (URL stored)' : 'off');
+    const row = document.createElement('div');
+    row.className = 'border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/50';
+    row.innerHTML = `
+      <div class="flex items-center justify-between mb-2">
+        <span class="text-xs font-semibold text-slate-200 flex items-center gap-2">${meta.icon} ${meta.name}</span>
+        <span class="flex items-center gap-2">
+          <span id="prov-status-${p.kind}" class="text-[11px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ${p.enabled ? 'text-ok' : 'text-slate-500'}">${statusText}</span>
+          <button type="button" id="prov-toggle-${p.kind}" onclick="toggleProvider('${p.kind}')" title="Toggle ${meta.name} alerts" class="relative w-10 h-6 rounded-full transition-colors ${p.enabled ? 'bg-ok/40 border border-ok/60' : 'bg-surface-800 border border-surface-700'}">
+            <span class="absolute top-0.5 ${p.enabled ? 'left-5' : 'left-0.5'} w-5 h-5 rounded-full transition-transform ${p.enabled ? 'bg-ok' : 'bg-slate-400'}"></span>
+          </button>
+        </span>
+      </div>
+      <div class="flex items-center gap-2">
+        <input id="prov-url-${p.kind}" type="text" placeholder="${p.kind === 'discord' ? 'https://discord.com/api/webhooks/…/…' : 'https://chat.googleapis.com/v1/spaces/…/messages?key=…'}"
+          value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        ${p.has_url ? `<button type="button" onclick="clearProviderURL('${p.kind}')" title="Clear the stored ${meta.name} URL" class="px-2 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-[11px] font-mono whitespace-nowrap">Clear</button>` : ''}
+        <button type="button" id="prov-test-${p.kind}" onclick="testWebhook('${p.kind}')" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-xs font-semibold whitespace-nowrap">
+          <i class="ph-bold ph-paper-plane-tilt"></i> Test
+        </button>
+      </div>`;
+    box.appendChild(row);
+  });
+  updateSetSummary();
+}
+
+function updateSetSummary() {
+  const el = $('set-summary');
+  if (!el || !SETTINGS || !SETTINGS.providers) return;
+  const active = SETTINGS.providers.filter(p => p.enabled && p.has_url);
+  el.textContent = active.length ? (active.map(p => providerMeta(p.kind).name).join(' · ')) : 'no destinations active';
+  el.className = 'px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ' + (active.length ? 'text-ok' : 'text-slate-400');
+}
+
+// Toggle a provider's enable flag and persist it immediately.
+async function toggleProvider(kind) {
+  const p = (SETTINGS.providers || []).find(x => x.kind === kind);
+  if (!p) return;
+  const next = !p.enabled;
   try {
-    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhook_url: '' }) });
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, enabled: next }] }) });
     SETTINGS = r;
-    $('f-webhook').value = '';
-    $('set-source').textContent = r.webhook_configured ? ('configured via ' + r.source) : 'not configured';
-    setMsg(r.webhook_configured ? 'reset — using the container env URL' : 'reset — no env URL found, alerts disabled', 'ok');
+    renderProviderList(r.providers || []);
+  } catch (e) { setMsg(e.message, 'bad'); }
+}
+
+// Clear a provider's stored URL (immediate).
+async function clearProviderURL(kind) {
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, url: '' }] }) });
+    SETTINGS = r;
+    renderProviderList(r.providers || []);
+    setMsg(providerMeta(kind).name + ' URL cleared', 'ok');
   } catch (e) { setMsg(e.message, 'bad'); }
 }
 
 async function saveSettings() {
-  const url = $('f-webhook').value.trim();
   const body = {
     alert_scope: $('f-scope').value,
     alert_filter: selectedFilterItems(),
     realert_min: +$('f-realert').value,
     maintenance_mode: SETTINGS.maintenance_mode === true
   };
-  if (url) body.webhook_url = url;
+  // Only send a URL for providers whose field actually has a non-masked value.
+  body.providers = (SETTINGS.providers || []).filter(p => {
+    const input = $('prov-url-' + p.kind);
+    return input && input.value.trim() !== '';
+  }).map(p => {
+    const input = $('prov-url-' + p.kind);
+    return { kind: p.kind, url: input.value.trim() };
+  });
   if (body.alert_scope !== 'all' && body.alert_filter.length === 0) {
     setMsg('pick at least one ' + (body.alert_scope === 'tags' ? 'tag' : 'sensor') + ' — otherwise no alerts will fire', 'bad');
     return;
@@ -823,27 +888,28 @@ async function saveSettings() {
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     SETTINGS = r;
-    $('set-source').textContent = r.webhook_configured ? ('configured via ' + r.source) : 'not configured';
-    $('f-webhook').value = '';
+    renderProviderList(r.providers || []);
     setMsg('settings saved', 'ok');
   } catch (e) { setMsg(e.message, 'bad'); }
 }
 
-async function testWebhook() {
-  const url = $('f-webhook').value.trim();
-  if (url && !url.includes('***')) {
+async function testWebhook(kind) {
+  const input = $('prov-url-' + kind);
+  // If the user typed a fresh (non-masked) URL, save it first so the test
+  // hits the intended endpoint.
+  if (input && input.value.trim() && !input.value.includes('***')) {
     try {
-      await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ webhook_url: url }) });
-      $('f-webhook').value = '';
+      await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, url: input.value.trim() }] }) });
+      input.value = '';
     } catch (e) { setMsg('save failed: ' + e.message, 'bad'); return; }
   }
-  const btn = $('btn-test'); btn.disabled = true; btn.textContent = 'sending…';
+  const btn = $('prov-test-' + kind);
+  if (btn) { btn.disabled = true; btn.textContent = 'sending…'; }
   try {
-    const r = await api('/api/settings/test', { method: 'POST' });
+    const r = await api('/api/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
     if (r.ok) { setMsg('✓ ' + r.detail, 'ok'); } else { setMsg(r.detail, 'bad'); }
   } catch (e) { setMsg(e.message, 'bad'); }
-  btn.disabled = false;
-  btn.innerHTML = '<i class="ph-bold ph-paper-plane-tilt"></i> Send test';
+  if (btn) { btn.disabled = false; btn.innerHTML = '<i class="ph-bold ph-paper-plane-tilt"></i> Test'; }
   setTimeout(openSettings, 800);
 }
 
