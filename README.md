@@ -55,6 +55,31 @@ Open http://localhost:8080 and add sensors from the **new sensor** button.
 > `chmod 0777` is the no-sudo option) avoids that. If it already happened,
 > `sudo chown -R 1000:1000 data` fixes it.
 
+## Bare install (no Docker, user-level systemd)
+
+```bash
+git clone https://github.com/invizen/zenmon zenmon && cd zenmon
+./install.sh              # latest release, or ./install.sh v0.1.7 to pin
+```
+
+The installer (no sudo required) downloads and **SHA-256-verifies** the
+release binary, installs it to `~/zenmon/`, writes a user-level
+`zenmon.service` (pointing at `~/zenmon/data/zenmon.db` via `ZENMON_DB`),
+adds `~/zenmon` to `PATH` in `~/.bashrc` (guarded — re-running never
+duplicates the line), and enables + starts the service. It tries
+`sudo -n loginctl enable-linger` so zenmon keeps running after you log out;
+if that needs a password it tells you the one command to run.
+
+```bash
+zenmon update            # self-update from any directory (v0.1.6+)
+zenmon update check      # check only — exit 2 when a newer release exists
+zenmon update v0.1.7     # pin or roll back to a specific version
+```
+
+`zenmon update` finds the running binary itself (`os.Executable`), verifies
+the published SHA-256, and swaps it atomically — then prints the restart
+command. After it runs: `systemctl --user restart zenmon`.
+
 ## ICMP & privileges
 
 zenmon opens a single shared ICMP socket and dispatches replies by sequence
