@@ -371,10 +371,18 @@ func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
 		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err}
 	}
+	// Explicit timer, stopped on every return path. (time.After works on
+	// Go 1.23+ — the runtime reclaims an abandoned timer's object early,
+	// verified empirically on this toolchain — but an abandoned After
+	// timer still occupies the runtime's timer heap until it fires, so a
+	// 2ms reply on a 1s timeout parks a useless pending wake-up for ~1s.
+	// NewTimer + Stop removes it the instant the probe returns.)
+	t := time.NewTimer(timeout)
+	defer t.Stop()
 	select {
 	case d := <-p.ch:
 		return PingResult{RTT: d, Lost: false}
-	case <-time.After(timeout):
+	case <-t.C:
 		return PingResult{Lost: true}
 	}
 }
