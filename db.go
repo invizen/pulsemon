@@ -41,11 +41,11 @@ func NewDB(dsn string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Multiple concurrent connections are required: the probe worker and HTTP
-	// handlers issue nested queries (e.g. iterating sensors while fetching each
-	// one's tags). With a single shared connection those nest and deadlock.
-	// WAL mode allows concurrent readers; SQLite serializes writers internally
-	// (and busy_timeout above makes a blocked writer wait rather than fail).
+	// Pool sizing: SQLite WAL allows concurrent readers and serializes
+	// writers internally (busy_timeout above makes a blocked writer wait
+	// rather than fail). Ten connections comfortably cover the probe worker
+	// plus concurrent HTTP handlers. Nested per-row queries inside rows.Next()
+	// are NOT a thing in this codebase — batch them (see SensorTagsFor).
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(0)
@@ -187,6 +187,37 @@ func (db *DB) SensorTags(id string) []string {
 		var t string
 		if rows.Scan(&t) == nil {
 			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// SensorTagsFor fetches the sorted tag lists for a batch of sensors in ONE
+// query. Batch callers (fetchSensors, syncSensors) must not run a per-row
+// SensorTags() inside a rows.Next() loop: the outer iteration holds a pooled
+// connection, and per-row queries starve the pool under concurrent load.
+// Empty ids → empty map; ids are internal UUIDs (no user string injection).
+func (db *DB) SensorTagsFor(ids []string) map[string][]string {
+	out := make(map[string][]string, len(ids))
+	if len(ids) == 0 {
+		return out
+	}
+	q := make([]string, len(ids))
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		q[i] = "?"
+		args[i] = id
+	}
+	rows, err := db.Query("SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
+		strings.Join(q, ",")+") ORDER BY tag", args...)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, tag string
+		if rows.Scan(&id, &tag) == nil {
+			out[id] = append(out[id], tag)
 		}
 	}
 	return out

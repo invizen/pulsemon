@@ -68,18 +68,18 @@ func TestDeriveStatus(t *testing.T) {
 	}
 
 	type tc struct {
-		id         string
-		lossWarn   int
-		downAfter  int
-		spikeMult  int
-		rtt        []*float64 // oldest -> newest
-		want       string
+		id        string
+		lossWarn  int
+		downAfter int
+		spikeMult int
+		rtt       []*float64 // oldest -> newest
+		want      string
 	}
 
 	tests := []tc{
 		{
 			id: "clean", lossWarn: 25, downAfter: 4, spikeMult: 3,
-			rtt: f(10, 10, 10, 10, 10, 10, 10, 10, 10, 10), // 0% loss, flat RTT
+			rtt:  f(10, 10, 10, 10, 10, 10, 10, 10, 10, 10), // 0% loss, flat RTT
 			want: "up",
 		},
 		{
@@ -134,7 +134,7 @@ func TestDeriveStatus(t *testing.T) {
 			id: "spike-no-status", lossWarn: 25, downAfter: 4, spikeMult: 3,
 			// newest 40ms vs avg(10x9)=10ms is a 4x spike, but spike no longer
 			// changes status (dashboard-only); 0% loss, newest 2 OK -> up
-			rtt: f(10, 10, 10, 10, 10, 10, 10, 10, 10, 40),
+			rtt:  f(10, 10, 10, 10, 10, 10, 10, 10, 10, 40),
 			want: "up",
 		},
 		{
@@ -142,7 +142,7 @@ func TestDeriveStatus(t *testing.T) {
 			// 50 consecutive losses with down_after=50: the window read must be
 			// max(statusWindow, down_after)=60 rows, not a fixed 60 that would
 			// truncate the consecutive run.
-			rtt: append(f(10, 10, 10, 10), make([]*float64, 50)...),
+			rtt:  append(f(10, 10, 10, 10), make([]*float64, 50)...),
 			want: "error",
 		},
 		{
@@ -158,7 +158,7 @@ func TestDeriveStatus(t *testing.T) {
 		{
 			id: "alternating", lossWarn: 25, downAfter: 4, spikeMult: 3,
 			// L U L U ... L U (newest OK): 50% loss >= 25%
-			rtt: []*float64{nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10)},
+			rtt:  []*float64{nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10), nil, f64(10)},
 			want: "warning",
 		},
 	}

@@ -5,6 +5,66 @@ import (
 	"testing"
 )
 
+// TestSensorTagsFor locks the batched tag fetch: one query returns every
+// sensor's sorted tags, comma-containing tags survive intact (the reason
+// this uses an IN-list instead of GROUP_CONCAT), and empty input is safe.
+func TestSensorTagsFor(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "tags.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	// Use names as ids here for readability (schema allows any TEXT id).
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at)
+		VALUES ('a','a','127.0.0.1',5,1000,25,4,'active','up','2026-01-01T00:00:00Z'),
+		           ('b','b','127.0.0.1',5,1000,25,4,'active','up','2026-01-01T00:00:00Z'),
+		           ('c','c','127.0.0.1',5,1000,25,4,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensors: %v", err)
+	}
+	if err := db.SetSensorTags("a", []string{"Linux Servers", "Core, Network"}); err != nil { // comma in tag
+		t.Fatalf("tags a: %v", err)
+	}
+	if err := db.SetSensorTags("b", []string{"Zeta", "Alpha"}); err != nil { // out-of-order, tests sort
+		t.Fatalf("tags b: %v", err)
+	}
+	// c intentionally has no tags.
+
+	got := db.SensorTagsFor([]string{"a", "b", "c"})
+	if len(got) != 2 {
+		t.Fatalf("len(map) = %d, want 2 (untagged sensor absent)", len(got))
+	}
+	if want := []string{"Core, Network", "Linux Servers"}; !equalTags(got["a"], want) {
+		t.Errorf("a = %v, want %v (comma tag must survive, sorted)", got["a"], want)
+	}
+	if want := []string{"Alpha", "Zeta"}; !equalTags(got["b"], want) {
+		t.Errorf("b = %v, want %v (sorted)", got["b"], want)
+	}
+
+	// Empty input: no query, empty map.
+	if m := db.SensorTagsFor(nil); len(m) != 0 {
+		t.Errorf("nil input: got %v, want empty map", m)
+	}
+	// Unknown ids: empty map entries, no error.
+	if m := db.SensorTagsFor([]string{"nope"}); len(m) != 0 {
+		t.Errorf("unknown id: got %v, want empty map", m)
+	}
+}
+
+func equalTags(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TestStatusRenameMigration locks the one-time v0.1.13 migration: existing
 // databases store "down"/"degraded" in sensors, events, and alert_state.
 // After InitSchema, all must be renamed to "error"/"warning" so the first

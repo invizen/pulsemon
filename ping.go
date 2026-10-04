@@ -200,8 +200,8 @@ type Engine struct {
 	mode    string
 
 	// Concrete handles for the reader goroutine (exactly one is set).
-	dgramFd  int
-	rawConn  *icmp.PacketConn
+	dgramFd int
+	rawConn *icmp.PacketConn
 }
 
 // NewEngine opens the shared ICMP socket: datagram (unprivileged) first,

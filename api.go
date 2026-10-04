@@ -26,8 +26,8 @@ type Sensor struct {
 	LossWarn  int      `json:"loss_warn"`
 	DownAfter int      `json:"down_after"`
 	SpikeMult int      `json:"spike_mult"`
-	State     string   `json:"state"`    // active | paused
-	Status    string   `json:"status"`   // up | warning | error
+	State     string   `json:"state"`  // active | paused
+	Status    string   `json:"status"` // up | warning | error
 	CreatedAt string   `json:"created_at"`
 }
 
@@ -39,24 +39,24 @@ type SensorView struct {
 
 // SensorStats is a 60-probe window summary (SPEC §4).
 type SensorStats struct {
-	RTTLast   *float64   `json:"rtt_last"`
-	RTTMin    *float64   `json:"rtt_min"`
-	RTTAvg    *float64   `json:"rtt_avg"`
-	RTTMax    *float64   `json:"rtt_max"`
-	LossPct   float64    `json:"loss_pct"`
-	LostCount int        `json:"lost_count"`
-	Total     int        `json:"total"`
-	Recent    []*float64 `json:"recent"`       // last 30 probes, newest first, null = lost (kept for compat)
-	Hour      []*float64 `json:"hour"`         // 60 one-minute buckets, oldest->newest: min RTT ms, null = lost, -2 = no data
-	HourLossPct float64 `json:"hour_loss_pct"` // % of past-hour probes that were lost
-	HourRTTAvg  *float64 `json:"hour_rtt_avg"` // avg RTT ms over the past hour
-	Uptime24h float64    `json:"uptime_24h"`   // % of last-24h probes that replied
+	RTTLast     *float64   `json:"rtt_last"`
+	RTTMin      *float64   `json:"rtt_min"`
+	RTTAvg      *float64   `json:"rtt_avg"`
+	RTTMax      *float64   `json:"rtt_max"`
+	LossPct     float64    `json:"loss_pct"`
+	LostCount   int        `json:"lost_count"`
+	Total       int        `json:"total"`
+	Recent      []*float64 `json:"recent"`        // last 30 probes, newest first, null = lost (kept for compat)
+	Hour        []*float64 `json:"hour"`          // 60 one-minute buckets, oldest->newest: min RTT ms, null = lost, -2 = no data
+	HourLossPct float64    `json:"hour_loss_pct"` // % of past-hour probes that were lost
+	HourRTTAvg  *float64   `json:"hour_rtt_avg"`  // avg RTT ms over the past hour
+	Uptime24h   float64    `json:"uptime_24h"`    // % of last-24h probes that replied
 }
 
 type ProbeRow struct {
-	TS     string   `json:"ts"`
-	RTT    *float64 `json:"rtt_ms"` // null = lost
-	Lost   bool     `json:"lost"`
+	TS   string   `json:"ts"`
+	RTT  *float64 `json:"rtt_ms"` // null = lost
+	Lost bool     `json:"lost"`
 }
 
 type APIError struct {
@@ -123,10 +123,10 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hz := map[string]interface{}{
-		"status":   "ok",
-		"sensors":  n,
-		"probing":  s.probeWorker.ActiveCount(),
-		"time":     time.Now().UTC().Format(time.RFC3339),
+		"status":  "ok",
+		"sensors": n,
+		"probing": s.probeWorker.ActiveCount(),
+		"time":    time.Now().UTC().Format(time.RFC3339),
 	}
 	hz["version"] = Version
 	if m := EngineMode(); m != "" {
@@ -185,7 +185,7 @@ func (s *Server) sensorStats(id string) *SensorStats {
 		st.LossPct = float64(st.LostCount) / float64(st.Total) * 100
 	}
 	if have {
-		mn, mx, avg := min, max, sum / float64(st.Total-st.LostCount)
+		mn, mx, avg := min, max, sum/float64(st.Total-st.LostCount)
 		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
 	}
 	// Past-1-hour loss % + avg RTT (the card's Loss and avg now reflect the
@@ -231,9 +231,9 @@ func (s *Server) sensorStats(id string) *SensorStats {
 				continue
 			}
 			if minRTT != nil {
-				st.Hour[pos] = minRTT   // at least one reply this minute
+				st.Hour[pos] = minRTT // at least one reply this minute
 			} else {
-				st.Hour[pos] = nil       // probes existed, all lost
+				st.Hour[pos] = nil // probes existed, all lost
 			}
 		}
 	}
@@ -257,8 +257,19 @@ func (s *Server) fetchSensors() []Sensor {
 		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
 			continue
 		}
-		sn.Tags = s.db.SensorTags(sn.ID)
 		out = append(out, sn)
+	}
+
+	// ONE batched tag query after the loop — never a per-sensor query inside
+	// rows.Next(): the outer iteration holds a pooled connection, and nested
+	// per-row queries starve the pool (deadlock risk under concurrency).
+	ids := make([]string, len(out))
+	for i := range out {
+		ids[i] = out[i].ID
+	}
+	tagMap := s.db.SensorTagsFor(ids)
+	for i := range out {
+		out[i].Tags = tagMap[out[i].ID]
 	}
 	return out
 }
@@ -1023,7 +1034,7 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 	}
 	ok, detail := s.probeWorker.TestWebhook()
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"ok":    ok,
+		"ok":     ok,
 		"detail": detail,
 	})
 }

@@ -9,14 +9,16 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strings"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
 // Version is stamped at build time:
-//   go build -ldflags "-X main.Version=v0.1.6" ...
+//
+//	go build -ldflags "-X main.Version=v0.1.6" ...
+//
 // Binaries built without it report "dev".
 var Version = "dev"
 
@@ -91,7 +93,7 @@ type releaseAsset struct {
 }
 
 type ghRelease struct {
-	TagName string `json:"tag_name"`
+	TagName string         `json:"tag_name"`
 	Assets  []releaseAsset `json:"assets"`
 }
 

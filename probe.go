@@ -98,10 +98,21 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		if c.spikeMult < 2 {
 			c.spikeMult = 5
 		}
-		c.tags = pw.db.SensorTags(c.id)
 		configs = append(configs, c)
 	}
 	rows.Close()
+
+	// ONE batched tag query after the loop — never a per-sensor query inside
+	// rows.Next(): the outer iteration holds a pooled connection, and nested
+	// per-row queries starve the pool (deadlock risk under concurrency).
+	ids := make([]string, len(configs))
+	for i := range configs {
+		ids[i] = configs[i].id
+	}
+	tagMap := pw.db.SensorTagsFor(ids)
+	for i := range configs {
+		configs[i].tags = tagMap[configs[i].id]
+	}
 
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
