@@ -422,11 +422,16 @@ func fileSHA256(path string) (string, error) {
 // renaming it over the original is atomic and safe — no "text file busy".
 func installBinary(src, dst string) error {
 	// Preserve the original binary's ownership (a root-installed binary
-	// must stay root-owned after a root update).
-	var uid, gid uint32
+	// must stay root-owned after a root update). The rename replaces dst's
+	// inode with one owned by the executing user, so restore the recorded
+	// owner on EVERY original — including 0:0, which the previous
+	// "uid != 0 || gid != 0" guard silently skipped.
+	var wantUID, wantGID uint32
+	haveOwner := false
 	if fi, err := os.Stat(dst); err == nil && fi.Sys() != nil {
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			uid, gid = st.Uid, st.Gid
+			wantUID, wantGID = st.Uid, st.Gid
+			haveOwner = true
 		}
 	}
 
@@ -462,8 +467,8 @@ func installBinary(src, dst string) error {
 	if err := os.Rename(tmpName, dst); err != nil {
 		return err
 	}
-	if uid != 0 || gid != 0 {
-		if err := os.Chown(dst, int(uid), int(gid)); err != nil {
+	if haveOwner {
+		if err := os.Chown(dst, int(wantUID), int(wantGID)); err != nil {
 			uWarn("could not restore original ownership on " + dst + ": " + err.Error())
 		}
 	}
