@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -117,12 +118,23 @@ func targetAsset() string {
 // locates the running binary via os.Executable, so the systemd unit and
 // Docker need no changes.
 //
-//	zenmon update        check + install if newer
-//	zenmon update check  check only, no install
-//	zenmon update v0.1.5 install a specific version
+//	zenmon update          check + install if newer
+//	zenmon update check    check only, no install
+//	zenmon update v0.1.5   install a specific version
+//	zenmon update --restart install AND restart the running service
+//
+// --restart auto-restarts ONLY when a live systemd zenmon service is
+// confidently detected (a user-bus service, or a system-bus service when
+// running as root), then polls healthz and reports the outcome. It keeps the
+// default install-and-hint contract otherwise, because the fleet is mixed:
+// containers, root installs, and non-systemd hosts are safer told how to
+// restart than auto-restarted (a bad new version would otherwise take the
+// monitor down).
 //
 // Exit codes: 0 = up to date or update installed (including a check of a
-// target that is NOT newer than the running version), 1 = failure,
+// target that is NOT newer than the running version, and a --restart that
+// found nothing to restart or a container), 1 = failure (including a
+// --restart whose service failed to come up healthy),
 // 2 = target is newer than the running version and --check (check-only,
 // for scripting — the target may be "latest" or an explicit pin).
 //
@@ -132,13 +144,16 @@ func targetAsset() string {
 // in the system temp dir. main() performs the actual exit.
 func runUpdate(args []string) int {
 	checkOnly := false
+	restart := false
 	version := "latest"
 	for _, a := range args {
 		switch a {
 		case "check", "--check":
 			checkOnly = true
+		case "restart", "--restart":
+			restart = true
 		case "-h", "--help":
-			fmt.Println("usage: zenmon update [check|<version>]")
+			fmt.Println("usage: zenmon update [check|<version>] [--restart]")
 			return 0
 		default:
 			version = a
@@ -251,15 +266,55 @@ func runUpdate(args []string) int {
 	}
 	uInfo("installed " + rel.TagName + " to " + exe)
 
-	// Restart hint: detect how this process is running.
+	// Restart handling. Container: the binary in the running image is
+	// unchanged; a rebuild is required, not a restart.
 	if exe == "/zenmon" {
-		uWarn("container detected — the binary inside the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
+		if restart {
+			uWarn("--restart ignored: container detected — the binary in the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
+		} else {
+			uWarn("container detected — the binary inside the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
+		}
 		return 0
 	}
-	if _, err := os.Stat("/run/systemd/system"); err == nil {
-		uInfo("restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
+
+	// Default (no --restart): install-and-hint. Tell the operator how to
+	// restart based on how the process is running — never auto-restart,
+	// because the fleet is mixed and a bad new version must not take the
+	// monitor down on its own.
+	if !restart {
+		if _, err := os.Stat("/run/systemd/system"); err == nil {
+			uInfo("restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
+		} else {
+			uWarn("restart the zenmon process to pick up the new binary.")
+		}
+		return 0
+	}
+
+	// --restart: only auto-restart when we can confidently detect a live
+	// systemd zenmon service; otherwise fall back to the hint (never guess
+	// a restart on a mixed fleet).
+	d := detectRestart()
+	if d == "" {
+		if _, err := os.Stat("/run/systemd/system"); err == nil {
+			uInfo("no live zenmon service detected; restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
+		} else {
+			uWarn("no live zenmon service detected; restart the zenmon process to pick up the new binary.")
+		}
+		return 0
+	}
+	uInfo("restarting zenmon (" + d + " service)...")
+	if err := performRestart(d); err != nil {
+		uErr("restart failed: " + err.Error())
+		uErr("the new binary is installed but the service did not restart — check: " + journalHint(d))
+		return 1
+	}
+	// Poll healthz to confirm the new binary actually came up.
+	if ok, detail := waitHealthy(); ok {
+		uInfo("zenmon is up and healthy after restart (" + detail + ")")
 	} else {
-		uWarn("restart the zenmon process to pick up the new binary.")
+		uErr("service restarted but is not answering healthz yet (" + detail + ")")
+		uErr("check: " + journalHint(d))
+		return 1
 	}
 	return 0
 }
@@ -492,4 +547,117 @@ func installBinary(src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// detectRestart and performRestart are vars (not plain funcs) so tests can
+// stub them: a unit test must NEVER run systemctl against the host it runs
+// on, and must never rename over the test binary. The real implementations
+// shell out to systemctl; the stubs in update_restart_test.go just record
+// what would have run.
+var (
+	detectRestart  = detectRestartSystemd
+	performRestart = func(bus string) error { return runRestart(bus) }
+)
+
+// detectRestartSystemd reports which systemd bus the live zenmon service runs
+// on: "user" if a user-bus service is active, "system" if a system-bus service
+// is active (root), else "" when no live service is confidently detectable.
+// It probes the USER bus first (that's how install.sh installs it) and falls
+// back to the system bus. Probing via is-active (exit code, not output) means
+// root's nonexistent user bus and non-systemd hosts both report "" — the safe
+// "don't guess a restart" answer.
+func detectRestartSystemd() string {
+	if systemctlActive("user") {
+		return "user"
+	}
+	if systemctlActive("system") {
+		return "system"
+	}
+	return ""
+}
+
+// systemctlActive reports whether the zenmon service is active on the given
+// bus ("user" or "system"). `systemctl is-active` exits 0 only when active.
+func systemctlActive(bus string) bool {
+	args := []string{"is-active", "zenmon"}
+	if bus == "user" {
+		args = append([]string{"--user"}, args...)
+	}
+	cmd := exec.Command("systemctl", args...)
+	// is-active prints "active"/"inactive"/"failed"/"unknown"; we only care
+	// about the exit code, so discard output.
+	return cmd.Run() == nil
+}
+
+// runRestart restarts the zenmon service on the given bus and waits for the
+// command to return. The systemd restart is itself bounded (systemd waits for
+// the unit to reach a settled state), so no extra timeout is needed here.
+func runRestart(bus string) error {
+	args := []string{"restart", "zenmon"}
+	if bus == "user" {
+		args = append([]string{"--user"}, args...)
+	}
+	out, err := exec.Command("systemctl", args...).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// journalHint is the operator's next diagnostic step after a restart problem.
+func journalHint(bus string) string {
+	if bus == "user" {
+		return "journalctl --user -u zenmon"
+	}
+	return "journalctl -u zenmon"
+}
+
+// healthzTarget derives the host:port to healthcheck from ZENMON_ADDR, the
+// same way install.sh does:
+//
+//	":9299"           -> "localhost:9299"  (all-interface bind)
+//	"127.0.0.1:9299"  -> "127.0.0.1:9299"
+//	"9299" (bare)     -> "localhost:9299"
+//	"" (unset)        -> "localhost:9299"  (the binary's own default)
+func healthzTarget() string {
+	addr := os.Getenv("ZENMON_ADDR")
+	switch {
+	case addr == "":
+		return "localhost:9299"
+	case strings.HasPrefix(addr, ":"):
+		return "localhost" + addr
+	case strings.ContainsRune(addr, ':'):
+		return addr
+	default: // bare port
+		return "localhost:" + addr
+	}
+}
+
+// healthzTimeout bounds the post-restart poll. A var so tests can shrink it.
+var healthzTimeout = 15 * time.Second
+
+// waitHealthy polls the zenmon healthz endpoint until it answers a 2xx/3xx or
+// the timeout elapses. It returns ok plus a short detail for the log line.
+func waitHealthy() (bool, string) {
+	target := healthzTarget()
+	url := "http://" + target + "/api/healthz"
+	deadline := time.Now().Add(healthzTimeout)
+	client := &http.Client{Timeout: 3 * time.Second}
+	var lastErr error
+	for {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode < 400 {
+				return true, target
+			}
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			return false, target + " — " + lastErr.Error()
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
