@@ -264,6 +264,16 @@ func runUpdate(args []string) int {
 	return 0
 }
 
+// userAgent identifies this client to the GitHub API. GitHub's API
+// guidelines require a custom User-Agent; the stdlib default
+// (Go-http-client/1.1) gets throttled or 403'd far more aggressively
+// than an app-specific one. Set on EVERY outbound request below —
+// fetchRelease, fetchChecksumSidecar and downloadAsset all reach
+// api.github.com (the asset-URL fallback paths included).
+func userAgent() string {
+	return "zenmon-updater/" + Version
+}
+
 func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 	url := releaseBase + "/latest"
 	if version != "latest" {
@@ -273,6 +283,7 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 		url = releaseBase + "/tags/" + version
 	}
 	req, _ := http.NewRequest("GET", url, nil)
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -332,6 +343,7 @@ func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := client.Do(req)
 	if err != nil {
@@ -372,6 +384,7 @@ func downloadAsset(client *http.Client, url string) (string, error) {
 	// that fail the SHA-256 check with no obvious cause; the Accept header
 	// makes an API asset URL (fallback path) return the binary instead of
 	// its JSON metadata.
+	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Accept-Encoding", "identity")
 	req.Header.Set("Accept", "application/octet-stream")
 	resp, err := client.Do(req)
