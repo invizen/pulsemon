@@ -39,10 +39,22 @@ import (
 
 const (
 	probeID     = 0x5a11
-	payloadSize = 32
+	payloadSize = 32 // max probe payload in bytes (probePayload must fit within this)
 )
 
-var probePayload = []byte("ZENMON-PING-0123456789ABCDEF") // 24 bytes, fits payloadSize
+// probePayload is the ICMP echo payload: a fixed human-readable identifier.
+// Its size is bounded by payloadSize (enforced in init) so the on-wire
+// echo request stays well under any MTU concern.
+var probePayload = []byte("ZENMON-PING-0123456789ABCDEF") // 28 bytes, <= payloadSize
+
+func init() {
+	// Enforce the payload cap at startup: a future edit that lengthens the
+	// identifier past payloadSize would otherwise silently send an oversized
+	// ICMP echo payload, so fail loudly instead.
+	if len(probePayload) > payloadSize {
+		panic(fmt.Sprintf("ping: probePayload is %d bytes, exceeds max payloadSize %d", len(probePayload), payloadSize))
+	}
+}
 
 type PingResult struct {
 	RTT        time.Duration
