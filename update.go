@@ -336,7 +336,8 @@ func selectAssets(rel *ghRelease) releaseSelection {
 }
 
 // fetchChecksumSidecar downloads the published .sha256 sidecar asset and
-// returns the bare 64-hex digest. Accepts both "sha256sum" format
+// returns the bare 64-hex digest, normalized to lowercase (uppercase hex
+// from checksum tools is accepted). Accepts both "sha256sum" format
 // ("<hex>  <name>") and a bare hex line.
 func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
 	req, err := http.NewRequest("GET", url, nil)
@@ -365,9 +366,14 @@ func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
 	if len(hexd) != 64 {
 		return "", fmt.Errorf("malformed sidecar: %q", hexd)
 	}
+	// Some pipelines and checksum tools emit uppercase hex (sha256sum -b on
+	// some distros, hand-typed digests). Normalize before validating so an
+	// uppercase sidecar is accepted and still compares equal to the
+	// lowercase digest computed by fileSHA256.
+	hexd = strings.ToLower(hexd)
 	for _, c := range hexd {
 		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
-			return "", fmt.Errorf("sidecar digest is not lowercase hex: %q", hexd)
+			return "", fmt.Errorf("sidecar digest is not hex: %q", hexd)
 		}
 	}
 	return hexd, nil
