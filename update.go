@@ -378,7 +378,17 @@ func installBinary(src, dst string) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after successful rename
 
-	if _, err := io.Copy(tmp, mustOpen(src)); err != nil {
+	// Open the source with a managed lifecycle — the previous mustOpen
+	// helper leaked this descriptor on every install and panicked (raw
+	// runtime trace, no formatted diagnostic) when the open failed.
+	srcFile, err := os.Open(src)
+	if err != nil {
+		tmp.Close()
+		return fmt.Errorf("open source binary: %w", err)
+	}
+	defer srcFile.Close()
+
+	if _, err := io.Copy(tmp, srcFile); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -398,12 +408,4 @@ func installBinary(src, dst string) error {
 		}
 	}
 	return nil
-}
-
-func mustOpen(path string) *os.File {
-	f, err := os.Open(path)
-	if err != nil {
-		panic(err)
-	}
-	return f
 }
