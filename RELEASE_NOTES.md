@@ -3,7 +3,7 @@
 First multi-architecture release: zenmon now ships for **linux/amd64 and
 linux/arm64**, so the self-updater, the `install.sh` installer, and the Docker
 image all work on ARM SBCs and single-board computers (Jetson, Raspberry Pi,
-RK3588) as well as x86_64. A batch of `zenmon update` hardening fixes ships
+RK3588) as well as x86_64. Nine `zenmon update` hardening fixes ship
 alongside. No change to probe behavior or status logic.
 
 ### New: linux/arm64 release asset
@@ -55,6 +55,38 @@ testable `selectAssets()` helper.
 inconsistent on a failed resolution, making `installBinary`'s `filepath.Dir`
 fall back to the CWD. The result is now used only on success; a failure warns
 and keeps the `os.Executable()` path.
+
+### Fix: `--check` respects version ordering for explicit pins
+
+`zenmon update check v0.1.5` while running v0.1.16 reported "new version
+available: v0.1.5" and exited 2 — the version-ordering check was gated on
+the target being `latest`, so an explicit pin skipped it. An older pin must
+read "target version … is not newer" and exit 0, so automation can't treat a
+downgrade pin as an available upgrade.
+
+### Fix: self-update restores original ownership on every binary
+
+When swapping the running binary, the old code only restored the original
+file's owner when it was *not* root — so a root-installed binary updated by
+a non-root updater with CAP_CHOWN (a setuid installer, a service with file
+capabilities) was silently left owned by the updater. The recorded owner is
+now restored on every original, including 0:0; a failed restore warns
+instead of skipping.
+
+### Fix: app-specific User-Agent on all GitHub API requests
+
+The releases lookup, sidecar download, and asset download now send
+`User-Agent: zenmon-updater/<version>` instead of the Go stdlib default.
+GitHub's API guidelines require a custom User-Agent; generic clients are
+throttled or 403'd far more aggressively.
+
+### Fix: sidecar SHA-256 accepts uppercase hex
+
+The sidecar digest was rejected unless every character was lowercase
+`a-f`. Checksum tools and pipelines that emit uppercase (or mixed-case)
+hex produced a valid digest that the updater refused with "no trusted
+SHA-256 available". The digest is now normalized with `strings.ToLower`
+before validation.
 
 ### Verification
 
