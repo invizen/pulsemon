@@ -1029,7 +1029,7 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 		Kind string `json:"kind"`
 	}
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	ok, detail := s.probeWorker.TestWebhook(req.Kind)
+	ok, detail := s.probeWorker.TestWebhook(r.Context(), req.Kind)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":     ok,
 		"detail": detail,

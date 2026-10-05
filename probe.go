@@ -128,6 +128,15 @@ type ProbeWorker struct {
 	// (sendWebhook's first act is a settings read).
 	alertWG sync.WaitGroup
 
+	// stopCtx bounds in-flight webhook POSTs (postJSON). It is cancelled
+	// by StopAlerts on shutdown: a POST stuck in a network blip then
+	// aborts at the next read instead of stalling DrainAlerts for the
+	// client's full 10s timeout. It is deliberately a SEPARATE context
+	// from Run's — Run's cancel happens first so no NEW alerts start,
+	// while the in-flight ones get their own bounded second chance.
+	stopCtx    context.Context
+	stopCancel context.CancelFunc
+
 	// stats cache: the in-memory source of truth for the dashboard's
 	// per-sensor stats (v0.1.18). Written by doProbe (one append per probe)
 	// and by the startup warm-up; read by GetStats, which the API serves
@@ -142,11 +151,14 @@ type ProbeWorker struct {
 const retentionSeconds int64 = 24 * 3600
 
 func NewProbeWorker(db *DB) *ProbeWorker {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &ProbeWorker{
 		sensors:    make(map[string]*ProbeState),
 		loops:      make(map[string]context.CancelFunc),
 		db:         db,
 		statsCache: make(map[string]*probeSeries),
+		stopCtx:    ctx,
+		stopCancel: cancel,
 	}
 }
 
@@ -1187,8 +1199,10 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, state string, rttMs float64
 
 // TestWebhook sends a test message to ONE provider and reports whether it
 // accepted it. kind is required (the dashboard tests the provider whose URL
-// is being verified).
-func (pw *ProbeWorker) TestWebhook(kind string) (bool, string) {
+// is being verified). ctx bounds the POST (the handler passes r.Context(),
+// so an abandoned dashboard request aborts the delivery at its next read
+// instead of holding the client's 10s timeout).
+func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, string) {
 	p, ok := providerByKey(kind)
 	if !ok {
 		return false, "unknown provider"
@@ -1206,7 +1220,12 @@ func (pw *ProbeWorker) TestWebhook(kind string) (bool, string) {
 	} else {
 		body = map[string]string{"text": "🟢 *zenmon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
-	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(mustJSON(body)))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
+	if err != nil {
+		return false, err.Error()
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := webhookClient.Do(req)
 	if err != nil {
 		return false, err.Error()
 	}
@@ -1238,9 +1257,11 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 }
 
 // DrainAlerts waits for in-flight alert deliveries to finish, bounded by
-// timeout (the webhook client's own 10s timeout makes this effectively
-// unreachable). Called from main AFTER Run returns and BEFORE db.Close,
-// so an alert fired on the final probe tick is not killed mid-delivery.
+// timeout. It is called from main AFTER Run returns and BEFORE db.Close, so
+// an alert fired on the final probe tick is not killed mid-delivery. main
+// calls StopAlerts first, so any delivery stuck in a network blip is
+// aborted at its next read (stopCtx) instead of holding this drain for the
+// client's full 10s timeout — the timeout here is a backstop only.
 func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
@@ -1252,6 +1273,14 @@ func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 	case <-time.After(timeout):
 		log.Println("WARNING: alert drain timed out; in-flight webhook deliveries may be aborted")
 	}
+}
+
+// StopAlerts cancels stopCtx, aborting any in-flight webhook POST at its
+// next read. main calls it on shutdown, BEFORE DrainAlerts: without this,
+// a POST stuck in a network blip would keep its connection open until the
+// client's 10s timeout and hold process exit that long.
+func (pw *ProbeWorker) StopAlerts() {
+	pw.stopCancel()
 }
 
 // sendAlert dispatches a state-transition alert to every active provider.
@@ -1325,10 +1354,18 @@ func discordCardRe(state, name, target string, rttMs float64) string {
 }
 
 // postJSON delivers a JSON payload to a webhook with the shared hardened
-// client (10s timeout, no redirects).
+// client (10s timeout, no redirects). The POST is bound to pw.stopCtx so
+// that on shutdown a delivery stuck in a network blip is aborted at its
+// next read instead of holding DrainAlerts for the full client timeout.
 func (pw *ProbeWorker) postJSON(url string, payload map[string]string) {
 	body, _ := json.Marshal(payload)
-	resp, err := webhookClient.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		log.Printf("webhook: send failed: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := webhookClient.Do(req)
 	if err != nil {
 		log.Printf("webhook: send failed: %v", err)
 		return
