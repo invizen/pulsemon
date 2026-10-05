@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -578,26 +579,34 @@ func detectRestartSystemd() string {
 
 // systemctlActive reports whether the zenmon service is active on the given
 // bus ("user" or "system"). `systemctl is-active` exits 0 only when active.
+// Bounded by activeTimeout: systemctl talks to dbus, and a wedged bus
+// must not stall `zenmon update --restart` — an unanswered probe is treated
+// as "no live service" and the safe hint is printed.
 func systemctlActive(bus string) bool {
 	args := []string{"is-active", "zenmon"}
 	if bus == "user" {
 		args = append([]string{"--user"}, args...)
 	}
-	cmd := exec.Command("systemctl", args...)
+	ctx, cancel := context.WithTimeout(context.Background(), activeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
 	// is-active prints "active"/"inactive"/"failed"/"unknown"; we only care
 	// about the exit code, so discard output.
 	return cmd.Run() == nil
 }
 
 // runRestart restarts the zenmon service on the given bus and waits for the
-// command to return. The systemd restart is itself bounded (systemd waits for
-// the unit to reach a settled state), so no extra timeout is needed here.
+// command to return. Bounded by restartTimeout: systemctl restart can wait a
+// while for the unit to settle (a slow or stuck service), and the bound keeps
+// a wedged dbus from hanging the update indefinitely.
 func runRestart(bus string) error {
 	args := []string{"restart", "zenmon"}
 	if bus == "user" {
 		args = append([]string{"--user"}, args...)
 	}
-	out, err := exec.Command("systemctl", args...).CombinedOutput()
+	ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -632,6 +641,15 @@ func healthzTarget() string {
 		return "localhost:" + addr
 	}
 }
+
+// activeTimeout and restartTimeout bound the two systemctl calls in the
+// --restart path. systemctl talks to dbus (user or system bus); a wedged bus
+// must not hang the update, so both are hard-limited. Vars so a test could
+// shrink them.
+var (
+	activeTimeout  = 10 * time.Second
+	restartTimeout = 60 * time.Second
+)
 
 // healthzTimeout bounds the post-restart poll. A var so tests can shrink it.
 var healthzTimeout = 15 * time.Second
