@@ -407,25 +407,25 @@ func (pw *ProbeWorker) warmStats() {
 // right after the DB insert succeeds, so cache and DB stay in lockstep. The
 // map is created lazily so a ProbeWorker built by a test without
 // NewProbeWorker (which leaves statsCache nil) can't panic.
+//
+// The write lock is held across the whole read-create-append so the series is
+// never observed or mutated in a half-built state. This is what keeps
+// recordProbe's append and statsFor's snapshot mutually exclusive: an
+// RWMutex's write lock excludes its read locks, so a dashboard read can't
+// snapshot mid-append even though probeSeries carries no lock of its own.
 func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
-	pw.statsMu.RLock()
+	pw.statsMu.Lock()
+	defer pw.statsMu.Unlock()
+	if pw.statsCache == nil {
+		pw.statsCache = make(map[string]*probeSeries)
+	}
 	s, ok := pw.statsCache[id]
-	pw.statsMu.RUnlock()
 	if !ok {
 		// Sensor isn't in the cache yet (added after warm-up). Create it.
-		pw.statsMu.Lock()
-		if pw.statsCache == nil {
-			pw.statsCache = make(map[string]*probeSeries)
-		}
-		if s, ok = pw.statsCache[id]; !ok {
-			s = &probeSeries{}
-			pw.statsCache[id] = s
-		}
-		pw.statsMu.Unlock()
+		s = &probeSeries{}
+		pw.statsCache[id] = s
 	}
-	pw.statsMu.Lock()
 	s.append(e)
-	pw.statsMu.Unlock()
 }
 
 // statsFor computes a sensor's SensorStats from the in-memory series,
