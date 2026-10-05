@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"sync"
@@ -256,6 +257,18 @@ type Engine struct {
 	// does NOT wake a goroutine blocked in a blocking Recvfrom — verified —
 	// so the readers are Poll-based and select on done.)
 	done chan struct{}
+
+	// pollFn is the poll implementation readDgram drives. It is a field (not
+	// a direct unix.Poll call) so a test can inject EINTR and deterministically
+	// verify the retry path — see TestEngineReaderRetriesEINTR. Set in
+	// NewEngine; Engine literals in unit tests that only exercise deliver()
+	// never touch it.
+	pollFn func(fds []unix.PollFd, timeout int) (int, error)
+
+	// readerAlive tracks whether the reader goroutine is currently running
+	// (set in readDgram/readRaw, cleared on return). Used by tests to detect
+	// the silent-exit regression.
+	readerAlive int32 // atomic
 }
 
 // NewEngine opens the shared ICMP socket: datagram (unprivileged) first,
@@ -263,12 +276,12 @@ type Engine struct {
 // on this host at all.
 func NewEngine() (*Engine, error) {
 	if t, err := newDgramTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{})}, nil
+		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
 		fmt.Fprintf(os.Stderr, "zenmon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
 	}
 	if t, err := newRawTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{})}, nil
+		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
 		return nil, fmt.Errorf("icmp: cannot open socket (need root/CAP_NET_RAW or ping_group_range): %w", err)
 	}
@@ -360,6 +373,8 @@ func (e *Engine) run() {
 // close(fd) does not wake it (verified) — which is exactly why the socket is
 // non-blocking and the loop is Poll-based.
 func (e *Engine) readDgram() {
+	atomic.StoreInt32(&e.readerAlive, 1)
+	defer atomic.StoreInt32(&e.readerAlive, 0)
 	buf := make([]byte, 1500)
 	for {
 		// Stop signal first, every iteration — so a busy socket still exits.
@@ -369,7 +384,18 @@ func (e *Engine) readDgram() {
 		default:
 		}
 		fds := []unix.PollFd{{Fd: int32(e.dgramFd), Events: unix.POLLIN}}
-		if _, err := unix.Poll(fds, 100); err != nil {
+		poll := e.pollFn
+		if poll == nil {
+			poll = unix.Poll
+		}
+		if _, err := poll(fds, 100); err == unix.EINTR {
+			continue // signal (the runtime fires SIGURG to wake parked threads);
+			// x/sys's Poll returns EINTR to us — unlike syscall.Recvfrom,
+			// which retries internally — so it must NOT be fatal or the
+			// reader dies on the first interrupt and every later probe is a
+			// false loss.
+		} else if err != nil {
+			log.Printf("zenmon: icmp reader: poll: %v (reader stopping)", err)
 			return
 		}
 		if fds[0].Revents&unix.POLLIN != 0 {
@@ -382,7 +408,11 @@ func (e *Engine) readDgram() {
 						e.deliver(seq, src)
 					}
 				}
+			} else if rerr == syscall.EINTR {
+				continue // defensive: the syscall layer retries EINTR, but if
+				// it ever surfaces, retry rather than kill the reader
 			} else if rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
+				log.Printf("zenmon: icmp reader: recvfrom: %v (reader stopping)", rerr)
 				return // real error (e.g. socket closed)
 			}
 		}
@@ -396,6 +426,8 @@ func (e *Engine) readDgram() {
 // signal, which makes the pending ReadFrom return an error — so this reader
 // always terminates. The done check also gives a fast exit between reads.
 func (e *Engine) readRaw() {
+	atomic.StoreInt32(&e.readerAlive, 1)
+	defer atomic.StoreInt32(&e.readerAlive, 0)
 	buf := make([]byte, 1500)
 	for {
 		select {
@@ -405,6 +437,9 @@ func (e *Engine) readRaw() {
 		}
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
+			if err != net.ErrClosed {
+				log.Printf("zenmon: icmp reader (raw): read: %v (reader stopping)", err)
+			}
 			return
 		}
 		rm, err := icmp.ParseMessage(1, buf[:n])
