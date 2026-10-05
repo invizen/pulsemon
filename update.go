@@ -148,7 +148,17 @@ func runUpdate(args []string) int {
 		uErr("cannot locate running binary: " + err.Error())
 		return 1
 	}
-	exe, _ = filepath.EvalSymlinks(exe)
+	// Best-effort symlink resolution (on Linux os.Executable already returns
+	// the resolved path via /proc/self/exe, so this mostly matters on other
+	// platforms). Never ignore the error: a failed resolution that empties
+	// exe would make installBinary's filepath.Dir(dst) fall back to the CWD
+	// and swap the binary into the working directory instead of the install
+	// location.
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		exe = resolved
+	} else {
+		uWarn("could not evaluate symlink for " + exe + ": " + err.Error())
+	}
 	uInfo("binary:  " + exe)
 	uInfo("version: " + Version)
 
