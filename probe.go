@@ -238,8 +238,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		} else {
 			ps.isPaused = c.state == "paused" // keep pause in sync with DB
 		}
-		cancel, ok := pw.loops[c.id]
-		if !ok {
+		if _, ok := pw.loops[c.id]; !ok {
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
 			cfg := c.sensorConfig
@@ -248,9 +247,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 				defer pw.wg.Done()
 				pw.sensorLoop(lctx, cfg)
 			}()
-			cancel = lcancel
 		}
-		_ = cancel
 	}
 
 	// Stop loops for sensors that vanished or were deleted.
