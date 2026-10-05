@@ -40,6 +40,7 @@ const (
 	dRunServer dispatchKind = iota
 	dExit0
 	dExit1
+	dExit2
 )
 
 // dispatch parses the command line and executes any non-server command.
@@ -53,9 +54,17 @@ func dispatch(args []string) dispatchKind {
 	}
 	switch args[1] {
 	case "update":
-		// runUpdate only returns on success paths (errors exit itself).
-		runUpdate(args[2:])
-		return dExit0
+		// runUpdate returns its exit code instead of calling os.Exit
+		// itself (os.Exit skips deferred cleanup of the downloaded temp
+		// file); main() exits with the mapped status.
+		switch runUpdate(args[2:]) {
+		case 0:
+			return dExit0
+		case 2:
+			return dExit2
+		default:
+			return dExit1
+		}
 	case "-healthz", "--healthz":
 		return runHealthcheck()
 	case "-v", "-version", "--version", "version":
@@ -105,6 +114,8 @@ func main() {
 		return
 	case dExit1:
 		os.Exit(1)
+	case dExit2:
+		os.Exit(2)
 	}
 
 	db, err := NewDB(dbPathFromEnv())

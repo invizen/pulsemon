@@ -22,7 +22,9 @@ import (
 // Binaries built without it report "dev".
 var Version = "dev"
 
-const releaseBase = "https://api.github.com/repos/invizen/zenmon/releases"
+// releaseBase is the GitHub releases API for this repo. It is a var (not a
+// const) so tests can point runUpdate at a local httptest server.
+var releaseBase = "https://api.github.com/repos/invizen/zenmon/releases"
 
 // update colors — matches the house script style (update_llama.sh).
 const (
@@ -107,7 +109,12 @@ type ghRelease struct {
 //
 // Exit codes: 0 = up to date or update installed, 1 = failure,
 // 2 = newer version available but --check (check-only, for scripting).
-func runUpdate(args []string) {
+//
+// It RETURNS the exit code instead of calling os.Exit itself: os.Exit skips
+// the deferred os.Remove of the downloaded temp file, so every failed
+// verification or check-only run would have orphaned a multi-megabyte binary
+// in the system temp dir. main() performs the actual exit.
+func runUpdate(args []string) int {
 	checkOnly := false
 	version := "latest"
 	for _, a := range args {
@@ -116,7 +123,7 @@ func runUpdate(args []string) {
 			checkOnly = true
 		case "-h", "--help":
 			fmt.Println("usage: zenmon update [check|<version>]")
-			return
+			return 0
 		default:
 			version = a
 		}
@@ -125,7 +132,7 @@ func runUpdate(args []string) {
 	exe, err := os.Executable()
 	if err != nil {
 		uErr("cannot locate running binary: " + err.Error())
-		os.Exit(1)
+		return 1
 	}
 	exe, _ = filepath.EvalSymlinks(exe)
 	uInfo("binary:  " + exe)
@@ -136,7 +143,7 @@ func runUpdate(args []string) {
 	rel, err := fetchRelease(client, version)
 	if err != nil {
 		uErr("fetch release: " + err.Error())
-		os.Exit(1)
+		return 1
 	}
 	uInfo("release: " + rel.TagName)
 
@@ -157,7 +164,7 @@ func runUpdate(args []string) {
 	}
 	if assetURL == "" {
 		uErr("release has no zenmon-linux-amd64 asset")
-		os.Exit(1)
+		return 1
 	}
 
 	if version == "latest" && !newerRelease(rel.TagName, Version) {
@@ -166,19 +173,19 @@ func runUpdate(args []string) {
 		} else {
 			uInfo("already up to date (" + Version + "). Nothing to do.")
 		}
-		return
+		return 0
 	}
 
 	if checkOnly {
 		uWarn("new version available: " + rel.TagName + " (running " + Version + "). Run 'zenmon update' to install.")
-		os.Exit(2)
+		return 2
 	}
 
 	uInfo("downloading " + rel.TagName + "...")
 	tmp, err := downloadAsset(client, assetURL)
 	if err != nil {
 		uErr("download: " + err.Error())
-		os.Exit(1)
+		return 1
 	}
 	defer os.Remove(tmp)
 
@@ -196,7 +203,7 @@ func runUpdate(args []string) {
 		if err != nil {
 			uErr("refusing to update: no trusted SHA-256 available for " + rel.TagName)
 			uErr("  (GitHub API digest absent and sidecar fetch failed: " + err.Error() + ")")
-			os.Exit(1)
+			return 1
 		}
 		verifySHA = sidecar
 		uInfo("sha256 source: release sidecar asset (API digest unavailable)")
@@ -204,31 +211,32 @@ func runUpdate(args []string) {
 	got, err := fileSHA256(tmp)
 	if err != nil {
 		uErr("verify: " + err.Error())
-		os.Exit(1)
+		return 1
 	}
 	if got != verifySHA {
 		uErr("SHA-256 MISMATCH — expected " + verifySHA + ", got " + got)
 		uErr("refusing to install.")
-		os.Exit(1)
+		return 1
 	}
 	uInfo("sha256:  " + got + " ✓")
 
 	if err := installBinary(tmp, exe); err != nil {
 		uErr("install: " + err.Error())
-		os.Exit(1)
+		return 1
 	}
 	uInfo("installed " + rel.TagName + " to " + exe)
 
 	// Restart hint: detect how this process is running.
 	if exe == "/zenmon" {
 		uWarn("container detected — the binary inside the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
-		return
+		return 0
 	}
 	if _, err := os.Stat("/run/systemd/system"); err == nil {
 		uInfo("restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
 	} else {
 		uWarn("restart the zenmon process to pick up the new binary.")
 	}
+	return 0
 }
 
 func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
