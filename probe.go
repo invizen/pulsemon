@@ -556,6 +556,24 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 		}
 	}
 
+	// Status-window loss: the SAME window deriveStatus uses, so the inspector
+	// can show the number the badge actually came from. Fewer than
+	// statusWindow probes (a new sensor) just means a shorter window — the
+	// same rule deriveStatus applies (up on the newest 2, warning on loss%).
+	st.StatusWindowSize = statusWindow
+	sw := entries
+	if len(sw) > statusWindow {
+		sw = sw[len(sw)-statusWindow:]
+	}
+	for _, e := range sw {
+		if e.rtt == nil {
+			st.StatusLostCount++
+		}
+	}
+	if len(sw) > 0 {
+		st.StatusLossPct = float64(st.StatusLostCount) / float64(len(sw)) * 100
+	}
+
 	// 24h uptime.
 	d24, l24 := 0, 0
 	for _, e := range entries {

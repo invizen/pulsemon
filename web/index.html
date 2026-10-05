@@ -1003,7 +1003,16 @@ async function loadInspector() {
     $('insp-minavgmax').textContent = (st && st.rtt_min != null) ? fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max) : '—';
     $('insp-loss').textContent = st ? st.loss_pct.toFixed(1) + '%' : '—';
     $('insp-loss').className = 'text-lg font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');
-    $('insp-losssub').textContent = st ? st.lost_count + ' / ' + st.total + ' dropped (60p)' : '';
+    // The big number is the 60-probe window; the sub-line shows the
+    // status-window number the badge actually came from (v0.1.22 derives
+    // status from the last statusWindow probes), so an UP badge next to a
+    // high 60p loss% (a sensor recovering) is self-explanatory.
+    let sub = st ? st.lost_count + ' / ' + st.total + ' dropped (60p)' : '';
+    if (st && st.status_window_size) {
+      sub += '  ·  status window ' + st.status_window_size + 'p: ' +
+        st.status_loss_pct.toFixed(0) + '% (' + st.status_lost_count + ' lost)';
+    }
+    $('insp-losssub').textContent = sub;
     const j = jitterOf(s); $('insp-jitter').textContent = j != null ? '±' + fmtRtt(j) : '—';
   } catch (e) { console.error(e); }
 }

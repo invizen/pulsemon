@@ -52,6 +52,13 @@ type SensorStats struct {
 	HourLossPct float64    `json:"hour_loss_pct"` // % of past-hour probes that were lost
 	HourRTTAvg  *float64   `json:"hour_rtt_avg"`  // avg RTT ms over the past hour
 	Uptime24h   float64    `json:"uptime_24h"`    // % of last-24h probes that replied
+	// StatusWindow fields mirror the window deriveStatus actually uses (the
+	// last statusWindow probes). The inspector shows them so the badge is
+	// directly explained: a green UP can coexist with a high 60p loss% while
+	// recovering — the status-window number is the one the badge came from.
+	StatusLossPct    float64 `json:"status_loss_pct"`    // % lost over the last statusWindow probes
+	StatusLostCount  int     `json:"status_lost_count"`  // losses in that window
+	StatusWindowSize int     `json:"status_window_size"` // the window length (statusWindow)
 }
 
 type ProbeRow struct {
