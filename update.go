@@ -99,6 +99,10 @@ type ghRelease struct {
 	Assets  []releaseAsset `json:"assets"`
 }
 
+// targetAsset is the release asset name for this platform. The sidecar
+// checksum asset is targetAsset + ".sha256" (see the fallback below).
+const targetAsset = "zenmon-linux-amd64"
+
 // runUpdate implements `zenmon update`. Works from any directory: it
 // locates the running binary via os.Executable, so the systemd unit and
 // Docker need no changes.
@@ -149,7 +153,7 @@ func runUpdate(args []string) int {
 
 	assetURL, sha := "", ""
 	for _, a := range rel.Assets {
-		if a.Name == "zenmon-linux-amd64" {
+		if a.Name == targetAsset {
 			sha = strings.TrimPrefix(a.Digest, "sha256:")
 			// Prefer the browser download URL. The API asset URL
 			// (api.github.com/.../assets/N) returns JSON metadata unless
@@ -198,11 +202,30 @@ func runUpdate(args []string) int {
 	// release pipeline).
 	verifySHA := strings.TrimPrefix(sha, "sha256:")
 	if verifySHA == "" {
-		sidecarURL := strings.TrimSuffix(assetURL, "zenmon-linux-amd64") + "zenmon-linux-amd64.sha256"
+		// Find the sidecar asset by name in the release metadata rather
+		// than deriving its URL by string-munging the binary URL — a URL
+		// that fell back to the API endpoint (".../assets/N") never
+		// carries the asset name, so the munged URL 404'd and the update
+		// was always refused.
+		var sidecarURL string
+		for _, a := range rel.Assets {
+			if a.Name == targetAsset+".sha256" {
+				if a.BrowserDownloadURL != "" {
+					sidecarURL = a.BrowserDownloadURL
+				} else {
+					sidecarURL = a.URL
+				}
+				break
+			}
+		}
+		if sidecarURL == "" {
+			uErr("refusing to update: no trusted SHA-256 sidecar asset found in " + rel.TagName)
+			return 1
+		}
 		sidecar, err := fetchChecksumSidecar(client, sidecarURL)
 		if err != nil {
 			uErr("refusing to update: no trusted SHA-256 available for " + rel.TagName)
-			uErr("  (GitHub API digest absent and sidecar fetch failed: " + err.Error() + ")")
+			uErr("  (sidecar fetch failed: " + err.Error() + ")")
 			return 1
 		}
 		verifySHA = sidecar
