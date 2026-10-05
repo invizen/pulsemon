@@ -267,8 +267,19 @@ func runUpdate(args []string) int {
 	}
 	uInfo("installed " + rel.TagName + " to " + exe)
 
-	// Restart handling. Container: the binary in the running image is
-	// unchanged; a rebuild is required, not a restart.
+	return handleRestart(exe, restart)
+}
+
+// handleRestart is the post-install restart decision, factored out of
+// runUpdate so it can be tested in isolation without touching installBinary.
+// That matters: installBinary renames the new binary over exe, and under
+// `go test` exe is the cached test binary (/tmp/go-build.../zenmon.test) —
+// so the restart tests call handleRestart directly and never enter the
+// install path (no fake payload ever lands on the test binary). Returns the
+// exit code for this stage; runUpdate returns it.
+func handleRestart(exe string, restart bool) int {
+	// Container: the binary in the running image is unchanged; a rebuild is
+	// required, not a restart.
 	if exe == "/zenmon" {
 		if restart {
 			uWarn("--restart ignored: container detected — the binary in the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
@@ -552,9 +563,8 @@ func installBinary(src, dst string) error {
 
 // detectRestart and performRestart are vars (not plain funcs) so tests can
 // stub them: a unit test must NEVER run systemctl against the host it runs
-// on, and must never rename over the test binary. The real implementations
-// shell out to systemctl; the stubs in update_restart_test.go just record
-// what would have run.
+// on. The real implementations shell out to systemctl; the stubs in
+// update_restart_test.go just record what would have run.
 var (
 	detectRestart  = detectRestartSystemd
 	performRestart = func(bus string) error { return runRestart(bus) }
