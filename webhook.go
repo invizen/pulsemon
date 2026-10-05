@@ -97,21 +97,32 @@ var webhookClient = &http.Client{
 // validateWebhookURL rejects webhook destinations that cannot be legitimate
 // alert endpoints. Blocklist: loopback, link-local (covers the 169.254.0.0/16
 // cloud-metadata range), unspecified, multicast. RFC1918 (10/8, 172.16/12,
-// 192.168/16) is deliberately ALLOWED — a homelab may legitimately point at
-// an internal relay (self-hosted ntfy, chat bridge), and an attacker on the
-// same LAN can already reach those hosts directly, so blocking them buys
-// nothing.
+// 192.168/16) and ULA (fc00::/7) are deliberately ALLOWED — a homelab may
+// legitimately point at an internal relay (self-hosted ntfy, chat bridge),
+// and an attacker on the same LAN can already reach those hosts directly, so
+// blocking them buys nothing.
+//
+// Scheme: https:// anywhere; http:// ONLY when the host itself is (or
+// resolves to) such a private address — internal relays commonly run plain
+// HTTP with no local TLS certs. Public destinations must use https, because
+// an attacker on the LAN who could see a public IP's cleartext can already
+// intercept the alert anyway.
 func validateWebhookURL(raw string) error {
 	u, err := url.ParseRequestURI(raw)
 	if err != nil {
 		return errors.New("not a valid URL")
 	}
-	if u.Scheme != "https" {
-		return errors.New("must be an https:// URL")
-	}
 	host := u.Hostname()
 	if host == "" {
 		return errors.New("must include a host")
+	}
+	if u.Scheme != "https" {
+		if u.Scheme != "http" {
+			return errors.New("must be an http:// or https:// URL")
+		}
+		if !httpAllowsPrivate(host) {
+			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+		}
 	}
 	if ip := net.ParseIP(host); ip != nil {
 		return checkWebhookIP(ip, host)
@@ -130,6 +141,28 @@ func validateWebhookURL(raw string) error {
 		}
 	}
 	return nil
+}
+
+// httpAllowsPrivate reports whether host may be reached over plain http
+// because it is, or resolves to, a private RFC1918 / ULA address.
+// checkWebhookIP still runs on every address afterwards, so loopback,
+// link-local (169.254/16), unspecified and multicast addresses are rejected
+// here regardless of scheme — http is only a relaxation for addresses
+// already allowed on https.
+func httpAllowsPrivate(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsPrivate()
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false
+	}
+	for _, ip := range ips {
+		if ip.IsPrivate() {
+			return true
+		}
+	}
+	return false
 }
 
 func checkWebhookIP(ip net.IP, host string) error {
