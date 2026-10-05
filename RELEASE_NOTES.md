@@ -1,3 +1,60 @@
+## v0.1.25
+
+Security hardening for outbound webhook delivery. Four fixes to
+`webhook.go` (and its callers) close gaps in how alert URLs are validated
+and how in-flight deliveries are bounded. No change to probe behavior,
+status logic, or the self-updater.
+
+### Fix: enforce the webhook IP blocklist at dial time (DNS-rebinding TOCTOU)
+
+`validateWebhookURL` resolved the host at save time, but the webhook client's
+default transport re-resolved it at dial time — so a rebinding domain that
+flipped from an allowed public IP to `127.0.0.1` / `169.254.169.254` between
+save and dispatch slipped past the SSRF blocklist. The client now dials
+through `dialChecked`: it resolves (or parses the literal IP), runs the
+blocklist on **every** resolved address, and connects to the very IP it
+checked — closing even the check→connect microsecond window. The transport
+still performs the TLS handshake itself (ServerName = URL host), so SNI and
+certificate verification are unchanged.
+
+### Fix: allow `http://` webhooks to RFC1918 private relays, `https` elsewhere
+
+Internal homelab relays (self-hosted ntfy, chat bridges) commonly run plain
+HTTP with no local TLS certs, but the validator demanded `https://` for
+every destination — rejecting the exact internal-relay use the code comments
+said was allowed. Scheme is now: `https://` anywhere; `http://` only when the
+host is, or resolves to, a private RFC1918 / ULA address. Public destinations
+still require https, and the IP blocklist still applies afterwards, so
+`http://127.0.0.1`, `http://169.254.169.254` etc. are refused regardless of
+scheme.
+
+### Fix: bound outbound webhook POSTs with a cancellable context
+
+`webhookClient` only had a global 10s timeout; both call sites used
+`webhookClient.Post()`, which cannot be cancelled. If shutdown happened during
+a network blip, an in-flight alert delivery kept its connection open until the
+10s timeout and held process exit that long. `postJSON` now builds the request
+with `NewRequestWithContext` bound to a worker-level `stopCtx`, and
+`StopAlerts()` — called by `main` on shutdown before `DrainAlerts` — aborts
+any in-flight POST at its next read. `TestWebhook` takes a caller-provided
+context (the settings-test handler passes `r.Context()`), so an abandoned
+dashboard request aborts its delivery the same way. The stop context is
+deliberately separate from `Run`'s: `Run`'s cancel stops new probes/alerts,
+while in-flight ones get their own bounded second chance before `db.Close()`.
+
+### Fix: report blocked literal IPs with an accurate reason (IPv6 reorder)
+
+A blocked literal IP over `http` was misreported: `http://[::1]:8080` said
+"must be an https:// URL unless `::1` is a private RFC1918 host" — telling the
+user to use https or RFC1918 when the truth is "this is loopback, never
+allowed". A literal IP is now judged against the blocklist **first**, for
+every scheme, so loopback / link-local / unspecified / multicast are refused
+up front with an accurate "blocked address". RFC1918 / ULA literals pass the
+blocklist and are then gated by scheme. The `.local` / `.localhost` /
+`localhost` host check is kept: a `.local` name that mDNS-resolves to a
+private RFC1918 address passes the blocklist, so the suffix check is the only
+thing keeping those out of the http-relay path.
+
 ## v0.1.24
 
 First multi-architecture release: zenmon now ships for **linux/amd64 and
