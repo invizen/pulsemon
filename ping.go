@@ -182,7 +182,17 @@ func (t *rawTransport) send(dst net.IP, seq uint16) error {
 
 func (t *rawTransport) close() error { return t.conn.Close() }
 
-// icmpChecksum computes the ICMP one's-complement checksum over a message.
+// icmpChecksum computes the ICMP one's-complement checksum (RFC 1071 / RFC
+// 792) over a message. Each 16-bit half-word is read big-endian (byte order
+// independent); a trailing odd byte is placed in the HIGH-order position
+// (<< 8), which is the canonical network-order padding. The final fold is the
+// standard two-step end-around carry: the first fold brings a 32-bit sum under
+// 2^17, the second clears the remaining carry, and the uint16() on return
+// drops any residual carry bit.
+//
+// NOTE: the previous odd-length handling was already correct — this is the
+// canonical form, not a bug fix. TestIcmpChecksumMatchesReference locks it
+// against an independent reference across every length (odd and even).
 func icmpChecksum(b []byte) uint16 {
 	var sum uint32
 	for i := 0; i+1 < len(b); i += 2 {
@@ -191,9 +201,8 @@ func icmpChecksum(b []byte) uint16 {
 	if len(b)%2 == 1 {
 		sum += uint32(b[len(b)-1]) << 8
 	}
-	for sum>>16 != 0 {
-		sum = (sum & 0xffff) + (sum >> 16)
-	}
+	sum = (sum >> 16) + (sum & 0xffff)
+	sum += sum >> 16
 	return ^uint16(sum)
 }
 
