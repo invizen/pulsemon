@@ -281,8 +281,10 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 	}
 }
 
-// Restart respawns a sensor's probe loop so config changes (target/interval/
-// timeout) take effect without a process restart.
+// Restart respawns a sensor's probe loop so config changes take effect
+// without a process restart: target/interval/timeout are read by the loop
+// and loss_warn/down_after by deriveStatus, all from the spawn-time config
+// copy captured in syncSensors.
 func (pw *ProbeWorker) Restart(id string) {
 	pw.mu.Lock()
 	if cancel, ok := pw.loops[id]; ok {

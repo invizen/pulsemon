@@ -434,8 +434,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		if req.State != nil {
 			s.probeWorker.SetPaused(id, *req.State == "paused")
 		}
-		// A config change (target/interval/...) requires respawning the loop.
-		if req.Target != nil || req.IntervalS != nil || req.TimeoutMS != nil {
+		// A config change requires respawning the loop so the running probe
+		// picks up the new values: target/interval/timeout are read by the
+		// loop itself, and loss_warn/down_after by deriveStatus — all from the
+		// spawn-time config copy, none are hot-reloaded.
+		if req.Target != nil || req.IntervalS != nil || req.TimeoutMS != nil ||
+			req.LossWarn != nil || req.DownAfter != nil {
 			s.probeWorker.Restart(id)
 		}
 
