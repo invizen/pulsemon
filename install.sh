@@ -24,6 +24,18 @@ VERSION="${1:-latest}"
 # default matches the binary's own default (all interfaces on 9299).
 ZENMON_ADDR="${ZENMON_ADDR:-:9299}"
 
+# Map the host's machine type to the release asset's Go arch name, so the
+# installer grabs the binary built for THIS machine instead of hardcoding
+# amd64 (a Pi / Jetson / Apple-Silicon box would otherwise get x86_64).
+case "$(uname -m)" in
+  x86_64|amd64)   GOARCH="amd64" ;;
+  aarch64|arm64)  GOARCH="arm64" ;;
+  *)
+    echo "zenmon: unsupported architecture '$(uname -m)' — expected x86_64 or aarch64/arm64" >&2
+    exit 1 ;;
+esac
+ASSET="zenmon-linux-${GOARCH}"
+
 if [ "$(id -u)" = "0" ]; then
   echo "zenmon: do not run as root — zenmon is designed to run unprivileged" >&2
   echo "       as the user it monitors (its uid must be inside ping_group_range)." >&2
@@ -44,17 +56,17 @@ BASE="https://github.com/$REPO/releases/download/$VERSION"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
-curl -sfL -o "$TMP/zenmon-linux-amd64" "$BASE/zenmon-linux-amd64"
-curl -sfL -o "$TMP/zenmon-linux-amd64.sha256" "$BASE/zenmon-linux-amd64.sha256" || {
-  echo "zenmon: release $VERSION has no published sha256 digest — refusing to install" >&2
+curl -sfL -o "$TMP/$ASSET" "$BASE/$ASSET"
+curl -sfL -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256" || {
+  echo "zenmon: release $VERSION has no published $ASSET.sha256 digest — refusing to install" >&2
   echo "        (an unverified binary is worse than no update; check github.com/$REPO/releases/$VERSION)" >&2
   exit 1; }
-( cd "$TMP" && sha256sum -c zenmon-linux-amd64.sha256 ) || {
+( cd "$TMP" && sha256sum -c "$ASSET.sha256" ) || {
   echo "zenmon: SHA-256 verification FAILED — aborting" >&2; exit 1; }
-echo "zenmon: sha256 ok"
+echo "zenmon: sha256 ok ($ASSET)"
 
 # --- 2. install binary --------------------------------------------------------
-install -m 0755 "$TMP/zenmon-linux-amd64" "$BIN"
+install -m 0755 "$TMP/$ASSET" "$BIN"
 echo "zenmon: installed $BIN"
 
 # --- 3. systemd user service (only if absent) ---------------------------------
