@@ -121,8 +121,10 @@ func targetAsset() string {
 //	zenmon update check  check only, no install
 //	zenmon update v0.1.5 install a specific version
 //
-// Exit codes: 0 = up to date or update installed, 1 = failure,
-// 2 = newer version available but --check (check-only, for scripting).
+// Exit codes: 0 = up to date or update installed (including a check of a
+// target that is NOT newer than the running version), 1 = failure,
+// 2 = target is newer than the running version and --check (check-only,
+// for scripting — the target may be "latest" or an explicit pin).
 //
 // It RETURNS the exit code instead of calling os.Exit itself: os.Exit skips
 // the deferred os.Remove of the downloaded temp file, so every failed
@@ -178,11 +180,18 @@ func runUpdate(args []string) int {
 	}
 	assetURL, sha := sel.assetURL, sel.sha
 
-	if version == "latest" && !newerRelease(rel.TagName, Version) {
-		if checkOnly {
-			uInfo("up to date (" + Version + " is the latest release). Nothing to do.")
+	// Version ordering matters for BOTH "latest" and explicit pins: a check
+	// against an older pin must not claim "new version available" (exit 2),
+	// which would mislead automation into treating a downgrade as an update.
+	if isNewer := newerRelease(rel.TagName, Version); !isNewer {
+		if version == "latest" {
+			if checkOnly {
+				uInfo("up to date (" + Version + " is the latest release). Nothing to do.")
+			} else {
+				uInfo("already up to date (" + Version + "). Nothing to do.")
+			}
 		} else {
-			uInfo("already up to date (" + Version + "). Nothing to do.")
+			uInfo("target version " + rel.TagName + " is not newer than running " + Version + ". Nothing to do.")
 		}
 		return 0
 	}
