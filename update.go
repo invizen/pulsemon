@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -99,9 +100,18 @@ type ghRelease struct {
 	Assets  []releaseAsset `json:"assets"`
 }
 
-// targetAsset is the release asset name for this platform. The sidecar
-// checksum asset is targetAsset + ".sha256" (see the fallback below).
-const targetAsset = "zenmon-linux-amd64"
+// targetAsset is the release asset name for the platform this binary runs
+// on — "zenmon-<GOOS>-<GOARCH>" (e.g. zenmon-linux-amd64, zenmon-linux-arm64
+// on a Pi 4/5 or RK3588). It honors $GOARCH so a host can deliberately fetch
+// a different architecture's release asset. The sidecar checksum asset is
+// targetAsset() + ".sha256" (see the fallback below).
+func targetAsset() string {
+	goarch := os.Getenv("GOARCH")
+	if goarch == "" {
+		goarch = runtime.GOARCH
+	}
+	return fmt.Sprintf("zenmon-%s-%s", runtime.GOOS, goarch)
+}
 
 // runUpdate implements `zenmon update`. Works from any directory: it
 // locates the running binary via os.Executable, so the systemd unit and
@@ -151,25 +161,12 @@ func runUpdate(args []string) int {
 	}
 	uInfo("release: " + rel.TagName)
 
-	assetURL, sha := "", ""
-	for _, a := range rel.Assets {
-		if a.Name == targetAsset {
-			sha = strings.TrimPrefix(a.Digest, "sha256:")
-			// Prefer the browser download URL. The API asset URL
-			// (api.github.com/.../assets/N) returns JSON metadata unless
-			// the request carries Accept: application/octet-stream.
-			if a.BrowserDownloadURL != "" {
-				assetURL = a.BrowserDownloadURL
-			} else {
-				assetURL = a.URL
-			}
-			break
-		}
-	}
-	if assetURL == "" {
-		uErr("release has no zenmon-linux-amd64 asset")
+	sel := selectAssets(rel)
+	if sel.assetURL == "" {
+		uErr("release has no " + targetAsset() + " asset")
 		return 1
 	}
+	assetURL, sha := sel.assetURL, sel.sha
 
 	if version == "latest" && !newerRelease(rel.TagName, Version) {
 		if checkOnly {
@@ -196,33 +193,19 @@ func runUpdate(args []string) int {
 	// Mandatory verification (security): the update must never install an
 	// unverified binary. Primary source is the GitHub-computed asset digest
 	// from the release API; if that is absent (pre-2025 uploads) we fall
-	// back to the published zenmon-linux-amd64.sha256 sidecar asset. If
+	// back to the published sidecar asset (targetAsset()+".sha256", resolved
+	// by name in selectAssets — never by string-munging the binary URL,
+	// which 404'd when the URL was the API endpoint ".../assets/N"). If
 	// NEITHER exists we refuse the update — an unverifiable binary is worse
 	// than no update (guards against DNS poisoning, MITM, or a compromised
 	// release pipeline).
 	verifySHA := strings.TrimPrefix(sha, "sha256:")
 	if verifySHA == "" {
-		// Find the sidecar asset by name in the release metadata rather
-		// than deriving its URL by string-munging the binary URL — a URL
-		// that fell back to the API endpoint (".../assets/N") never
-		// carries the asset name, so the munged URL 404'd and the update
-		// was always refused.
-		var sidecarURL string
-		for _, a := range rel.Assets {
-			if a.Name == targetAsset+".sha256" {
-				if a.BrowserDownloadURL != "" {
-					sidecarURL = a.BrowserDownloadURL
-				} else {
-					sidecarURL = a.URL
-				}
-				break
-			}
-		}
-		if sidecarURL == "" {
+		if sel.sidecarURL == "" {
 			uErr("refusing to update: no trusted SHA-256 sidecar asset found in " + rel.TagName)
 			return 1
 		}
-		sidecar, err := fetchChecksumSidecar(client, sidecarURL)
+		sidecar, err := fetchChecksumSidecar(client, sel.sidecarURL)
 		if err != nil {
 			uErr("refusing to update: no trusted SHA-256 available for " + rel.TagName)
 			uErr("  (sidecar fetch failed: " + err.Error() + ")")
@@ -285,6 +268,41 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 		return nil, err
 	}
 	return &rel, nil
+}
+
+// releaseSelection is the (binary, digest, sidecar) triple resolved from a
+// release's asset list for the running platform.
+type releaseSelection struct {
+	assetURL   string
+	sha        string
+	sidecarURL string
+}
+
+// selectAssets picks the release assets for this platform: the binary
+// (targetAsset()), its GitHub-computed digest if present, and the
+// targetAsset()+".sha256" sidecar URL used when no API digest exists. URLs
+// prefer the browser download URL; the API asset endpoint only works with
+// Accept: application/octet-stream and carries no asset name.
+func selectAssets(rel *ghRelease) releaseSelection {
+	sel := releaseSelection{}
+	for _, a := range rel.Assets {
+		switch a.Name {
+		case targetAsset():
+			sel.sha = strings.TrimPrefix(a.Digest, "sha256:")
+			if a.BrowserDownloadURL != "" {
+				sel.assetURL = a.BrowserDownloadURL
+			} else {
+				sel.assetURL = a.URL
+			}
+		case targetAsset() + ".sha256":
+			if a.BrowserDownloadURL != "" {
+				sel.sidecarURL = a.BrowserDownloadURL
+			} else {
+				sel.sidecarURL = a.URL
+			}
+		}
+	}
+	return sel
 }
 
 // fetchChecksumSidecar downloads the published .sha256 sidecar asset and
