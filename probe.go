@@ -118,6 +118,16 @@ type ProbeWorker struct {
 	// shutdown_probe_test.go for the regression this guards.
 	wg sync.WaitGroup
 
+	// alertWG tracks in-flight alert deliveries (sendAlert/sendRealert,
+	// launched fire-and-forget so a slow webhook never blocks the probe
+	// tick). They are NOT in wg: a hung endpoint would otherwise stall
+	// Run's return up to the 10s client timeout, which main's 10s worker
+	// budget would read as a failure. main drains these separately via
+	// DrainAlerts after Run returns — without that, an alert fired on the
+	// final probe tick dies mid-TLS-negotiation the instant db.Close() runs
+	// (sendWebhook's first act is a settings read).
+	alertWG sync.WaitGroup
+
 	// stats cache: the in-memory source of truth for the dashboard's
 	// per-sensor stats (v0.1.18). Written by doProbe (one append per probe)
 	// and by the startup warm-up; read by GetStats, which the API serves
@@ -758,7 +768,7 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	// Warning (loss) is dashboard-only; error transitions and recoveries
 	// alert.
 	if pw.shouldAlertNow(c, newStatus) {
-		go pw.sendAlert(c.id, c.name, c.target, newStatus, rttMs)
+		pw.launchAlert(func() { pw.sendAlert(c.id, c.name, c.target, newStatus, rttMs) })
 	}
 }
 
@@ -855,7 +865,7 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	}
 	pw.setAlertState(c.id, status, now)
 	if pw.shouldAlertNow(c, status) {
-		go pw.sendRealert(c.id, c.name, c.target, status, rttMs)
+		pw.launchAlert(func() { pw.sendRealert(c.id, c.name, c.target, status, rttMs) })
 	}
 }
 
@@ -1216,6 +1226,35 @@ func (pw *ProbeWorker) TestWebhook(kind string) (bool, string) {
 func mustJSON(v interface{}) []byte {
 	b, _ := json.Marshal(v)
 	return b
+}
+
+// launchAlert runs an alert delivery in a tracked goroutine. It is NOT
+// counted in wg (probe loops): a hung webhook must not stall Run's return,
+// which main bounds to 10s and treats as a failure. alertWG + DrainAlerts
+// give the delivery a bounded second chance after Run returns.
+func (pw *ProbeWorker) launchAlert(fn func()) {
+	pw.alertWG.Add(1)
+	go func() {
+		defer pw.alertWG.Done()
+		fn()
+	}()
+}
+
+// DrainAlerts waits for in-flight alert deliveries to finish, bounded by
+// timeout (the webhook client's own 10s timeout makes this effectively
+// unreachable). Called from main AFTER Run returns and BEFORE db.Close,
+// so an alert fired on the final probe tick is not killed mid-delivery.
+func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		pw.alertWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Println("WARNING: alert drain timed out; in-flight webhook deliveries may be aborted")
+	}
 }
 
 // sendAlert dispatches a state-transition alert to every active provider.

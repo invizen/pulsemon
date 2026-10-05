@@ -166,7 +166,15 @@ func main() {
 		log.Println("WARNING: probe worker did not stop in 10s; in-flight probes may be aborted")
 	}
 
-	// 2. Drain active HTTP connections.
+	// 2. Drain in-flight alert deliveries BEFORE the deferred db.Close:
+	// an alert fired on the final probe tick is a fire-and-forget goroutine
+	// whose first act is a settings read — without this, Close() lands mid
+	// TLS-negotiation and the alert dies. Bounded by the webhook client's
+	// own 10s timeout, so this effectively never fires.
+	pw.DrainAlerts(15 * time.Second)
+	log.Println("Alert deliveries drained")
+
+	// 3. Drain active HTTP connections.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
