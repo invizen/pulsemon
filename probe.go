@@ -875,17 +875,32 @@ func parseTSForRealert(ts string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, ts)
 }
 
-// statusWindow is the fixed probe count used for loss% detection.
-// At the default 15s interval it is ~15 min of history.
-const statusWindow = 60
+// statusWindow is the probe count used for loss% detection. It must also be
+// >= down_after (the API allows down_after down to 1; the window read takes
+// the max) so the consecutive-loss test always has enough history. At the
+// default 15s interval, 8 probes is ~2 min of history — short enough that a
+// recovered sensor's status washes out in minutes, not an hour.
+const statusWindow = 8
 
-// Status is derived from the sensor's most recent probes with fixed precedence:
+// Status is derived from the sensor's most recent probes with fixed
+// precedence:
 //
+//	up        — the newest 2 probes both succeeded (a sensor with only one
+//	            probe is up if that probe succeeded). This is checked FIRST:
+//	            a recovered sensor must read up after 2 good probes even if
+//	            the recent window still shows high loss (a long outage
+//	            otherwise pins it in warning for a full window-washout —
+//	            an hour at the old 60-probe window).
 //	error     — `down_after` consecutive losses from the newest probe
 //	warning   — window loss% (last `statusWindow` probes) >= loss_warn
-//	up        — the newest 2 probes both succeeded and loss% is below
-//	            loss_warn (a sensor with only one probe is up if that
-//	            probe succeeded)
+//	fallback  — warning (a loss is in the recent window but it's not
+//	            error and the newest 2 aren't both up)
+//
+// Consequence of the up-first ordering: a sensor whose newest 2 probes both
+// succeeded reads up even at a high window loss% (e.g. alternating loss —
+// up, lost, up). Sustained loss where the newest 2 include a loss reads
+// warning, so the dashboard still shows degraded sensors; only a genuinely
+// recovered sensor (2 straight replies) clears.
 //
 // The window read is max(statusWindow, down_after) rows so that a sensor
 // configured with down_after > statusWindow still has enough history for the
@@ -923,7 +938,18 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		return "up" // no data yet
 	}
 
-	// ERROR: down_after consecutive losses from the newest probe.
+	// UP (highest precedence): the newest 2 probes both succeeded. With only
+	// one probe recorded, a single success is enough (new-sensor grace).
+	// Checked before error/warning so recovery is immediate — a sensor back
+	// from an hour-long outage reads up on its 2nd good probe, not after
+	// the window washes out.
+	if recent[0] != nil && (len(recent) == 1 || recent[1] != nil) {
+		return "up"
+	}
+
+	// ERROR: down_after consecutive losses from the newest probe. (The
+	// newest probe is a loss here, so this and the up check are mutually
+	// exclusive.)
 	consec := 0
 	for _, r := range recent {
 		if r == nil {
@@ -948,12 +974,6 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		if lossPct >= float64(c.lossWarn) {
 			return "warning"
 		}
-	}
-
-	// UP: the newest 2 probes both succeeded. With only one probe recorded,
-	// a single success is enough (new-sensor grace).
-	if recent[0] != nil && (len(recent) == 1 || recent[1] != nil) {
-		return "up"
 	}
 
 	// WARNING: a loss is in the recent window but it's not error and not up.

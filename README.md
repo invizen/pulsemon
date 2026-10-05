@@ -124,13 +124,17 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 ### Alert behavior
 
 Statuses are `up`, `warning`, and `error`. A sensor's status is derived from
-its recent probe window (the last 60 probes), checked in this order:
+its most recent probes, checked in this order:
 
+- **up** — the last 2 probes both succeeded (a brand-new sensor with 1
+  successful probe reads up). Checked first, so a sensor recovering from a
+  long outage flips back to up on its 2nd good reply — it does not wait for
+  the loss window to wash out.
 - **error** — `error after` consecutive losses (4 at the default)
-- **warning** — window packet loss ≥ the sensor's loss threshold (25% at
-  the default). The spike multiplier is **informational** — shown in the
+- **warning** — packet loss over the last 8 probes ≥ the sensor's loss
+  threshold (25% at the default) — or any recent loss that is not up and
+  not error. The spike multiplier is **informational** — shown in the
   dashboard, but it never changes status.
-- **up** — anything else (a brand-new sensor with 1 successful probe reads up)
 
 - New sensors default to: interval 15s, timeout 1000ms, loss warn 25%,
   error after 4, spike 3×. New and cloned sensors start **paused** so a fresh
