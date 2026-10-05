@@ -14,6 +14,7 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sys/unix"
 )
 
 // One shared ICMP socket for the whole process.
@@ -124,7 +125,14 @@ func newDgramTransport() (*dgramTransport, error) {
 	// place and asks for a manual restart), and the socket binds to port 0, so
 	// there is no port to "reuse" — but any future subprocess would inherit a
 	// raw ICMP fd without this.
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, syscall.IPPROTO_ICMP)
+	//
+	// SOCK_NONBLOCK: the reader (readDgram) drives the socket with a bounded
+	// Poll loop that must be stoppable by Close(). A blocking fd is NOT
+	// interruptible by close() (a goroutine blocked in Recvfrom stays stuck —
+	// verified empirically), so the socket is non-blocking and the reader only
+	// Recvfrom's after Poll reports readability. Sendto is unaffected: a small
+	// ICMP datagram that fits the send buffer is written immediately.
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, syscall.IPPROTO_ICMP)
 	if err != nil {
 		return nil, err
 	}
@@ -219,6 +227,23 @@ type Engine struct {
 	// Concrete handles for the reader goroutine (exactly one is set).
 	dgramFd int
 	rawConn *icmp.PacketConn
+
+	// wg tracks the reply-reader goroutine so Close() can block until it has
+	// actually stopped. Without it, Close() returns the instant the socket
+	// closes while the reader is still unwinding — and deliver() targets the
+	// package-global pending map, so a not-fully-stopped reader is a hazard
+	// for anyone who creates/destroys engines (tests, future code). The reader
+	// exits when the socket closes (Recvfrom/ReadFrom return an error), so the
+	// wait is bounded. closeOnce guards against a double close.
+	wg        sync.WaitGroup
+	closeOnce sync.Once
+
+	// done is closed by Close() to unblock the reader's Poll loop. A
+	// non-blocking socket alone is not enough to make the reader stoppable:
+	// it must also be told to stop, and done is that signal. (Closing the fd
+	// does NOT wake a goroutine blocked in a blocking Recvfrom — verified —
+	// so the readers are Poll-based and select on done.)
+	done chan struct{}
 }
 
 // NewEngine opens the shared ICMP socket: datagram (unprivileged) first,
@@ -226,12 +251,12 @@ type Engine struct {
 // on this host at all.
 func NewEngine() (*Engine, error) {
 	if t, err := newDgramTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd}, nil
+		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{})}, nil
 	} else {
 		fmt.Fprintf(os.Stderr, "zenmon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
 	}
 	if t, err := newRawTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn}, nil
+		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{})}, nil
 	} else {
 		return nil, fmt.Errorf("icmp: cannot open socket (need root/CAP_NET_RAW or ping_group_range): %w", err)
 	}
@@ -240,11 +265,22 @@ func NewEngine() (*Engine, error) {
 // Mode reports the active transport: "unprivileged-datagram" or "raw".
 func (e *Engine) Mode() string { return e.mode }
 
-// Close releases the shared socket.
+// Close stops the engine: it signals the reader to exit (done), blocks until
+// the reader goroutine has actually stopped, then closes the socket. This
+// ordering matters — closing the socket FIRST does not reliably wake the
+// reader (a goroutine blocked in a blocking Recvfrom is NOT interrupted by
+// close(); verified empirically), so we signal via done and WAIT before
+// closing. wg.Wait() guarantees no stale reader is left delivering into the
+// package-global pending map. Safe to call when run() was never called (no
+// reader to wait for) and safe to call twice (closeOnce).
 func (e *Engine) Close() {
-	if e.closeFn != nil {
-		e.closeFn()
-	}
+	e.closeOnce.Do(func() {
+		e.closeDone()
+		e.wg.Wait()
+		if e.closeFn != nil {
+			e.closeFn()
+		}
+	})
 }
 
 // deliver hands a reply's RTT to its waiting probe (keyed by seq +
@@ -278,47 +314,83 @@ func (e *Engine) deliver(seq uint16, src net.IP) {
 	}
 }
 
-// run starts the single reply-reader goroutine for the active transport.
-func (e *Engine) run() {
-	if e.isDgram {
-		go e.readDgram()
-	} else {
-		go e.readRaw()
+// closeDone closes the stop-signal channel exactly once (nil-safe:
+// test-constructed engines that never set done are handled).
+func (e *Engine) closeDone() {
+	if e.done != nil {
+		close(e.done)
 	}
 }
 
-// readDgram is the reader for the datagram socket. The kernel strips the
-// IP header and delivers the ICMP message directly, and has already
-// demuxed by its per-socket identifier — we dispatch by seq only.
+// run starts the single reply-reader goroutine for the active transport,
+// tracked by wg so Close() can wait for it to finish.
+func (e *Engine) run() {
+	if e.done == nil {
+		e.done = make(chan struct{})
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		if e.isDgram {
+			e.readDgram()
+		} else {
+			e.readRaw()
+		}
+	}()
+}
+
+// readDgram is the reader for the datagram socket. The kernel strips the IP
+// header and demuxes by the per-socket identifier, so replies are dispatched
+// by seq only. The socket is non-blocking (SOCK_NONBLOCK, see
+// newDgramTransport) and driven with a bounded Poll loop: a ready reply wakes
+// Poll immediately (no RTT impact), and a closed done channel exits the loop
+// at the next iteration. A blocking Recvfrom here would be un-interruptible —
+// close(fd) does not wake it (verified) — which is exactly why the socket is
+// non-blocking and the loop is Poll-based.
 func (e *Engine) readDgram() {
 	buf := make([]byte, 1500)
 	for {
-		n, from, err := syscall.Recvfrom(e.dgramFd, buf, 0)
-		if err != nil {
+		// Stop signal first, every iteration — so a busy socket still exits.
+		select {
+		case <-e.done:
+			return
+		default:
+		}
+		fds := []unix.PollFd{{Fd: int32(e.dgramFd), Events: unix.POLLIN}}
+		if _, err := unix.Poll(fds, 100); err != nil {
 			return
 		}
-		if n < 8 {
-			continue
+		if fds[0].Revents&unix.POLLIN != 0 {
+			if rn, from, rerr := syscall.Recvfrom(e.dgramFd, buf, 0); rerr == nil {
+				if rn >= 8 && buf[0] == 0 { // ICMPTypeEchoReply
+					seq := binary.BigEndian.Uint16(buf[6:])
+					if sa, ok := from.(*syscall.SockaddrInet4); ok {
+						src := make(net.IP, 4)
+						copy(src, sa.Addr[:])
+						e.deliver(seq, src)
+					}
+				}
+			} else if rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
+				return // real error (e.g. socket closed)
+			}
 		}
-		if buf[0] != 0 { // ICMPTypeEchoReply
-			continue
-		}
-		seq := binary.BigEndian.Uint16(buf[6:])
-		sa, isSA := from.(*syscall.SockaddrInet4)
-		if !isSA {
-			continue
-		}
-		src := make(net.IP, 4)
-		copy(src, sa.Addr[:])
-		e.deliver(seq, src)
 	}
 }
 
 // readRaw is the reader for the raw socket: parse IP/ICMP, filter by our
 // constant ID, dispatch by seq (source-IP verified in deliver).
+//
+// The raw conn is blocking, but Close() closes the connection after the done
+// signal, which makes the pending ReadFrom return an error — so this reader
+// always terminates. The done check also gives a fast exit between reads.
 func (e *Engine) readRaw() {
 	buf := make([]byte, 1500)
 	for {
+		select {
+		case <-e.done:
+			return
+		default:
+		}
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
 			return
