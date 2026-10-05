@@ -107,6 +107,12 @@ var webhookClient = &http.Client{
 // HTTP with no local TLS certs. Public destinations must use https, because
 // an attacker on the LAN who could see a public IP's cleartext can already
 // intercept the alert anyway.
+//
+// Host forms: u.Hostname() already strips brackets and the port, so a
+// bracketed IPv6 host ([::1], [fe80::1], [::ffff:127.0.0.1]) lands here as a
+// bare address that net.ParseIP understands directly — no separate bracket
+// handling is needed. Zone identifiers ([::1%eth0]) are rejected at URL-parse
+// ("not a valid URL"), which is the safe direction.
 func validateWebhookURL(raw string) error {
 	u, err := url.ParseRequestURI(raw)
 	if err != nil {
@@ -116,20 +122,35 @@ func validateWebhookURL(raw string) error {
 	if host == "" {
 		return errors.New("must include a host")
 	}
-	if u.Scheme != "https" {
-		if u.Scheme != "http" {
-			return errors.New("must be an http:// or https:// URL")
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return errors.New("must be an http:// or https:// URL")
+	}
+	// A literal IP is judged against the blocklist FIRST, for every scheme.
+	// This is where loopback / link-local / unspecified / multicast are
+	// rejected with an accurate "blocked address" reason — up front, so a
+	// blocked literal over http is never misreported as "not RFC1918".
+	// RFC1918 / ULA literals pass the blocklist and are then gated by scheme:
+	// https anywhere, http only when private.
+	if ip := net.ParseIP(host); ip != nil {
+		if err := checkWebhookIP(ip, host); err != nil {
+			return err
 		}
-		if !httpAllowsPrivate(host) {
+		if u.Scheme == "http" && !ip.IsPrivate() {
 			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 		}
+		return nil
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return checkWebhookIP(ip, host)
-	}
+	// Hostname path. Reject mDNS / dev domains that commonly resolve to
+	// loopback or LAN addresses. This is NOT redundant with the blocklist:
+	// a .local name that mDNS-resolves to a private RFC1918 address PASSES
+	// checkWebhookIP (RFC1918 is allowed), so the suffix check is the only
+	// thing that keeps those out of the http-relay path.
 	lower := strings.ToLower(host)
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
 		return fmt.Errorf("host %q cannot be used for alerts", host)
+	}
+	if u.Scheme == "http" && !httpAllowsPrivate(host) {
+		return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 	}
 	ips, err := net.LookupIP(host)
 	if err != nil {
