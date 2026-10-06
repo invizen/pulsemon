@@ -1,9 +1,11 @@
 ## v0.1.27
 
 Closes the **silent ICMP failure mode**. When neither ICMP transport could
-open (e.g. RHEL 8's default `net.ipv4.ping_group_range` excludes the service
-uid and `CAP_NET_RAW` isn't granted), zenmon used to start the server, report
-`status: "ok"` in healthz, and simply never ping — with no error anywhere.
+open (e.g. RHEL 8's or Ubuntu 18.04's default `net.ipv4.ping_group_range`
+excludes the service uid and `CAP_NET_RAW` isn't granted — any distro with
+systemd < 244, since that's the version that ships the wide range), zenmon
+used to start the server, report `status: "ok"` in healthz, and simply never
+ping — with no error anywhere.
 The failure was only findable by noticing the *missing* `icmp_mode` key.
 Now the failure is loud, at three layers:
 
