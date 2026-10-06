@@ -27,7 +27,7 @@ var Version = "dev"
 
 // releaseBase is the GitHub releases API for this repo. It is a var (not a
 // const) so tests can point runUpdate at a local httptest server.
-var releaseBase = "https://api.github.com/repos/invizen/zenmon/releases"
+var releaseBase = "https://api.github.com/repos/invizen/pulsemon/releases"
 
 // update colors — matches the house script style (update_llama.sh).
 const (
@@ -103,7 +103,7 @@ type ghRelease struct {
 }
 
 // targetAsset is the release asset name for the platform this binary runs
-// on — "zenmon-<GOOS>-<GOARCH>" (e.g. zenmon-linux-amd64, zenmon-linux-arm64
+// on — "pulsemon-<GOOS>-<GOARCH>" (e.g. pulsemon-linux-amd64, pulsemon-linux-arm64
 // on a Pi 4/5 or RK3588). It honors $GOARCH so a host can deliberately fetch
 // a different architecture's release asset. The sidecar checksum asset is
 // targetAsset() + ".sha256" (see the fallback below).
@@ -112,19 +112,19 @@ func targetAsset() string {
 	if goarch == "" {
 		goarch = runtime.GOARCH
 	}
-	return fmt.Sprintf("zenmon-%s-%s", runtime.GOOS, goarch)
+	return fmt.Sprintf("pulsemon-%s-%s", runtime.GOOS, goarch)
 }
 
-// runUpdate implements `zenmon update`. Works from any directory: it
+// runUpdate implements `pulsemon update`. Works from any directory: it
 // locates the running binary via os.Executable, so the systemd unit and
 // Docker need no changes.
 //
-//	zenmon update          check + install if newer
-//	zenmon update check    check only, no install
-//	zenmon update v0.1.5   install a specific version
-//	zenmon update --restart install AND restart the running service
+//	pulsemon update          check + install if newer
+//	pulsemon update check    check only, no install
+//	pulsemon update v0.1.5   install a specific version
+//	pulsemon update --restart install AND restart the running service
 //
-// --restart auto-restarts ONLY when a live systemd zenmon service is
+// --restart auto-restarts ONLY when a live systemd pulsemon service is
 // confidently detected (a user-bus service, or a system-bus service when
 // running as root), then polls healthz and reports the outcome. It keeps the
 // default install-and-hint contract otherwise, because the fleet is mixed:
@@ -154,7 +154,7 @@ func runUpdate(args []string) int {
 		case "restart", "--restart":
 			restart = true
 		case "-h", "--help":
-			fmt.Println("usage: zenmon update [check|<version>] [--restart]")
+			fmt.Println("usage: pulsemon update [check|<version>] [--restart]")
 			return 0
 		default:
 			version = a
@@ -213,7 +213,7 @@ func runUpdate(args []string) int {
 	}
 
 	if checkOnly {
-		uWarn("new version available: " + rel.TagName + " (running " + Version + "). Run 'zenmon update' to install.")
+		uWarn("new version available: " + rel.TagName + " (running " + Version + "). Run 'pulsemon update' to install.")
 		return 2
 	}
 
@@ -273,14 +273,14 @@ func runUpdate(args []string) int {
 // handleRestart is the post-install restart decision, factored out of
 // runUpdate so it can be tested in isolation without touching installBinary.
 // That matters: installBinary renames the new binary over exe, and under
-// `go test` exe is the cached test binary (/tmp/go-build.../zenmon.test) —
+// `go test` exe is the cached test binary (/tmp/go-build.../pulsemon.test) —
 // so the restart tests call handleRestart directly and never enter the
 // install path (no fake payload ever lands on the test binary). Returns the
 // exit code for this stage; runUpdate returns it.
 func handleRestart(exe string, restart bool) int {
 	// Container: the binary in the running image is unchanged; a rebuild is
 	// required, not a restart.
-	if exe == "/zenmon" {
+	if exe == "/pulsemon" {
 		if restart {
 			uWarn("--restart ignored: container detected — the binary in the image is unchanged; rebuild with `docker compose up -d --build` (pulling the new release) to update.")
 		} else {
@@ -295,26 +295,26 @@ func handleRestart(exe string, restart bool) int {
 	// monitor down on its own.
 	if !restart {
 		if _, err := os.Stat("/run/systemd/system"); err == nil {
-			uInfo("restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
+			uInfo("restart with: systemctl --user restart pulsemon   (system-wide install: sudo systemctl restart pulsemon)")
 		} else {
-			uWarn("restart the zenmon process to pick up the new binary.")
+			uWarn("restart the pulsemon process to pick up the new binary.")
 		}
 		return 0
 	}
 
 	// --restart: only auto-restart when we can confidently detect a live
-	// systemd zenmon service; otherwise fall back to the hint (never guess
+	// systemd pulsemon service; otherwise fall back to the hint (never guess
 	// a restart on a mixed fleet).
 	d := detectRestart()
 	if d == "" {
 		if _, err := os.Stat("/run/systemd/system"); err == nil {
-			uInfo("no live zenmon service detected; restart with: systemctl --user restart zenmon   (system-wide install: sudo systemctl restart zenmon)")
+			uInfo("no live pulsemon service detected; restart with: systemctl --user restart pulsemon   (system-wide install: sudo systemctl restart pulsemon)")
 		} else {
-			uWarn("no live zenmon service detected; restart the zenmon process to pick up the new binary.")
+			uWarn("no live pulsemon service detected; restart the pulsemon process to pick up the new binary.")
 		}
 		return 0
 	}
-	uInfo("restarting zenmon (" + d + " service)...")
+	uInfo("restarting pulsemon (" + d + " service)...")
 	if err := performRestart(d); err != nil {
 		uErr("restart failed: " + err.Error())
 		uErr("the new binary is installed but the service did not restart — check: " + journalHint(d))
@@ -322,7 +322,7 @@ func handleRestart(exe string, restart bool) int {
 	}
 	// Poll healthz to confirm the new binary actually came up.
 	if ok, detail := waitHealthy(); ok {
-		uInfo("zenmon is up and healthy after restart (" + detail + ")")
+		uInfo("pulsemon is up and healthy after restart (" + detail + ")")
 	} else {
 		uErr("service restarted but is not answering healthz yet (" + detail + ")")
 		uErr("check: " + journalHint(d))
@@ -338,7 +338,7 @@ func handleRestart(exe string, restart bool) int {
 // fetchRelease, fetchChecksumSidecar and downloadAsset all reach
 // api.github.com (the asset-URL fallback paths included).
 func userAgent() string {
-	return "zenmon-updater/" + Version
+	return "pulsemon-updater/" + Version
 }
 
 func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
@@ -471,7 +471,7 @@ func downloadAsset(client *http.Client, url string) (string, error) {
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && ce != "identity" {
 		return "", fmt.Errorf("unexpected Content-Encoding %q from release CDN (refusing to verify compressed bytes)", ce)
 	}
-	f, err := os.CreateTemp("", "zenmon-update-*")
+	f, err := os.CreateTemp("", "pulsemon-update-*")
 	if err != nil {
 		return "", err
 	}
@@ -522,7 +522,7 @@ func installBinary(src, dst string) error {
 	}
 
 	dir := filepath.Dir(dst)
-	tmp, err := os.CreateTemp(dir, ".zenmon-swap-*")
+	tmp, err := os.CreateTemp(dir, ".pulsemon-swap-*")
 	if err != nil {
 		return err
 	}
@@ -570,7 +570,7 @@ var (
 	performRestart = func(bus string) error { return runRestart(bus) }
 )
 
-// detectRestartSystemd reports which systemd bus the live zenmon service runs
+// detectRestartSystemd reports which systemd bus the live pulsemon service runs
 // on: "user" if a user-bus service is active, "system" if a system-bus service
 // is active (root), else "" when no live service is confidently detectable.
 // It probes the USER bus first (that's how install.sh installs it) and falls
@@ -587,13 +587,13 @@ func detectRestartSystemd() string {
 	return ""
 }
 
-// systemctlActive reports whether the zenmon service is active on the given
+// systemctlActive reports whether the pulsemon service is active on the given
 // bus ("user" or "system"). `systemctl is-active` exits 0 only when active.
 // Bounded by activeTimeout: systemctl talks to dbus, and a wedged bus
-// must not stall `zenmon update --restart` — an unanswered probe is treated
+// must not stall `pulsemon update --restart` — an unanswered probe is treated
 // as "no live service" and the safe hint is printed.
 func systemctlActive(bus string) bool {
-	args := []string{"is-active", "zenmon"}
+	args := []string{"is-active", "pulsemon"}
 	if bus == "user" {
 		args = append([]string{"--user"}, args...)
 	}
@@ -605,12 +605,12 @@ func systemctlActive(bus string) bool {
 	return cmd.Run() == nil
 }
 
-// runRestart restarts the zenmon service on the given bus and waits for the
+// runRestart restarts the pulsemon service on the given bus and waits for the
 // command to return. Bounded by restartTimeout: systemctl restart can wait a
 // while for the unit to settle (a slow or stuck service), and the bound keeps
 // a wedged dbus from hanging the update indefinitely.
 func runRestart(bus string) error {
-	args := []string{"restart", "zenmon"}
+	args := []string{"restart", "pulsemon"}
 	if bus == "user" {
 		args = append([]string{"--user"}, args...)
 	}
@@ -626,12 +626,12 @@ func runRestart(bus string) error {
 // journalHint is the operator's next diagnostic step after a restart problem.
 func journalHint(bus string) string {
 	if bus == "user" {
-		return "journalctl --user -u zenmon"
+		return "journalctl --user -u pulsemon"
 	}
-	return "journalctl -u zenmon"
+	return "journalctl -u pulsemon"
 }
 
-// healthzTarget derives the host:port to healthcheck from ZENMON_ADDR, the
+// healthzTarget derives the host:port to healthcheck from PULSEMON_ADDR, the
 // same way install.sh does:
 //
 //	":9299"           -> "localhost:9299"  (all-interface bind)
@@ -639,7 +639,7 @@ func journalHint(bus string) string {
 //	"9299" (bare)     -> "localhost:9299"
 //	"" (unset)        -> "localhost:9299"  (the binary's own default)
 func healthzTarget() string {
-	addr := os.Getenv("ZENMON_ADDR")
+	addr := os.Getenv("PULSEMON_ADDR")
 	switch {
 	case addr == "":
 		return "localhost:9299"
@@ -664,7 +664,7 @@ var (
 // healthzTimeout bounds the post-restart poll. A var so tests can shrink it.
 var healthzTimeout = 15 * time.Second
 
-// waitHealthy polls the zenmon healthz endpoint until it answers a 2xx/3xx or
+// waitHealthy polls the pulsemon healthz endpoint until it answers a 2xx/3xx or
 // the timeout elapses. It returns ok plus a short detail for the log line.
 func waitHealthy() (bool, string) {
 	target := healthzTarget()

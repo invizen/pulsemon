@@ -12,25 +12,25 @@ import (
 	"time"
 )
 
-// listenAddr is the HTTP listen address. Override with ZENMON_ADDR — a full
+// listenAddr is the HTTP listen address. Override with PULSEMON_ADDR — a full
 // "host:port" (e.g. ":9299" for all interfaces on 9299, "127.0.0.1:9299" for
 // localhost only, or "10.0.0.5:9299" for a specific interface). Port 8080 was
 // the original default but is heavily claimed on homelab boxes (Traefik,
 // Pi-hole, reverse proxies); 9299 is the new default.
 func listenAddr() string {
-	if a := os.Getenv("ZENMON_ADDR"); a != "" {
+	if a := os.Getenv("PULSEMON_ADDR"); a != "" {
 		return a
 	}
 	return ":9299"
 }
 
-// dbPathFromEnv returns the database path: ZENMON_DB if set, else the
+// dbPathFromEnv returns the database path: PULSEMON_DB if set, else the
 // Docker default.
 func dbPathFromEnv() string {
-	if p := os.Getenv("ZENMON_DB"); p != "" {
+	if p := os.Getenv("PULSEMON_DB"); p != "" {
 		return p
 	}
-	return "/data/zenmon.db"
+	return "/data/pulsemon.db"
 }
 
 // dispatchKind is the outcome of dispatching os.Args.
@@ -68,17 +68,17 @@ func dispatch(args []string) dispatchKind {
 	case "-healthz", "--healthz":
 		return runHealthcheck()
 	case "-v", "-version", "--version", "version":
-		fmt.Println("zenmon", Version)
+		fmt.Println("pulsemon", Version)
 		return dExit0
 	}
-	// Anything else must be a known flag. Unknown flags (zenmon -invalid,
-	// zenmon --foo) previously fell through to a normal server start — the
+	// Anything else must be a known flag. Unknown flags (pulsemon -invalid,
+	// pulsemon --foo) previously fell through to a normal server start — the
 	// operator's typo silently booted a dashboard instead of surfacing an
 	// error.
 	if strings.HasPrefix(args[1], "-") {
-		fmt.Fprintf(os.Stderr, "zenmon: unknown flag %q\n\n", args[1])
-		fmt.Fprint(os.Stderr, "Usage:\n  zenmon            start the monitor + dashboard\n  zenmon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  zenmon -healthz     verify the store is usable (container healthcheck)\n  zenmon -version     print the build version and exit\n")
-		if os.Getenv("ZENMON_TEST_NOFATAL") == "" {
+		fmt.Fprintf(os.Stderr, "pulsemon: unknown flag %q\n\n", args[1])
+		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
+		if os.Getenv("PULSEMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
 		return dExit1

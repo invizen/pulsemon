@@ -1,4 +1,4 @@
-module zenmon
+module pulsemon
 
 go 1.26.0
 

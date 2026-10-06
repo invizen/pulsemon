@@ -46,7 +46,7 @@ const (
 // probePayload is the ICMP echo payload: a fixed human-readable identifier.
 // Its size is bounded by payloadSize (enforced in init) so the on-wire
 // echo request stays well under any MTU concern.
-var probePayload = []byte("ZENMON-PING-0123456789ABCDEF") // 28 bytes, <= payloadSize
+var probePayload = []byte("PULSEMON-PING-0123456789ABCDEF") // 28 bytes, <= payloadSize
 
 func init() {
 	// Enforce the payload cap at startup: a future edit that lengthens the
@@ -134,7 +134,7 @@ func newDgramTransport() (*dgramTransport, error) {
 	// so the raw ICMP descriptor can never leak into a subprocess's fd table.
 	// The stdlib net package sets CLOEXEC on every socket it creates; this
 	// hand-rolled syscall should match. It's defensive, not a fix for a live
-	// bug: zenmon update does not fork/exec (installBinary renames the file in
+	// bug: pulsemon update does not fork/exec (installBinary renames the file in
 	// place and asks for a manual restart), and the socket binds to port 0, so
 	// there is no port to "reuse" — but any future subprocess would inherit a
 	// raw ICMP fd without this.
@@ -278,7 +278,7 @@ func NewEngine() (*Engine, error) {
 	if t, err := newDgramTransport(); err == nil {
 		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "zenmon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
+		fmt.Fprintf(os.Stderr, "pulsemon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
 	}
 	if t, err := newRawTransport(); err == nil {
 		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{}), pollFn: unix.Poll}, nil
@@ -395,7 +395,7 @@ func (e *Engine) readDgram() {
 			// reader dies on the first interrupt and every later probe is a
 			// false loss.
 		} else if err != nil {
-			log.Printf("zenmon: icmp reader: poll: %v (reader stopping)", err)
+			log.Printf("pulsemon: icmp reader: poll: %v (reader stopping)", err)
 			return
 		}
 		if fds[0].Revents&unix.POLLIN != 0 {
@@ -412,7 +412,7 @@ func (e *Engine) readDgram() {
 				continue // defensive: the syscall layer retries EINTR, but if
 				// it ever surfaces, retry rather than kill the reader
 			} else if rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
-				log.Printf("zenmon: icmp reader: recvfrom: %v (reader stopping)", rerr)
+				log.Printf("pulsemon: icmp reader: recvfrom: %v (reader stopping)", rerr)
 				return // real error (e.g. socket closed)
 			}
 		}
@@ -438,7 +438,7 @@ func (e *Engine) readRaw() {
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
 			if err != net.ErrClosed {
-				log.Printf("zenmon: icmp reader (raw): read: %v (reader stopping)", err)
+				log.Printf("pulsemon: icmp reader (raw): read: %v (reader stopping)", err)
 			}
 			return
 		}

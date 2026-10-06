@@ -1,17 +1,17 @@
 services:
-  zenmon:
+  pulsemon:
     build: .
-    container_name: zenmon
+    container_name: pulsemon
     ports:
       - "9299:9299"
     volumes:
       - ./data:/data
     environment:
-      - ZENMON_DB=/data/zenmon.db
+      - PULSEMON_DB=/data/pulsemon.db
       - GOOGLE_CHAT_WEBHOOK_URL=${GOOGLE_CHAT_WEBHOOK_URL:-}
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "/zenmon", "-healthz"]
+      test: ["CMD", "/pulsemon", "-healthz"]
       interval: 30s
       timeout: 5s
       retries: 3

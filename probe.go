@@ -1275,9 +1275,9 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	}
 	var body map[string]string
 	if p.Kind == "discord" {
-		body = map[string]string{"content": "🟢 **zenmon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
+		body = map[string]string{"content": "🟢 **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
 	} else {
-		body = map[string]string{"text": "🟢 *zenmon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
+		body = map[string]string{"text": "🟢 *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
 	if err != nil {
@@ -1361,7 +1361,7 @@ func cardFor(state, name, target string, rttMs float64) string {
 	if state == "up" {
 		title = "recovered"
 	}
-	card := fmt.Sprintf("%s *zenmon: %s*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s**",
+	card := fmt.Sprintf("%s *pulsemon: %s*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s**",
 		icon, title, name, target, state)
 	if rttMs > 0 {
 		card += fmt.Sprintf("\n*Ping*: %d ms", int(rttMs+0.5))
@@ -1374,7 +1374,7 @@ func cardForRe(state, name, target string, rttMs float64) string {
 	if icon == "" {
 		icon = "🟢"
 	}
-	card := fmt.Sprintf("%s *zenmon: still %s (re-alert)*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s** — no change, re-notifying",
+	card := fmt.Sprintf("%s *pulsemon: still %s (re-alert)*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s** — no change, re-notifying",
 		icon, state, name, target, state)
 	if rttMs > 0 {
 		card += fmt.Sprintf("\n*Ping*: %d ms", int(rttMs+0.5))
@@ -1393,7 +1393,7 @@ func discordCard(state, name, target string, rttMs float64) string {
 	if state == "up" {
 		title = "recovered"
 	}
-	card := fmt.Sprintf("%s **zenmon: %s**\n**Sensor:** %s\n**Target:** %s\n**State:** %s", icon, title, name, target, state)
+	card := fmt.Sprintf("%s **pulsemon: %s**\n**Sensor:** %s\n**Target:** %s\n**State:** %s", icon, title, name, target, state)
 	if rttMs > 0 {
 		card += fmt.Sprintf("\n**Ping:** %d ms", int(rttMs+0.5))
 	}
@@ -1405,7 +1405,7 @@ func discordCardRe(state, name, target string, rttMs float64) string {
 	if icon == "" {
 		icon = "🟢"
 	}
-	card := fmt.Sprintf("%s **zenmon: still %s (re-alert)**\n**Sensor:** %s\n**Target:** %s\n**State:** %s — no change, re-notifying", icon, state, name, target, state)
+	card := fmt.Sprintf("%s **pulsemon: still %s (re-alert)**\n**Sensor:** %s\n**Target:** %s\n**State:** %s — no change, re-notifying", icon, state, name, target, state)
 	if rttMs > 0 {
 		card += fmt.Sprintf("\n**Ping:** %d ms", int(rttMs+0.5))
 	}

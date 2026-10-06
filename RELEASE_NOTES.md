@@ -1,9 +1,48 @@
 ## v0.1.27
 
-Closes the **silent ICMP failure mode**. When neither ICMP transport could
+### Renamed: zenmon → pulsemon
+
+The project is now **pulsemon**. Repo: `github.com/invizen/pulsemon` (the old
+`invizen/zenmon` URL 301-redirects after the GitHub rename, so existing links
+keep working). Everything user-facing moved with it:
+
+- Binary, install prefix, DB: `~/pulsemon/pulsemon`, `~/pulsemon/data/pulsemon.db`
+- Release assets: `pulsemon-linux-{amd64,arm64}` (+ `.sha256`)
+- systemd unit: `pulsemon.service` (user-level, as before)
+- Env vars: `PULSEMON_ADDR`, `PULSEMON_DB` (was `ZENMON_*`)
+- Dashboard wordmark: **pulse** in the EKG green (`#10b981`) + **mon** in
+  neutral gray (`#808080`)
+
+Existing installs are NOT auto-migrated — the v0.1.27 release notes carry a
+one-shot migration (move the dir, install the new unit, disable the old one).
+`zenmon update` on old binaries keeps working through the GitHub redirect
+until the instance is migrated.
+
+#### One-shot migration (bare / user-systemd installs)
+
+```bash
+# stop the old service, move the data (DB + binary) to the new prefix
+systemctl --user stop zenmon
+systemctl --user disable zenmon
+mv ~/zenmon ~/pulsemon
+# install the new unit (writes ~/.config/systemd/user/pulsemon.service)
+curl -sfL https://github.com/invizen/pulsemon/releases/latest/download/install.sh | bash
+# remove the stale unit + old PATH line (the installer adds the new one)
+rm -f ~/.config/systemd/user/zenmon.service
+sed -i '/zenmon: keep the zenmon binary on PATH/d' ~/.bashrc
+sed -i '/^export PATH="\$HOME\/zenmon:/d' ~/.bashrc
+systemctl --user daemon-reload
+```
+
+Docker installs: just point `compose.yaml` at the new image name; the data
+volume carries over unchanged.
+
+### Closes the **silent ICMP failure mode**
+
+When neither ICMP transport could
 open (e.g. RHEL 8's or Ubuntu 18.04's default `net.ipv4.ping_group_range`
 excludes the service uid and `CAP_NET_RAW` isn't granted — any distro with
-systemd < 244, since that's the version that ships the wide range), zenmon
+systemd < 244, since that's the version that ships the wide range), pulsemon
 used to start the server, report `status: "ok"` in healthz, and simply never
 ping — with no error anywhere.
 The failure was only findable by noticing the *missing* `icmp_mode` key.
@@ -13,7 +52,7 @@ Now the failure is loud, at three layers:
 
 Before installing, the script reads `net.ipv4.ping_group_range` and checks
 whether the installer's gid falls inside it. If not, it prints the exact
-remediation (`sysctl` + the persistent `/etc/sysctl.d/90-zenmon-ping.conf`)
+remediation (`sysctl` + the persistent `/etc/sysctl.d/90-pulsemon-ping.conf`)
 and, on an interactive terminal, asks before continuing (non-interactive
 installs continue but flag that the dashboard will warn). Background: the
 kernel default is `1 0` (nobody may ping); systemd ≥ 244 — RHEL 9+, Fedora,
@@ -28,8 +67,8 @@ When the shared ICMP engine fails to open (both transports), `GET
 ```json
 {"status": "degraded", "icmp_mode": "unavailable", "icmp_hint": "ICMP socket
 unavailable: ... Fix: sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\"
-(persist via /etc/sysctl.d/90-zenmon-ping.conf) and restart zenmon — or grant
-CAP_NET_RAW. See `journalctl -u zenmon` for the exact error.", ...}
+(persist via /etc/sysctl.d/90-pulsemon-ping.conf) and restart pulsemon — or grant
+CAP_NET_RAW. See `journalctl -u pulsemon` for the exact error.", ...}
 ```
 
 instead of the previous `status: "ok"` with no `icmp_mode` key. The engine is
@@ -56,20 +95,20 @@ correctness fixes to probe status, sensor editing, fresh installs, target
 validation, and the "Echo Now" diagnostic. No change to how a normal probe
 tick works on a healthy install.
 
-### New: `zenmon update --restart`
+### New: `pulsemon update --restart`
 
 The self-updater now optionally restarts the running service for you. By
-default `zenmon update` keeps its install-and-hint contract (swap the binary,
+default `pulsemon update` keeps its install-and-hint contract (swap the binary,
 print the restart command) because the fleet is mixed — containers, root
 installs, and non-systemd hosts are safer told how to restart than
 auto-restarted (a bad new version would otherwise take the monitor down).
 With `--restart`:
 
 ```
-zenmon update --restart
+pulsemon update --restart
 ```
 
-it first confirms a **live** systemd `zenmon` service via `systemctl is-active`
+it first confirms a **live** systemd `pulsemon` service via `systemctl is-active`
 (user bus, or system bus when running as root), restarts on the correct bus,
 then polls `healthz` and reports the outcome — exit 1 if the service fails to
 come up healthy. Both `systemctl` calls are bounded (10s is-active / 60s
@@ -214,27 +253,27 @@ thing keeping those out of the http-relay path.
 
 ## v0.1.24
 
-First multi-architecture release: zenmon now ships for **linux/amd64 and
+First multi-architecture release: pulsemon now ships for **linux/amd64 and
 linux/arm64**, so the self-updater, the `install.sh` installer, and the Docker
 image all work on ARM SBCs and single-board computers (Jetson, Raspberry Pi,
-RK3588) as well as x86_64. Nine `zenmon update` hardening fixes ship
+RK3588) as well as x86_64. Nine `pulsemon update` hardening fixes ship
 alongside. No change to probe behavior or status logic.
 
 ### New: linux/arm64 release asset
 
-The release now publishes a static, stripped `zenmon-linux-arm64` (with its
-`.sha256` sidecar) next to the existing `zenmon-linux-amd64`. `zenmon update`
-resolves the asset for the platform it runs on (`zenmon-<GOOS>-<GOARCH>`), and
+The release now publishes a static, stripped `pulsemon-linux-arm64` (with its
+`.sha256` sidecar) next to the existing `pulsemon-linux-amd64`. `pulsemon update`
+resolves the asset for the platform it runs on (`pulsemon-<GOOS>-<GOARCH>`), and
 `install.sh` picks the matching binary from the host's `uname -m`. The Docker
 image is multi-arch (`TARGETARCH`), so `docker compose up -d --build` builds
 for the host it runs on.
 
-> **Note:** `zenmon update` on an ARM box now looks for
-> `zenmon-linux-arm64`. Until this release's arm64 asset is published, an ARM
-> host correctly refuses with `release has no zenmon-linux-arm64 asset` —
+> **Note:** `pulsemon update` on an ARM box now looks for
+> `pulsemon-linux-arm64`. Until this release's arm64 asset is published, an ARM
+> host correctly refuses with `release has no pulsemon-linux-arm64 asset` —
 > install v0.1.24+ via `install.sh`, which now ships the arm64 binary.
 
-### Fix: `zenmon update` no longer leaks the downloaded binary
+### Fix: `pulsemon update` no longer leaks the downloaded binary
 
 `runUpdate` returned an exit code to `main()` instead of calling `os.Exit`
 directly. `os.Exit` skips deferred functions, so every failed verification,
@@ -258,7 +297,7 @@ sidecar is now looked up directly in the release's asset list by name.
 
 ### Fix: release asset name follows the running platform
 
-The asset name was hardcoded to `zenmon-linux-amd64`. It is now derived from
+The asset name was hardcoded to `pulsemon-linux-amd64`. It is now derived from
 `runtime.GOOS`/`GOARCH` (honoring `$GOARCH`), so the updater targets the right
 binary on every platform. Asset/sidecar/digest selection moved into a small
 testable `selectAssets()` helper.
@@ -272,7 +311,7 @@ and keeps the `os.Executable()` path.
 
 ### Fix: `--check` respects version ordering for explicit pins
 
-`zenmon update check v0.1.5` while running v0.1.16 reported "new version
+`pulsemon update check v0.1.5` while running v0.1.16 reported "new version
 available: v0.1.5" and exited 2 — the version-ordering check was gated on
 the target being `latest`, so an explicit pin skipped it. An older pin must
 read "target version … is not newer" and exit 0, so automation can't treat a
@@ -290,7 +329,7 @@ instead of skipping.
 ### Fix: app-specific User-Agent on all GitHub API requests
 
 The releases lookup, sidecar download, and asset download now send
-`User-Agent: zenmon-updater/<version>` instead of the Go stdlib default.
+`User-Agent: pulsemon-updater/<version>` instead of the Go stdlib default.
 GitHub's API guidelines require a custom User-Agent; generic clients are
 throttled or 403'd far more aggressively.
 

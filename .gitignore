@@ -8,8 +8,8 @@ data/
 .env
 
 # build artifacts
-zenmon
-zenmon-bin
+pulsemon
+pulsemon-bin
 pingmon
 bin/
 

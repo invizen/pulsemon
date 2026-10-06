@@ -22,7 +22,7 @@ import (
 //  1. No redirects. The default http.Client follows 302s, which is an SSRF
 //     pivot: the save-time check requires https://, but a public URL that
 //     redirects to http://169.254.169.254/ (cloud metadata) or an internal
-//     admin console would get zenmon's egress for free. Real webhook
+//     admin console would get pulsemon's egress for free. Real webhook
 //     endpoints (Google Chat, ntfy, …) don't redirect — a redirect is
 //     reported to the caller instead of followed.
 //  2. 10s timeout. The default client has none; a hung endpoint would

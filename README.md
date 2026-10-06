@@ -1,4 +1,4 @@
-# zenmon
+# pulsemon
 
 A single-container ICMP network sensor monitor for your homelab. One Go binary,
 one SQLite file, one dark dashboard — built to replace Uptime Kuma with
@@ -6,7 +6,7 @@ something that pings exactly what you care about and says nothing until
 something changes.
 
 ```
-zenmon
+pulsemon
 ```
 
 ## Features
@@ -31,12 +31,12 @@ zenmon
 ## Requirements
 
 - Docker (with Compose v2)
-- Port 9299 free on the host (change in `compose.yaml`, or set `ZENMON_ADDR`)
+- Port 9299 free on the host (change in `compose.yaml`, or set `PULSEMON_ADDR`)
 
 ## Quick start
 
 ```bash
-git clone https://github.com/invizen/zenmon zenmon && cd zenmon
+git clone https://github.com/invizen/pulsemon pulsemon && cd pulsemon
 cp .env.example .env          # optional: put a Google Chat webhook URL in .env
 chmod 600 .env
 mkdir -p data && chmod 0777 data  # pre-create the data dir (see note below)
@@ -46,7 +46,7 @@ docker compose up -d --build
 Open http://localhost:9299 and add sensors from the **new sensor** button.
 
 > **First boot:** the database is created automatically on first run
-> (`data/zenmon.db`). Two demo sensors (`router`, `server`) are seeded
+> (`data/pulsemon.db`). Two demo sensors (`router`, `server`) are seeded
 > automatically — paused, targeting `127.0.0.1` — because not every host
 > has a router or server on the same network; edit their targets (or
 > delete them) and resume. Seeding runs only on an empty database.
@@ -61,39 +61,39 @@ Open http://localhost:9299 and add sensors from the **new sensor** button.
 ## Bare install (no Docker, user-level systemd)
 
 ```bash
-curl -sfL https://github.com/invizen/zenmon/releases/latest/download/install.sh -o /tmp/zenmon-install.sh
-bash /tmp/zenmon-install.sh              # latest release, or: bash /tmp/zenmon-install.sh v0.1.7
+curl -sfL https://github.com/invizen/pulsemon/releases/latest/download/install.sh -o /tmp/pulsemon-install.sh
+bash /tmp/pulsemon-install.sh              # latest release, or: bash /tmp/pulsemon-install.sh v0.1.7
 ```
 
 The installer (no sudo required) downloads and **SHA-256-verifies** the
-release binary, installs it to `~/zenmon/`, writes a user-level
-`zenmon.service` (pointing at `~/zenmon/data/zenmon.db` via `ZENMON_DB`),
-adds `~/zenmon` to `PATH` in `~/.bashrc` (guarded — re-running never
+release binary, installs it to `~/pulsemon/`, writes a user-level
+`pulsemon.service` (pointing at `~/pulsemon/data/pulsemon.db` via `PULSEMON_DB`),
+adds `~/pulsemon` to `PATH` in `~/.bashrc` (guarded — re-running never
 duplicates the line), and enables + starts the service. It tries
-`sudo -n loginctl enable-linger` so zenmon keeps running after you log out;
+`sudo -n loginctl enable-linger` so pulsemon keeps running after you log out;
 if that needs a password it tells you the one command to run.
 
 ```bash
-zenmon update            # self-update from any directory (v0.1.6+)
-zenmon update --restart  # install AND restart the running service, then verify healthz
-zenmon update check      # check only — exit 2 when a newer release exists
-zenmon update v0.1.7     # pin or roll back to a specific version
+pulsemon update            # self-update from any directory (v0.1.6+)
+pulsemon update --restart  # install AND restart the running service, then verify healthz
+pulsemon update check      # check only — exit 2 when a newer release exists
+pulsemon update v0.1.7     # pin or roll back to a specific version
 ```
 
-`zenmon update` finds the running binary itself (`os.Executable`), verifies
+`pulsemon update` finds the running binary itself (`os.Executable`), verifies
 the published SHA-256, and swaps it atomically — then prints the restart
-command. After it runs: `systemctl --user restart zenmon`.
+command. After it runs: `systemctl --user restart pulsemon`.
 `--restart` does that for you: it auto-restarts only when a live systemd
-`zenmon` service is confidently detected (user bus, or system bus when
+`pulsemon` service is confidently detected (user bus, or system bus when
 running as root), then polls healthz and reports the outcome — so a
 container or non-systemd host still just gets the restart hint (a bad new
 version would otherwise take the monitor down).
 
 ## ICMP & privileges
 
-zenmon opens a single shared ICMP socket and dispatches replies by sequence
+pulsemon opens a single shared ICMP socket and dispatches replies by sequence
 number (so RTTs stay accurate when many sensors probe at once). On Linux there
-are two ways to send ICMP, and zenmon tries them in order at startup:
+are two ways to send ICMP, and pulsemon tries them in order at startup:
 
 1. **Datagram ping socket** (`socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP)`) —
    preferred. This is the socket the `ping` binary uses as an ordinary user.
@@ -101,7 +101,7 @@ are two ways to send ICMP, and zenmon tries them in order at startup:
    fall inside `net.ipv4.ping_group_range` (check with
    `sysctl net.ipv4.ping_group_range`). On Linux the kernel overwrites the
    ICMP identifier with a per-socket value and delivers only that socket's
-   replies, so zenmon dispatches by sequence + source IP on this path.
+   replies, so pulsemon dispatches by sequence + source IP on this path.
 2. **Raw socket** (`SOCK_RAW` + `IPPROTO_ICMP`) via
    `icmp.ListenPacket("ip4:icmp", …)` — fallback. It requires **root or
    `CAP_NET_RAW`**, regardless of `ping_group_range`. Used automatically when
@@ -125,7 +125,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | Where | What |
 |---|---|
 | `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
-| env | `ZENMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
+| env | `PULSEMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
 | Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode |
 | Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
 
@@ -186,8 +186,8 @@ GET    /api/healthz                liveness
 ## Building without Docker
 
 ```bash
-go build -o zenmon .
-ZENMON_DB=./data/zenmon.db ./zenmon
+go build -o pulsemon .
+PULSEMON_DB=./data/pulsemon.db ./pulsemon
 ```
 
 ## Project layout

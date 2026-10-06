@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>zenmon</title>
+<title>pulsemon</title>
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
 <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
@@ -47,8 +47,8 @@ tailwind.config = {
       </div>
       <div>
         <div class="flex items-center gap-2">
-          <span class="font-bold tracking-tight"><span class="text-[#98a1b0]">zen</span><span class="text-[#f02020]">mon</span></span>
-          <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="zenmon version">v…</span>
+          <span class="font-bold tracking-tight"><span class="text-[#10b981]">pulse</span><span class="text-[#808080]">mon</span></span>
+          <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="pulsemon version">v…</span>
         </div>
         <p class="text-[11px] text-slate-500 hidden sm:block">network sensor monitor</p>
       </div>
@@ -262,7 +262,7 @@ tailwind.config = {
       </div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
-      <span class="text-[11px] text-slate-500 font-mono">stored in the zenmon database</span>
+      <span class="text-[11px] text-slate-500 font-mono">stored in the pulsemon database</span>
       <div class="flex gap-2">
         <button onclick="closeSettings()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Close</button>
         <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save</button>
@@ -336,7 +336,7 @@ tailwind.config = {
 <script>
 let SENSORS = [], EVENTS = [], SETTINGS = {};
 let activeTags = new Set(), searchQ = '', inspectId = null, graphRange = '1h';
-let viewMode = localStorage.getItem('zenmon_view') || 'cards';
+let viewMode = localStorage.getItem('pulsemon_view') || 'cards';
 
 const $ = id => document.getElementById(id);
 
@@ -556,7 +556,7 @@ async function clearActivity() {
 
 function setViewMode(m) {
   viewMode = m;
-  localStorage.setItem('zenmon_view', m);
+  localStorage.setItem('pulsemon_view', m);
   $('view-cards-btn').className = 'p-1.5 rounded ' + (m === 'cards' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
   $('view-table-btn').className = 'p-1.5 rounded ' + (m === 'table' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
   render();
