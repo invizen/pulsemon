@@ -46,8 +46,10 @@ docker compose up -d --build
 Open http://localhost:9299 and add sensors from the **new sensor** button.
 
 > **First boot:** the database is created automatically on first run
-> (`data/zenmon.db`). If you want seeded example sensors, see `db.go`
-> (`seedSensors`) — it runs only on an empty database.
+> (`data/zenmon.db`). Two demo sensors (`router`, `server`) are seeded
+> automatically — paused, targeting `127.0.0.1` — because not every host
+> has a router or server on the same network; edit their targets (or
+> delete them) and resume. Seeding runs only on an empty database.
 >
 > **Why pre-create `data/`?** The container runs as uid 1000 (unprivileged).
 > If the bind-mount source doesn't exist, Docker creates it **root-owned**

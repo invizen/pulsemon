@@ -366,17 +366,26 @@ func (db *DB) SeedSensors() error {
 		return nil
 	}
 
+	// Fresh-install demo sensors. Tuning matches the UI-created defaults in
+	// the API (POST /api/sensors: 15s / 1000ms / 25% / 4) so a seeded
+	// sensor and a dashboard-created one behave identically. They start
+	// PAUSED — like UI-created sensors — because the targets are
+	// environment-independent placeholders (127.0.0.1: not every host runs
+	// a router or a server on 192.168.1.x, and a wrong active target would
+	// fire down alerts on day one). The user edits the targets and resumes.
+	// spike_mult is written explicitly so the seed row matches the UI
+	// default (3) rather than the schema column default (5).
 	sensors := []struct {
 		name, target, tags string
 	}{
-		{"router", "192.168.1.1", "Networking"},
-		{"server", "192.168.1.10", "Servers"},
+		{"router", "127.0.0.1", "Networking"},
+		{"server", "127.0.0.1", "Servers"},
 	}
 
 	for _, s := range sensors {
 		if _, err := db.Exec(`
-			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at)
-			VALUES (?, ?, ?, 5, 2000, 5, 3, 'active', 'up', ?)`,
+			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+			VALUES (?, ?, ?, 15, 1000, 25, 4, 3, 'paused', 'up', ?)`,
 			s.name, s.name, s.target, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}
