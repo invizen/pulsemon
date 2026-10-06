@@ -21,6 +21,17 @@ import (
 type ProbeState struct {
 	id       string
 	isPaused bool
+	// lastStatus is the most recently derived status for this sensor
+	// (maintained by doProbe). It drives the fast-recovery rule: a sensor
+	// recovering from ERROR flips back to up on a single good probe, even
+	// though a flapping (loss/up/loss/up) sensor that was in WARNING does
+	// not. deriveStatus reads it; doProbe writes it after each probe.
+	lastStatus string
+	// fastRetry is true while the sensor's status is ERROR: the probe loop
+	// re-checks it on the shortened cadence (errorRetryInterval, 30s) until
+	// a probe brings it back to up, then reverts to the configured interval.
+	// Maintained by doProbe, read by sensorLoop under pw.mu.
+	fastRetry bool
 }
 
 // probeEntry is one probe in the in-memory stats series: its UTC epoch second
@@ -675,19 +686,24 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 		phase += 250 * time.Millisecond // never probe in the first instant
 	}
 
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	// First probe after the staggered phase; subsequent probes every interval.
-	first := time.NewTimer(phase)
-	defer first.Stop()
+	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
+	// ERROR is re-checked on the fast-retry cadence (errorRetryInterval,
+	// capped at the configured interval so it is never FASTER than normal —
+	// a 15s-interval sensor keeps its 15s during error, a 60s sensor
+	// re-checks every 30s) until a probe brings it back to up, then reverts
+	// to the configured interval. The 10s floor makes a ping-storm
+	// impossible: even if every sensor errors at once, total load is at
+	// most 2x the normal load, and each sensor keeps its staggered phase
+	// (no re-synchronization into a burst).
+	timer := time.NewTimer(phase)
+	defer timer.Stop()
+	var nextDelay time.Duration
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-first.C:
-		case <-ticker.C:
+		case <-timer.C:
 		}
 		pw.mu.Lock()
 		ps, ok := pw.sensors[c.id]
@@ -696,12 +712,29 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 			return
 		}
 		paused := ps.isPaused
+		fast := ps.fastRetry
 		pw.mu.Unlock()
 
 		if paused {
-			continue // paused = no packets, no rows, no alerts
+			// Paused: hold the full interval (no packets, no rows, no
+			// alerts) — a paused sensor is not being watched.
+			nextDelay = interval
+		} else if fast {
+			nextDelay = errorRetryInterval
+			if nextDelay > interval {
+				nextDelay = interval // never faster than the user's pace
+			}
+			if nextDelay < 10*time.Second {
+				nextDelay = 10 * time.Second // floor: no ping-storm loops
+			}
+		} else {
+			nextDelay = interval
 		}
-		pw.doProbe(c)
+		timer.Reset(nextDelay)
+
+		if !paused {
+			pw.doProbe(c)
+		}
 	}
 }
 
@@ -797,12 +830,26 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	}
 	pw.recordProbe(c.id, probeEntry{ts: now.Unix(), rtt: rttPtr})
 
-	newStatus := pw.deriveStatus(c)
-
+	// Read the current status BEFORE deriving the new one: deriveStatus's
+	// fast-recovery rule needs to know whether the sensor was in ERROR (one
+	// good probe then flips it up) vs WARNING (it must have 2 straight good
+	// probes). The DB is the source of truth (survives restarts).
 	var oldStatus string
 	if err := pw.db.QueryRow("SELECT status FROM sensors WHERE id = ?", c.id).Scan(&oldStatus); err != nil {
 		return
 	}
+
+	newStatus := pw.deriveStatus(c, oldStatus)
+
+	// Keep the in-memory lastStatus + fastRetry flag in lockstep so the
+	// sensorLoop can pick the next-tick cadence without a DB read.
+	pw.mu.Lock()
+	if ps, ok := pw.sensors[c.id]; ok {
+		ps.lastStatus = newStatus
+		ps.fastRetry = newStatus == "error"
+	}
+	pw.mu.Unlock()
+
 	if newStatus == oldStatus {
 		// No transition: a sustained ERROR may be due for a re-alert.
 		// Warning is never re-alerted (loss flapping is dashboard noise).
@@ -965,6 +1012,14 @@ func parseTSForRealert(ts string) (time.Time, error) {
 	return time.Parse(time.RFC3339Nano, ts)
 }
 
+// errorRetryInterval is the probe cadence for a sensor while its status is
+// ERROR: re-check every 30s until a probe brings it back to up, then revert
+// to the sensor's configured interval. It is capped at the configured
+// interval (a sensor polling faster than 30s already re-checks at least as
+// often) and floored at 10s, so the fast path is never faster than the
+// normal one and a total-outage scenario is bounded to ~2x normal load.
+const errorRetryInterval = 30 * time.Second
+
 // statusWindow is the probe count used for loss% detection. It must also be
 // >= down_after (the API allows down_after down to 1; the window read takes
 // the max) so the consecutive-loss test always has enough history. At the
@@ -975,28 +1030,29 @@ const statusWindow = 8
 // Status is derived from the sensor's most recent probes with fixed
 // precedence:
 //
-//	up        — the newest 2 probes both succeeded (a sensor with only one
-//	            probe is up if that probe succeeded). This is checked FIRST:
-//	            a recovered sensor must read up after 2 good probes even if
-//	            the recent window still shows high loss (a long outage
-//	            otherwise pins it in warning for a full window-washout —
-//	            an hour at the old 60-probe window).
+//	up        — the newest probe succeeded AND the sensor is either
+//	            recovering from ERROR (lastStatus == "error" — one good
+//	            reply is enough to prove it's back) or the probe before it
+//	            also succeeded (steady state / brand-new sensor). A flapping
+//	            sensor in WARNING (loss, success, loss, success…) reads
+//	            warning, not up — one good probe amid ongoing loss is not
+//	            "recovered", and error+1-success would make a flapping link
+//	            oscillate up/error every cycle.
 //	error     — `down_after` consecutive losses from the newest probe
 //	warning   — window loss% (last `statusWindow` probes) >= loss_warn
 //	fallback  — warning (a loss is in the recent window but it's not
-//	            error and the newest 2 aren't both up)
+//	            error and the up rule doesn't hold)
 //
-// Consequence of the up-first ordering: a sensor whose newest 2 probes both
-// succeeded reads up even at a high window loss% (e.g. alternating loss —
-// up, lost, up). Sustained loss where the newest 2 include a loss reads
-// warning, so the dashboard still shows degraded sensors; only a genuinely
-// recovered sensor (2 straight replies) clears.
+// Consequence of the up-first ordering: a sensor back from a long outage
+// reads up on its FIRST good probe (fast recovery — it was already
+// confirmed down, one reply is sufficient proof of return), while a sensor
+// merely losing packets reads warning until it has 2 straight good probes.
 //
 // The window read is max(statusWindow, down_after) rows so that a sensor
 // configured with down_after > statusWindow still has enough history for the
 // consecutive-loss test. A probe-level ICMP error (broken socket) forces
 // warning so a dead probe path never reads as "up".
-func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
+func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// Broken probe path (e.g. ICMP socket cannot be created): probes never
 	// land, so we cannot know the real state — flag warning, never up.
 	if probeErrCount.Load() > c.lastErrCount {
@@ -1034,12 +1090,14 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 		return "up" // no data yet
 	}
 
-	// UP (highest precedence): the newest 2 probes both succeeded. With only
-	// one probe recorded, a single success is enough (new-sensor grace).
-	// Checked before error/warning so recovery is immediate — a sensor back
-	// from an hour-long outage reads up on its 2nd good probe, not after
-	// the window washes out.
-	if recent[0] != nil && (len(recent) == 1 || recent[1] != nil) {
+	// UP (highest precedence): the newest probe succeeded, and the sensor is
+	// either recovering from ERROR (fast recovery — one good reply is enough
+	// once it was confirmed down) or the previous probe also succeeded (2
+	// straight = steady up; with only one probe recorded, a single success
+	// is enough — new-sensor grace). Checked before error/warning so
+	// recovery is immediate, but a flapping sensor in WARNING (newest
+	// success, 2nd-newest loss, lastStatus=warning) does NOT read up.
+	if recent[0] != nil && (lastStatus == "error" || len(recent) == 1 || recent[1] != nil) {
 		return "up"
 	}
 

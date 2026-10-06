@@ -385,7 +385,7 @@ func (db *DB) SeedSensors() error {
 	for _, s := range sensors {
 		if _, err := db.Exec(`
 			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-			VALUES (?, ?, ?, 15, 1000, 25, 4, 3, 'paused', 'up', ?)`,
+			VALUES (?, ?, ?, 60, 1000, 25, 2, 3, 'paused', 'up', ?)`,
 			s.name, s.name, s.target, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return err
 		}

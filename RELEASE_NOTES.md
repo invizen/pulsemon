@@ -37,6 +37,36 @@ systemctl --user daemon-reload
 Docker installs: just point `compose.yaml` at the new image name; the data
 volume carries over unchanged.
 
+### Probe tuning: 60s default, faster error recovery
+
+Three behavior changes around how a sensor is watched when it fails:
+
+- **Default interval 60s** (was 15s) for new sensors, the fresh-install seed
+  sensors, and the dashboard form — one less DB write / ping on a healthy
+  install; per-sensor intervals are untouched.
+- **Default "error after" = 2** consecutive losses (was 4): with the 60s
+  interval, a dead target was previously confirmed down after ~4 minutes;
+  now after ~2 minutes. The fast re-check below closes the recovery side of
+  the same gap.
+- **Fast re-check in error:** while a sensor's status is **error** it is
+  probed every **30s** instead of the configured interval, until a probe
+  brings it back to up — then it reverts to the configured interval. If the
+  sensor's interval is already shorter than 30s, the error state keeps the
+  sensor's own pace (it never polls faster than normal).
+- **Error → up on 1 successful ping:** a sensor recovering from **error**
+  flips back to up on a single good probe, instead of waiting for 2
+  straight good replies. A flapping sensor in **warning** is unaffected:
+  loss/up/loss/up still reads warning (one good reply amid ongoing loss is
+  not "recovered" — and up↔warning never alerts anyway, so there is no new
+  alert noise).
+
+**No ping storms.** The fast cadence is capped at the configured interval
+(never faster than normal) and floored at 10s, so worst case — every sensor
+errors at once (total outage) — total probe load is bounded to ~2× the
+normal load, spread evenly: each sensor keeps its staggered probe phase, so
+they do not re-synchronize into a burst. Each sensor loop owns its own
+timer; one slow sensor can't delay another.
+
 ### Closes the **silent ICMP failure mode**
 
 When neither ICMP transport could
@@ -85,7 +115,10 @@ The existing warning banner now fires on `icmp_hint` (before the generic
 ### Verified
 
 - `go test` — full suite green, including the new `TestHealthzIcmpMode`
-  (dead → degraded/unavailable/hint; unprivileged-datagram → ok; raw → ok).
+  (dead → degraded/unavailable/hint; unprivileged-datagram → ok; raw → ok),
+  and the extended `TestDeriveStatus` cases (error→up on one success;
+  warning flapping stays warning; still-down stays error; DB-error path
+  unchanged).
 - Live container matrix on zentest: RHEL-8-like netns (range `1 0`, no caps)
   → degraded + hint; wide range → ok; raw-socket-possible → ok.
 ## v0.1.26

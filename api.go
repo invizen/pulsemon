@@ -240,7 +240,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Tags = cleanTags(req.Tags)
 		if req.IntervalS <= 0 {
-			req.IntervalS = 15
+			req.IntervalS = 60
 		}
 		if req.IntervalS < 1 || req.IntervalS > 3600 {
 			respondWithError(w, http.StatusBadRequest, "interval_s must be 1-3600")
@@ -257,7 +257,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			req.LossWarn = 25
 		}
 		if req.DownAfter <= 0 {
-			req.DownAfter = 4
+			req.DownAfter = 2
 		}
 		if req.SpikeMult <= 0 {
 			req.SpikeMult = 3

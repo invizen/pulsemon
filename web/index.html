@@ -185,7 +185,7 @@ tailwind.config = {
       </label>
       <div class="grid grid-cols-5 gap-3">
         <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
-          <input id="f-interval" type="number" min="1" max="3600" value="15" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
           <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
@@ -194,7 +194,7 @@ tailwind.config = {
           <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Error after
-          <input id="f-down" type="number" min="1" max="30" value="4" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-down" type="number" min="1" max="30" value="2" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
           <input id="f-spike" type="number" min="2" max="10" value="3" title="Informational — shown in the dashboard. Does not change status." class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
@@ -693,7 +693,7 @@ function openSensorModal(id) {
     $('modal-title').textContent = 'New sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
     renderFormTags([]);
-    $('f-interval').value = 15; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 4; $('f-spike').value = 3;
+    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2; $('f-spike').value = 3;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);

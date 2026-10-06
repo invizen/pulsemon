@@ -134,19 +134,28 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 Statuses are `up`, `warning`, and `error`. A sensor's status is derived from
 its most recent probes, checked in this order:
 
-- **up** — the last 2 probes both succeeded (a brand-new sensor with 1
-  successful probe reads up). Checked first, so a sensor recovering from a
-  long outage flips back to up on its 2nd good reply — it does not wait for
-  the loss window to wash out.
-- **error** — `error after` consecutive losses (4 at the default)
+- **up** — the last 2 probes both succeeded; **or** a sensor recovering
+  from **error** whose newest probe succeeded (error → up on a single good
+  reply). A brand-new sensor with 1 successful probe reads up. Checked
+  first, so a sensor recovering from a long outage flips back quickly — it
+  does not wait for the loss window to wash out.
+- **error** — `error after` consecutive losses (2 at the default)
 - **warning** — packet loss over the last 8 probes ≥ the sensor's loss
   threshold (25% at the default) — or any recent loss that is not up and
-  not error. The spike multiplier is **informational** — shown in the
-  dashboard, but it never changes status.
+  not error. A flapping sensor (loss/up/loss/up) that was in warning stays
+  in warning — one good probe amid ongoing loss is not "recovered". The
+  spike multiplier is **informational** — shown in the dashboard, but it
+  never changes status.
 
-- New sensors default to: interval 15s, timeout 1000ms, loss warn 25%,
-  error after 4, spike 3×. New and cloned sensors start **paused** so a fresh
+- New sensors default to: interval 60s, timeout 1000ms, loss warn 25%,
+  error after 2, spike 3×. New and cloned sensors start **paused** so a fresh
   target can't fire alerts before you review it — resume it from the dashboard.
+- **Fast re-check in error:** while a sensor's status is error it is probed
+  every **30s** instead of the configured interval, until a probe brings it
+  back to up, then it reverts to the configured interval. If the sensor's
+  interval is already shorter than 30s, the error state keeps the sensor's
+  own pace (it never polls faster than normal), so a total outage with many
+  sensors down is bounded to ~2× the normal probe load — no ping storms.
 - Alerts fire on **error transitions**: up → error, warning → error, and
   recovery (→ up). **Warning transitions (up ↔ warning) never alert** — loss
   flapping is shown in the dashboard, not pushed to you.
