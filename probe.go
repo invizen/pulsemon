@@ -720,6 +720,57 @@ func fnvHash(b []byte) uint64 {
 	return h
 }
 
+// pingNowTimeout bounds the "Echo Now" manual probe. It is a fixed 1s,
+// independent of the sensor's configured timeout: a manual echo is a quick
+// diagnostic, not a scheduled probe, so it shouldn't wait out a long
+// configured timeout. It is a var (like the other bounded call sites) so a
+// test can shorten it.
+var pingNowTimeout = time.Second
+
+// pingNow is the probe the "Echo Now" path issues. A var (not a direct
+// pingHost call) so a test can stub it and assert the timeout without
+// opening a real ICMP socket.
+var pingNow = func(target string, timeout time.Duration) PingResult {
+	return pingHost(target, timeout)
+}
+
+// PingNow performs one immediate "Echo Now" probe and RECORDS it: the row
+// lands in probes (history + dashboard sparkline) and the in-memory stats
+// cache, exactly as a scheduled tick would — but it deliberately does NOT
+// derive a status, write a transition event, or fire an alert. A manual
+// echo is a diagnostic: recording it keeps the history honest (the user saw
+// a real RTT / loss at that instant), while keeping status and alerts driven
+// only by the scheduled probe loop (a single manual probe must not flip a
+// healthy sensor to error or fire a recovery webhook). Works while paused
+// (SPEC §2).
+func (pw *ProbeWorker) PingNow(id string) (PingResult, error) {
+	var target string
+	if err := pw.db.QueryRow("SELECT target FROM sensors WHERE id = ?", id).Scan(&target); err != nil {
+		return PingResult{}, err // sql.ErrNoRows for an unknown sensor
+	}
+
+	res := pingNow(target, pingNowTimeout)
+
+	var rttVal interface{}
+	if !res.Lost {
+		rttVal = res.RTT.Seconds() * 1000
+	}
+	now := time.Now().UTC()
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)",
+		id, now.Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
+		return res, fmt.Errorf("record echo probe: %w", err)
+	}
+	// Keep the in-memory stats cache in lockstep with the DB row (the same
+	// lockstep doProbe maintains), so the dashboard reflects the echo.
+	var rttPtr *float64
+	if !res.Lost {
+		v := res.RTT.Seconds() * 1000
+		rttPtr = &v
+	}
+	pw.recordProbe(id, probeEntry{ts: now.Unix(), rtt: rttPtr})
+	return res, nil
+}
+
 func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	c.lastErrCount = probeErrCount.Load()
 	res := pingHost(c.target, time.Duration(c.timeoutMS)*time.Millisecond)

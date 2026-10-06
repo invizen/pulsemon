@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -463,8 +464,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleSensorPing performs one immediate probe ("Echo Now"). Works while paused
-// (SPEC §2) — the result is NOT recorded in history; it is diagnostic only.
+// handleSensorPing performs one immediate probe ("Echo Now"). Works while
+// paused (SPEC §2). The probe IS recorded in history (a manual echo is a real
+// sample the dashboard should reflect) but does not drive status or alerts —
+// see ProbeWorker.PingNow. It uses a fixed 1s timeout (pingNowTimeout),
+// independent of the sensor's configured timeout: a manual echo is a quick
+// diagnostic, not a scheduled probe.
 func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -472,14 +477,15 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	var target string
-	err := s.db.QueryRow("SELECT target FROM sensors WHERE id = ?", id).Scan(&target)
+	res, err := s.probeWorker.PingNow(id)
 	if err != nil {
-		respondWithError(w, http.StatusNotFound, "sensor not found")
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "sensor not found")
+			return
+		}
+		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	res := pingHost(target, 2*time.Second)
 	respondWithJSON(w, http.StatusOK, pingResponse(res))
 }
 
