@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"regexp"
@@ -1394,9 +1395,26 @@ func newID() string {
 }
 
 // validateTarget guards against SQL/host injection-ish junk in targets.
-var targetRe = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$|^\d{1,3}(\.\d{1,3}){3}$`)
+//
+// Hostnames must be dotted labels ending in an alphabetic TLD (one or more
+// labels). Bare single-label hostnames (a plain "router", "NAS", "home")
+// are deliberately REJECTED: for an ICMP tool a bare label is almost always
+// a typo (the user meant "router.local" or the actual IP) and most resolvers
+// won't resolve it anyway — so it must fail at save time with a clear error,
+// not hang every probe tick. This is intentional, not a bug.
+var targetRe = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 
+// validTarget reports whether t is a usable probe target: a range-checked
+// IPv4 address, or a dotted hostname. IPv4 is checked with net.ParseIP so
+// out-of-range octets like "999.999.999.999" are rejected up front instead
+// of passing validation and then failing DNS every tick.
 func validTarget(t string) bool {
+	if t == "" {
+		return false
+	}
+	if ip := net.ParseIP(t); ip != nil {
+		return ip.To4() != nil // accept IPv4; IPv6 targets are not supported
+	}
 	return targetRe.MatchString(t)
 }
 
