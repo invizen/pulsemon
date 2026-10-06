@@ -1,3 +1,52 @@
+## v0.1.27
+
+Closes the **silent ICMP failure mode**. When neither ICMP transport could
+open (e.g. RHEL 8's default `net.ipv4.ping_group_range` excludes the service
+uid and `CAP_NET_RAW` isn't granted), zenmon used to start the server, report
+`status: "ok"` in healthz, and simply never ping — with no error anywhere.
+The failure was only findable by noticing the *missing* `icmp_mode` key.
+Now the failure is loud, at three layers:
+
+### 1. `install.sh` preflight (fail before the service starts)
+
+Before installing, the script reads `net.ipv4.ping_group_range` and checks
+whether the installer's gid falls inside it. If not, it prints the exact
+remediation (`sysctl` + the persistent `/etc/sysctl.d/90-zenmon-ping.conf`)
+and, on an interactive terminal, asks before continuing (non-interactive
+installs continue but flag that the dashboard will warn). Background: the
+kernel default is `1 0` (nobody may ping); systemd ≥ 244 — RHEL 9+, Fedora,
+Ubuntu/Debian — ships `0 2147483647` via `50-default.conf`, but RHEL 8
+(systemd 239) does not.
+
+### 2. Honest `healthz`
+
+When the shared ICMP engine fails to open (both transports), `GET
+/api/healthz` now returns:
+
+```json
+{"status": "degraded", "icmp_mode": "unavailable", "icmp_hint": "ICMP socket
+unavailable: ... Fix: sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\"
+(persist via /etc/sysctl.d/90-zenmon-ping.conf) and restart zenmon — or grant
+CAP_NET_RAW. See `journalctl -u zenmon` for the exact error.", ...}
+```
+
+instead of the previous `status: "ok"` with no `icmp_mode` key. The engine is
+warmed at probe-worker startup, so this is visible on the first healthz after
+boot — not after the first failed probe tick. The failure error now wraps the
+`errNoIcmpTransport` sentinel so tooling can match it with `errors.Is` while
+still carrying the underlying cause.
+
+### 3. Dashboard banner
+
+The existing warning banner now fires on `icmp_hint` (before the generic
+`probe_error`), showing the remediation command right on the dashboard.
+
+### Verified
+
+- `go test` — full suite green, including the new `TestHealthzIcmpMode`
+  (dead → degraded/unavailable/hint; unprivileged-datagram → ok; raw → ok).
+- Live container matrix on zentest: RHEL-8-like netns (range `1 0`, no caps)
+  → degraded + hint; wide range → ok; raw-socket-possible → ok.
 ## v0.1.26
 
 A review-driven release: one new self-update convenience flag, and a batch of

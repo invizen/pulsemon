@@ -361,7 +361,11 @@ async function refresh() {
     SENSORS = s; EVENTS = e || [];
     if (hz && hz.version) { const v = document.getElementById('app-ver'); if (v) v.textContent = hz.version; }
     const banner = document.getElementById('probe-banner');
-    if (hz && hz.probe_error) {
+    if (hz && hz.icmp_hint) {
+      document.getElementById('probe-banner-text').textContent =
+        'ICMP unavailable — no pings are happening: ' + hz.icmp_hint;
+      banner.classList.remove('hidden');
+    } else if (hz && hz.probe_error) {
       document.getElementById('probe-banner-text').textContent =
         'probing is broken: ' + hz.probe_error;
       banner.classList.remove('hidden');

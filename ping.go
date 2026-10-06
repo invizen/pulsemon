@@ -283,7 +283,7 @@ func NewEngine() (*Engine, error) {
 	if t, err := newRawTransport(); err == nil {
 		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
-		return nil, fmt.Errorf("icmp: cannot open socket (need root/CAP_NET_RAW or ping_group_range): %w", err)
+		return nil, fmt.Errorf("%w (need root/CAP_NET_RAW or ping_group_range): %w", errNoIcmpTransport, err)
 	}
 }
 
@@ -566,6 +566,22 @@ func EngineMode() string {
 	}
 	return ""
 }
+
+// EngineDead reports whether the shared ICMP engine was attempted and BOTH
+// transports failed (datagram: gid outside net.ipv4.ping_group_range; raw:
+// no CAP_NET_RAW / root). Once dead it stays dead for the process lifetime
+// (the open is a sync.Once), so healthz can surface it as a stable condition
+// instead of the old silent behavior: server running, healthz "ok", no
+// pings. The probe worker warms the engine at startup precisely so this is
+// visible immediately, not after the first failed probe tick.
+func EngineDead() bool {
+	return sharedEngineErr != nil
+}
+
+// errNoIcmpTransport is the sentinel for "neither ICMP transport could open".
+// It wraps the underlying errors so diagnostics still surface, but gives
+// healthz / tests a stable thing to match against (errors.Is).
+var errNoIcmpTransport = errors.New("icmp: no transport available")
 
 // pingHost is the probe worker's entry point: resolve the target, then
 // ping the resolved IP through the shared engine.

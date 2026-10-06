@@ -136,8 +136,19 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"time":    time.Now().UTC().Format(time.RFC3339),
 	}
 	hz["version"] = Version
-	if m := EngineMode(); m != "" {
+	// ICMP availability: the probe worker warms the shared engine at startup,
+	// so by the time healthz is reachable the outcome is known. Reporting it
+	// here closes the silent-failure mode: when BOTH transports fail
+	// (e.g. RHEL 8's default ping_group_range excludes the uid and there is
+	// no CAP_NET_RAW), the server used to start and report "ok" with no
+	// pings. Now it reports "degraded" + an explicit remediation hint.
+	switch m := EngineMode(); {
+	case m != "":
 		hz["icmp_mode"] = m
+	case EngineDead():
+		hz["status"] = "degraded"
+		hz["icmp_mode"] = "unavailable"
+		hz["icmp_hint"] = "ICMP socket unavailable: this uid is outside net.ipv4.ping_group_range and CAP_NET_RAW is not granted. Fix: sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\" (persist via /etc/sysctl.d/90-zenmon-ping.conf) and restart zenmon — or grant CAP_NET_RAW. See `journalctl -u zenmon` for the exact error."
 	}
 	if e := LastProbeError(); e != "" {
 		hz["probe_error"] = e

@@ -42,6 +42,46 @@ if [ "$(id -u)" = "0" ]; then
   exit 1
 fi
 
+# --- preflight: ICMP socket availability ------------------------------------
+# zenmon's unprivileged ICMP path needs THIS user's gid inside
+# net.ipv4.ping_group_range; otherwise it falls back to the raw socket, which
+# needs CAP_NET_RAW. The kernel default is "1 0" (nobody); systemd >= 244
+# (RHEL 9+, Fedora, Ubuntu/Debian) ships it wide via /usr/lib/sysctl.d/
+# 50-default.conf, but RHEL 8 (systemd 239) does NOT. Check now, so the
+# install fails loudly instead of the service running with silent no-pings.
+PGG="$(sysctl -n net.ipv4.ping_group_range 2>/dev/null | tr '\t' ' ')"
+if [ -n "$PGG" ]; then
+  PGG_LO="$(echo "$PGG" | awk '{print $1}')"
+  PGG_HI="$(echo "$PGG" | awk '{print $2}')"
+  GID="$(id -g)"
+  if [ "$GID" -ge "$PGG_LO" ] && [ "$GID" -le "$PGG_HI" ]; then
+    echo "zenmon: preflight ok — gid $GID is inside ping_group_range $PGG (unprivileged ICMP works)"
+  else
+    echo "zenmon: preflight WARNING — this user's gid $GID is OUTSIDE net.ipv4.ping_group_range ($PGG)."
+    echo "        The unprivileged ICMP socket will fail; zenmon will fall back to the raw"
+    echo "        socket, which needs CAP_NET_RAW (not granted by default for user services)."
+    echo "        Until fixed, zenmon will run but send NO pings and the dashboard will show"
+    echo "        an 'ICMP unavailable' banner (healthz: status=degraded, icmp_mode=unavailable)."
+    echo ""
+    echo "        Fix now (needs sudo):"
+    echo "          sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\""
+    echo "          echo 'net.ipv4.ping_group_range=0 65535' | sudo tee /etc/sysctl.d/90-zenmon-ping.conf"
+    echo "        Then re-run this installer."
+    echo ""
+    if [ -t 0 ]; then
+      read -r -p "zenmon: continue installing anyway? [y/N] " ans
+      case "$ans" in
+        y|Y|yes|YES) ;;
+        *) echo "zenmon: aborting — set ping_group_range first (see above)."; exit 1 ;;
+      esac
+    else
+      echo "zenmon: no interactive terminal — continuing (the dashboard banner will flag it)."
+    fi
+  fi
+else
+  echo "zenmon: preflight: could not read net.ipv4.ping_group_range (sysctl missing?)."
+fi
+
 echo "zenmon: installing ${VERSION} for user '$USER'"
 mkdir -p "$PREFIX" "$PREFIX/data"
 
