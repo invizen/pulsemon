@@ -87,8 +87,17 @@ mkdir -p "$PREFIX" "$PREFIX/data"
 
 # --- 1. download + verify -----------------------------------------------------
 if [ "$VERSION" = "latest" ]; then
-  VERSION="$(curl -sf "https://api.github.com/repos/$REPO/releases/latest" | \
-    grep -m1 '"tag_name"' | sed 's/.*"tag_name": *"//;s/".*//')"
+  # Fetch the JSON to a file BEFORE parsing: piping curl into `grep -m1`
+  # is flaky under `set -o pipefail` — grep exits after the first match,
+  # curl's next write gets SIGPIPE (exit 23), and the pipeline aborts.
+  # How often it trips depends on whether the whole API response fits in
+  # a single write before the pipe closes.
+  API_JSON="$(mktemp)"
+  curl -sf "https://api.github.com/repos/$REPO/releases/latest" -o "$API_JSON" || {
+    echo "pulsemon: could not reach the GitHub API (latest release lookup failed)" >&2
+    rm -f "$API_JSON"; exit 1; }
+  VERSION="$(grep -m1 '"tag_name"' "$API_JSON" | sed 's/.*"tag_name": *"//;s/".*//')"
+  rm -f "$API_JSON"
 fi
 [ -n "$VERSION" ] || { echo "pulsemon: could not resolve version" >&2; exit 1; }
 
