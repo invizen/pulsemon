@@ -26,7 +26,7 @@ systemctl --user stop zenmon
 systemctl --user disable zenmon
 mv ~/zenmon ~/pulsemon
 # install the new unit (writes ~/.config/systemd/user/pulsemon.service)
-curl -sfL https://github.com/invizen/pulsemon/releases/latest/download/install.sh | bash
+curl -sfL https://raw.githubusercontent.com/invizen/pulsemon/main/install.sh | bash
 # remove the stale unit + old PATH line (the installer adds the new one)
 rm -f ~/.config/systemd/user/zenmon.service
 sed -i '/zenmon: keep the zenmon binary on PATH/d' ~/.bashrc

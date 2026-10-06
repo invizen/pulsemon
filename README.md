@@ -61,7 +61,7 @@ Open http://localhost:9299 and add sensors from the **new sensor** button.
 ## Bare install (no Docker, user-level systemd)
 
 ```bash
-curl -sfL https://github.com/invizen/pulsemon/releases/latest/download/install.sh -o /tmp/pulsemon-install.sh
+curl -sfL https://raw.githubusercontent.com/invizen/pulsemon/main/install.sh -o /tmp/pulsemon-install.sh
 bash /tmp/pulsemon-install.sh              # latest release, or: bash /tmp/pulsemon-install.sh v0.1.7
 ```
 
