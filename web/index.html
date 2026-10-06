@@ -525,7 +525,7 @@ function cardHtml(s) {
       '</div>' +
     '</div>' +
     '<div class="flex items-center justify-between pt-2 border-t border-surface-800/60">' +
-      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now (single probe, recorded to history)" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
       '<div class="flex items-center gap-1">' +
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause for maintenance') + '" class="p-1.5 rounded-md hover:bg-surface-800 ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
         '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple"></i></button>' +
@@ -596,7 +596,7 @@ function renderTable(list) {
       '<td class="py-3.5 px-4 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-bold' : 'text-ok') + '">' + up24 + '</td>' +
       '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-xs text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-3.5 px-4 text-right"><div class="flex items-center justify-end gap-0.5">' +
-        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
         '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
         '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
