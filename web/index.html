@@ -612,8 +612,8 @@ async function echoPing(id, btn) {
   try {
     const r = await api('/api/sensors/' + id + '/ping', { method: 'POST' });
     if (btn) { btn.classList.add(r.lost ? 'text-bad' : 'text-ok'); setTimeout(() => { btn.classList.remove('text-bad','text-ok'); btn.disabled = false; }, 1500); }
-    toast(r.lost ? 'no reply from ' + id : 'echo: ' + fmtRtt(r.rtt_ms), r.lost ? 'bad' : 'ok');
-  } catch (e) { toast('echo failed: ' + e.message, 'bad'); }
+    toast(r.lost ? 'no reply from ' + id : 'pulse: ' + fmtRtt(r.rtt_ms), r.lost ? 'bad' : 'ok');
+  } catch (e) { toast('pulse failed: ' + e.message, 'bad'); }
   echoBusy = false;
 }
 
