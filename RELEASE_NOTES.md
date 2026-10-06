@@ -1,3 +1,109 @@
+## v0.1.26
+
+A review-driven release: one new self-update convenience flag, and a batch of
+correctness fixes to probe status, sensor editing, fresh installs, target
+validation, and the "Echo Now" diagnostic. No change to how a normal probe
+tick works on a healthy install.
+
+### New: `zenmon update --restart`
+
+The self-updater now optionally restarts the running service for you. By
+default `zenmon update` keeps its install-and-hint contract (swap the binary,
+print the restart command) because the fleet is mixed — containers, root
+installs, and non-systemd hosts are safer told how to restart than
+auto-restarted (a bad new version would otherwise take the monitor down).
+With `--restart`:
+
+```
+zenmon update --restart
+```
+
+it first confirms a **live** systemd `zenmon` service via `systemctl is-active`
+(user bus, or system bus when running as root), restarts on the correct bus,
+then polls `healthz` and reports the outcome — exit 1 if the service fails to
+come up healthy. Both `systemctl` calls are bounded (10s is-active / 60s
+restart) so a wedged D-Bus can't hang the update. If no live service is
+detected (container, no bus, non-systemd host) it degrades to the hint, and in
+a container it warns to `docker compose up -d --build` instead. The flag is now
+documented in both user-facing places (the `main.go` usage line and the README
+command block), not just the in-code help.
+
+### Fix: PATCH loss_warn / down_after now respawn the probe loop
+
+Editing a sensor's `loss_warn` or `down_after` in the UI wrote the new value to
+the database and echoed "updated," but the running probe kept the spawn-time
+copy until a full process restart — so a user who set `down_after` 4 → 10 would
+still get an error after 4 consecutive losses while the UI showed 10. Those two
+fields now trigger the same probe-loop respawn as `target` / `interval_s` /
+`timeout_ms`, so the operating thresholds change immediately. (`spike_mult`
+stays informational-only — `deriveStatus` doesn't read it — so a PATCH of it
+correctly does not churn the loop.)
+
+### Fix: never read "up" on a DB read error
+
+`deriveStatus` returned `"up"` when its probe-history query failed — the most
+optimistic status, the exact opposite of the broken-socket path just above,
+which deliberately returns `"warning"` (never fake up). A downed sensor would
+read recovered for a tick on a database hiccup, and the probe would record a
+"recovered" event and fire a recovery alert. It now returns `"warning"`
+(unknown) on a `Query` error. Safe by construction: `warning` is dashboard-only
+(it never fires an alert), so a transient WAL/SQLite hiccup just reads degraded
+for one tick and self-clears the next.
+
+### Fix: fresh-install seed sensors match the UI defaults
+
+The demo sensors created on an empty database (`router`, `server`) used
+5s / 2000ms / 5% / 3, ACTIVE, targeting `192.168.1.1` / `192.168.1.10` —
+different tuning than a dashboard-created sensor (15s / 1000ms / 25% / 4,
+spike_mult 3, paused), and hardcoded to a network many installs don't use. They
+now match the UI defaults (15s / 1000ms / 25% / 4, spike_mult written explicitly
+as 3 so they stop inheriting the schema column default of 5), start **paused**
+so placeholder targets can't fire down alerts on day one, and point at
+`127.0.0.1` — environment-neutral until the user edits the targets and resumes.
+Only affects fresh databases; the seeding guard still no-ops when the sensors
+table is non-empty, so existing installs are untouched.
+
+### Fix: `validTarget` range-checks IPv4 and documents bare-hostname rejection
+
+The IPv4 branch of the target validator (`\d{1,3}` per octet) accepted
+out-of-range addresses like `999.999.999.999`, which then just failed DNS every
+probe tick. IPv4 is now checked with `net.ParseIP`, so out-of-range octets are
+rejected at save time with the existing 400; IPv6 is rejected explicitly (not a
+supported ICMPv4 target). A comment now states that bare single-label hostnames
+(`router`, `NAS`) are **deliberately** rejected (they're almost always a typo for
+an ICMP tool and won't resolve) — intentional, not a bug a future maintainer
+might "fix."
+
+### Fix: "Echo Now" records its sample at a fixed 1s timeout
+
+The manual "Echo Now" probe used a hardcoded 2s timeout (independent of the
+sensor's configured timeout) and discarded its result. It now runs at a fixed
+1s and **records** the sample — a `probes` row plus the dashboard sparkline — so
+a manual probe shows up in the sensor's history. It deliberately does not derive
+a status or fire an alert: a single manual echo keeps history honest without
+flipping a healthy sensor to error or firing a recovery webhook. Works while
+paused, and the dashboard tooltip now reads "recorded to history."
+
+### Cleanup: drop a dead `database/sql` import
+
+`probe.go` imported `database/sql` solely to satisfy a `var _ = sql.ErrNoRows`
+at the bottom of the file — no other symbol in the file used it, and the files
+that do (`api.go`, `db.go`) import it themselves. Both the import and the
+blank-var keeper are gone.
+
+### Verification
+
+- Full test suite green with `-race`, `go vet` and `gofmt` clean.
+- New regression tests per fix, each confirmed to fail against the pre-fix code:
+  `--restart` service detection / bounded `systemctl` / container path;
+  PATCH `loss_warn` / `down_after` respawn vs. `spike_mult` / `name` no-respawn;
+  `deriveStatus` "warning" on a DB read error; fresh-install seed tuning /
+  state / targets and the empty-DB guard; `validTarget` in-range vs. out-of-range
+  IPv4, dotted hostnames, and bare-label rejection; and "Echo Now" recording its
+  sample at exactly 1s while leaving status untouched.
+
+---
+
 ## v0.1.25
 
 Security hardening for outbound webhook delivery. Four fixes to
