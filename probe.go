@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -1417,5 +1416,3 @@ func validTarget(t string) bool {
 	}
 	return targetRe.MatchString(t)
 }
-
-var _ = sql.ErrNoRows // keep database/sql import for callers
