@@ -75,6 +75,7 @@ if that needs a password it tells you the one command to run.
 
 ```bash
 zenmon update            # self-update from any directory (v0.1.6+)
+zenmon update --restart  # install AND restart the running service, then verify healthz
 zenmon update check      # check only — exit 2 when a newer release exists
 zenmon update v0.1.7     # pin or roll back to a specific version
 ```
@@ -82,6 +83,11 @@ zenmon update v0.1.7     # pin or roll back to a specific version
 `zenmon update` finds the running binary itself (`os.Executable`), verifies
 the published SHA-256, and swaps it atomically — then prints the restart
 command. After it runs: `systemctl --user restart zenmon`.
+`--restart` does that for you: it auto-restarts only when a live systemd
+`zenmon` service is confidently detected (user bus, or system bus when
+running as root), then polls healthz and reports the outcome — so a
+container or non-systemd host still just gets the restart hint (a bad new
+version would otherwise take the monitor down).
 
 ## ICMP & privileges
 

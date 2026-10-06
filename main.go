@@ -77,7 +77,7 @@ func dispatch(args []string) dispatchKind {
 	// error.
 	if strings.HasPrefix(args[1], "-") {
 		fmt.Fprintf(os.Stderr, "zenmon: unknown flag %q\n\n", args[1])
-		fmt.Fprint(os.Stderr, "Usage:\n  zenmon            start the monitor + dashboard\n  zenmon update [check|VERSION]  self-update (check only, or pin a version)\n  zenmon -healthz     verify the store is usable (container healthcheck)\n  zenmon -version     print the build version and exit\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  zenmon            start the monitor + dashboard\n  zenmon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  zenmon -healthz     verify the store is usable (container healthcheck)\n  zenmon -version     print the build version and exit\n")
 		if os.Getenv("ZENMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
