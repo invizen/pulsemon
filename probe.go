@@ -960,9 +960,15 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig) string {
 	}
 	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, limit)
 	if err != nil {
-		return "up"
+		// Can't read the probe history, so we can't know the real state —
+		// report unknown (warning), never "up". Matches the broken-socket path
+		// above: a monitoring tool must not fake a recovery it can't confirm.
+		// A transient WAL/SQLite hiccup just reads degraded for this one tick
+		// and self-clears next tick, and it never fires an alert (warning is
+		// dashboard-only — see alertable).
+		return "warning"
 	}
-	defer rows.Close() // top-level: this function has a post-Query return ("up"),
+	defer rows.Close() // top-level: this function has a post-Query return ("warning"),
 	// so a bare rows.Close() below the loop would leak the pooled connection
 	// on that path — the hang under SetMaxOpenConns(10) the issue describes.
 	var recent []*float64 // index 0 = newest; nil = lost, non-nil = rtt
