@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,6 +85,9 @@ func dispatch(args []string) dispatchKind {
 		}
 	case "-healthz", "--healthz":
 		return runHealthcheck()
+	case "restart":
+		// Apply a config that needs a fresh process (listener/TLS).
+		return runRestartCommand()
 	case "-v", "-version", "--version", "version":
 		fmt.Println("pulsemon", Version)
 		return dExit0
@@ -120,6 +125,89 @@ func runHealthcheck() dispatchKind {
 		return dExit1
 	}
 	return dExit0
+}
+
+// tlsKeyPairOK pre-validates the cert+key pair the listener is about to
+// serve. tls.LoadX509KeyPair reads both files and parses the key — so an
+// encrypted or corrupt key is caught HERE, at startup, with a clear
+// message, instead of surfacing mid-handshake from ServeTLS after the
+// 30s bind-retry window.
+func tlsKeyPairOK(cert, key string) error {
+	_, err := tls.LoadX509KeyPair(cert, key)
+	return err
+}
+
+// startListener starts the HTTP (and, when a TLS pair is in place,
+// HTTPS) listener in the background and wires its fatal errors to
+// log.Fatalf (same behavior as the old inline goroutine).
+//
+// HTTPS is served on the configured TLS port; the plain-HTTP port is
+// NOT bound when TLS is active — the dashboard is reachable only over
+// TLS. This is deliberate: a box that uploaded a cert must not stay
+// reachable in plaintext on the old port.
+//
+// When PULSEMON_RESTARTING is set (we are the child of a re-exec), the
+// bind may fail for up to 30s while the parent still holds the port;
+// retry with backoff instead of dying.
+func startListener(srv *http.Server, db *DB) {
+	cfg := loadListenerCfg(db)
+	retry := os.Getenv("PULSEMON_RESTARTING") == "1"
+
+	go func() {
+		if cfg.certPath != "" {
+			if _, err := os.Stat(cfg.certPath); err != nil {
+				log.Printf("WARNING: %s is not readable (%v); serving plain HTTP until it is in place", cfg.certPath, err)
+			} else if _, err := os.Stat(cfg.keyPath); err != nil {
+				log.Printf("WARNING: %s is not readable (%v); serving plain HTTP until it is in place", cfg.keyPath, err)
+			} else if err := tlsKeyPairOK(cfg.certPath, cfg.keyPath); err != nil {
+				// A pair is in place but unusable (encrypted key,
+				// corrupt cert, mismatched pair). Fail fast with the
+				// reason instead of looping or serving plaintext.
+				log.Fatalf("TLS: %s + %s are in place but cannot be loaded: %v", cfg.certPath, cfg.keyPath, err)
+			} else {
+				srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+				addr := httpsAddrFor(cfg.httpsPort)
+				log.Println("Starting server on " + addr + " (TLS, cert " + cfg.source + ")")
+				deadline := time.Now().Add(30 * time.Second)
+				for {
+					err := listenTLS(srv, addr, cfg.certPath, cfg.keyPath)
+					if err == nil {
+						return
+					}
+					if err != http.ErrServerClosed && !retry && time.Now().After(deadline) {
+						// TLS was configured and the bind keeps failing:
+						// fail fast rather than serve plaintext.
+						log.Fatalf("Listen (TLS: %s): %v", addr, err)
+					}
+					if err == http.ErrServerClosed || time.Now().After(deadline) {
+						log.Println("listener stopped")
+						return
+					}
+					time.Sleep(500 * time.Millisecond)
+				}
+			}
+		}
+		addr := listenAddr()
+		log.Println("Starting server on " + addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("Listen: %v", err)
+		}
+	}()
+}
+
+// listenTLS binds and serves TLS on a fresh listener; returns when the
+// server is shut down. The listener is always closed so a retry after a
+// failed serve does not leak a socket.
+func listenTLS(srv *http.Server, addr, cert, key string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	srv.Addr = addr
+	errCh := make(chan error, 1)
+	go func() { errCh <- srv.ServeTLS(ln, cert, key) }()
+	return <-errCh
 }
 
 func main() {
@@ -160,29 +248,11 @@ func main() {
 	}()
 
 	server := NewServer(db, pw)
-	addr := listenAddr()
 	srv := &http.Server{
-		Addr:              addr,
 		Handler:           server.Mux(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-
-	go func() {
-		cert, key := certPaths()
-		if cert != "" {
-			log.Println("Starting server on " + addr + " (TLS)")
-			if err := srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
-				// Fail fast: a broken cert/key pair must not leave a box
-				// that configured TLS silently running plain HTTP.
-				log.Fatalf("Listen (TLS: %s): %v", cert, err)
-			}
-			return
-		}
-		log.Println("Starting server on " + addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Listen: %v", err)
-		}
-	}()
+	startListener(srv, db)
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)

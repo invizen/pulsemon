@@ -6,6 +6,8 @@ data/
 
 # secrets — never commit
 .env
+# TLS certs: drop cert.pem + key.pem into ./certs/ and set PULSEMON_CERT/PULSEMON_KEY
+certs/
 
 # build artifacts
 pulsemon

@@ -125,6 +125,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
 	s.mux.HandleFunc("PUT /api/settings", s.handleSettingsPut)
 	s.mux.HandleFunc("POST /api/settings/test", s.handleSettingsTest)
+	s.mux.HandleFunc("POST /api/settings/tls", s.handleTLSSettingsPut)
+	s.mux.HandleFunc("DELETE /api/settings/tls", s.handleTLSSettingsDelete)
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 
@@ -991,6 +993,7 @@ func (s *Server) settingsPayload() map[string]interface{} {
 		"alert_filter":       filter,
 		"realert_min":        realert,
 		"maintenance_mode":   s.db.GetSetting("maintenance_mode") == "1",
+		"tls":                s.tlsPayload(),
 	}
 }
 

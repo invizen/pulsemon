@@ -4,10 +4,14 @@ services:
     container_name: pulsemon
     ports:
       - "9299:9299"
+      - "443:443"
     volumes:
       - ./data:/data
+      - ./certs:/certs:ro
     environment:
       - PULSEMON_DB=/data/pulsemon.db
+      - PULSEMON_CERT=/certs/cert.pem
+      - PULSEMON_KEY=/certs/key.pem
       - GOOGLE_CHAT_WEBHOOK_URL=${GOOGLE_CHAT_WEBHOOK_URL:-}
     restart: unless-stopped
     healthcheck:

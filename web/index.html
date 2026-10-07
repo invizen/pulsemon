@@ -294,11 +294,28 @@ tailwind.config = {
           </span>
         </label>
       </div>
-      <div id="set-msg" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border"></div>
-      <div class="text-[12px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
-        <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
-        Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning (partial recovery). Warning (packet loss) is dashboard-only in both directions — neither entering nor leaving warning sends an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
+      <div id="tls-panel" class="border border-surface-800 rounded-lg p-3 bg-surface-950/50 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="text-[13px] font-semibold text-slate-300">TLS / HTTPS</span>
+          <span id="tls-status" class="text-[12px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+        </div>
+        <p class="text-[12px] text-slate-600 font-mono">Upload a certificate + key to serve the dashboard over HTTPS. Applying it restarts pulsemon — the dashboard reconnects on the HTTPS port, and the plain-HTTP port closes.</p>
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-[13px] text-slate-400">HTTPS Port</span>
+          <input id="f-tls-port" type="number" min="1" max="65535" value="443" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </div>
+        <label class="text-[12px] text-slate-500 font-mono flex flex-col gap-1">Certificate (PEM, or base64)
+          <textarea id="f-tls-cert" rows="3" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
+        </label>
+        <label class="text-[12px] text-slate-500 font-mono flex flex-col gap-1">Private Key (PEM, or base64)
+          <textarea id="f-tls-key" rows="3" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
+        </label>
+        <div class="flex gap-2">
+          <button onclick="applyTLSCert()" class="px-3 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">Apply Certificate</button>
+          <button onclick="removeTLSCert()" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono">Remove Certificate</button>
+        </div>
       </div>
+      <div id="set-msg" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border"></div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
       <span class="text-[12px] text-slate-500 font-mono">stored in the pulsemon database</span>
@@ -883,11 +900,73 @@ async function openSettings() {
     $('f-realert').value = s.realert_min ?? 30;
     renderScopeOptions();
     setMaintUI(SETTINGS.maintenance_mode === true);
+    renderTLSStatus(s.tls);
   } catch (e) {
     $('set-summary').textContent = 'error';
   }
 }
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
+
+function renderTLSStatus(t) {
+  const badge = $('tls-status');
+  const port = $('f-tls-port');
+  const rm = $('tls-remove-btn');
+  if (!t) { badge.textContent = '—'; return; }
+  if (port.value === '') port.value = t.port || 443;
+  if (t.enabled) {
+    const src = t.source === 'env' ? 'env' : 'dashboard';
+    badge.textContent = 'ON · ' + t.port + ' · ' + src;
+    badge.className = 'text-[12px] font-mono px-2 py-0.5 rounded bg-ok/15 border border-ok/40 text-ok';
+    rm.disabled = (t.source === 'env');
+    rm.title = t.source === 'env' ? 'TLS is configured by PULSEMON_CERT/PULSEMON_KEY env' : 'Remove the dashboard-installed certificate';
+    const detail = t.subject ? (t.subject + (t.expiry ? ' · expires ' + t.expiry : '')) : '';
+    $('tls-panel').dataset.detail = detail;
+  } else {
+    badge.textContent = 'OFF · HTTP ' + (t.http_addr || '');
+    badge.className = 'text-[12px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400';
+    rm.disabled = true;
+    rm.title = 'No certificate installed';
+  }
+}
+
+let tlsBusy = false;
+async function applyTLSCert() {
+  if (tlsBusy) return;
+  const cert = $('f-tls-cert').value.trim();
+  const key = $('f-tls-key').value.trim();
+  const port = parseInt($('f-tls-port').value || '443', 10);
+  if (!cert || !key) { setMsg('paste both the certificate and the private key', 'bad'); return; }
+  if (!confirm('Apply this certificate? pulsemon will restart and reconnect over HTTPS on port ' + port + ' (the plain-HTTP port closes).')) return;
+  tlsBusy = true;
+  setMsg('applying certificate — pulsemon is restarting…', 'ok');
+  try {
+    const r = await api('/api/settings/tls', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cert, key, port }) });
+    renderTLSStatus(r.tls);
+    setMsg('certificate applied — pulsemon is restarting on HTTPS port ' + r.tls.port, 'ok');
+  } catch (e) {
+    setMsg('apply failed: ' + e.message, 'bad');
+  } finally {
+    tlsBusy = false;
+  }
+}
+
+async function removeTLSCert() {
+  if (tlsBusy) return;
+  if (!confirm('Remove the certificate? pulsemon will restart and reconnect over plain HTTP.')) return;
+  tlsBusy = true;
+  setMsg('removing certificate — pulsemon is restarting…', 'ok');
+  try {
+    await api('/api/settings/tls', { method: 'DELETE' });
+    $('f-tls-cert').value = '';
+    $('f-tls-key').value = '';
+    renderTLSStatus({ enabled: false, http_addr: location.hostname + ':' + (location.port || '80') });
+    setMsg('certificate removed — pulsemon is restarting on HTTP', 'ok');
+  } catch (e) {
+    setMsg('remove failed: ' + e.message, 'bad');
+  } finally {
+    tlsBusy = false;
+  }
+}
 
 function setMaintUI(on) {
   const btn = $('maint-btn'), icon = $('maint-icon');
