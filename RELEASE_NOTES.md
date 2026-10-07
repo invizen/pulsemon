@@ -24,6 +24,14 @@ Chain building uses the full certificate chain the server presents (leaf +
 intermediates) against the system trust store, so public and CDN-fronted
 certs verify the same way a standard TLS client does.
 
+A common real-world case is handled too: many CDNs and registrars serve a
+cert for the **www** variant of a bare domain (google.com presents a cert
+whose names are `www.google.com`) or the reverse. When the target host
+differs from the certificate's names only by the `www.` prefix, the check
+is retried once with the other variant — so a sensor on `google.com` works
+even though the presented cert literally names only `www.google.com`.
+Unrelated domains still fail; the fallback only crosses the www boundary.
+
 "Allow self-signed" deliberately does **not** become "allow anything": a
 cert signed by an untrusted (rogue) CA, an **expired** cert, and a cert whose
 names don't match the target are all still losses, exactly as before. The
