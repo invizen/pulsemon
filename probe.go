@@ -941,10 +941,11 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	}
 
 	pw.setAlertState(c.id, newStatus, time.Now().UTC())
-	// Warning (loss) is dashboard-only; error transitions and recoveries
-	// alert.
-	if pw.shouldAlertNow(c, newStatus) {
-		pw.launchAlert(func() { pw.sendAlert(c.id, c.name, c.target, newStatus, rttMs) })
+	// Warning-only flapping is dashboard-only; everything involving error
+	// alerts (into error, partial recovery error -> warning, full recovery
+	// error -> up).
+	if pw.shouldAlertNow(c, oldStatus, newStatus) {
+		pw.launchAlert(func() { pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) })
 	}
 }
 
@@ -954,23 +955,41 @@ func (pw *ProbeWorker) alertsEnabled() bool {
 	return pw.db.GetSetting("maintenance_mode") != "1"
 }
 
-// alertable reports whether a transition INTO this status sends an alert.
-// Warning (packet loss) is dashboard-only by design — loss flapping was
-// alert noise. Error and recovery (up) alert.
-func alertable(status string) bool { return status != "warning" }
+// alertableTransition reports whether a status CHANGE sends an alert.
+// Warning-only movement is dashboard-only by design — up<->warning flapping
+// was alert noise: neither entering warning nor warning -> up is worth a
+// notification. Everything involving error alerts: into error, error ->
+// warning (partial recovery), and error -> up (full recovery). Same-state
+// input is false here; sustained-error re-alerts don't go through this
+// gate — see alertGates.
+func alertableTransition(oldStatus, newStatus string) bool {
+	if oldStatus == newStatus {
+		return false
+	}
+	if oldStatus == "error" || newStatus == "error" {
+		return true
+	}
+	return false // up<->warning flapping: dashboard-only
+}
 
-// shouldAlertNow applies the maintenance gate, the status gate (warning is
-// dashboard-only — see alertable), and the global alert routing rule
+// alertGates applies the maintenance gate and the global alert routing rule
 // (settings table): "all", "tags" (any of the sensor's tags in filter list),
 // or "sensors" (id in filter list).
-func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, status string) bool {
+func (pw *ProbeWorker) alertGates(c sensorConfig) bool {
 	if !pw.alertsEnabled() {
 		return false
 	}
-	if !alertable(status) {
+	return pw.shouldAlert(c.id, c.tags)
+}
+
+// shouldAlertNow decides whether a status transition alerts: maintenance
+// off, routing in scope, and the transition itself is alertable (warning is
+// dashboard-only in both directions — see alertableTransition).
+func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, oldStatus, newStatus string) bool {
+	if !pw.alertGates(c) {
 		return false
 	}
-	return pw.shouldAlert(c.id, c.tags)
+	return alertableTransition(oldStatus, newStatus)
 }
 
 // shouldAlert applies the global alert routing rule (settings table):
@@ -1040,7 +1059,9 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 		return
 	}
 	pw.setAlertState(c.id, status, now)
-	if pw.shouldAlertNow(c, status) {
+	// A sustained error re-alerts on its own schedule (error -> error is
+	// not a transition); only the maintenance + routing gates apply.
+	if pw.alertGates(c) {
 		pw.launchAlert(func() { pw.sendRealert(c.id, c.name, c.target, status, rttMs) })
 	}
 }
@@ -1139,7 +1160,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 		// above: a monitoring tool must not fake a recovery it can't confirm.
 		// A transient WAL/SQLite hiccup just reads degraded for this one tick
 		// and self-clears next tick, and it never fires an alert (warning is
-		// dashboard-only — see alertable).
+		// dashboard-only — see alertableTransition).
 		return "warning"
 	}
 	defer rows.Close() // top-level: this function has a post-Query return ("warning"),
@@ -1355,7 +1376,7 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 	return out
 }
 
-func (pw *ProbeWorker) sendWebhook(id, name, target, state string, rttMs float64, reAlert bool) {
+func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) {
 	for _, p := range pw.activeProviders() {
 		url := pw.db.GetSetting(p.Kind + "_url")
 		if url == "" && p.EnvFallback != "" {
@@ -1366,13 +1387,13 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, state string, rttMs float64
 		}
 		switch p.Kind {
 		case "google_chat":
-			card := cardFor(state, name, target, rttMs)
+			card := cardFor(oldState, state, name, target, rttMs)
 			if reAlert {
 				card = cardForRe(state, name, target, rttMs)
 			}
 			pw.postJSON(url, map[string]string{"text": card})
 		case "discord":
-			card := discordCard(state, name, target, rttMs)
+			card := discordCard(oldState, state, name, target, rttMs)
 			if reAlert {
 				card = discordCardRe(state, name, target, rttMs)
 			}
@@ -1468,24 +1489,36 @@ func (pw *ProbeWorker) StopAlerts() {
 }
 
 // sendAlert dispatches a state-transition alert to every active provider.
-func (pw *ProbeWorker) sendAlert(id, name, target, state string, rttMs float64) {
-	pw.sendWebhook(id, name, target, state, rttMs, false)
+func (pw *ProbeWorker) sendAlert(id, name, target, oldState, state string, rttMs float64) {
+	pw.sendWebhook(id, name, target, oldState, state, rttMs, false)
 }
 
 // sendRealert notifies that a sensor has stayed in the same non-up state.
+// oldState == state (the re-alert is not a transition; the card just says
+// "still <state>").
 func (pw *ProbeWorker) sendRealert(id, name, target, state string, rttMs float64) {
-	pw.sendWebhook(id, name, target, state, rttMs, true)
+	pw.sendWebhook(id, name, target, state, state, rttMs, true)
 }
 
-func cardFor(state, name, target string, rttMs float64) string {
+// recoveryTitle picks the alert headline for the new status: a full
+// recovery reads "recovered", an error -> warning improvement reads
+// "partial recovery".
+func recoveryTitle(oldState, state string) string {
+	if state == "up" {
+		return "recovered"
+	}
+	if state == "warning" && oldState == "error" {
+		return "partial recovery"
+	}
+	return state
+}
+
+func cardFor(oldState, state, name, target string, rttMs float64) string {
 	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
 	if icon == "" {
 		icon = "🟢"
 	}
-	title := state
-	if state == "up" {
-		title = "recovered"
-	}
+	title := recoveryTitle(oldState, state)
 	card := fmt.Sprintf("%s *pulsemon: %s*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s**",
 		icon, title, name, target, state)
 	if rttMs > 0 {
@@ -1509,15 +1542,12 @@ func cardForRe(state, name, target string, rttMs float64) string {
 
 // Discord uses Markdown (**bold**, no *italic* emphasis); the card is plain
 // content. Same information, Discord-flavored.
-func discordCard(state, name, target string, rttMs float64) string {
+func discordCard(oldState, state, name, target string, rttMs float64) string {
 	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
 	if icon == "" {
 		icon = "🟢"
 	}
-	title := state
-	if state == "up" {
-		title = "recovered"
-	}
+	title := recoveryTitle(oldState, state)
 	card := fmt.Sprintf("%s **pulsemon: %s**\n**Sensor:** %s\n**Target:** %s\n**State:** %s", icon, title, name, target, state)
 	if rttMs > 0 {
 		card += fmt.Sprintf("\n**Ping:** %d ms", int(rttMs+0.5))

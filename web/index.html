@@ -263,7 +263,7 @@ tailwind.config = {
       <div id="set-msg" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border"></div>
       <div class="text-[12px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
         <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
-        Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning. Warning (packet loss) is shown in the dashboard but does not send an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
+        Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning (partial recovery). Warning (packet loss) is dashboard-only in both directions — neither entering nor leaving warning sends an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
       </div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
