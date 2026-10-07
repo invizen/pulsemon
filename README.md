@@ -126,6 +126,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 |---|---|
 | `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
 | env | `PULSEMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
+| env | `PULSEMON_CERT` + `PULSEMON_KEY` — optional TLS certificate and key file paths (PEM). Set **both** together to serve HTTPS directly (`https://host:9299`); omit both for plain HTTP. A broken pair fails startup — pulsemon never silently drops to HTTP when TLS was requested. A self-signed cert works for LAN use (the browser warns once, then remembers); use a real cert (e.g. Let's Encrypt) if the dashboard is reachable from outside. |
 | Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode |
 | Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
 

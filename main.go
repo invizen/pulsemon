@@ -33,6 +33,22 @@ func dbPathFromEnv() string {
 	return "/data/pulsemon.db"
 }
 
+// certPaths returns the TLS certificate/key pair to serve HTTPS with, or
+// ("", "") for plain HTTP. Both PULSEMON_CERT and PULSEMON_KEY must be set
+// together — a cert without a key (or vice versa) is a misconfiguration
+// worth failing on at startup, not a half-working listener.
+func certPaths() (string, string) {
+	cert := os.Getenv("PULSEMON_CERT")
+	key := os.Getenv("PULSEMON_KEY")
+	if cert == "" || key == "" {
+		if cert != "" || key != "" {
+			log.Printf("WARNING: PULSEMON_CERT and PULSEMON_KEY must be set together; running plain HTTP")
+		}
+		return "", ""
+	}
+	return cert, key
+}
+
 // dispatchKind is the outcome of dispatching os.Args.
 type dispatchKind int
 
@@ -152,6 +168,16 @@ func main() {
 	}
 
 	go func() {
+		cert, key := certPaths()
+		if cert != "" {
+			log.Println("Starting server on " + addr + " (TLS)")
+			if err := srv.ListenAndServeTLS(cert, key); err != nil && err != http.ErrServerClosed {
+				// Fail fast: a broken cert/key pair must not leave a box
+				// that configured TLS silently running plain HTTP.
+				log.Fatalf("Listen (TLS: %s): %v", cert, err)
+			}
+			return
+		}
 		log.Println("Starting server on " + addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Listen: %v", err)
