@@ -211,7 +211,7 @@ tailwind.config = {
           <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="hostname">
         </label>
         <label class="text-[13px] text-slate-400 flex flex-col gap-1">Target <span id="f-target-hint" class="text-slate-600">IP or hostname</span>
-          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
+          <input id="f-target" required maxlength="253" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="url" style="font-weight:600;letter-spacing:.03em;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
         </label>
       </div>
       <label class="text-[13px] text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
@@ -826,6 +826,10 @@ function onFormTypeChange() {
 }
 
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }
+
+// Target input: heavier strokes + a small letter gap (see the inline style
+// on #f-target) so the thin "//" in URLs doesn't fail to rasterize on some
+// high-DPI displays — the value was always intact, one slash just looked gone.
 
 async function submitSensor(ev) {
   ev.preventDefault();
