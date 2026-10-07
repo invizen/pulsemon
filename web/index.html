@@ -1061,29 +1061,42 @@ function renderGraph(el, data) {
     el.innerHTML = '<div class="flex items-center justify-center h-28 text-[12px] text-slate-600 font-mono">no data in this range yet</div>';
     return;
   }
-  const W = 760, H = 120, padL = 8, padR = 8, padT = 8, padB = 14;
+  // Render at the container's real pixel size: preserveAspectRatio="none"
+  // stretches text, so a fixed 760-wide viewBox would distort the ms labels.
+  const W = Math.max(el.clientWidth || 0, 320), H = 120;
+  const padL = 44, padR = 8, padT = 8, padB = 16;
   const maxAvg = Math.max(...pts.map(p => p.avg || 0), 20);
+  // Dynamic top: next multiple of 10 ms at/above peak*1.1, rounded up to a
+  // multiple of 40 so 5 evenly-spaced ticks (0, ¼, ½, ¾, top) all land on
+  // whole ms — e.g. top 80 -> 0/20/40/60/80ms.
+  const top = Math.max(40, Math.ceil(maxAvg * 1.1 / 40) * 40);
   const x = i => padL + (i / Math.max(pts.length - 1, 1)) * (W - padL - padR);
-  const y = v => padT + (1 - v / maxAvg) * (H - padT - padB);
+  const y = v => padT + (1 - v / top) * (H - padT - padB);
   const path = pts.map((p, i) => p.avg == null ? '' : (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + (p.avg != null ? y(p.avg).toFixed(1) : y(0).toFixed(1))).join(' ');
   const area = path ? path + ' L' + x(pts.length - 1).toFixed(1) + ' ' + (H - padB) + ' L' + x(0).toFixed(1) + ' ' + (H - padB) + ' Z' : '';
+  // ms axis: 5 labels (0 at bottom, dynamic top) + faint horizontal gridlines
+  const axis = [0, 0.25, 0.5, 0.75, 1].map(f => {
+    const v = Math.round(top * f), yy = y(v).toFixed(1);
+    return '<line x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy + '" stroke="#161f30" stroke-width="1"/>' +
+      '<text x="' + (padL - 6) + '" y="' + (y(v) + 3).toFixed(1) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + v + 'ms</text>';
+  }).join('');
   // loss ticks
   const ticks = pts.map((p, i) => p.lost > 0
     ? '<line x1="' + x(i).toFixed(1) + '" y1="' + (H - padB) + '" x2="' + x(i).toFixed(1) + '" y2="' + (H - padB + 7) + '" stroke="#f43f5e" stroke-width="2" opacity="' + Math.min(1, p.lost / p.total * 1.5) + '"/>'
     : '').join('');
-  // axis labels: start / middle / end time
+  // time labels: start / middle / end, below the axis
   const t0 = new Date(pts[0].t * 1000), t1 = new Date(pts[pts.length - 1].t * 1000);
   const fmtT = t => t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
   const mid = pts[Math.floor(pts.length / 2)];
   el.innerHTML =
-    '<svg viewBox="0 0 ' + W + ' ' + H + '" class="w-full" preserveAspectRatio="none">' +
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" class="w-full">' +
       '<path d="' + area + '" fill="#10b981" opacity="0.12"/>' +
       '<path d="' + path + '" fill="none" stroke="#10b981" stroke-width="1.5"/>' +
-      '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#161f30" stroke-width="1"/>' +
+      axis +
       ticks +
-      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
-      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
-      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
+      '<text x="' + padL + '" y="' + (H - 3) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
+      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 3) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
+      '<text x="' + (W - padR) + '" y="' + (H - 3) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
     '</svg>' +
     '<div class="flex items-center justify-between text-[12px] font-mono text-slate-600 mt-1">' +
       '<span>peak avg ' + fmtRtt(maxAvg) + '</span>' +
