@@ -12,7 +12,7 @@
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://unpkg.com/@phosphor-icons/web"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script>
 tailwind.config = {
   theme: { extend: {
@@ -43,18 +43,18 @@ tailwind.config = {
   <div class="max-w-[1700px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
     <div class="flex items-center gap-3">
       <div class="h-9 w-9 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok">
-        <i class="ph-bold ph-activity text-lg"></i>
+        <i class="ph-bold ph-activity text-[19px]"></i>
       </div>
       <div>
         <div class="flex items-center gap-2">
-          <span class="font-bold tracking-tight"><span class="text-[#10b981]">pulse</span><span class="text-[#808080]">mon</span></span>
-          <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="pulsemon version">v…</span>
+          <span class="font-extrabold tracking-tight text-[17px]"><span class="text-[#10b981]">pulse</span><span class="text-[#808080]">mon</span></span>
+          <span id="app-ver" class="text-[12px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="pulsemon version">v…</span>
         </div>
-        <p class="text-[11px] text-slate-500 hidden sm:block">network sensor monitor</p>
+        <p class="text-[13px] text-slate-500 hidden sm:block">network sensor monitor</p>
       </div>
     </div>
 
-    <div id="status-pill" class="hidden md:flex items-center gap-5 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-xs">
+    <div id="status-pill" class="hidden md:flex items-center gap-5 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-[13px]">
       <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-ok glow-ok"></span><span class="text-slate-400">UP</span><span id="c-up" class="text-ok font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
       <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-warn glow-warn"></span><span class="text-slate-400">WARN</span><span id="c-warn" class="text-warn font-semibold">0</span></span>
@@ -66,17 +66,17 @@ tailwind.config = {
 
     <div class="flex items-center gap-2">
       <button onclick="openSettings()" title="Settings (webhook)" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
-        <i class="ph-bold ph-gear text-lg"></i>
+        <i class="ph-bold ph-gear text-[19px]"></i>
       </button>
-      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-xs font-semibold">
-        <i class="ph-bold ph-plus text-sm"></i> New Sensor
+      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
+        <i class="ph-bold ph-plus text-[15px]"></i> New Sensor
       </button>
     </div>
   </div>
 </header>
 
 <div id="probe-banner" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pt-4">
-  <div class="text-xs font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+  <div class="text-[13px] font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
     <i class="ph-bold ph-warning"></i>
     <span id="probe-banner-text">probing is broken</span>
     <span class="text-warn/70 font-normal ml-1">— statuses below are unreliable until this clears</span>
@@ -88,13 +88,13 @@ tailwind.config = {
   <!-- ============ TOOLBAR ============ -->
   <section class="bg-surface-900 border border-surface-800 rounded-xl p-3 flex flex-col lg:flex-row lg:items-center gap-3">
     <div class="relative w-full lg:w-72">
-      <i class="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm"></i>
+      <i class="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-[15px]"></i>
       <input id="q" type="text" placeholder="filter name, target, tag…" oninput="render()"
-        class="w-full bg-surface-950 border border-surface-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60 font-mono">
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg pl-9 pr-3 py-1.5 text-[13px] text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60 font-mono">
     </div>
-    <div id="tag-chips" class="flex items-center gap-1.5 overflow-x-auto text-xs font-mono py-1 flex-1"></div>
+    <div id="tag-chips" class="flex items-center gap-1.5 overflow-x-auto text-[13px] font-mono py-1 flex-1"></div>
     <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 font-mono text-xs">
+      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 font-mono text-[13px]">
         <span class="text-slate-500 mr-1.5">SORT</span>
         <select id="sort" onchange="render()" class="bg-surface-900 text-slate-100 focus:outline-none cursor-pointer rounded">
           <option value="severity" class="bg-surface-900 text-slate-100">Severity</option>
@@ -105,8 +105,8 @@ tailwind.config = {
         </select>
       </div>
       <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg p-0.5">
-        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800"><i class="ph-bold ph-squares-four text-sm"></i></button>
-        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white"><i class="ph-bold ph-rows text-sm"></i></button>
+        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800"><i class="ph-bold ph-squares-four text-[15px]"></i></button>
+        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white"><i class="ph-bold ph-rows text-[15px]"></i></button>
       </div>
     </div>
   </section>
@@ -116,9 +116,9 @@ tailwind.config = {
 
   <!-- ============ SENSOR TABLE ============ -->
   <section id="table-wrap" class="hidden bg-surface-900 border border-surface-800 rounded-xl overflow-hidden">
-    <table class="w-full text-base font-mono">
+    <table class="w-full text-[17px] font-mono">
       <thead>
-        <tr class="text-xs text-slate-500 uppercase tracking-wider border-b border-surface-800 bg-surface-850/50">
+        <tr class="text-[13px] text-slate-500 uppercase tracking-wider border-b border-surface-800 bg-surface-850/50">
           <th class="text-left py-3.5 px-4">Status</th>
           <th class="text-left py-3.5 px-4">Sensor</th>
           <th class="text-left py-3.5 px-4 hidden sm:table-cell">Target</th>
@@ -136,22 +136,22 @@ tailwind.config = {
   </section>
 
   <div id="empty" class="hidden py-16 text-center">
-    <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-3xl"></i></div>
-    <h3 class="text-sm font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
-    <p class="text-xs text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
-    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-xs font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto"><i class="ph-bold ph-plus"></i> Add your first sensor</button>
+    <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-[31px]"></i></div>
+    <h3 class="text-[15px] font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
+    <p class="text-[13px] text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
+    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto"><i class="ph-bold ph-plus"></i> Add your first sensor</button>
   </div>
 
   <!-- ============ ACTIVITY FEED ============ -->
   <section class="bg-surface-900 border border-surface-800 rounded-xl">
     <div class="px-4 py-2.5 border-b border-surface-800 flex items-center gap-2">
-      <i class="ph ph-list-bullets text-slate-500 text-sm"></i>
-      <span class="text-xs font-semibold text-slate-300 tracking-wide">ACTIVITY</span>
-      <span class="text-[11px] text-slate-600 font-mono">state transitions</span>
+      <i class="ph ph-list-bullets text-slate-500 text-[15px]"></i>
+      <span class="text-[13px] font-semibold text-slate-300 tracking-wide">ACTIVITY</span>
+      <span class="text-[12px] text-slate-600 font-mono">state transitions</span>
       <button onclick="clearActivity()" title="Clear activity log"
-        class="ml-auto px-2 py-0.5 rounded-md text-[11px] font-mono text-slate-500 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1"><i class="ph ph-trash-simple"></i> clear</button>
+        class="ml-auto px-2 py-0.5 rounded-md text-[12px] font-mono text-slate-500 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1"><i class="ph ph-trash-simple"></i> clear</button>
     </div>
-    <ul id="feed" class="divide-y divide-surface-800/60 max-h-56 overflow-y-auto text-xs font-mono"></ul>
+    <ul id="feed" class="divide-y divide-surface-800/60 max-h-56 overflow-y-auto text-[13px] font-mono"></ul>
   </section>
 </main>
 
@@ -159,51 +159,56 @@ tailwind.config = {
 <div id="modal-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
   <div class="bg-surface-900 border border-surface-700/80 w-full max-w-3xl rounded-2xl shadow-2xl overflow-hidden">
     <div class="px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
-      <h2 id="modal-title" class="text-sm font-bold text-white">New sensor</h2>
+      <h2 id="modal-title" class="text-[15px] font-bold text-white">New Sensor</h2>
       <button onclick="closeModal()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
     </div>
     <form id="sensor-form" onsubmit="submitSensor(event)" class="p-5 space-y-3">
       <input type="hidden" id="f-id">
+      <div class="flex items-center gap-2">
+        <span class="text-[13px] text-slate-400">Type</span>
+        <select id="f-type" onchange="onFormTypeChange()" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="http">HTTPS / HTTP</option>
+          <option value="icmp">PING / ICMP</option>
+        </select>
+        <span id="f-type-hint" class="text-[12px] text-slate-600 font-mono">probes with ICMP echo — up when the host replies</span>
+      </div>
       <div class="grid grid-cols-2 gap-3">
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
-          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="hostname">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
+          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="hostname">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Target <span class="text-slate-600">IP or hostname</span>
-          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Target <span id="f-target-hint" class="text-slate-600">IP or hostname</span>
+          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
         </label>
       </div>
-      <label class="text-xs text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
+      <label class="text-[13px] text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
         <div id="f-tagchips" class="flex flex-wrap items-center gap-1.5 min-h-[2.2rem] bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5"></div>
         <div class="flex items-center gap-2 mt-1">
-          <select id="f-tagpick" onchange="addFormTag(this.value);this.value=''" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+          <select id="f-tagpick" onchange="addFormTag(this.value);this.value=''" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-300 focus:outline-none focus:border-ok/60">
             <option value="">+ add existing tag…</option>
           </select>
           <input id="f-tagnew" maxlength="30" placeholder="or type new tag ↵"
             onkeydown="if(event.key==='Enter'){event.preventDefault();addFormTag(this.value.trim());this.value=''}"
-            class="w-1/3 text-right bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+            class="w-1/3 text-right bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-300 focus:outline-none focus:border-ok/60">
         </div>
       </label>
-      <div class="grid grid-cols-5 gap-3">
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
-          <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+      <div class="grid grid-cols-4 gap-3">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Interval (s)
+          <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
-          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Timeout (ms)
+          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
-          <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Loss warn (%)
+          <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Error after
-          <input id="f-down" type="number" min="1" max="30" value="2" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
-        </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
-          <input id="f-spike" type="number" min="2" max="10" value="3" title="Informational — shown in the dashboard. Does not change status." class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[13px] text-slate-400 flex flex-col gap-1">Error after
+          <input id="f-down" type="number" min="1" max="30" value="2" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
-      <div id="form-err" class="hidden text-xs text-bad font-mono"></div>
+      <div id="form-err" class="hidden text-[13px] text-bad font-mono"></div>
       <div class="flex justify-end gap-2 pt-1">
-        <button type="button" onclick="closeModal()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Close</button>
-        <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save sensor</button>
+        <button type="button" onclick="closeModal()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[13px] font-mono">Close</button>
+        <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[13px] font-semibold">Save Sensor</button>
       </div>
     </form>
   </div>
@@ -213,59 +218,59 @@ tailwind.config = {
 <div id="settings-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
   <div class="bg-surface-900 border border-surface-700/80 w-full max-w-lg max-h-[calc(100vh-2rem)] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
     <div class="sticky top-0 shrink-0 z-10 px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
-      <h2 class="text-sm font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
+      <h2 class="text-[15px] font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
       <button onclick="closeSettings()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
     </div>
     <div class="p-5 space-y-4 overflow-y-auto min-h-0">
-      <div id="maint-banner" class="hidden text-xs font-mono px-3 py-2 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
-        <i class="ph-bold ph-warning"></i> Maintenance mode is ON — no alerts are being sent.
+      <div id="maint-banner" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+        <i class="ph-bold ph-pause"></i> Maintenance Mode is ON — all active sensors are paused.
       </div>
       <div class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-warn/5">
-        <span class="text-xs font-semibold text-slate-300">
-          <i class="ph-bold ph-wrench text-warn"></i> Maintenance mode
-          <span class="block text-[11px] font-normal text-slate-600 mt-0.5">silence all alerts (sensors keep probing)</span>
+        <span class="text-[13px] font-semibold text-slate-300">
+          <i class="ph-bold ph-wrench text-warn"></i> Maintenance Mode
+          <span class="block text-[12px] font-normal text-slate-600 mt-0.5" id="maint-desc">pause all active sensors</span>
         </span>
-        <button type="button" id="maint-toggle" onclick="toggleMaint()" class="relative w-10 h-6 rounded-full bg-surface-800 border border-surface-700 transition-colors" title="Toggle maintenance mode">
-          <span id="maint-knob" class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-slate-400 transition-transform"></span>
+        <button type="button" id="maint-btn" onclick="toggleMaint()" title="Pause all sensors" class="flex items-center justify-center p-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-warn hover:bg-warn/10 transition">
+          <i id="maint-icon" class="ph-bold ph-pause text-[20px] mt-[1px]"></i>
         </button>
       </div>
-      <div class="flex items-center justify-between text-xs font-mono">
-        <span class="text-slate-400">Alert destinations</span>
+      <div class="flex items-center justify-between text-[13px] font-mono">
+        <span class="text-slate-400">Alert Destinations</span>
         <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
       </div>
       <div class="space-y-2.5">
-        <p class="text-[11px] text-slate-600 font-mono">Each destination you enable receives every alert. A destination sends only when it's toggled on <em>and</em> has a URL.</p>
+        <p class="text-[12px] text-slate-600 font-mono">Each destination you enable receives every alert. A destination sends only when it's toggled on <em>and</em> has a URL.</p>
         <div id="provider-list" class="space-y-2.5"></div>
       </div>
       <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/50 space-y-3">
         <div class="flex items-center justify-between">
-          <span class="text-xs font-semibold text-slate-300">Alert routing</span>
-          <span class="text-[11px] text-slate-600 font-mono">which sensors can fire alerts</span>
+          <span class="text-[13px] font-semibold text-slate-300">Alert Routing</span>
+          <span class="text-[12px] text-slate-600 font-mono">which sensors can fire alerts</span>
         </div>
-        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60">
-          <option value="all">All sensors</option>
-          <option value="tags">Only sensors with selected tags</option>
-          <option value="sensors">Only selected sensors</option>
+        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="all">All Sensors</option>
+          <option value="tags">Sensors With Selected Tags</option>
+          <option value="sensors">Only Selected Sensors</option>
         </select>
         <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
-        <label class="text-xs text-slate-400 flex items-center justify-between gap-3">
-          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still error — 0 = one alert per outage (recovery still alerts)</span></span>
+        <label class="text-[13px] text-slate-400 flex items-center justify-between gap-3">
+          <span class="flex flex-col">Re-Alert Interval <span class="text-[12px] text-slate-600">while still error — 0 = one alert per outage (recovery still alerts)</span></span>
           <span class="flex items-center gap-1.5 font-mono">
-            <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-ok/60"> min
+            <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-[13px] text-slate-200 focus:outline-none focus:border-ok/60"> min
           </span>
         </label>
       </div>
-      <div id="set-msg" class="hidden text-xs font-mono px-3 py-2 rounded-lg border"></div>
-      <div class="text-[11px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
+      <div id="set-msg" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border"></div>
+      <div class="text-[12px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
         <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
         Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning. Warning (packet loss) is shown in the dashboard but does not send an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
       </div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
-      <span class="text-[11px] text-slate-500 font-mono">stored in the pulsemon database</span>
+      <span class="text-[12px] text-slate-500 font-mono">stored in the pulsemon database</span>
       <div class="flex gap-2">
-        <button onclick="closeSettings()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Close</button>
-        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save</button>
+        <button onclick="closeSettings()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[13px] font-mono">Close</button>
+        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[13px] font-semibold">Save</button>
       </div>
     </div>
   </div>
@@ -279,10 +284,10 @@ tailwind.config = {
         <span id="insp-dot" class="w-3 h-3 rounded-full"></span>
         <div>
           <div class="flex items-center gap-2">
-            <h2 id="insp-name" class="text-base font-bold text-white font-mono">—</h2>
-            <span id="insp-tag" class="px-2 py-0.5 rounded text-[11px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
+            <h2 id="insp-name" class="text-[17px] font-bold text-white font-mono">—</h2>
+            <span id="insp-tag" class="px-2 py-0.5 rounded text-[12px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
           </div>
-          <p id="insp-target" class="text-xs text-slate-500 font-mono mt-0.5"></p>
+          <p id="insp-target" class="text-[13px] text-slate-500 font-mono mt-0.5"></p>
         </div>
       </div>
       <button onclick="closeInspector()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
@@ -290,44 +295,45 @@ tailwind.config = {
     <div class="p-5 space-y-5 overflow-y-auto min-h-0">
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono">
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Ping last</div>
-          <div id="insp-rtt" class="text-lg font-bold text-white mt-1">—</div>
+          <div id="insp-rtt-label" class="text-[12px] text-slate-500 uppercase tracking-wider">Ping last</div>
+          <div id="insp-rtt" class="text-[19px] font-bold text-white mt-1">—</div>
         </div>
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">min / avg / max</div>
-          <div id="insp-minavgmax" class="text-xs font-semibold text-slate-200 mt-1.5">—</div>
+          <div class="text-[12px] text-slate-500 uppercase tracking-wider">min / avg / max</div>
+          <div id="insp-minavgmax" class="text-[13px] font-semibold text-slate-200 mt-1.5">—</div>
         </div>
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Loss (60p)</div>
-          <div id="insp-loss" class="text-lg font-bold text-ok mt-1">—</div>
-          <div id="insp-losssub" class="text-[11px] text-slate-500 mt-0.5"></div>
+          <div class="text-[12px] text-slate-500 uppercase tracking-wider">Loss (60p)</div>
+          <div id="insp-loss" class="text-[19px] font-bold text-ok mt-1">—</div>
+          <div id="insp-losssub" class="text-[12px] text-slate-500 mt-0.5"></div>
         </div>
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Jitter</div>
-          <div id="insp-jitter" class="text-lg font-bold text-jit mt-1">—</div>
+          <div class="text-[12px] text-slate-500 uppercase tracking-wider">Jitter</div>
+          <div id="insp-jitter" class="text-[19px] font-bold text-jit mt-1">—</div>
         </div>
       </div>
+      <div id="insp-cert" class="hidden"></div>
       <div>
         <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-semibold text-slate-300 flex items-center gap-3">
+          <span class="text-[13px] font-semibold text-slate-300 flex items-center gap-3">
             Ping over time
-            <span id="insp-graph-up" class="text-[11px] font-mono text-slate-500"></span>
+            <span id="insp-graph-up" class="text-[12px] font-mono text-slate-500"></span>
           </span>
           <div class="flex items-center gap-1">
-            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
-            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
+            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2.5 py-1 rounded text-[12px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
+            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2.5 py-1 rounded text-[12px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
           </div>
         </div>
         <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
       </div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex flex-col gap-3">
-      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono text-center"></span>
+      <span id="insp-interval" class="text-[12px] text-slate-500 font-mono text-center"></span>
       <div class="flex items-center justify-end gap-2">
-        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-xs font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
-          <i class="ph ph-trash"></i> Clear history
+        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[13px] font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
+          <i class="ph ph-trash"></i> Clear History
         </button>
-        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono whitespace-nowrap">Close</button>
+        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-[13px] font-mono whitespace-nowrap">Close</button>
       </div>
     </div>
   </div>
@@ -379,6 +385,33 @@ async function refresh() {
 function fmtRtt(v) {
   if (v == null) return '—';
   return Math.round(v) + ' ms';
+}
+
+// ---- HTTP sensor helpers ----
+function typeLabel(s) {
+  if (s.type !== 'http') return 'PING';
+  // The API requires an explicit scheme, so the target's prefix tells us
+  // whether the probe actually runs HTTPS.
+  return /^https:/i.test(s.target || '') ? 'HTTPS' : 'HTTP';
+}
+function httpStatusText(s) {
+  // "503" when a response arrived; "no reply" when the probe timed out or
+  // failed to connect. Shown on the card in place of / beside the RTT.
+  if (s.type !== 'http') return null;
+  if (s.state === 'paused') return null;
+  if (s.http_status != null) return String(s.http_status);
+  return 'no reply';
+}
+// certNote builds the advisory cert-expiry line for an HTTPS card. It NEVER
+// touches status — it's a text note only. Thresholds: >30d silent, 8-30d
+// amber, <=7d red, expired red. Returns '' for plain-HTTP / no cert.
+function certNote(s) {
+  if (s.type !== 'http' || !s.cert_expiry) return '';
+  const days = Math.floor((new Date(s.cert_expiry).getTime() - Date.now()) / 86400000);
+  if (days < 0)  return '<div class="text-[12px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expired ' + Math.abs(days) + 'd ago</div>';
+  if (days <= 7) return '<div class="text-[12px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
+  if (days <= 30) return '<div class="text-[12px] font-mono text-warn flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
+  return '';
 }
 
 function jitterOf(s) {
@@ -490,10 +523,19 @@ function cardHtml(s) {
   const m = statusMeta(s);
   const st = s.stats;
   const paused = s.state === 'paused';
-  const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : 'no data');
+  const isHttp = s.type === 'http';
+  let rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : 'no data');
+  if (isHttp && !paused) {
+    // "503 · 120 ms" — status code leads; RTT follows when a response
+    // arrived. "no reply" / "no data" stand alone when there is no code.
+    const code = httpStatusText(s);
+    rtt = (code && code !== 'no reply' && st && st.rtt_last != null) ? code + ' · ' + fmtRtt(st.rtt_last)
+         : (code || rtt);
+  }
   const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
   const j = jitterOf(s);
   const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
+  const cert = certNote(s);
   const border = paused ? 'border-surface-700' : s.status === 'error' ? 'border-bad/40' : s.status === 'warning' ? 'border-warn/30' : 'border-surface-800';
   const n = st && st.recent ? st.recent.length : 0;
   return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-4 flex flex-col gap-3 transition-all hover:shadow-lg hover:shadow-black/30 ' + (paused ? 'opacity-70' : '') + '">' +
@@ -501,27 +543,31 @@ function cardHtml(s) {
       '<div class="flex items-center gap-2.5 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
         '<span class="w-2.5 h-2.5 rounded-full shrink-0 ' + m.dot + ' ' + m.glow + '"></span>' +
         '<div class="min-w-0">' +
-          '<h3 class="text-sm font-semibold text-slate-100 font-mono truncate">' + esc(s.name) + '</h3>' +
-          '<div class="flex flex-wrap items-center gap-1 mt-0.5">' +
-            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join(' ') : '') +
+          '<div class="flex items-center gap-1.5 min-w-0">' +
+            '<h3 class="text-[15px] font-semibold text-slate-100 font-mono truncate">' + esc(s.name) + '</h3>' +
+            '<span class="px-1.5 py-0.2 rounded text-[11px] font-mono font-semibold border ' + (isHttp ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span>' +
+          '</div>' +
+          '<div class="flex flex-wrap items-center gap-1 mt-0.5 min-h-[19px]">' +
+            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[12px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join(' ') : '') +
           '</div>' +
         '</div>' +
       '</div>' +
-      '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-semibold border ' + m.cls + '">' + m.label + '</span>' +
+      '<span class="px-2 py-0.5 rounded text-[12px] font-mono font-semibold border ' + m.cls + '">' + m.label + '</span>' +
     '</div>' +
     '<div class="grid grid-cols-3 gap-2 p-2.5 bg-surface-950/80 rounded-lg border border-surface-800/80 font-mono text-center">' +
-      '<div><div class="text-[11px] text-slate-500 uppercase">Ping</div><div class="text-sm font-bold text-slate-100 mt-0.5">' + rtt + '</div></div>' +
-      '<div class="border-x border-surface-800"><div class="text-[11px] text-slate-500 uppercase">Jitter</div><div class="text-sm font-bold text-jit mt-0.5">' + jit + '</div></div>' +
-      '<div><div class="text-[11px] text-slate-500 uppercase">Loss</div><div class="text-sm font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div></div>' +
+      '<div><div class="text-[12px] text-slate-500 uppercase">' + typeLabel(s) + '</div><div class="text-[15px] font-bold text-slate-100 mt-0.5">' + rtt + '</div></div>' +
+      '<div class="border-x border-surface-800"><div class="text-[12px] text-slate-500 uppercase">Jitter</div><div class="text-[15px] font-bold text-jit mt-0.5">' + jit + '</div></div>' +
+      '<div><div class="text-[12px] text-slate-500 uppercase">Loss</div><div class="text-[15px] font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div></div>' +
     '</div>' +
+    (cert ? cert : '') +
     '<div>' +
-      '<div class="flex items-center justify-between text-[11px] text-slate-600 font-mono mb-1">' +
+      '<div class="flex items-center justify-between text-[12px] text-slate-600 font-mono mb-1">' +
         '<span>past hour</span>' +
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (((st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) != null) ? ' · avg ' + fmtRtt(st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) : '') + '</span>' : '') +
       '</div>' +
       '<div class="h-7 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
-        (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused — probing stopped</span>'
-          : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
+        (paused ? '<span class="text-[12px] text-slate-600 font-mono">paused — probing stopped</span>'
+          : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[12px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
     '<div class="flex items-center justify-between pt-2 border-t border-surface-800/60">' +
@@ -576,25 +622,33 @@ function miniSpark(recent) {
 }
 
 function renderTable(list) {
+  const hasHttp = list.some(s => s.type === 'http');
+  const pingHdr = hasHttp ? 'Resp' : 'Ping';
   $('table-body').innerHTML = list.map(s => {
     const m = statusMeta(s);
     const st = s.stats;
     const paused = s.state === 'paused';
-    const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—');
+    let rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—');
+    if (s.type === 'http' && !paused) {
+      const code = httpStatusText(s);
+      rtt = (code && code !== 'no reply' && st && st.rtt_last != null) ? code + ' · ' + fmtRtt(st.rtt_last)
+           : (code || rtt);
+    }
     const j = jitterOf(s);
     const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
     const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
     const up24 = paused ? '—' : (st && st.total ? st.uptime_24h.toFixed(2) + '%' : '—');
+    const cert = s.type === 'http' ? (certNote(s) ? ' <span class="text-warn text-[11px]">⚠ cert</span>' : '') : '';
     return '<tr class="hover:bg-surface-850/60 transition-colors">' +
       '<td class="py-3.5 px-4"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2.5 h-2.5 rounded-full ' + m.dot + ' ' + m.glow + '"></span>' + m.label + '</span></td>' +
-      '<td class="py-3.5 px-4 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span></td>' +
+      '<td class="py-3.5 px-4 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1.5 py-0.2 rounded text-[11px] font-mono font-semibold border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
       '<td class="py-3.5 px-4 text-slate-400 hidden sm:table-cell">' + esc(s.target) + '</td>' +
-      '<td class="py-3.5 px-4">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-2.5 py-1 rounded text-xs bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-700">—</span>') + '</td>' +
-      '<td class="py-3.5 px-4 text-right ' + (st && st.rtt_last != null ? 'text-slate-100 font-bold' : 'text-slate-500') + '">' + rtt + '</td>' +
+      '<td class="py-3.5 px-4">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-2.5 py-1 rounded text-[13px] bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-700">—</span>') + '</td>' +
+      '<td class="py-3.5 px-4 text-right ' + (st && st.rtt_last != null ? 'text-slate-100 font-bold' : 'text-slate-500') + '">' + rtt + cert + '</td>' +
       '<td class="py-3.5 px-4 text-right text-jit">' + jit + '</td>' +
       '<td class="py-3.5 px-4 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-bold' : 'text-slate-400') + '">' + loss + '</td>' +
       '<td class="py-3.5 px-4 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-bold' : 'text-ok') + '">' + up24 + '</td>' +
-      '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-xs text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
+      '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-[13px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-3.5 px-4 text-right"><div class="flex items-center justify-end gap-0.5">' +
         '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
@@ -603,6 +657,9 @@ function renderTable(list) {
         '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
       '</div></td></tr>';
   }).join('');
+  // Update the Ping header to Resp when any HTTP sensor is visible.
+  const ths = document.querySelectorAll('#table-wrap thead th');
+  if (ths.length >= 5) ths[4].textContent = pingHdr;
 }
 document.addEventListener('input', e => { if (e.target.id === 'q') searchQ = e.target.value.trim().toLowerCase(); render(); });
 
@@ -612,7 +669,11 @@ async function echoPing(id, btn) {
   try {
     const r = await api('/api/sensors/' + id + '/ping', { method: 'POST' });
     if (btn) { btn.classList.add(r.lost ? 'text-bad' : 'text-ok'); setTimeout(() => { btn.classList.remove('text-bad','text-ok'); btn.disabled = false; }, 1500); }
-    toast(r.lost ? 'no reply from ' + id : 'pulse: ' + fmtRtt(r.rtt_ms), r.lost ? 'bad' : 'ok');
+    let msg;
+    if (r.lost) msg = 'no reply from ' + id;
+    else if (r.http_status != null) msg = 'pulse: HTTP ' + r.http_status + ' · ' + fmtRtt(r.rtt_ms);
+    else msg = 'pulse: ' + fmtRtt(r.rtt_ms);
+    toast(msg, r.lost ? 'bad' : 'ok');
   } catch (e) { toast('pulse failed: ' + e.message, 'bad'); }
   echoBusy = false;
 }
@@ -651,11 +712,11 @@ function allExistingTags() { return [...new Set(SENSORS.flatMap(s => s.tags || [
 function renderFormTags(selected) {
   const box = $('f-tagchips');
   if (!selected.length) {
-    box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no tags — pick or type one below</span>';
+    box.innerHTML = '<span class="text-[12px] text-slate-600 font-mono">no tags — pick or type one below</span>';
   } else {
     box.innerHTML = selected.map(t =>
-      '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-800 border border-surface-700 text-[11px] font-mono text-slate-200">' +
-      esc(t) + '<button type="button" onclick="removeFormTag(\'' + t.replace(/'/g, "\\'") + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[11px]"></i></button></span>').join('');
+      '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-800 border border-surface-700 text-[12px] font-mono text-slate-200">' +
+      esc(t) + '<button type="button" onclick="removeFormTag(\'' + t.replace(/'/g, "\\'") + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[12px]"></i></button></span>').join('');
   }
   // dropdown: existing tags not already selected
   const pick = $('f-tagpick');
@@ -684,29 +745,45 @@ function openSensorModal(id) {
   formTagsCache = [];
   if (id) {
     const s = SENSORS.find(x => x.id === id); if (!s) return;
-    $('modal-title').textContent = 'Edit sensor';
+    $('modal-title').textContent = 'Edit Sensor';
     $('f-id').value = s.id; $('f-name').value = s.name; $('f-target').value = s.target;
+    $('f-type').value = s.type === 'http' ? 'http' : 'icmp';
+    onFormTypeChange();
     formTagsCache = (s.tags || []).slice();
     renderFormTags(formTagsCache);
-    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 3;
+    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after;
   } else {
-    $('modal-title').textContent = 'New sensor';
+    $('modal-title').textContent = 'New Sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
+    $('f-type').value = 'http';
+    onFormTypeChange();
     renderFormTags([]);
-    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2; $('f-spike').value = 3;
+    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);
 }
+
+// onFormTypeChange swaps the target hint + placeholder so the form asks for
+// an IP/hostname (icmp) or a URL (http) — the backend validates the pair.
+function onFormTypeChange() {
+  const isHttp = $('f-type').value === 'http';
+  $('f-target-hint').textContent = isHttp ? 'URL (http:// or https://)' : 'IP or hostname';
+  $('f-target').placeholder = isHttp ? 'https://example.com/health' : '0.0.0.0';
+  $('f-type-hint').textContent = isHttp
+    ? 'GETs the URL — up when it answers 200–299 in time (redirects followed; 4xx/5xx = loss)'
+    : 'probes with ICMP echo — up when the host replies';
+}
+
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }
 
 async function submitSensor(ev) {
   ev.preventDefault();
   const id = $('f-id').value;
   const body = {
-    name: $('f-name').value.trim(), target: $('f-target').value.trim(), tags: selectedFormTags(),
+    name: $('f-name').value.trim(), target: $('f-target').value.trim(), type: $('f-type').value, tags: selectedFormTags(),
     interval_s: +$('f-interval').value, timeout_ms: +$('f-timeout').value,
-    loss_warn: +$('f-loss').value, down_after: +$('f-down').value, spike_mult: +$('f-spike').value
+    loss_warn: +$('f-loss').value, down_after: +$('f-down').value
   };
   try {
     if (id) {
@@ -752,23 +829,51 @@ async function openSettings() {
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
 
 function setMaintUI(on) {
-  const track = $('maint-toggle'), knob = $('maint-knob');
-  track.className = 'relative w-10 h-6 rounded-full border transition-colors ' + (on ? 'bg-warn/40 border-warn/60' : 'bg-surface-800 border-surface-700');
-  knob.className = 'absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform ' + (on ? 'translate-x-4 bg-warn' : 'translate-x-0 bg-slate-400');
+  const btn = $('maint-btn'), icon = $('maint-icon');
+  if (on) {
+    btn.className = 'flex items-center justify-center p-2 rounded-lg bg-warn/15 border border-warn/40 text-warn hover:bg-warn/25 transition';
+    btn.title = 'Resume all sensors';
+    // Phosphor's play glyph sits high and right of its box — nudge it down
+    // and left so it reads centered like the pause does.
+    icon.className = 'ph-bold ph-play text-[20px] mt-[1px] -ml-[2px]';
+  } else {
+    btn.className = 'flex items-center justify-center p-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-warn hover:bg-warn/10 transition';
+    btn.title = 'Pause all sensors';
+    // Pause glyph sits a hair high — nudge down to optical center.
+    icon.className = 'ph-bold ph-pause text-[20px] mt-[1px]';
+  }
+  $('maint-desc').textContent = on ? 'resume all previously-running sensors' : 'pause all active sensors';
   $('maint-banner').classList.toggle('hidden', !on);
 }
 
+let maintBusy = false;
 async function toggleMaint() {
+  if (maintBusy) return; // a toggle round-trip is in flight — the cached
+  // SETTINGS may lag the server, so toggling off the cache could send the
+  // same value twice. Read the current state from the server instead.
   const next = !(SETTINGS.maintenance_mode === true);
+  if (next) {
+    // Nothing active -> the snapshot would be empty, and a later resume
+    // would have nothing to restore. Refuse instead of silently doing
+    // nothing.
+    if (!SENSORS.some(s => s.state === 'active')) {
+      setMsg('no active sensors to pause', 'bad');
+      return;
+    }
+  }
+  maintBusy = true;
   setMaintUI(next); // optimistic
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maintenance_mode: next }) });
     SETTINGS = r;
     setMaintUI(!!r.maintenance_mode);
-    setMsg(next ? 'maintenance mode ON — alerts silenced (sensors keep probing). Re-alert timers reset on turn-off.' : 'maintenance mode off — alerts active again', 'ok');
+    setMsg(next ? 'Maintenance Mode ON — all active sensors paused.' : 'Maintenance Mode off — previously-running sensors resumed.', 'ok');
+    await refresh(); // sensor states changed — re-render cards
   } catch (e) {
     setMaintUI(SETTINGS.maintenance_mode === true);
     setMsg('failed to update maintenance mode: ' + e.message, 'bad');
+  } finally {
+    maintBusy = false;
   }
 }
 
@@ -776,16 +881,16 @@ function renderScopeOptions(selected) {
   const scope = $('f-scope').value;
   const box = $('scope-options');
   if (!selected) selected = SETTINGS.alert_filter || [];
-  if (scope === 'all') { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">every sensor can fire an alert</span>'; return; }
+  if (scope === 'all') { box.innerHTML = '<span class="text-[12px] text-slate-600 font-mono">every sensor can fire an alert</span>'; return; }
   const items = scope === 'tags'
     ? [...new Set(SENSORS.flatMap(s => s.tags || []))]
     : SENSORS.map(s => s.id + '||' + s.name);
-  if (!items.length) { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no ' + (scope === 'tags' ? 'tags' : 'sensors') + ' yet</span>'; return; }
+  if (!items.length) { box.innerHTML = '<span class="text-[12px] text-slate-600 font-mono">no ' + (scope === 'tags' ? 'tags' : 'sensors') + ' yet</span>'; return; }
   box.innerHTML = items.map(v => {
     const val = scope === 'tags' ? v : v.split('||')[0];
     const label = scope === 'tags' ? v : v.split('||')[1];
     const on = selected.includes(val);
-    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2.5 py-1 rounded-lg text-[11px] font-mono border transition-colors ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
+    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2.5 py-1 rounded-lg text-[12px] font-mono border transition-colors ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
   }).join('');
 }
 
@@ -807,7 +912,7 @@ function selectedFilterItems() {
 function setMsg(text, kind) {
   const el = $('set-msg');
   el.textContent = text;
-  el.className = 'text-xs font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
+  el.className = 'text-[13px] font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
   el.classList.remove('hidden');
 }
 
@@ -831,9 +936,9 @@ function renderProviderList(providers) {
     row.className = 'border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/50';
     row.innerHTML = `
       <div class="flex items-center justify-between mb-2">
-        <span class="text-xs font-semibold text-slate-200 flex items-center gap-2">${meta.icon} ${meta.name}</span>
+        <span class="text-[13px] font-semibold text-slate-200 flex items-center gap-2">${meta.icon} ${meta.name}</span>
         <span class="flex items-center gap-2">
-          <span id="prov-status-${p.kind}" class="text-[11px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ${p.enabled ? 'text-ok' : 'text-slate-500'}">${statusText}</span>
+          <span id="prov-status-${p.kind}" class="text-[12px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ${p.enabled ? 'text-ok' : 'text-slate-500'}">${statusText}</span>
           <button type="button" id="prov-toggle-${p.kind}" onclick="toggleProvider('${p.kind}')" title="Toggle ${meta.name} alerts" class="relative w-10 h-6 rounded-full transition-colors ${p.enabled ? 'bg-ok/40 border border-ok/60' : 'bg-surface-800 border border-surface-700'}">
             <span class="absolute top-0.5 ${p.enabled ? 'left-5' : 'left-0.5'} w-5 h-5 rounded-full transition-transform ${p.enabled ? 'bg-ok' : 'bg-slate-400'}"></span>
           </button>
@@ -841,9 +946,9 @@ function renderProviderList(providers) {
       </div>
       <div class="flex items-center gap-2">
         <input id="prov-url-${p.kind}" type="text" placeholder="${p.kind === 'discord' ? 'https://discord.com/api/webhooks/…/…' : 'https://chat.googleapis.com/v1/spaces/…/messages?key=…'}"
-          value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
-        ${p.has_url ? `<button type="button" onclick="clearProviderURL('${p.kind}')" title="Clear the stored ${meta.name} URL" class="px-2 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-[11px] font-mono whitespace-nowrap">Clear</button>` : ''}
-        <button type="button" id="prov-test-${p.kind}" onclick="testWebhook('${p.kind}')" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-xs font-semibold whitespace-nowrap">
+          value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        ${p.has_url ? `<button type="button" onclick="clearProviderURL('${p.kind}')" title="Clear the stored ${meta.name} URL" class="px-2 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-[12px] font-mono whitespace-nowrap">Clear</button>` : ''}
+        <button type="button" id="prov-test-${p.kind}" onclick="testWebhook('${p.kind}')" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[13px] font-semibold whitespace-nowrap">
           <i class="ph-bold ph-paper-plane-tilt"></i> Test
         </button>
       </div>`;
@@ -953,7 +1058,7 @@ async function clearHistory() {
 function renderGraph(el, data) {
   const pts = (data.points || []).filter(p => p.total > 0);
   if (!pts.length) {
-    el.innerHTML = '<div class="flex items-center justify-center h-28 text-[11px] text-slate-600 font-mono">no data in this range yet</div>';
+    el.innerHTML = '<div class="flex items-center justify-center h-28 text-[12px] text-slate-600 font-mono">no data in this range yet</div>';
     return;
   }
   const W = 760, H = 120, padL = 8, padR = 8, padT = 8, padB = 14;
@@ -976,11 +1081,11 @@ function renderGraph(el, data) {
       '<path d="' + path + '" fill="none" stroke="#10b981" stroke-width="1.5"/>' +
       '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#161f30" stroke-width="1"/>' +
       ticks +
-      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
-      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
-      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
+      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
+      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
+      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="10" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
     '</svg>' +
-    '<div class="flex items-center justify-between text-[11px] font-mono text-slate-600 mt-1">' +
+    '<div class="flex items-center justify-between text-[12px] font-mono text-slate-600 mt-1">' +
       '<span>peak avg ' + fmtRtt(maxAvg) + '</span>' +
       '<span>red ticks = packet loss in bucket</span>' +
     '</div>';
@@ -995,18 +1100,30 @@ async function loadInspector() {
     $('insp-name').textContent = s.name;
     $('insp-tag').textContent = (s.tags && s.tags.length) ? s.tags.join(' · ') : '—';
     $('insp-target').textContent = s.target + (s.state === 'paused' ? '   ·   PAUSED' : '');
-    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · error after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 3) + '×';
+    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · error after ' + s.down_after + ' · loss warn ' + s.loss_warn + '%';
     const g1 = document.getElementById('grange-1h');
     const g2 = document.getElementById('grange-24h');
-    if (g1) g1.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
-    if (g2) g2.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+    if (g1) g1.className = 'px-2.5 py-1 rounded text-[12px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+    if (g2) g2.className = 'px-2.5 py-1 rounded text-[12px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
     $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime over ' + graphRange : 'no data in ' + graphRange;
     renderGraph($('insp-graph'), g);
     const st = s.stats;
-    $('insp-rtt').textContent = (st && st.rtt_last != null) ? fmtRtt(st.rtt_last) : '—';
+    $('insp-rtt-label').textContent = s.type === 'http' ? 'HTTP last' : 'Ping last';
+    if (s.type === 'http') {
+      const code = httpStatusText(s);
+      if (code && code !== 'no reply' && st && st.rtt_last != null) $('insp-rtt').textContent = code + ' · ' + fmtRtt(st.rtt_last);
+      else $('insp-rtt').textContent = code || (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—');
+    } else {
+      $('insp-rtt').textContent = (st && st.rtt_last != null) ? fmtRtt(st.rtt_last) : '—';
+    }
+    // Cert-expiry advisory (HTTPS only) — informational, never changes status.
+    const certEl = $('insp-cert');
+    const cert = certNote(s);
+    if (cert) { certEl.innerHTML = cert; certEl.classList.remove('hidden'); }
+    else certEl.classList.add('hidden');
     $('insp-minavgmax').textContent = (st && st.rtt_min != null) ? fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max) : '—';
     $('insp-loss').textContent = st ? st.loss_pct.toFixed(1) + '%' : '—';
-    $('insp-loss').className = 'text-lg font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');
+    $('insp-loss').className = 'text-[19px] font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');
     // The big number is the 60-probe window; the sub-line shows the
     // status-window number the badge actually came from (v0.1.22 derives
     // status from the last statusWindow probes), so an UP badge next to a
@@ -1030,7 +1147,7 @@ function toast(msg, kind) {
     document.body.appendChild(el);
   }
   const color = kind === 'bad' ? 'text-bad border-bad/40 bg-surface-900' : 'text-ok border-ok/40 bg-surface-900';
-  el.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg border text-xs font-mono shadow-xl ' + color;
+  el.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg border text-[13px] font-mono shadow-xl ' + color;
   el.textContent = msg;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.remove(), 2500);

@@ -62,6 +62,7 @@ func (db *DB) InitSchema() error {
 		id TEXT PRIMARY KEY,
 		name TEXT UNIQUE NOT NULL,
 		target TEXT NOT NULL,
+		type TEXT NOT NULL DEFAULT 'icmp',
 		tag TEXT,
 		interval_s INTEGER NOT NULL,
 		timeout_ms INTEGER NOT NULL,
@@ -79,6 +80,7 @@ func (db *DB) InitSchema() error {
 		ts DATETIME NOT NULL,
 		rtt_ms REAL,
 		resolved_ip TEXT,
+		http_status INTEGER,
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
@@ -143,6 +145,24 @@ func (db *DB) InitSchema() error {
 	var resolvedCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'resolved_ip'`).Scan(&resolvedCol); err == nil && resolvedCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN resolved_ip TEXT`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: record the HTTP status code for HTTP sensors
+	// (NULL for ICMP probes and any probe that got no response). Lets the
+	// card show "HTTP 503" vs "no response" for the same loss row.
+	var httpStatusCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'http_status'`).Scan(&httpStatusCol); err == nil && httpStatusCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN http_status INTEGER`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: sensor probe type. Existing sensors default to
+	// 'icmp' (the original and only type), so this is a no-op data-wise; it
+	// just lets the probe worker dispatch the right probe.
+	var typeCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'type'`).Scan(&typeCol); err == nil && typeCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN type TEXT NOT NULL DEFAULT 'icmp'`); err != nil {
 			return err
 		}
 	}
@@ -355,6 +375,58 @@ func (db *DB) SetSetting(key, value string) error {
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, value, tsNow())
 	return err
+}
+
+// ActiveSensorIDs lists the ids of every sensor currently in state 'active',
+// in name order. Used to snapshot which sensors are running before maintenance
+// mode pauses them, so resume can restore exactly that set.
+func (db *DB) ActiveSensorIDs() ([]string, error) {
+	rows, err := db.Query("SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SetSensorStates sets the state for a batch of sensor ids, running in
+// inQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
+// SQLite host-parameter limit (same rule as SensorTagsFor). Returns the number
+// of rows changed. An empty id list is a no-op.
+func (db *DB) SetSensorStates(ids []string, state string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	var total int64
+	for start := 0; start < len(ids); start += inQueryChunk {
+		end := start + inQueryChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		q := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, state)
+		for j, id := range chunk {
+			q[j] = "?"
+			args = append(args, id)
+		}
+		res, err := db.Exec("UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
 }
 
 func (db *DB) SeedSensors() error {

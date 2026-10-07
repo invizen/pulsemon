@@ -32,6 +32,17 @@ type ProbeState struct {
 	// a probe brings it back to up, then reverts to the configured interval.
 	// Maintained by doProbe, read by sensorLoop under pw.mu.
 	fastRetry bool
+	// lastHTTPStatus is the most recent HTTP status code for an HTTP sensor
+	// (nil for ICMP, or when no response has ever arrived). doProbe updates
+	// it after each probe; the API reads it via LastHTTPStatus. It is NOT
+	// part of the stats cache (SensorStats is type-agnostic and shared by
+	// the differential test).
+	lastHTTPStatus *int
+	// lastCertExpiry is the server cert's NotAfter from the most recent
+	// probe (HTTPS only; nil for plain HTTP or no handshake). Informational:
+	// the card shows an expiry note when it is near, but it never feeds
+	// status. Kept alongside lastHTTPStatus for the same reason.
+	lastCertExpiry *time.Time
 }
 
 // probeEntry is one probe in the in-memory stats series: its UTC epoch second
@@ -101,9 +112,13 @@ func (ps *probeSeries) snapshot() []probeEntry {
 }
 
 type sensorConfig struct {
-	id        string
-	name      string
-	target    string
+	id     string
+	name   string
+	target string
+	// probeType is the probe transport: "icmp" (default) or "http". It
+	// decides which probe probeTarget dispatches to; everything downstream
+	// (status derivation, loss/jitter, sparkline, alerts) is type-agnostic.
+	probeType string
 	tags      []string
 	intervalS int
 	timeoutMS int
@@ -213,7 +228,7 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 }
 
 func (pw *ProbeWorker) syncSensors(ctx context.Context) {
-	rows, err := pw.db.Query(`SELECT id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state
+	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state
 		FROM sensors WHERE state = 'active'`)
 	if err != nil {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
@@ -227,8 +242,11 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	var configs []activeCfg
 	for rows.Next() {
 		var c activeCfg
-		if err := rows.Scan(&c.id, &c.name, &c.target, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.spikeMult, &c.state); err != nil {
+		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.spikeMult, &c.state); err != nil {
 			continue
+		}
+		if c.probeType == "" {
+			c.probeType = "icmp" // legacy rows pre-migration
 		}
 		if c.spikeMult < 2 {
 			c.spikeMult = 5
@@ -753,78 +771,121 @@ func fnvHash(b []byte) uint64 {
 	return h
 }
 
-// pingNowTimeout bounds the "Echo Now" manual probe. It is a fixed 1s,
-// independent of the sensor's configured timeout: a manual echo is a quick
+// pingNowTimeout bounds the "Pulse Now" manual probe. It is a fixed 1s,
+// independent of the sensor's configured timeout: a manual pulse is a quick
 // diagnostic, not a scheduled probe, so it shouldn't wait out a long
 // configured timeout. It is a var (like the other bounded call sites) so a
 // test can shorten it.
 var pingNowTimeout = time.Second
 
-// pingNow is the probe the "Echo Now" path issues. A var (not a direct
-// pingHost call) so a test can stub it and assert the timeout without
-// opening a real ICMP socket.
-var pingNow = func(target string, timeout time.Duration) PingResult {
-	return pingHost(target, timeout)
-}
-
-// PingNow performs one immediate "Echo Now" probe and RECORDS it: the row
+// PingNow performs one immediate "Pulse Now" probe and RECORDS it: the row
 // lands in probes (history + dashboard sparkline) and the in-memory stats
 // cache, exactly as a scheduled tick would — but it deliberately does NOT
 // derive a status, write a transition event, or fire an alert. A manual
-// echo is a diagnostic: recording it keeps the history honest (the user saw
+// pulse is a diagnostic: recording it keeps the history honest (the user saw
 // a real RTT / loss at that instant), while keeping status and alerts driven
 // only by the scheduled probe loop (a single manual probe must not flip a
 // healthy sensor to error or fire a recovery webhook). Works while paused
-// (SPEC §2).
-func (pw *ProbeWorker) PingNow(id string) (PingResult, error) {
-	var target string
-	if err := pw.db.QueryRow("SELECT target FROM sensors WHERE id = ?", id).Scan(&target); err != nil {
-		return PingResult{}, err // sql.ErrNoRows for an unknown sensor
+// (SPEC §2). Dispatches by sensor type, so an HTTP sensor's manual pulse
+// makes an HTTP request (the card's "Pulse Now" shows its status code).
+func (pw *ProbeWorker) PingNow(id string) (probeOutcome, error) {
+	var target, probeType string
+	if err := pw.db.QueryRow("SELECT target, type FROM sensors WHERE id = ?", id).Scan(&target, &probeType); err != nil {
+		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
+	}
+	if probeType == "" {
+		probeType = "icmp"
 	}
 
-	res := pingNow(target, pingNowTimeout)
+	o := probeTarget(probeType, target, pingNowTimeout)
 
 	var rttVal interface{}
-	if !res.Lost {
-		rttVal = res.RTT.Seconds() * 1000
+	if !o.lost {
+		rttVal = o.rttMs
 	}
 	now := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)",
-		id, now.Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
-		return res, fmt.Errorf("record echo probe: %w", err)
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)",
+		id, now.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
+		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
 	// lockstep doProbe maintains), so the dashboard reflects the echo.
 	var rttPtr *float64
-	if !res.Lost {
-		v := res.RTT.Seconds() * 1000
+	if !o.lost {
+		v := o.rttMs
 		rttPtr = &v
 	}
 	pw.recordProbe(id, probeEntry{ts: now.Unix(), rtt: rttPtr})
-	return res, nil
+	return o, nil
+}
+
+// LastHTTPStatus returns the most recent HTTP status code and cert expiry for
+// a sensor, or (nil, nil) for ICMP sensors / sensors never probed this run.
+// The card uses it to render "HTTP 503" and the cert-expiry note without a
+// DB read per poll.
+func (pw *ProbeWorker) LastHTTPStatus(id string) (*int, *time.Time) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	if ps, ok := pw.sensors[id]; ok {
+		return ps.lastHTTPStatus, ps.lastCertExpiry
+	}
+	return nil, nil
+}
+
+// probeOutcome is the transport-agnostic result of one probe: the round-trip
+// time (meaningful only when not lost), whether the probe was lost, the
+// resolved IP (diagnostic), and, for HTTP sensors, the status code when a
+// response arrived (nil when it didn't). Both ICMP and HTTP probes are
+// normalized to this so doProbe, PingNow, and status derivation share one
+// code path and don't care which transport produced the result.
+type probeOutcome struct {
+	rttMs      float64
+	lost       bool
+	ip         string
+	httpCode   *int
+	certExpiry *time.Time
+}
+
+// probeTarget dispatches one probe to the sensor's transport. A var so a
+// test can stub the whole probe without opening a socket or making a request.
+var probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+	if probeType == "http" {
+		r := probeHTTP(target, timeout)
+		o := probeOutcome{lost: r.Lost, ip: r.IP, httpCode: r.Status, certExpiry: r.CertExpiry}
+		if !r.Lost {
+			o.rttMs = r.Elapsed.Seconds() * 1000
+		}
+		return o
+	}
+	// icmp (default)
+	res := pingHost(target, timeout)
+	o := probeOutcome{lost: res.Lost, ip: res.ResolvedIP}
+	if !res.Lost {
+		o.rttMs = res.RTT.Seconds() * 1000
+	}
+	return o
 }
 
 func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	c.lastErrCount = probeErrCount.Load()
-	res := pingHost(c.target, time.Duration(c.timeoutMS)*time.Millisecond)
+	o := probeTarget(c.probeType, c.target, time.Duration(c.timeoutMS)*time.Millisecond)
 
 	var rttVal interface{}
 	var rttMs float64
-	if !res.Lost {
-		ms := res.RTT.Seconds() * 1000 // float64 ms, no truncation
-		rttVal = ms
-		rttMs = ms
+	if !o.lost {
+		rttVal = o.rttMs
+		rttMs = o.rttMs
 	}
 
 	now := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, ?)", c.id, now.Format(time.RFC3339Nano), rttVal, res.ResolvedIP); err != nil {
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, now.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row so the
 	// dashboard read path stays O(1) (no per-poll SQLite queries).
 	var rttPtr *float64
-	if !res.Lost {
+	if !o.lost {
 		v := rttMs
 		rttPtr = &v
 	}
@@ -842,11 +903,17 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 	newStatus := pw.deriveStatus(c, oldStatus)
 
 	// Keep the in-memory lastStatus + fastRetry flag in lockstep so the
-	// sensorLoop can pick the next-tick cadence without a DB read.
+	// sensorLoop can pick the next-tick cadence without a DB read. For HTTP
+	// sensors, also remember the status code + cert expiry so the card can
+	// show "HTTP 503" / "cert expires in 3d" without a DB read per poll.
 	pw.mu.Lock()
 	if ps, ok := pw.sensors[c.id]; ok {
 		ps.lastStatus = newStatus
 		ps.fastRetry = newStatus == "error"
+		if c.probeType == "http" {
+			ps.lastHTTPStatus = o.httpCode
+			ps.lastCertExpiry = o.certExpiry
+		}
 	}
 	pw.mu.Unlock()
 

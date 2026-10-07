@@ -22,6 +22,7 @@ type Sensor struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
 	Target    string   `json:"target"`
+	Type      string   `json:"type"` // "icmp" (default) | "http"
 	Tags      []string `json:"tags"`
 	IntervalS int      `json:"interval_s"`
 	TimeoutMS int      `json:"timeout_ms"`
@@ -37,6 +38,11 @@ type Sensor struct {
 type SensorView struct {
 	Sensor
 	Stats *SensorStats `json:"stats"` // nil when paused or no probes yet
+	// HTTP-sensor-only, derived from the probe worker (not the DB): the last
+	// status code + cert expiry. The card renders "HTTP 503" and a cert
+	// expiry note from these. Omitted for ICMP sensors (omitempty + nil).
+	HTTPStatus *int       `json:"http_status,omitempty"`
+	CertExpiry *time.Time `json:"cert_expiry,omitempty"`
 }
 
 // SensorStats is a 60-probe window summary (SPEC §4).
@@ -163,7 +169,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 // git history for reference; do not call.
 
 func (s *Server) fetchSensors() []Sensor {
-	rows, err := s.db.Query("SELECT id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name")
+	rows, err := s.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
 	if err != nil {
 		return nil
 	}
@@ -172,8 +178,11 @@ func (s *Server) fetchSensors() []Sensor {
 	var out []Sensor
 	for rows.Next() {
 		var sn Sensor
-		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
+		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
 			continue
+		}
+		if sn.Type == "" {
+			sn.Type = "icmp"
 		}
 		out = append(out, sn)
 	}
@@ -190,6 +199,17 @@ func (s *Server) fetchSensors() []Sensor {
 		out[i].Tags = tagMap[out[i].ID]
 	}
 	return out
+}
+
+// fillHTTPView attaches the probe-worker's last HTTP status code and cert
+// expiry to a view (HTTP sensors only). It is a no-op for ICMP sensors:
+// the card renders the status code + cert-expiry note from these, and both
+// stay omitted from the JSON for ICMP (pointer omitempty + nil).
+func (s *Server) fillHTTPView(v *SensorView) {
+	if v.Type != "http" {
+		return
+	}
+	v.HTTPStatus, v.CertExpiry = s.probeWorker.LastHTTPStatus(v.ID)
 }
 
 func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +229,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 				// the N+1 load this release eliminates.
 				v.Stats = s.probeWorker.GetStats(sn.ID)
 			}
+			s.fillHTTPView(&v)
 			views = append(views, v)
 		}
 		respondWithJSON(w, http.StatusOK, views)
@@ -217,6 +238,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Name      string   `json:"name"`
 			Target    string   `json:"target"`
+			Type      string   `json:"type"`
 			Tags      []string `json:"tags"`
 			IntervalS int      `json:"interval_s"`
 			TimeoutMS int      `json:"timeout_ms"`
@@ -230,11 +252,17 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		req.Name = strings.TrimSpace(req.Name)
 		req.Target = strings.TrimSpace(req.Target)
+		req.Type = normalizeProbeType(req.Type)
 		if req.Name == "" || req.Target == "" {
 			respondWithError(w, http.StatusBadRequest, "name and target are required")
 			return
 		}
-		if !validTarget(req.Target) {
+		if req.Type == "http" {
+			if !validURL(req.Target) {
+				respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
+				return
+			}
+		} else if !validTarget(req.Target) {
 			respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
 			return
 		}
@@ -272,9 +300,9 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
 		// mistyped, target can't fire down alerts before the user has a chance
 		// to review it. The user resumes it from the dashboard.
-		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-			id, req.Name, req.Target, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
+		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+			id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
@@ -288,9 +316,9 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 				log.Printf("API: failed to set tags for %s: %v", req.Name, err)
 			}
 		}
-		log.Printf("API: created sensor %s (%s) [paused]", req.Name, id)
+		log.Printf("API: created sensor %s (%s) [%s] [paused]", req.Name, id, req.Type)
 		respondWithJSON(w, http.StatusCreated, Sensor{
-			ID: id, Name: req.Name, Target: req.Target, Tags: req.Tags,
+			ID: id, Name: req.Name, Target: req.Target, Type: req.Type, Tags: req.Tags,
 			IntervalS: req.IntervalS, TimeoutMS: req.TimeoutMS,
 			LossWarn: req.LossWarn, DownAfter: req.DownAfter, SpikeMult: req.SpikeMult,
 			State: "paused", Status: "up", CreatedAt: now,
@@ -325,8 +353,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var sn Sensor
-		err := s.db.QueryRow("SELECT id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
+		err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
+			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -335,17 +363,22 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
+		if sn.Type == "" {
+			sn.Type = "icmp"
+		}
 		sn.Tags = s.db.SensorTags(id)
 		v := SensorView{Sensor: sn}
 		if sn.State == "active" {
 			v.Stats = s.probeWorker.GetStats(id)
 		}
+		s.fillHTTPView(&v)
 		respondWithJSON(w, http.StatusOK, v)
 
 	case http.MethodPatch:
 		var req struct {
 			Name      *string   `json:"name"`
 			Target    *string   `json:"target"`
+			Type      *string   `json:"type"`
 			Tags      *[]string `json:"tags"`
 			IntervalS *int      `json:"interval_s"`
 			TimeoutMS *int      `json:"timeout_ms"`
@@ -357,6 +390,27 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 			return
+		}
+
+		// Target and type validate as a pair against the RESULTING type:
+		// the dashboard edits both in one modal, so a target must be valid
+		// for the type the sensor will end up with (URL for http, host for
+		// icmp), whether the user changed the target, the type, or both.
+		var currentType string
+		if err := s.db.QueryRow("SELECT type FROM sensors WHERE id = ?", id).Scan(&currentType); err != nil {
+			respondWithError(w, http.StatusNotFound, "sensor not found")
+			return
+		}
+		if currentType == "" {
+			currentType = "icmp"
+		}
+		resultType := currentType
+		if req.Type != nil {
+			resultType = normalizeProbeType(*req.Type)
+		}
+		resultTarget := ""
+		if req.Target != nil {
+			resultTarget = strings.TrimSpace(*req.Target)
 		}
 
 		sets, args := []string{}, []interface{}{}
@@ -372,15 +426,38 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			add("name", strings.TrimSpace(*req.Name))
 		}
 		if req.Target != nil {
-			if strings.TrimSpace(*req.Target) == "" {
+			if resultTarget == "" {
 				respondWithError(w, http.StatusBadRequest, "target cannot be empty")
 				return
 			}
-			if !validTarget(strings.TrimSpace(*req.Target)) {
+			if resultType == "http" {
+				if !validURL(resultTarget) {
+					respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
+					return
+				}
+			} else if !validTarget(resultTarget) {
 				respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
 				return
 			}
-			add("target", strings.TrimSpace(*req.Target))
+			add("target", resultTarget)
+		}
+		if req.Type != nil {
+			add("type", resultType)
+			// Type changed: re-validate the EXISTING target against it.
+			// (Both target+type changed is already covered above.)
+			if req.Target == nil {
+				var existing string
+				_ = s.db.QueryRow("SELECT target FROM sensors WHERE id = ?", id).Scan(&existing)
+				if resultType == "http" {
+					if !validURL(existing) {
+						respondWithError(w, http.StatusBadRequest, "existing target is not an http:// or https:// URL")
+						return
+					}
+				} else if !validTarget(existing) {
+					respondWithError(w, http.StatusBadRequest, "existing target is not an IPv4 address or hostname")
+					return
+				}
+			}
 		}
 		if req.Tags != nil {
 			if err := s.db.SetSensorTags(id, cleanTags(*req.Tags)); err != nil {
@@ -448,9 +525,10 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		}
 		// A config change requires respawning the loop so the running probe
 		// picks up the new values: target/interval/timeout are read by the
-		// loop itself, and loss_warn/down_after by deriveStatus — all from the
-		// spawn-time config copy, none are hot-reloaded.
-		if req.Target != nil || req.IntervalS != nil || req.TimeoutMS != nil ||
+		// loop itself, type by probeTarget, and loss_warn/down_after by
+		// deriveStatus — all from the spawn-time config copy, none are
+		// hot-reloaded.
+		if req.Target != nil || req.Type != nil || req.IntervalS != nil || req.TimeoutMS != nil ||
 			req.LossWarn != nil || req.DownAfter != nil {
 			s.probeWorker.Restart(id)
 		}
@@ -475,11 +553,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleSensorPing performs one immediate probe ("Echo Now"). Works while
-// paused (SPEC §2). The probe IS recorded in history (a manual echo is a real
+// handleSensorPing performs one immediate probe ("Pulse Now"). Works while
+// paused (SPEC §2). The probe IS recorded in history (a manual pulse is a real
 // sample the dashboard should reflect) but does not drive status or alerts —
 // see ProbeWorker.PingNow. It uses a fixed 1s timeout (pingNowTimeout),
-// independent of the sensor's configured timeout: a manual echo is a quick
+// independent of the sensor's configured timeout: a manual pulse is a quick
 // diagnostic, not a scheduled probe.
 func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -488,7 +566,7 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	res, err := s.probeWorker.PingNow(id)
+	o, err := s.probeWorker.PingNow(id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -497,24 +575,29 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	respondWithJSON(w, http.StatusOK, pingResponse(res))
+	respondWithJSON(w, http.StatusOK, pulseResponse(o))
 }
 
-// pingResponse shapes an "Echo Now" diagnostic result. rtt_ms is null (not 0)
-// for a dropped probe: 0 ms is a real (if implausible) RTT, and a lost probe
-// has NO measured round-trip — reporting 0 would read as "instant". The
-// dashboard already keys off `lost` for the toast, so null is safe.
-func pingResponse(res PingResult) map[string]interface{} {
+// pulseResponse shapes a "Pulse Now" diagnostic result. rtt_ms is null (not
+// 0) for a dropped probe: 0 ms is a real (if implausible) RTT, and a lost
+// probe has NO measured round-trip — reporting 0 would read as "instant". The
+// dashboard keys off `lost` for the toast. http_status is present only for
+// HTTP sensors that got a response, so an HTTP card's toast can say
+// "HTTP 503" instead of a bare loss.
+func pulseResponse(o probeOutcome) map[string]interface{} {
 	var rttMs *float64
-	if !res.Lost {
-		v := rttMillis(res.RTT)
+	if !o.lost {
+		v := o.rttMs
 		rttMs = &v
 	}
-	return map[string]interface{}{
+	resp := map[string]interface{}{
 		"rtt_ms": rttMs, // null when lost
-		"lost":   res.Lost,
-		"error":  errText(res.Error),
+		"lost":   o.lost,
 	}
+	if o.httpCode != nil {
+		resp["http_status"] = *o.httpCode
+	}
+	return resp
 }
 
 // handleSensorHistory returns the last N probe records (SPEC §4, fix #4).
@@ -640,11 +723,14 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var src Sensor
-	err := s.db.QueryRow("SELECT id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-		Scan(&src.ID, &src.Name, &src.Target, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
+	err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
+		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
 	if err != nil {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
+	}
+	if src.Type == "" {
+		src.Type = "icmp"
 	}
 	src.Tags = s.db.SensorTags(id)
 
@@ -666,9 +752,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	newID := newID()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	// Clone starts PAUSED, matching new-sensor behavior.
-	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-		newID, name, src.Target, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
+	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+		newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "failed to clone sensor: "+err.Error())
 		return
@@ -679,7 +765,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	respondWithJSON(w, http.StatusCreated, Sensor{
-		ID: newID, Name: name, Target: src.Target, Tags: src.Tags,
+		ID: newID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
 		IntervalS: src.IntervalS, TimeoutMS: src.TimeoutMS,
 		LossWarn: src.LossWarn, DownAfter: src.DownAfter, SpikeMult: src.SpikeMult,
 		State: "paused", Status: "up", CreatedAt: now,
@@ -981,21 +1067,69 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaintMode != nil {
-		val := "0"
 		if *req.MaintMode {
-			val = "1"
-		}
-		if err := s.db.SetSetting("maintenance_mode", val); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-			return
-		}
-		// Coming out of maintenance: reset re-alert timers so sensors that
-		// are already in a bad state don't instantly re-alert on the next
-		// probe tick.
-		if !*req.MaintMode {
+			// Entering maintenance: remember which sensors are ACTIVE right
+			// now, then pause all of them so they stop probing (not just
+			// alerting). Sensors already paused by the user are not active,
+			// so they are left alone. The snapshot is what resume restores.
+			ids, err := s.db.ActiveSensorIDs()
+			if err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to snapshot active sensors: "+err.Error())
+				return
+			}
+			// Nothing active: the snapshot would be empty and resume would have
+			// nothing to restore. Refuse instead of silently entering a
+			// maintenance state that can't be cleanly undone.
+			if len(ids) == 0 {
+				respondWithError(w, http.StatusBadRequest, "no active sensors to pause")
+				return
+			}
+			if _, err := s.db.SetSensorStates(ids, "paused"); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to pause sensors: "+err.Error())
+				return
+			}
+			snapJSON, _ := json.Marshal(ids)
+			if err := s.db.SetSetting("maintenance_active_ids", string(snapJSON)); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+				return
+			}
+			if err := s.db.SetSetting("maintenance_mode", "1"); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+				return
+			}
+			// Paused sensors don't probe, so their alert state can't drift;
+			// reset it now so resume doesn't instantly re-alert on a stale
+			// bad state.
 			s.probeWorker.ResetAlertStates()
+			log.Printf("API: maintenance mode ON (%d sensors paused)", len(ids))
+		} else {
+			// Leaving maintenance: reactivate exactly the sensors that were
+			// active when maintenance started (the snapshot). Sensors the
+			// user paused, or that got paused/added during maintenance, stay
+			// paused. Then clear the snapshot and reset alert timers so a
+			// still-bad sensor doesn't instantly re-alert on the next tick.
+			snap := s.db.GetSetting("maintenance_active_ids")
+			var ids []string
+			if snap != "" {
+				if err := json.Unmarshal([]byte(snap), &ids); err != nil {
+					ids = nil
+				}
+			}
+			if _, err := s.db.SetSensorStates(ids, "active"); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to resume sensors: "+err.Error())
+				return
+			}
+			if err := s.db.SetSetting("maintenance_active_ids", ""); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+				return
+			}
+			if err := s.db.SetSetting("maintenance_mode", "0"); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+				return
+			}
+			s.probeWorker.ResetAlertStates()
+			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
 		}
-		log.Printf("API: maintenance mode %s", map[string]string{"1": "ON", "0": "off"}[val])
 	}
 	realertLog := 30
 	if v := s.db.GetSetting("realert_min"); v != "" {
@@ -1086,13 +1220,14 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-func rttMillis(d time.Duration) float64 {
-	return d.Seconds() * 1000
-}
-
-func errText(err error) string {
-	if err == nil {
-		return ""
+// normalizeProbeType maps any incoming probe type to the canonical set:
+// "http" (case-insensitive) or "icmp" (the default for empty/unknown values,
+// so old dashboards that omit the field keep creating ICMP sensors).
+func normalizeProbeType(t string) string {
+	switch strings.ToLower(strings.TrimSpace(t)) {
+	case "http":
+		return "http"
+	default:
+		return "icmp"
 	}
-	return fmt.Sprintf("%v", err)
 }

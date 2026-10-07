@@ -1,3 +1,83 @@
+## v0.1.28
+
+A feature release: sensors can now watch **web endpoints**, and maintenance
+mode became a real pause/resume of sensor probing instead of an alert
+switch. Plus a batch of dashboard polish (Title Case labels, a global +1px
+font bump, wordmark styling, card alignment). No change to how ICMP
+probing, status derivation, or alert routing work.
+
+### New: HTTP / HTTPS sensors
+
+Sensors now have a second probe type — **web endpoint** — next to
+**ping/ICMP**. The type is picked in the New Sensor / Edit Sensor form
+(HTTPS/HTTP listed first — hardly anything is plain HTTP anymore), and
+the target must be a valid `http://` or `https://` URL.
+
+- **Up when the final status is 200–299; 4xx/5xx and connection errors
+  count as loss** — the same loss/warn/down-after thresholds apply, so an
+  endpoint behaves exactly like a ping target from the status and alerting
+  point of view.
+- **Redirects are followed (up to 5 hops).** Most real endpoints sit
+  behind a login redirect (`303 → /login/`) or an http→https hop; the
+  probe follows to the final status, which is what decides up/loss.
+  Redirect loops read as loss, not success.
+- **HTTPS targets carry a certificate-expiry advisory** in the
+  inspector: silent while >30 days out, amber at 8–30 days, red at ≤7
+  days. It is advisory — an expiring cert never flips the status.
+- **Internal single-label hosts with an explicit port are valid targets**
+  (e.g. `http://zensrv:8080`). Bare labels without a port are still
+  rejected as before — an explicit port makes the target deliberate, and
+  container DNS resolves the name.
+- Card badges follow the target scheme: **HTTPS** for `https://`,
+  **HTTP** only for plain `http://`, **PING** for ICMP.
+
+### Maintenance Mode: pause/resume sensor probing
+
+The settings row was reworked from an "alerts on/off" toggle into a
+**Maintenance Mode** row with a **Pause / Resume** icon button (the
+description swaps with state: "pause all active sensors" ↔ "resume all
+previously-running sensors").
+
+- **Pause** silences alerts *and* pauses every sensor that is currently
+  active — they stop probing entirely. The set of active sensors is
+  snapshotted into the settings table first.
+- **Resume** re-activates exactly the snapshotted sensors and nothing
+  else. A sensor the user paused before pressing Pause stays paused.
+- **Nothing active → refused.** Pressing Pause with zero active sensors
+  used to be possible and left an empty snapshot, so a later resume had
+  nothing to restore. Now both the dashboard ("no active sensors to
+  pause" toast) and the API (`400`) refuse it.
+
+### Dashboard polish
+
+- **Global +1px font bump** across the whole dashboard (arbitrary-value
+  and named size classes alike), sized for 1080p+ displays.
+- **Wordmark**: `pulsemon` is now extrabold (800) at 17px; the version
+  pill and the "network sensor monitor" subtitle line up under it.
+- **Cards without tags align** with cards that have them (the tag row
+  keeps a minimum height instead of collapsing).
+- **Title Case everywhere it was inconsistent**: New Sensor, Edit
+  Sensor, Save Sensor, Clear History, Alert Destinations, Alert
+  Routing, All Sensors / Sensors With Selected Tags / Only Selected
+  Sensors, Re-Alert Interval, Maintenance Mode.
+- **Spike (× avg) removed from the forms and inspector.** The multiplier
+  no longer influences status, so it was dropped from the UI; the field
+  stays in the DB and API (server-side default 3) so nothing migrates.
+
+### Verified
+
+- Full suite green with `-race`, `go vet` and `gofmt` clean, including
+  new tests for: URL validation (single-label + port, schemes), redirect
+  following (303→200 = up with final status; redirect loop = loss), and
+  the maintenance cycle (enable snapshots the active set, disable
+  restores exactly it, user-paused sensors untouched, enable-with-nothing
+  active → 400).
+- Live container on zentest: an `http://zensrv:8080` sensor followed a
+  303→200 chain and reported up; a full maintenance on/off cycle
+  re-activated exactly the three active sensors while two user-paused
+  sensors stayed paused.
+
+---
 ## v0.1.27
 
 ### Renamed: zenmon → pulsemon
