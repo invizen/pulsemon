@@ -1,3 +1,37 @@
+## v0.1.30
+
+A focused HTTPS-sensor bugfix release: the certificate hostname check now
+crosses the **www** boundary, so a sensor on a bare domain works when the
+server presents a cert for the `www.` variant (and vice versa). This is the
+fix behind "google.com / letsencrypt.org read not trusted" on the v0.1.29
+fleet. No change to probe scheduling, status derivation, alert routing, or
+the dashboard.
+
+### HTTPS sensors: accept a www-variant certificate hostname
+
+Real CDNs and registrars commonly serve a certificate for the **www**
+variant of a bare domain, or the other way around. Google is the canonical
+case: a request to `https://google.com` presents a certificate whose only
+subject name is `www.google.com` — the bare `google.com` is not in the cert
+at all. A standard TLS client accepts that, but the strict hostname check
+in v0.1.29 did not, so the sensor read **error** ("not trusted") even
+though `curl` reached the site fine.
+
+`verifyHTTPCert` now retries the hostname check once against the other
+**www** variant — when the target is a bare host it also tries
+`www.<host>`, and when the target is a `www.` host it also tries the bare
+host — in both the system-trusted and self-signed branches. The fallback
+only crosses the `www.` boundary: an unrelated domain, a wrong host, an
+expired cert, and a rogue-CA-signed cert are all still losses, exactly as
+before.
+
+> Note: this is a republish of the corrected v0.1.29 certificate work. If
+> your box is on `v0.1.29` and `pulsemon update` reports "up to date," you
+> are on the original (pre-fix) v0.1.29 build — run `pulsemon update
+> v0.1.30` explicitly, or `./install.sh v0.1.30`.
+
+---
+
 ## v0.1.29
 
 A small HTTP-sensor hardening release: HTTPS probes now work out of the box
