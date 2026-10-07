@@ -20,6 +20,10 @@ HTTPS probes now accept a certificate when it is **either**:
 - **genuinely self-signed** (issuer == subject) *and* its hostname and
   validity period match the target.
 
+Chain building uses the full certificate chain the server presents (leaf +
+intermediates) against the system trust store, so public and CDN-fronted
+certs verify the same way a standard TLS client does.
+
 "Allow self-signed" deliberately does **not** become "allow anything": a
 cert signed by an untrusted (rogue) CA, an **expired** cert, and a cert whose
 names don't match the target are all still losses, exactly as before. The
@@ -53,11 +57,13 @@ badges) are untouched.
   new tests: valid self-signed cert accepted with expiry captured; expired
   self-signed rejected; self-signed with wrong hostname rejected;
   CA-signed-but-untrusted rejected (presented cert still captured for the
-  advisory); and a keep-alive regression test that three same-host probes
-  share one server-side connection — confirmed to fail against the pre-fix
-  code (3 distinct connections).
+  advisory); a keep-alive regression test that three same-host probes share
+  one server-side connection — confirmed to fail against the pre-fix code
+  (3 distinct connections); and a chain-building regression test that a
+  public CDN-fronted cert (leaf + intermediate to a trusted root) is
+  accepted — confirmed to fail against the pre-fix code.
 - Verified against live TLS servers: self-signed/valid → accept,
   self-signed/expired → reject, self-signed/wrong-host → reject,
-  rogue-CA/valid+right-host → reject.
+  rogue-CA/valid+right-host → reject, public leaf+intermediate → accept.
 
 ---

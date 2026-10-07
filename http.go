@@ -92,25 +92,37 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 		host = ip.String()
 	}
 	leaf := presented[0]
-	base := x509.VerifyOptions{KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	base.DNSName = host
-	// (a) Trusted by the system roots — accept.
-	if _, err := leaf.Verify(base); err == nil {
+
+	// The server presents the full chain: leaf first, then intermediates.
+	// Chain building to a trusted root REQUIRES those intermediates even
+	// when the root is in the system trust store — a standard TLS client
+	// gets them for free from resp.TLS.PeerCertificates, but a manual
+	// Verify() call must be handed them explicitly. Build the pool once and
+	// use it for both branches below. (This is why a real CA-issued cert
+	// must not be checked against system roots with an empty Intermediates
+	// pool: the chain can't be completed and the cert reads untrusted.)
+	inter := x509.NewCertPool()
+	for _, c := range presented[1:] {
+		inter.AddCert(c)
+	}
+
+	// (a) Trusted by the system roots, with the presented intermediates —
+	// accept. Roots nil → the platform/system trust store.
+	optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	optsA.DNSName = host
+	if _, err := leaf.Verify(optsA); err == nil {
 		return nil
 	}
+
 	// (b) Not system-trusted: accept only if self-signed AND its hostname +
 	// validity hold for this target. Verifying the leaf against itself as a
 	// root re-checks both without demanding a trusted issuing CA.
 	if leaf.CheckSignatureFrom(leaf) == nil {
 		roots := x509.NewCertPool()
 		roots.AddCert(leaf)
-		inter := x509.NewCertPool()
-		for _, c := range presented[1:] {
-			inter.AddCert(c)
-		}
-		opts := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-		opts.DNSName = host
-		if _, err := leaf.Verify(opts); err == nil {
+		optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		optsB.DNSName = host
+		if _, err := leaf.Verify(optsB); err == nil {
 			return nil
 		}
 	}
