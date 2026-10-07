@@ -99,8 +99,8 @@ tailwind.config = {
         <select id="sort" onchange="render()" class="bg-surface-900 text-slate-100 focus:outline-none cursor-pointer rounded">
           <option value="severity" class="bg-surface-900 text-slate-100">Severity</option>
           <option value="name" class="bg-surface-900 text-slate-100">Name A–Z</option>
-          <option value="rtt-desc" class="bg-surface-900 text-slate-100">Ping high→low</option>
-          <option value="rtt-asc" class="bg-surface-900 text-slate-100">Ping low→high</option>
+          <option value="rtt-desc" class="bg-surface-900 text-slate-100">Resp high→low</option>
+          <option value="rtt-asc" class="bg-surface-900 text-slate-100">Resp low→high</option>
           <option value="loss" class="bg-surface-900 text-slate-100">Loss %</option>
         </select>
       </div>
@@ -295,7 +295,7 @@ tailwind.config = {
     <div class="p-5 space-y-5 overflow-y-auto min-h-0">
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono">
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div id="insp-rtt-label" class="text-[12px] text-slate-500 uppercase tracking-wider">Ping last</div>
+          <div id="insp-rtt-label" class="text-[12px] text-slate-500 uppercase tracking-wider">Resp last</div>
           <div id="insp-rtt" class="text-[19px] font-bold text-white mt-1">—</div>
         </div>
         <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
@@ -316,7 +316,7 @@ tailwind.config = {
       <div>
         <div class="flex items-center justify-between mb-2">
           <span class="text-[13px] font-semibold text-slate-300 flex items-center gap-3">
-            Ping over time
+            Resp over time
             <span id="insp-graph-up" class="text-[12px] font-mono text-slate-500"></span>
           </span>
           <div class="flex items-center gap-1">
@@ -1108,7 +1108,7 @@ async function loadInspector() {
     $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime over ' + graphRange : 'no data in ' + graphRange;
     renderGraph($('insp-graph'), g);
     const st = s.stats;
-    $('insp-rtt-label').textContent = s.type === 'http' ? 'HTTP last' : 'Ping last';
+    $('insp-rtt-label').textContent = 'Resp last';
     if (s.type === 'http') {
       const code = httpStatusText(s);
       if (code && code !== 'no reply' && st && st.rtt_last != null) $('insp-rtt').textContent = code + ' · ' + fmtRtt(st.rtt_last);
