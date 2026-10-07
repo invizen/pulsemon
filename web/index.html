@@ -299,17 +299,32 @@ tailwind.config = {
           <span class="text-[13px] font-semibold text-slate-300">TLS / HTTPS</span>
           <span id="tls-status" class="text-[12px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
         </div>
-        <p class="text-[12px] text-slate-600 font-mono">Upload a certificate + key to serve the dashboard over HTTPS. Applying it restarts pulsemon — the dashboard reconnects on the HTTPS port, and the plain-HTTP port closes.</p>
+        <p class="text-[12px] text-slate-600 font-mono">Pick your cert.pem + key.pem (or paste the text) to serve the dashboard over HTTPS. Applying it restarts pulsemon — the dashboard reconnects on the HTTPS port, and the plain-HTTP port closes.</p>
         <div class="flex items-center justify-between gap-3">
           <span class="text-[13px] text-slate-400">HTTPS Port</span>
           <input id="f-tls-port" type="number" min="1" max="65535" value="443" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </div>
-        <label class="text-[12px] text-slate-500 font-mono flex flex-col gap-1">Certificate (PEM, or base64)
-          <textarea id="f-tls-cert" rows="3" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
-        </label>
-        <label class="text-[12px] text-slate-500 font-mono flex flex-col gap-1">Private Key (PEM, or base64)
-          <textarea id="f-tls-key" rows="3" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
-        </label>
+        <div class="space-y-1.5">
+          <span class="text-[12px] text-slate-500 font-mono">Certificate (cert.pem)</span>
+          <div class="flex items-center gap-2">
+            <input id="f-tls-cert-file" type="file" accept=".pem,.crt,.cer,.txt" class="file-input text-[12px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[12px] file:font-semibold hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+            <span id="tls-cert-file-name" class="text-[11px] font-mono text-slate-600 shrink-0">no file</span>
+          </div>
+        </div>
+        <div class="space-y-1.5">
+          <span class="text-[12px] text-slate-500 font-mono">Private Key (key.pem)</span>
+          <div class="flex items-center gap-2">
+            <input id="f-tls-key-file" type="file" accept=".pem,.key,.txt" class="file-input text-[12px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[12px] file:font-semibold hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+            <span id="tls-key-file-name" class="text-[11px] font-mono text-slate-600 shrink-0">no file</span>
+          </div>
+        </div>
+        <details class="text-[12px] text-slate-600 font-mono">
+          <summary class="cursor-pointer text-slate-500 hover:text-slate-400">…or paste the text instead</summary>
+          <div class="mt-1.5 space-y-1.5">
+            <textarea id="f-tls-cert" rows="3" spellcheck="false" placeholder="-----BEGIN CERTIFICATE-----" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
+            <textarea id="f-tls-key" rows="3" spellcheck="false" placeholder="-----BEGIN PRIVATE KEY-----" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60"></textarea>
+          </div>
+        </details>
         <div class="flex gap-2">
           <button onclick="applyTLSCert()" class="px-3 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">Apply Certificate</button>
           <button onclick="removeTLSCert()" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono">Remove Certificate</button>
@@ -901,11 +916,32 @@ async function openSettings() {
     renderScopeOptions();
     setMaintUI(SETTINGS.maintenance_mode === true);
     renderTLSStatus(s.tls);
+    // Reset the file pickers so a previously-chosen file isn't re-uploaded
+    // on a later "Apply" without the user noticing.
+    $('f-tls-cert-file').value = '';
+    $('f-tls-key-file').value = '';
+    $('tls-cert-file-name').textContent = 'no file';
+    $('tls-key-file-name').textContent = 'no file';
   } catch (e) {
     $('set-summary').textContent = 'error';
   }
 }
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
+
+// TLS cert/key: pick a file (loaded into the paste box client-side, so the
+// same paste flow works) or paste directly.
+$('f-tls-cert-file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('f-tls-cert').value = await f.text();
+  $('tls-cert-file-name').textContent = f.name;
+});
+$('f-tls-key-file').addEventListener('change', async (e) => {
+  const f = e.target.files[0];
+  if (!f) return;
+  $('f-tls-key').value = await f.text();
+  $('tls-key-file-name').textContent = f.name;
+});
 
 function renderTLSStatus(t) {
   const badge = $('tls-status');
@@ -959,6 +995,10 @@ async function removeTLSCert() {
     await api('/api/settings/tls', { method: 'DELETE' });
     $('f-tls-cert').value = '';
     $('f-tls-key').value = '';
+    $('f-tls-cert-file').value = '';
+    $('f-tls-key-file').value = '';
+    $('tls-cert-file-name').textContent = 'no file';
+    $('tls-key-file-name').textContent = 'no file';
     renderTLSStatus({ enabled: false, http_addr: location.hostname + ':' + (location.port || '80') });
     setMsg('certificate removed — pulsemon is restarting on HTTP', 'ok');
   } catch (e) {

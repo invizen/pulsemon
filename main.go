@@ -188,6 +188,7 @@ func startListener(srv *http.Server, db *DB) {
 			}
 		}
 		addr := listenAddr()
+		srv.Addr = addr // ListenAndServe defaults to :80 when Addr is empty
 		log.Println("Starting server on " + addr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Listen: %v", err)
