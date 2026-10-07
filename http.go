@@ -107,23 +107,37 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	}
 
 	// (a) Trusted by the system roots, with the presented intermediates —
-	// accept. Roots nil → the platform/system trust store.
-	optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-	optsA.DNSName = host
-	if _, err := leaf.Verify(optsA); err == nil {
-		return nil
+	// accept. Roots nil → the platform/system trust store. Real CDNs and
+	// registrars often serve a cert for the www variant of a bare domain
+	// (google.com → cert is www.google.com) or the other way around, so a
+	// hostname mismatch is retried once with the other variant.
+	triedHosts := []string{host}
+	if len(host) > 0 && !strings.HasPrefix(host, "www.") {
+		triedHosts = append(triedHosts, "www."+host)
+	} else if strings.HasPrefix(host, "www.") {
+		triedHosts = append(triedHosts, strings.TrimPrefix(host, "www."))
+	}
+	for _, hn := range triedHosts {
+		optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		optsA.DNSName = hn
+		if _, err := leaf.Verify(optsA); err == nil {
+			return nil
+		}
 	}
 
 	// (b) Not system-trusted: accept only if self-signed AND its hostname +
 	// validity hold for this target. Verifying the leaf against itself as a
-	// root re-checks both without demanding a trusted issuing CA.
+	// root re-checks both without demanding a trusted issuing CA. Same
+	// www-variant fallback as branch (a).
 	if leaf.CheckSignatureFrom(leaf) == nil {
 		roots := x509.NewCertPool()
 		roots.AddCert(leaf)
-		optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-		optsB.DNSName = host
-		if _, err := leaf.Verify(optsB); err == nil {
-			return nil
+		for _, hn := range triedHosts {
+			optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+			optsB.DNSName = hn
+			if _, err := leaf.Verify(optsB); err == nil {
+				return nil
+			}
 		}
 	}
 	return errors.New("pulsemon: TLS certificate is not trusted and is not a self-signed cert matching the target")
