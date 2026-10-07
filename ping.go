@@ -111,7 +111,7 @@ func LastProbeError() string {
 	if probeErrCount.Load() == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d probe send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
+	return fmt.Sprintf("%d pulse send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
 		probeErrCount.Load())
 }
 

@@ -112,7 +112,7 @@ tailwind.config = {
 <div id="probe-banner" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pt-4">
   <div class="text-[13px] font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
     <i class="ph-bold ph-warning"></i>
-    <span id="probe-banner-text">probing is broken</span>
+    <span id="probe-banner-text">pulsing is broken</span>
     <span class="text-warn/70 font-normal ml-1">— statuses below are unreliable until this clears</span>
   </div>
 </div>
@@ -204,7 +204,7 @@ tailwind.config = {
           <option value="http">HTTPS / HTTP</option>
           <option value="icmp">PING / ICMP</option>
         </select>
-        <span id="f-type-hint" class="text-[12px] text-slate-600 font-mono">probes with ICMP echo — up when the host replies</span>
+        <span id="f-type-hint" class="text-[12px] text-slate-600 font-mono">pulses with ICMP echo — up when the host replies</span>
       </div>
       <div class="grid grid-cols-2 gap-3">
         <label class="text-[13px] text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
@@ -236,7 +236,7 @@ tailwind.config = {
           <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-[13px] text-slate-400 flex flex-col gap-1">Error after
-          <input id="f-down" type="number" min="1" max="30" value="2" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-down" type="number" min="1" max="30" value="2" title="Mark ERROR after this many consecutive lost pulses" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
       <div id="form-err" class="hidden text-[13px] text-bad font-mono"></div>
@@ -364,7 +364,7 @@ tailwind.config = {
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex flex-col gap-3">
       <span id="insp-interval" class="text-[12px] text-slate-500 font-mono text-center"></span>
       <div class="flex items-center justify-end gap-2">
-        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[13px] font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
+        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[13px] font-mono whitespace-nowrap transition" title="Wipe this sensor's pulse history, events and alert state; the 60-pulse window rebuilds from the next pulse">
           <i class="ph ph-trash"></i> Clear History
         </button>
         <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-[13px] font-mono whitespace-nowrap">Close</button>
@@ -423,7 +423,7 @@ async function refresh() {
       banner.classList.remove('hidden');
     } else if (hz && hz.probe_error) {
       document.getElementById('probe-banner-text').textContent =
-        'probing is broken: ' + hz.probe_error;
+        'pulsing is broken: ' + hz.probe_error;
       banner.classList.remove('hidden');
     } else {
       banner.classList.add('hidden');
@@ -616,7 +616,7 @@ function cardHtml(s) {
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (((st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) != null) ? ' · avg ' + fmtRtt(st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) : '') + '</span>' : '') +
       '</div>' +
       '<div class="h-7 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
-        (paused ? '<span class="text-[12px] text-slate-600 font-mono">paused — probing stopped</span>'
+        (paused ? '<span class="text-[12px] text-slate-600 font-mono">paused — pulsing stopped</span>'
           : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[12px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
@@ -641,7 +641,7 @@ function setTag(t) {
 
 async function clearActivity() {
   if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
-  if (!confirm('Clear the ACTIVITY log? This removes all ' + EVENTS.length + ' state-transition entries (probe history and graphs are untouched).')) return;
+  if (!confirm('Clear the ACTIVITY log? This removes all ' + EVENTS.length + ' state-transition entries (pulse history and graphs are untouched).')) return;
   try {
     const r = await api('/api/events', { method: 'DELETE' });
     EVENTS = [];
@@ -822,7 +822,7 @@ function onFormTypeChange() {
   $('f-target').placeholder = isHttp ? 'https://example.com/health' : '0.0.0.0';
   $('f-type-hint').textContent = isHttp
     ? 'GETs the URL — up when it answers 200–299 in time (redirects followed; 4xx/5xx = loss)'
-    : 'probes with ICMP echo — up when the host replies';
+    : 'pulses with ICMP echo — up when the host replies';
 }
 
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }
@@ -1100,7 +1100,7 @@ async function clearHistory() {
   if (!id) return;
   const s = (SENSORS || []).find(x => x.id === id);
   const label = s ? s.name : 'sensor';
-  if (!confirm('Clear all probe history for "' + label + '"?\nThe 60-probe window rebuilds from the next probe.')) return;
+  if (!confirm('Clear all pulse history for "' + label + '"?\nThe 60-pulse window rebuilds from the next pulse.')) return;
   try {
     await api('/api/sensors/' + id + '/history', { method: 'DELETE' });
     toast('history cleared — ' + label, 'ok');
