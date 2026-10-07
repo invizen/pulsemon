@@ -6,6 +6,8 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -39,6 +41,14 @@ const maxHTTPRedirects = 5
 // maxHTTPRedirects) so a target that 301/302s to its real destination —
 // the common case for a web UI behind a redirect — is judged on where it
 // ends up, not the redirect itself.
+//
+// TLS: the transport sets InsecureSkipVerify so the handshake always
+// succeeds and the server's presented certificates are handed back instead
+// of being rejected at the TLS layer. probeHTTP then verifies them itself
+// via verifyHTTPCert, which accepts a cert when it is trusted by the system
+// roots OR genuinely self-signed with a hostname and validity matching the
+// target. That is how self-signed homelab web UIs become monitorable without
+// accepting every certificate.
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -55,15 +65,76 @@ var httpClient = &http.Client{
 		IdleConnTimeout:       10 * time.Minute,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
 	},
 }
+
+// verifyHTTPCert validates the certificate(s) the server presented after a
+// successful (skip-verify) handshake. It accepts the cert when EITHER
+// (a) it is trusted by the system roots, or
+// (b) it is genuinely self-signed (issuer == subject) AND its hostname and
+// validity hold for host. Everything else — a cert from an untrusted CA, an
+// expired cert, or a cert whose names don't match host — is rejected, so
+// "allow self-signed" never becomes "allow anything".
+//
+// host is the target's hostname (e.g. "10.0.0.5" or "router.local"). An IP
+// literal is normalized so x509 matches it against IP SANs, not DNS names.
+// A nil/empty presented slice (plain HTTP, or no certs) is accepted — there
+// is nothing to verify.
+func verifyHTTPCert(presented []*x509.Certificate, host string) error {
+	if len(presented) == 0 {
+		return nil
+	}
+	if host == "" {
+		return errors.New("pulsemon: no target host to verify TLS certificate against")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	leaf := presented[0]
+	base := x509.VerifyOptions{KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	base.DNSName = host
+	// (a) Trusted by the system roots — accept.
+	if _, err := leaf.Verify(base); err == nil {
+		return nil
+	}
+	// (b) Not system-trusted: accept only if self-signed AND its hostname +
+	// validity hold for this target. Verifying the leaf against itself as a
+	// root re-checks both without demanding a trusted issuing CA.
+	if leaf.CheckSignatureFrom(leaf) == nil {
+		roots := x509.NewCertPool()
+		roots.AddCert(leaf)
+		inter := x509.NewCertPool()
+		for _, c := range presented[1:] {
+			inter.AddCert(c)
+		}
+		opts := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		opts.DNSName = host
+		if _, err := leaf.Verify(opts); err == nil {
+			return nil
+		}
+	}
+	return errors.New("pulsemon: TLS certificate is not trusted and is not a self-signed cert matching the target")
+}
+
+// drainBodyCap bounds how much of a response body probeHTTP will read so
+// the transport can reuse the keep-alive connection. An UNREAD body makes
+// net/http discard the connection — which would defeat the whole point of
+// the shared client (one TCP+TLS handshake per host, not one per probe).
+// 1MB is far above any real health endpoint's response; anything larger is
+// discarded after the cap so a huge page costs one bounded read, not a
+// full download.
+const drainBodyCap = 1 << 20
 
 // httpProbeResult is one HTTP probe: the round-trip time, whether it counts
 // as a loss (no response OR status outside 200-299), the HTTP status code
 // when a response arrived (nil when it didn't), the resolved IP, the
 // server certificate's expiry (nil for plain HTTP or when no handshake
-// happened — including self-signed certs, which fail verification but still
-// hand the cert over in the error), and any transport error.
+// happened), and any transport/verification error. Self-signed certs that
+// match the target are accepted (see verifyHTTPCert), so an HTTPS probe to
+// a self-signed homelab UI succeeds and the expiry is captured from the
+// handshake; a cert that is neither system-trusted nor a valid self-signed
+// match is a loss.
 //
 // The cert expiry is INFORMATIONAL ONLY: it never affects Lost or status.
 // A cert expiring in 3 days does not take the sensor down — it just earns
@@ -111,20 +182,39 @@ func probeHTTP(target string, timeout time.Duration) httpProbeResult {
 	resp, err := httpClient.Do(req)
 	el := time.Since(start)
 	if err != nil {
-		// A TLS verification failure (expired/self-signed) is still a
-		// handshake: the server's cert is attached to the error, so the
-		// card can show its expiry even though the probe is a loss.
+		// A transport-level failure: timeout, connection refused, DNS, or a
+		// malformed TLS handshake. With InsecureSkipVerify the handshake
+		// itself always completes and the peer's certs ride back on resp, so
+		// a certificate problem no longer surfaces here — it is caught by
+		// verifyHTTPCert below. certNotAfterFromErr stays as a safety net
+		// for the rare handshake error that does carry a cert.
 		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certNotAfterFromErr(err), Err: err}
 	}
-	defer resp.Body.Close()
-	// We only need the status line, not the body. Draining it would cost a
-	// download per probe; releasing it here lets the transport reuse the
-	// connection for the next probe.
+
+	// Capture the server's presented certs and their expiry, then close the
+	// body. We only need the status line and the cert; draining (capped)
+	// before close lets the transport reuse the keep-alive connection
+	// instead of discarding it after an unread body.
+	var presented []*x509.Certificate
 	var certExp *time.Time
-	if resp.TLS != nil && len(resp.TLS.PeerCertificates) > 0 {
-		na := resp.TLS.PeerCertificates[0].NotAfter
+	if resp.TLS != nil {
+		presented = resp.TLS.PeerCertificates
+	}
+	if len(presented) > 0 {
+		na := presented[0].NotAfter
 		certExp = &na
 	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
+	resp.Body.Close()
+
+	// Now that the handshake has returned the peer's certificates, verify
+	// them ourselves. This is where "allow self-signed" lives: a cert
+	// trusted by the system roots OR a genuine self-signed cert matching the
+	// target's host is accepted; anything else is a loss.
+	if vErr := verifyHTTPCert(presented, host); vErr != nil {
+		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
+	}
+
 	code := resp.StatusCode
 	up := code >= 200 && code <= 299
 	return httpProbeResult{
