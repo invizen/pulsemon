@@ -211,6 +211,14 @@ func (t *rawTransport) close() error { return t.conn.Close() }
 // 2^17, the second clears the remaining carry, and the uint16() on return
 // drops any residual carry bit.
 //
+// Why hand-rolled instead of x/net/icmp: x/net/icmp's checksum is UNEXPORTED
+// (message.go `func checksum`, no public Checksum symbol), and its only
+// public entry point is Message.Marshal(), which cannot write to the
+// SOCK_DGRAM/IPPROTO_ICMP socket the unprivileged-datagram transport uses
+// (that path hand-builds the raw packet at the byte level). The raw
+// transport (rawTransport.send) DOES use msg.Marshal(nil) and inherits
+// x/net/icmp's checksum — this function exists only for the datagram path.
+//
 // NOTE: the previous odd-length handling was already correct — this is the
 // canonical form, not a bug fix. TestIcmpChecksumMatchesReference locks it
 // against an independent reference across every length (odd and even).

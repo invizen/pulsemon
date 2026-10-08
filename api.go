@@ -422,6 +422,14 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // frontend escJs() — it keeps the stored data clean for every consumer
 // (alert cards, logs, the inspector) and stops a malicious account from
 // planting a sensor whose name runs JS in other operators' browsers.
+//
+// This is a defense-in-depth INPUT gate, NOT the primary XSS mitigation:
+// the frontend already does context-aware OUTPUT encoding — esc()
+// (index.html) HTML-escapes every name render site and escJs() escapes
+// names interpolated into JS string literals (the deleteSensor / setTag
+// inline handlers). Removing the input gate would leave those still safe,
+// but would let a malicious name through to the non-HTML consumers (alert
+// cards, logs, the inspector) where output encoding does not apply.
 func validSensorName(name string) bool {
 	if name == "" || len(name) > 60 {
 		return false
