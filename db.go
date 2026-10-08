@@ -48,6 +48,16 @@ func NewDB(dsn string) (*DB, error) {
 	// rather than fail). Ten connections comfortably cover the probe worker
 	// plus concurrent HTTP handlers. Nested per-row queries inside rows.Next()
 	// are NOT a thing in this codebase — batch them (see SensorTagsFor).
+	//
+	// DO NOT lower this to 1 (a "single writer" suggestion): a single
+	// connection self-deadlocks on ANY nested query inside rows.Next() — the
+	// outer cursor holds the only connection and the nested query blocks
+	// forever. This exact bug shipped in an early revision and hung the whole
+	// server (healthcheck passed, every HTTP request hung). The pool must stay
+	// multi-connection so a cursor + nested query can use different
+	// connections; "database is locked" is mitigated by busy_timeout (above),
+	// not by pool size. Guarded by TestMaxOpenConnsOneSelfDeadlocksOnNestedQuery
+	// and TestConcurrentProbeWritesDoNotBusy.
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(0)
