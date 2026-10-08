@@ -80,6 +80,22 @@ const (
 // lowercase; the UNIQUE constraint is on the lower-cased column value.
 var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
 
+// dummyBcryptHash is the "unknown user" KDF equalizer for VerifyUser: a
+// well-formed bcrypt hash built ONCE at package init, at the SAME cost every
+// real account hash is generated at (bcryptCost). An unknown user and a wrong
+// password both run a full cost-N KDF, so the two paths take the same time —
+// no username enumeration via timing.
+//
+// It is a package-level var (not rebuilt per call) so a login spike or
+// brute-force attempt doesn't re-format the string on every failed lookup.
+// The slice is shared read-only across concurrent logins (bcrypt never
+// mutates its hash argument), and because bcryptCost is a const it is
+// computed exactly once, so there is no cross-goroutine write to protect.
+// It MUST stay tied to bcryptCost (never hardcode a fixed cost): raising the
+// cost and leaving the dummy behind would make the unknown-user path run a
+// weaker KDF than real hashes — a timing oracle.
+var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost))
+
 type authSession struct {
 	user   string
 	expiry time.Time
@@ -288,14 +304,14 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 	username = strings.ToLower(username)
 	hash, err := a.db.UserHash(username)
 	if err != nil || hash == "" {
-		// Fail with a constant-time-ish bcrypt compare against a dummy hash
-		// so the "unknown user" and "wrong password" paths take the same time
-		// (no username enumeration via timing). The dummy's cost is built from
+		// Fail with a constant-time-ish bcrypt compare against a dummy hash so
+		// the "unknown user" and "wrong password" paths take the same time (no
+		// username enumeration via timing). dummyBcryptHash is built at
 		// bcryptCost — the same cost every stored hash is generated at — so the
 		// two paths ALWAYS run at the same KDF cost and can never diverge into
-		// a timing oracle if bcryptCost is ever raised.
-		dummy := fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost)
-		bcrypt.CompareHashAndPassword([]byte(dummy), []byte(password))
+		// a timing oracle if bcryptCost is ever raised. It is precomputed (see
+		// dummyBcryptHash) so a failed lookup doesn't re-format the string.
+		bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
 		return "", false
 	}
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
