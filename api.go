@@ -1299,11 +1299,29 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Body: {"kind":"google_chat"|"discord"}. The dashboard tests the provider
-	// whose URL is being verified, so kind is required.
+	// whose URL is being verified, so kind is required — and must be a known
+	// provider. An unknown/missing kind is a 400 naming the valid kinds, so
+	// the endpoint is self-documenting instead of answering 200 {"ok":false,
+	// "detail":"unknown provider"}. (A known kind with no URL still gets a
+	// 200 {"ok":false} — that is "the test ran, nothing configured", which
+	// the UI displays as a hint, not an error.)
 	var req struct {
 		Kind string `json:"kind"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
+		return
+	}
+	if _, ok := providerByKey(strings.TrimSpace(req.Kind)); !ok {
+		var valid []string
+		for _, p := range providerList {
+			valid = append(valid, p.Kind)
+		}
+		respondWithError(w, http.StatusBadRequest,
+			fmt.Sprintf("unknown alert provider %q (valid: %s)", req.Kind, strings.Join(valid, ", ")))
+		return
+	}
 	ok, detail := s.probeWorker.TestWebhook(r.Context(), req.Kind)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":     ok,
