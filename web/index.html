@@ -515,8 +515,12 @@ function statusMeta(s) {
 }
 
 function severityRank(s) {
-  if (s.state === 'paused') return 3;
-  return { error: 0, warning: 1, up: 2 }[s.status] ?? 1;
+  // Group by sensor type so homogeneous fleets (all the HTTP servers) stay
+  // together in the Severity sort. Within a type, errors/warnings rise to
+  // the top; up and paused hold their place (paused last, as before).
+  const type = s.type === 'http' ? 0 : 1;
+  const sev = s.status === 'error' ? 0 : s.status === 'warning' ? 1 : s.state === 'paused' ? 3 : 2;
+  return type * 4 + sev;
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
@@ -592,14 +596,11 @@ function render() {
 
   $('feed').innerHTML = EVENTS.length ? EVENTS.map(ev => {
     const icon = ev.to === 'error' ? 'ph-arrow-down text-bad' : ev.to === 'warning' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
-    // Same day → time only; earlier → "Mon DD · HH:MM:SS" so an old entry
-    // is never mistaken for a fresh one (24h retention crosses midnight).
+    // Every entry carries a date so today's log is unambiguous and an old
+    // entry is never mistaken for a fresh one (24h retention crosses midnight).
     const d = new Date(ev.ts);
-    const now = new Date();
-    const t = (d.toDateString() === now.toDateString())
-      ? d.toLocaleTimeString([], { hour12: false })
-      : d.toLocaleDateString([], { weekday: 'short', day: '2-digit', month: 'short' }) + ' · '
-        + d.toLocaleTimeString([], { hour12: false });
+    const t = d.toLocaleDateString([], { weekday: 'short', day: '2-digit', month: 'short' }) + ' · '
+      + d.toLocaleTimeString([], { hour12: false });
     return '<li class="px-4 py-2 flex items-center gap-2.5">' +
       '<i class="ph ' + icon + '"></i>' +
       '<span class="text-slate-300">' + esc(ev.sensor) + '</span>' +
