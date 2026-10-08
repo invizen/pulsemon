@@ -936,7 +936,7 @@ func (pw *ProbeWorker) doProbe(c sensorConfig) {
 		note = "recovered" // first transition back to up after warning/error
 	}
 	if _, err := pw.db.Exec("INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES (?, ?, ?, ?, ?)",
-		c.id, time.Now().UTC().Format(time.RFC3339Nano), oldStatus, newStatus, note); err != nil {
+		c.id, tsNow(), oldStatus, newStatus, note); err != nil {
 		log.Printf("ProbeWorker: failed to record event for %s: %v", c.id, err)
 	}
 

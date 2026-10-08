@@ -366,9 +366,9 @@ func (a *AuthState) loginSuccess(ip string) {
 	delete(a.loginThrottle.lockout, ip)
 }
 
-// ValidSession reports whether the session token is live; a live hit
-// slides the expiry forward. An expired token is rejected AND deleted —
-// the returned value is the expiry test, never just a map hit.
+// ValidSession validates a session token: a live hit slides its expiry
+// forward; an unknown OR expired token is rejected AND deleted — the
+// returned value is the expiry test, never just a map hit.
 func (a *AuthState) ValidSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -429,7 +429,7 @@ func (a *AuthState) dropUserSessionsExcept(username, keepTok string) {
 
 // Disable removes ALL users, opening the dashboard again.
 func (a *AuthState) Disable() error {
-	if err := a.db.RemoveallUsers(); err != nil {
+	if err := a.db.RemoveAllUsers(); err != nil {
 		return err
 	}
 	a.mu.Lock()

@@ -253,7 +253,12 @@ func (s *Server) fetchSensors() []Sensor {
 	// the handler distinguishes from a genuinely empty fleet.
 	for rows.Next() {
 		var sn Sensor
+		// A per-row scan error means a corrupt/mismatched row. The schema is
+		// app-controlled so this shouldn't happen — but log it so a real
+		// corruption event is visible in the service log instead of "one
+		// sensor silently vanished from the fleet view".
 		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
+			log.Printf("API: skipping corrupt sensor row: %v", err)
 			continue
 		}
 		if sn.Type == "" {
@@ -376,7 +381,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 
 		id := newID()
-		now := time.Now().UTC().Format(time.RFC3339Nano)
+		now := tsNow()
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
 		// mistyped, target can't fire down alerts before the user has a chance
 		// to review it. The user resumes it from the dashboard.
@@ -863,7 +868,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	}
 
 	newID := newID()
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := tsNow()
 	// Clone starts PAUSED, matching new-sensor behavior.
 	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
