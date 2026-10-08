@@ -65,6 +65,14 @@ const (
 	// login (401) so the response time doesn't depend on which path ran, and
 	// an online attacker gets at most ~5 guesses/second per IP.
 	loginSlowDown = 200 * time.Millisecond
+
+	// enabledTTL bounds how long the "is auth enabled?" (user count > 0)
+	// cache is trusted before re-reading the DB. In-app user mutations
+	// refresh it immediately (the dashboard is never stale); this only caps
+	// how long an OUT-OF-BAND `pulsemon auth-user add/remove` waits before
+	// the gate notices. 2s is far below any human-perceptible gap and keeps
+	// the SELECT COUNT(*) off the per-request hot path.
+	enabledTTL = 2 * time.Second
 )
 
 // usernameRe: starts with a letter, then letters/digits/._- . Stored
@@ -79,8 +87,21 @@ type authSession struct {
 type AuthState struct {
 	db *DB
 
+	// userCountFn is the count source Enabled() reads through. Defaults to
+	// db.UserCount; a test may substitute a counting stub to prove the cache
+	// actually stops the per-request query. Guarded by enabledMu.
+	userCountFn func() (int, error)
+
 	mu       sync.Mutex
 	sessions map[string]authSession // session token → owner + expiry
+
+	// enabledCache: whether auth is enabled (user count > 0), memoized for
+	// enabledTTL so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on
+	// every request. enabledAt is zero until the first read; in-app user
+	// mutations call refreshEnabledNow to invalidate it instantly.
+	enabledMu sync.Mutex
+	enabled   bool
+	enabledAt time.Time
 
 	// loginThrottle: per-client-IP login failure accounting. Keyed by the
 	// request's source IP (X-Forwarded-For's first entry when present, so a
@@ -101,12 +122,47 @@ func NewAuthState(db *DB) *AuthState {
 	}
 }
 
-// Enabled reports whether at least one user exists. Read from the DB on
-// every call (one indexed COUNT) so an out-of-band `pulsemon auth-user
-// add/remove` takes effect on the very next request — no restart.
+// Enabled reports whether at least one user exists. The answer is memoized
+// for enabledTTL (a short-TTL cache) so the 5s dashboard poll — and every
+// other request — doesn't pay a SELECT COUNT(*) round-trip on the hot path.
+// In-app user mutations (AddUser/RemoveUser/Disable) call
+// refreshEnabledNow, so the dashboard is never stale; only OUT-OF-BAND
+// `pulsemon auth-user add/remove` is honored within enabledTTL (≤2s), which
+// is the documented tradeoff for removing the per-request query.
+//
+// The count source is userCountFn (defaults to db.UserCount); the seam lets
+// a test count reads and prove the cache actually stops the query.
 func (a *AuthState) Enabled() bool {
-	n, err := a.db.UserCount()
-	return err == nil && n > 0
+	a.enabledMu.Lock()
+	defer a.enabledMu.Unlock()
+	if time.Since(a.enabledAt) < enabledTTL && a.enabledAt != (time.Time{}) {
+		return a.enabled
+	}
+	fn := a.userCountFn
+	if fn == nil {
+		fn = a.db.UserCount
+	}
+	n, err := fn()
+	a.enabled = err == nil && n > 0
+	a.enabledAt = time.Now()
+	return a.enabled
+}
+
+// refreshEnabledNow re-reads the user count and updates the Enabled() cache
+// immediately. Called by the in-app user mutations (AddUser/RemoveUser/
+// Disable) so the gate reflects them on the very next request with no TTL
+// wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
+// handle and never reaches this method — which is exactly why the TTL exists.
+func (a *AuthState) refreshEnabledNow() {
+	a.enabledMu.Lock()
+	defer a.enabledMu.Unlock()
+	fn := a.userCountFn
+	if fn == nil {
+		fn = a.db.UserCount
+	}
+	n, err := fn()
+	a.enabled = err == nil && n > 0
+	a.enabledAt = time.Now()
 }
 
 // UserCount/CRUD live on *DB (see db.go); AuthState adds the password
@@ -138,6 +194,7 @@ func (a *AuthState) AddUser(username, password string) error {
 	if err := a.db.AddUser(username, string(hash)); err != nil {
 		return fmt.Errorf("user already exists")
 	}
+	a.refreshEnabledNow() // first user enables auth — don't wait for the TTL
 	log.Println("Dashboard user added: " + username)
 	return nil
 }
@@ -157,6 +214,7 @@ func (a *AuthState) RemoveUser(username string) error {
 		return err
 	}
 	a.dropUserSessions(username)
+	a.refreshEnabledNow() // may be the last user — don't wait for the TTL
 	log.Println("Dashboard user removed: " + username)
 	return nil
 }
@@ -377,6 +435,7 @@ func (a *AuthState) Disable() error {
 	a.mu.Lock()
 	a.sessions = map[string]authSession{}
 	a.mu.Unlock()
+	a.refreshEnabledNow() // all users gone — open the dashboard immediately
 	log.Println("Dashboard authentication disabled (all users removed)")
 	return nil
 }

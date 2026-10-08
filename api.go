@@ -132,9 +132,11 @@ func (s *Server) Mux() *http.ServeMux {
 }
 
 // authGate wraps the mux with a per-request auth check. The enabled state
-// (at least one user in the users table) is re-read per request, so an
-// out-of-band `pulsemon auth-user add/remove` on the host takes effect on
-// the very next request, no restart required.
+// (at least one user in the users table) is memoized in AuthState for
+// enabledTTL, so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on the
+// hot path. In-app user mutations refresh it immediately; an out-of-band
+// `pulsemon auth-user add/remove` is honored within the TTL (≤2s), no
+// restart required.
 //
 // Every request body is additionally bounded to maxRequestBytes via
 // http.MaxBytesReader: a malformed or malicious client can no longer stream
