@@ -2,6 +2,8 @@ package main
 
 import (
 	"database/sql"
+	"fmt"
+	"log"
 	"strings"
 	"time"
 
@@ -46,6 +48,16 @@ func NewDB(dsn string) (*DB, error) {
 	// rather than fail). Ten connections comfortably cover the probe worker
 	// plus concurrent HTTP handlers. Nested per-row queries inside rows.Next()
 	// are NOT a thing in this codebase — batch them (see SensorTagsFor).
+	//
+	// DO NOT lower this to 1 (a "single writer" suggestion): a single
+	// connection self-deadlocks on ANY nested query inside rows.Next() — the
+	// outer cursor holds the only connection and the nested query blocks
+	// forever. This exact bug shipped in an early revision and hung the whole
+	// server (healthcheck passed, every HTTP request hung). The pool must stay
+	// multi-connection so a cursor + nested query can use different
+	// connections; "database is locked" is mitigated by busy_timeout (above),
+	// not by pool size. Guarded by TestMaxOpenConnsOneSelfDeadlocksOnNestedQuery
+	// and TestConcurrentProbeWritesDoNotBusy.
 	db.SetMaxOpenConns(10)
 	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(0)
@@ -62,6 +74,7 @@ func (db *DB) InitSchema() error {
 		id TEXT PRIMARY KEY,
 		name TEXT UNIQUE NOT NULL,
 		target TEXT NOT NULL,
+		type TEXT NOT NULL DEFAULT 'icmp',
 		tag TEXT,
 		interval_s INTEGER NOT NULL,
 		timeout_ms INTEGER NOT NULL,
@@ -79,6 +92,7 @@ func (db *DB) InitSchema() error {
 		ts DATETIME NOT NULL,
 		rtt_ms REAL,
 		resolved_ip TEXT,
+		http_status INTEGER,
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
@@ -114,6 +128,14 @@ func (db *DB) InitSchema() error {
 		last_ts TEXT NOT NULL,
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
+
+	-- Dashboard accounts (username/password auth). Auth is enabled iff this
+	-- table has at least one row.
+	CREATE TABLE IF NOT EXISTS users (
+		username TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL,
+		created_at TEXT
+	);
 	`
 	_, err := db.Exec(schema)
 	if err != nil {
@@ -143,6 +165,24 @@ func (db *DB) InitSchema() error {
 	var resolvedCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'resolved_ip'`).Scan(&resolvedCol); err == nil && resolvedCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN resolved_ip TEXT`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: record the HTTP status code for HTTP sensors
+	// (NULL for ICMP probes and any probe that got no response). Lets the
+	// card show "HTTP 503" vs "no response" for the same loss row.
+	var httpStatusCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'http_status'`).Scan(&httpStatusCol); err == nil && httpStatusCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN http_status INTEGER`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: sensor probe type. Existing sensors default to
+	// 'icmp' (the original and only type), so this is a no-op data-wise; it
+	// just lets the probe worker dispatch the right probe.
+	var typeCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'type'`).Scan(&typeCol); err == nil && typeCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN type TEXT NOT NULL DEFAULT 'icmp'`); err != nil {
 			return err
 		}
 	}
@@ -203,6 +243,25 @@ func (db *DB) InitSchema() error {
 		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
 		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_enabled')`); err != nil {
 		return err
+	}
+	// One-time migration: auth pivoted from a single settings token to the
+	// users table (username/password). If a legacy auth_token row exists
+	// AND no users exist yet, it becomes the "admin" account (the hash is
+	// already bcrypt, so it verifies exactly as before). The row is then
+	// cleared either way — the users table is the source of truth.
+	if db.GetSetting("auth_token") != "" {
+		if n, err := db.UserCount(); err == nil && n == 0 {
+			if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at)
+				VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), ?)`,
+				tsNow()); err != nil {
+				log.Println("WARNING: legacy auth_token migration to users table failed:", err)
+			} else {
+				log.Println("Migrated legacy auth token to the 'admin' user; set a new password in Settings")
+			}
+		}
+		if err := db.SetSetting("auth_token", ""); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -357,6 +416,135 @@ func (db *DB) SetSetting(key, value string) error {
 	return err
 }
 
+// ---------- dashboard users (username/password auth) ----------
+
+// UserCount returns how many dashboard accounts exist. Auth is enabled
+// iff this is > 0.
+func (db *DB) UserCount() (int, error) {
+	var n int
+	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n)
+	return n, err
+}
+
+// AddUser creates an account. Returns the driver error (SQLITE_CONSTRAINT
+// → "user already exists" in the caller).
+func (db *DB) AddUser(username, passwordHash string) error {
+	_, err := db.Exec("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+		username, passwordHash, tsNow())
+	return err
+}
+
+// UserHash returns the stored bcrypt hash for a username ("", sql.ErrNoRows
+// when absent).
+func (db *DB) UserHash(username string) (string, error) {
+	var h string
+	err := db.QueryRow("SELECT password_hash FROM users WHERE username = ?", username).Scan(&h)
+	if err != nil {
+		return "", err
+	}
+	return h, nil
+}
+
+// SetUserPassword overwrites a user's hash.
+func (db *DB) SetUserPassword(username, passwordHash string) error {
+	res, err := db.Exec("UPDATE users SET password_hash = ? WHERE username = ?", passwordHash, username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("no such user: %s", username)
+	}
+	return nil
+}
+
+// RemoveUser deletes one account.
+func (db *DB) RemoveUser(username string) error {
+	_, err := db.Exec("DELETE FROM users WHERE username = ?", username)
+	return err
+}
+
+// RemoveAllUsers clears every account (the "disable authentication" path).
+func (db *DB) RemoveAllUsers() error {
+	_, err := db.Exec("DELETE FROM users")
+	return err
+}
+
+type authUser struct {
+	Username  string `json:"username"`
+	CreatedAt string `json:"created_at"`
+}
+
+// ListUsers returns every account, oldest first (created_at is the standard
+// app timestamp, RFC3339Nano).
+func (db *DB) ListUsers() ([]authUser, error) {
+	rows, err := db.Query("SELECT username, created_at FROM users ORDER BY created_at, username")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []authUser{}
+	for rows.Next() {
+		var u authUser
+		if err := rows.Scan(&u.Username, &u.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+// ActiveSensorIDs lists the ids of every sensor currently in state 'active',
+// in name order. Used to snapshot which sensors are running before maintenance
+// mode pauses them, so resume can restore exactly that set.
+func (db *DB) ActiveSensorIDs() ([]string, error) {
+	rows, err := db.Query("SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// SetSensorStates sets the state for a batch of sensor ids, running in
+// inQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
+// SQLite host-parameter limit (same rule as SensorTagsFor). Returns the number
+// of rows changed. An empty id list is a no-op.
+func (db *DB) SetSensorStates(ids []string, state string) (int64, error) {
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	var total int64
+	for start := 0; start < len(ids); start += inQueryChunk {
+		end := start + inQueryChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[start:end]
+		q := make([]string, len(chunk))
+		args := make([]any, 0, len(chunk)+1)
+		args = append(args, state)
+		for j, id := range chunk {
+			q[j] = "?"
+			args = append(args, id)
+		}
+		res, err := db.Exec("UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...)
+		if err != nil {
+			return total, err
+		}
+		n, _ := res.RowsAffected()
+		total += n
+	}
+	return total, nil
+}
+
 func (db *DB) SeedSensors() error {
 	var count int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&count); err != nil {
@@ -385,8 +573,8 @@ func (db *DB) SeedSensors() error {
 	for _, s := range sensors {
 		if _, err := db.Exec(`
 			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-			VALUES (?, ?, ?, 15, 1000, 25, 4, 3, 'paused', 'up', ?)`,
-			s.name, s.name, s.target, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			VALUES (?, ?, ?, 60, 1000, 25, 2, 3, 'paused', 'up', ?)`,
+			s.name, s.name, s.target, tsNow()); err != nil {
 			return err
 		}
 		if s.tags != "" {

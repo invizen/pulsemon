@@ -1,209 +1,331 @@
 <!DOCTYPE html>
-<html lang="en" class="dark">
+<html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>zenmon</title>
-<link rel="icon" type="image/svg+xml" href="/favicon.svg">
-<link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
-<link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
-<link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
-<link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://unpkg.com/@phosphor-icons/web"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script>
-tailwind.config = {
-  theme: { extend: {
-    fontFamily: { sans: ['"Plus Jakarta Sans"','sans-serif'], mono: ['"JetBrains Mono"','monospace'] },
-    colors: { surface: {950:'#07090e',900:'#0b0f17',850:'#101622',800:'#161f30',700:'#222f47',600:'#334466'},
-      ok:'#10b981', warn:'#f59e0b', bad:'#f43f5e', jit:'#818cf8' }
-  } }
-};
-</script>
-<style>
-  :root{color-scheme:dark}
-  select,option{color-scheme:dark;background-color:#0b0f17;color:#f1f5f9}
-  ::-webkit-scrollbar{width:6px;height:6px}
-  ::-webkit-scrollbar-track{background:#0b0f17}
-  ::-webkit-scrollbar-thumb{background:#222f47;border-radius:3px}
-  .glow-ok{box-shadow:0 0 10px rgba(16,185,129,.55)}
-  .glow-warn{box-shadow:0 0 10px rgba(245,158,11,.55)}
-  .glow-bad{box-shadow:0 0 10px rgba(244,63,94,.6)}
-  .spark-bar{transition:height .25s ease, background-color .25s ease}
-  .modal-backdrop{animation:fadein .12s ease}
-  @keyframes fadein{from{opacity:0}to{opacity:1}}
-</style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pulsemon</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+  <link rel="icon" type="image/png" sizes="16x16" href="/favicon-16x16.png">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32x32.png">
+  <link rel="icon" type="image/png" sizes="48x48" href="/favicon-48x48.png">
+  <link rel="apple-touch-icon" sizes="180x180" href="/apple-touch-icon.png">
+  <script>
+    if (localStorage.getItem('pulsemon_theme') === 'light') document.documentElement.classList.add('light');
+  </script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/@phosphor-icons/web"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <script>
+    tailwind.config = {
+      theme: {
+        extend: {
+          fontFamily: {
+            sans: ['"Plus Jakarta Sans"', 'sans-serif'],
+            mono: ['"JetBrains Mono"', 'monospace']
+          },
+          colors: {
+            surface: {
+              950: 'rgb(var(--s950)/<alpha-value>)',
+              900: 'rgb(var(--s900)/<alpha-value>)',
+              850: 'rgb(var(--s850)/<alpha-value>)',
+              800: 'rgb(var(--s800)/<alpha-value>)',
+              700: 'rgb(var(--s700)/<alpha-value>)',
+              600: 'rgb(var(--s600)/<alpha-value>)'
+            },
+            ok: 'rgb(var(--okc)/<alpha-value>)',
+            warn: 'rgb(var(--warnc)/<alpha-value>)',
+            bad: 'rgb(var(--badc)/<alpha-value>)',
+            jit: 'rgb(var(--jitc)/<alpha-value>)'
+          }
+        }
+      }
+    };
+  </script>
+  <style>
+    :root {
+      color-scheme: dark;
+      --s950: 7 9 14; --s900: 11 15 23; --s850: 16 22 34; --s800: 22 31 48; --s700: 34 47 71; --s600: 51 68 102;
+      --okc: 16 185 129; --warnc: 245 158 11; --badc: 244 63 94; --jitc: 129 140 248;
+      --ok-solid: #10b981; --bad-solid: #f43f5e; --g-grid: #161f30; --g-text: #64748b;
+    }
+    .light {
+      color-scheme: light;
+      --s950: 238 241 245; --s900: 255 255 255; --s850: 234 238 245; --s800: 210 216 228; --s700: 186 195 209; --s600: 160 172 190;
+      --okc: 5 150 105; --warnc: 217 119 6; --badc: 225 29 72; --jitc: 99 102 241;
+      --ok-solid: #059669; --bad-solid: #e11d48; --g-grid: #d7dee8; --g-text: #64748b;
+    }
+    .light .text-slate-100 { color: #1e293b; }
+    .light .text-slate-200 { color: #334155; }
+    .light .text-slate-300 { color: #475569; }
+    .light .text-slate-400 { color: #475569; }
+    .light .text-slate-500 { color: #56637a; }
+    .light .text-slate-600 { color: #8494a8; }
+    .light .text-slate-700 { color: #cbd5e1; }
+    .light .text-white { color: #0f172a; }
+    .light .hover\:text-white:hover { color: #0f172a; }
+    select, option { color-scheme: dark; background-color: #0b0f17; color: #f1f5f9; }
+    .light select, .light option { color-scheme: light; background-color: #fff; color: #1e293b; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    /* ── Global +1px text scale (tune the +1px here; set to +0px to revert) ── */
+    .text-\[10px\] { font-size: 11px !important; }
+    .text-\[11px\] { font-size: 12px !important; }
+    .text-\[12px\] { font-size: 13px !important; }
+    .text-\[13px\] { font-size: 14px !important; }
+    .text-\[14px\] { font-size: 15px !important; }
+    .text-\[15px\] { font-size: 16px !important; }
+    .text-\[16px\] { font-size: 17px !important; }
+    .text-\[17px\] { font-size: 18px !important; }
+    .text-\[18px\] { font-size: 19px !important; }
+    .text-\[19px\] { font-size: 20px !important; }
+    .text-\[20px\] { font-size: 21px !important; }
+    .text-\[32px\] { font-size: 33px !important; }
+    ::-webkit-scrollbar-track { background: #0b0f17; }
+    ::-webkit-scrollbar-thumb { background: #222f47; border-radius: 3px; }
+    .light ::-webkit-scrollbar-track { background: #eef1f5; }
+    .light ::-webkit-scrollbar-thumb { background: #b9c5d6; border-radius: 3px; }
+    .glow-ok { box-shadow: 0 0 10px rgba(16, 185, 129, 0.45); }
+    .glow-warn { box-shadow: 0 0 10px rgba(245, 158, 11, 0.45); }
+    .glow-bad { box-shadow: 0 0 10px rgba(244, 63, 94, 0.55); }
+    .light .glow-ok { box-shadow: 0 0 8px rgba(5, 150, 105, 0.35); }
+    .light .glow-warn { box-shadow: 0 0 8px rgba(217, 119, 6, 0.35); }
+    .light .glow-bad { box-shadow: 0 0 8px rgba(225, 29, 72, 0.4); }
+    .spark-bar { transition: height 0.2s ease, background-color 0.2s ease; }
+    .modal-backdrop { animation: fadein 0.12s ease; }
+    @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+  </style>
 </head>
-<body class="bg-surface-950 text-slate-200 font-sans min-h-screen antialiased">
+<body class="bg-surface-950 text-slate-200 font-sans min-h-screen antialiased select-none sm:select-auto">
+
+<!-- ============ AUTH GATE (login overlay) ============ -->
+<div id="auth-gate" class="hidden fixed inset-0 z-[100] bg-surface-950 flex items-center justify-center p-4">
+  <div class="w-full max-w-sm">
+    <div class="flex items-center gap-3 mb-6 justify-center">
+      <div class="h-10 w-10 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok">
+        <i class="ph-bold ph-activity text-[20px]"></i>
+      </div>
+      <div class="text-left">
+        <div class="font-extrabold tracking-tight text-[18px]"><span class="text-ok">pulse</span><span class="text-slate-400">mon</span></div>
+        <p class="text-[12px] text-slate-500">network sensor monitor</p>
+      </div>
+    </div>
+    <form id="auth-form" class="bg-surface-900 border border-surface-800 rounded-2xl p-5 space-y-3">
+      <p class="text-[13px] text-slate-400">Sign in to unlock the dashboard.</p>
+      <input id="auth-username" type="text" autocomplete="username" spellcheck="false" placeholder="username"
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-[14px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60" />
+      <input id="auth-password" type="password" autocomplete="current-password" spellcheck="false" placeholder="password"
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-[14px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60" />
+      <p id="auth-err" class="hidden text-[12px] font-mono text-bad"></p>
+      <button type="submit" class="w-full py-2 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[13px] font-semibold transition">Sign In</button>
+    </form>
+  </div>
+</div>
 
 <!-- ============ HEADER ============ -->
 <header class="border-b border-surface-800 bg-surface-900/80 backdrop-blur sticky top-0 z-30">
   <div class="max-w-[1700px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
     <div class="flex items-center gap-3">
-      <div class="h-9 w-9 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok">
-        <i class="ph-bold ph-activity text-lg"></i>
+      <div class="h-9 w-9 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok shadow-inner">
+        <i class="ph-bold ph-activity text-[19px]"></i>
       </div>
       <div>
         <div class="flex items-center gap-2">
-          <span class="font-bold tracking-tight"><span class="text-[#98a1b0]">zen</span><span class="text-[#f02020]">mon</span></span>
-          <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="zenmon version">v…</span>
+          <span class="font-extrabold tracking-tight text-[17px]"><span class="text-ok">pulse</span><span class="text-slate-400">mon</span></span>
+          <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="pulsemon version">v…</span>
+          <button id="update-pill" class="hidden text-[11px] font-mono px-1.5 py-0.5 rounded bg-warn/10 border border-warn/40 text-warn hover:bg-warn/20 transition" title="Update available — see Settings" onclick="openSettings()"><i class="ph-bold ph-arrow-up"></i> <span id="update-pill-ver">update</span></button>
         </div>
-        <p class="text-[11px] text-slate-500 hidden sm:block">network sensor monitor</p>
+        <p class="text-[12px] text-slate-500 hidden sm:block">network sensor monitor</p>
       </div>
     </div>
 
-    <div id="status-pill" class="hidden md:flex items-center gap-5 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-xs">
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-ok glow-ok"></span><span class="text-slate-400">UP</span><span id="c-up" class="text-ok font-semibold">0</span></span>
+    <!-- Status Counter (Responsive Desktop Pill) -->
+    <div id="status-pill" class="hidden md:flex items-center gap-4 px-4 py-1.5 bg-surface-850 border border-surface-800 rounded-full font-mono text-[12px]">
+      <span class="flex items-center gap-1.5" title="Nodes UP"><i class="ph-bold ph-check-circle text-ok"></i><span class="text-slate-400">UP</span><span id="c-up" class="text-ok font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-warn glow-warn"></span><span class="text-slate-400">WARN</span><span id="c-warn" class="text-warn font-semibold">0</span></span>
+      <span class="flex items-center gap-1.5" title="Nodes in Warning"><i class="ph-bold ph-warning text-warn"></i><span class="text-slate-400">WARN</span><span id="c-warn" class="text-warn font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-bad glow-bad"></span><span class="text-slate-400">ERROR</span><span id="c-error" class="text-bad font-semibold">0</span></span>
+      <span class="flex items-center gap-1.5" title="Nodes in Error"><i class="ph-bold ph-x-circle text-bad"></i><span class="text-slate-400">ERROR</span><span id="c-error" class="text-bad font-semibold">0</span></span>
       <span class="h-3 w-px bg-surface-700"></span>
-      <span class="flex items-center gap-2"><span class="w-2 h-2 rounded-full bg-slate-500"></span><span class="text-slate-400">PAUSED</span><span id="c-paused" class="text-slate-400 font-semibold">0</span></span>
+      <span class="flex items-center gap-1.5" title="Paused Nodes"><i class="ph-bold ph-pause-circle text-slate-500"></i><span class="text-slate-400">PAUSED</span><span id="c-paused" class="text-slate-400 font-semibold">0</span></span>
     </div>
 
     <div class="flex items-center gap-2">
-      <button onclick="openSettings()" title="Settings (webhook)" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
-        <i class="ph-bold ph-gear text-lg"></i>
+      <button onclick="toggleTheme()" id="theme-toggle" title="Toggle light/dark theme" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+        <i id="theme-icon" class="ph-bold ph-sun text-[19px]"></i>
       </button>
-      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-xs font-semibold">
-        <i class="ph-bold ph-plus text-sm"></i> New sensor
+      <button onclick="openSettings()" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+        <i class="ph-bold ph-gear text-[19px]"></i>
+      </button>
+      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
+        <i class="ph-bold ph-plus text-[15px]"></i> <span class="hidden sm:inline">New Sensor</span><span class="sm:hidden">New</span>
       </button>
     </div>
+  </div>
+
+  <!-- Mobile Sub-Bar Status -->
+  <div class="md:hidden flex items-center justify-around border-t border-surface-800/80 bg-surface-900 px-4 py-1.5 font-mono text-[11px]">
+    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-ok"></span><span class="text-slate-400">UP</span><span id="m-up" class="text-ok font-semibold">0</span></span>
+    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-warn"></span><span class="text-slate-400">WARN</span><span id="m-warn" class="text-warn font-semibold">0</span></span>
+    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-bad"></span><span class="text-slate-400">ERR</span><span id="m-error" class="text-bad font-semibold">0</span></span>
+    <span class="flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-slate-500"></span><span class="text-slate-400">PAUSE</span><span id="m-paused" class="text-slate-400 font-semibold">0</span></span>
   </div>
 </header>
 
 <div id="probe-banner" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pt-4">
-  <div class="text-xs font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+  <div class="text-[13px] font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
     <i class="ph-bold ph-warning"></i>
-    <span id="probe-banner-text">probing is broken</span>
+    <span id="probe-banner-text">pulsing is broken</span>
     <span class="text-warn/70 font-normal ml-1">— statuses below are unreliable until this clears</span>
   </div>
 </div>
 
-<main class="max-w-[1700px] mx-auto px-4 sm:px-6 py-6 flex flex-col gap-5">
-
+<main class="max-w-[1700px] mx-auto px-4 sm:px-6 py-5 flex flex-col gap-4">
   <!-- ============ TOOLBAR ============ -->
-  <section class="bg-surface-900 border border-surface-800 rounded-xl p-3 flex flex-col lg:flex-row lg:items-center gap-3">
+  <section class="bg-surface-900 border border-surface-800 rounded-xl p-2.5 flex flex-col lg:flex-row lg:items-center gap-2.5 shadow-sm">
     <div class="relative w-full lg:w-72">
-      <i class="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm"></i>
+      <i class="ph ph-magnifying-glass absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-[14px]"></i>
       <input id="q" type="text" placeholder="filter name, target, tag…" oninput="render()"
-        class="w-full bg-surface-950 border border-surface-800 rounded-lg pl-9 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60 font-mono">
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg pl-8 pr-3 py-1.5 text-[13px] text-slate-200 placeholder-slate-600 focus:outline-none focus:border-ok/60 font-mono transition">
     </div>
-    <div id="tag-chips" class="flex items-center gap-1.5 overflow-x-auto text-xs font-mono py-1 flex-1"></div>
-    <div class="flex items-center gap-2 shrink-0">
-      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 font-mono text-xs">
-        <span class="text-slate-500 mr-1.5">SORT</span>
-        <select id="sort" onchange="render()" class="bg-surface-900 text-slate-100 focus:outline-none cursor-pointer rounded">
-          <option value="severity" class="bg-surface-900 text-slate-100">Severity</option>
-          <option value="name" class="bg-surface-900 text-slate-100">Name A–Z</option>
-          <option value="rtt-desc" class="bg-surface-900 text-slate-100">Ping high→low</option>
-          <option value="rtt-asc" class="bg-surface-900 text-slate-100">Ping low→high</option>
-          <option value="loss" class="bg-surface-900 text-slate-100">Loss %</option>
+
+    <!-- Tag Bar with visual indicator of scroll -->
+    <div id="tag-chips" class="flex items-center gap-1.5 overflow-x-auto text-[12px] font-mono py-0.5 flex-1 scrollbar-none"></div>
+
+    <div class="flex items-center gap-2 shrink-0 justify-between lg:justify-end">
+      <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px]">
+        <span class="text-slate-500 mr-1.5 text-[11px] font-semibold">SORT</span>
+        <select id="sort" onchange="render()" class="bg-surface-900 text-slate-200 focus:outline-none cursor-pointer rounded text-[12px]">
+          <option value="severity">Severity</option>
+          <option value="name">Name A–Z</option>
+          <option value="rtt-desc">Resp high→low</option>
+          <option value="rtt-asc">Resp low→high</option>
+          <option value="loss">Loss %</option>
         </select>
       </div>
+
       <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg p-0.5">
-        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800"><i class="ph-bold ph-squares-four text-sm"></i></button>
-        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white"><i class="ph-bold ph-rows text-sm"></i></button>
+        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800 transition">
+          <i class="ph-bold ph-squares-four text-[15px]"></i>
+        </button>
+        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white transition">
+          <i class="ph-bold ph-rows text-[15px]"></i>
+        </button>
       </div>
     </div>
   </section>
 
   <!-- ============ SENSOR GRID ============ -->
-  <section id="grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-4"></section>
+  <section id="grid" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4 gap-3.5"></section>
 
   <!-- ============ SENSOR TABLE ============ -->
-  <section id="table-wrap" class="hidden bg-surface-900 border border-surface-800 rounded-xl overflow-hidden">
-    <table class="w-full text-base font-mono">
+  <section id="table-wrap" class="hidden bg-surface-900 border border-surface-800 rounded-xl overflow-x-auto shadow-sm">
+    <table class="w-full text-[13px] font-mono text-left whitespace-nowrap">
       <thead>
-        <tr class="text-xs text-slate-500 uppercase tracking-wider border-b border-surface-800 bg-surface-850/50">
-          <th class="text-left py-3.5 px-4">Status</th>
-          <th class="text-left py-3.5 px-4">Sensor</th>
-          <th class="text-left py-3.5 px-4 hidden sm:table-cell">Target</th>
-          <th class="text-left py-3.5 px-4">Tag</th>
-          <th class="text-right py-3.5 px-4">Ping</th>
-          <th class="text-right py-3.5 px-4">Jitter</th>
-          <th class="text-right py-3.5 px-4">Loss</th>
-          <th class="text-right py-3.5 px-4">Uptime 24h</th>
-          <th class="text-left py-3.5 px-4 hidden lg:table-cell">Trend</th>
-          <th class="text-right py-3.5 px-4">Actions</th>
+        <tr class="text-[11px] text-slate-400 uppercase tracking-wider border-b border-surface-800 bg-surface-850/60 select-none">
+          <th class="py-2.5 px-3.5 font-semibold">Status</th>
+          <th class="py-2.5 px-3.5 font-semibold">Sensor</th>
+          <th class="py-2.5 px-3.5 font-semibold hidden md:table-cell">Target</th>
+          <th class="py-2.5 px-3.5 font-semibold">Tags</th>
+          <th class="text-right py-2.5 px-3.5 font-semibold">Ping / Resp</th>
+          <th class="text-right py-2.5 px-3.5 font-semibold">Jitter</th>
+          <th class="text-right py-2.5 px-3.5 font-semibold">Loss</th>
+          <th class="text-right py-2.5 px-3.5 font-semibold">Uptime 24h</th>
+          <th class="text-left py-2.5 px-3.5 font-semibold hidden lg:table-cell">Trend (1h)</th>
+          <th class="text-right py-2.5 px-3.5 font-semibold">Actions</th>
         </tr>
       </thead>
-      <tbody id="table-body" class="divide-y divide-surface-800/60"></tbody>
+      <tbody id="table-body" class="divide-y divide-surface-800/40"></tbody>
     </table>
   </section>
 
+  <!-- Empty state -->
   <div id="empty" class="hidden py-16 text-center">
-    <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-3xl"></i></div>
-    <h3 class="text-sm font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
-    <p class="text-xs text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
-    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-xs font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto"><i class="ph-bold ph-plus"></i> Add your first sensor</button>
+    <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-[32px]"></i></div>
+    <h3 class="text-[15px] font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
+    <p class="text-[13px] text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
+    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
+      <i class="ph-bold ph-plus"></i> Add your first sensor
+    </button>
   </div>
 
   <!-- ============ ACTIVITY FEED ============ -->
-  <section class="bg-surface-900 border border-surface-800 rounded-xl">
-    <div class="px-4 py-2.5 border-b border-surface-800 flex items-center gap-2">
-      <i class="ph ph-list-bullets text-slate-500 text-sm"></i>
-      <span class="text-xs font-semibold text-slate-300 tracking-wide">ACTIVITY</span>
-      <span class="text-[11px] text-slate-600 font-mono">state transitions</span>
-      <button onclick="clearActivity()" title="Clear activity log"
-        class="ml-auto px-2 py-0.5 rounded-md text-[11px] font-mono text-slate-500 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1"><i class="ph ph-trash-simple"></i> clear</button>
+  <section class="bg-surface-900 border border-surface-800 rounded-xl overflow-hidden shadow-sm">
+    <div class="px-4 py-2 border-b border-surface-800 flex items-center justify-between">
+      <div class="flex items-center gap-2">
+        <i class="ph-bold ph-list-bullets text-slate-500 text-[14px]"></i>
+        <span class="text-[12px] font-bold text-slate-300 tracking-wider">ACTIVITY</span>
+        <span class="text-[11px] text-slate-500 font-mono">state transitions</span>
+      </div>
+      <button id="clear-activity-btn" onclick="confirmClearActivity(this)" title="Clear activity log"
+        class="px-2 py-0.5 rounded text-[11px] font-mono text-slate-400 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1">
+        <i class="ph ph-trash-simple"></i> Clear
+      </button>
     </div>
-    <ul id="feed" class="divide-y divide-surface-800/60 max-h-56 overflow-y-auto text-xs font-mono"></ul>
+    <ul id="feed" class="divide-y divide-surface-800/50 max-h-48 overflow-y-auto text-[12px] font-mono"></ul>
   </section>
 </main>
 
 <!-- ============ SENSOR MODAL (create / edit) ============ -->
 <div id="modal-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
-  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-3xl rounded-2xl shadow-2xl overflow-hidden">
-    <div class="px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
-      <h2 id="modal-title" class="text-sm font-bold text-white">New sensor</h2>
-      <button onclick="closeModal()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden">
+    <div class="px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <h2 id="modal-title" class="text-[14px] font-bold text-white uppercase tracking-wider font-mono">New Sensor</h2>
+      <button onclick="closeModal()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
     </div>
-    <form id="sensor-form" onsubmit="submitSensor(event)" class="p-5 space-y-3">
+    <form id="sensor-form" onsubmit="submitSensor(event)" class="p-5 space-y-3.5">
       <input type="hidden" id="f-id">
-      <div class="grid grid-cols-2 gap-3">
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Name <span class="text-slate-600">required</span>
-          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="hostname">
+      
+      <div class="flex items-center gap-2 bg-surface-950 p-2 rounded-lg border border-surface-800">
+        <label for="f-type" class="text-[12px] text-slate-400 font-semibold px-1">Type</label>
+        <select id="f-type" onchange="onFormTypeChange()" class="bg-surface-900 border border-surface-700 rounded-md px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="http">HTTPS / HTTP</option>
+          <option value="icmp">PING / ICMP</option>
+        </select>
+        <span id="f-type-hint" class="text-[11px] text-slate-500 font-mono truncate ml-1">GETs URL — expects 2xx status code</span>
+      </div>
+
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <label class="text-[12px] text-slate-400 flex flex-col gap-1 font-semibold">Name <span class="text-[10px] text-slate-500 font-normal">required</span>
+          <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="e.g. gateway-01">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Target <span class="text-slate-600">IP or hostname</span>
-          <input id="f-target" required maxlength="253" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="0.0.0.0">
+        <label class="text-[12px] text-slate-400 flex flex-col gap-1 font-semibold">Target <span id="f-target-hint" class="text-[10px] text-slate-500 font-normal">URL or IP</span>
+          <input id="f-target" required maxlength="253" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="https://api.domain.internal">
         </label>
       </div>
-      <label class="text-xs text-slate-400 flex flex-col gap-1">Tags <span class="text-slate-600">multiple allowed, pick existing or type new</span>
+
+      <div class="flex flex-col gap-1">
+        <span class="text-[12px] text-slate-400 font-semibold">Tags</span>
         <div id="f-tagchips" class="flex flex-wrap items-center gap-1.5 min-h-[2.2rem] bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5"></div>
         <div class="flex items-center gap-2 mt-1">
-          <select id="f-tagpick" onchange="addFormTag(this.value);this.value=''" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+          <select id="f-tagpick" onchange="addFormTag(this.value);this.value=''" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-300 focus:outline-none focus:border-ok/60">
             <option value="">+ add existing tag…</option>
           </select>
-          <input id="f-tagnew" maxlength="30" placeholder="or type new tag ↵"
+          <input id="f-tagnew" maxlength="30" placeholder="or enter new tag ↵"
             onkeydown="if(event.key==='Enter'){event.preventDefault();addFormTag(this.value.trim());this.value=''}"
-            class="w-1/3 text-right bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-xs font-mono text-slate-300 focus:outline-none focus:border-ok/60">
+            class="w-1/3 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[12px] font-mono text-slate-300 focus:outline-none focus:border-ok/60">
         </div>
-      </label>
-      <div class="grid grid-cols-5 gap-3">
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Interval (s)
-          <input id="f-interval" type="number" min="1" max="3600" value="15" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+      </div>
+
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
+        <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Interval (s)
+          <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Timeout (ms)
-          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Timeout (ms)
+          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Loss warn (%)
-          <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Warn Loss (%)
+          <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Error after
-          <input id="f-down" type="number" min="1" max="30" value="4" title="Mark ERROR after this many consecutive lost probes" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
-        </label>
-        <label class="text-xs text-slate-400 flex flex-col gap-1">Spike (× avg)
-          <input id="f-spike" type="number" min="2" max="10" value="3" title="Informational — shown in the dashboard. Does not change status." class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-sm font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Down After
+          <input id="f-down" type="number" min="1" max="30" value="2" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
-      <div id="form-err" class="hidden text-xs text-bad font-mono"></div>
-      <div class="flex justify-end gap-2 pt-1">
-        <button type="button" onclick="closeModal()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Close</button>
-        <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save sensor</button>
+
+      <div id="form-err" class="hidden text-[12px] text-bad font-mono"></div>
+
+      <div class="flex justify-end gap-2 pt-2 border-t border-surface-800">
+        <button type="button" onclick="closeModal()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Cancel</button>
+        <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Sensor</button>
       </div>
     </form>
   </div>
@@ -211,123 +333,235 @@ tailwind.config = {
 
 <!-- ============ SETTINGS MODAL ============ -->
 <div id="settings-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
-  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-lg max-h-[calc(100vh-2rem)] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
-    <div class="sticky top-0 shrink-0 z-10 px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
-      <h2 class="text-sm font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
-      <button onclick="closeSettings()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
+    <div class="shrink-0 px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <h2 class="text-[14px] font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
+      <button onclick="closeSettings()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
     </div>
-    <div class="p-5 space-y-4 overflow-y-auto min-h-0">
-      <div id="maint-banner" class="hidden text-xs font-mono px-3 py-2 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
-        <i class="ph-bold ph-warning"></i> Maintenance mode is ON — no alerts are being sent.
+
+    <div class="p-5 space-y-4 overflow-y-auto min-h-0 text-[13px]">
+      <div id="maint-banner" class="hidden text-[12px] font-mono px-3 py-2 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+        <i class="ph-bold ph-pause"></i> Maintenance Mode is active — all probes are paused.
       </div>
-      <div class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-warn/5">
-        <span class="text-xs font-semibold text-slate-300">
-          <i class="ph-bold ph-wrench text-warn"></i> Maintenance mode
-          <span class="block text-[11px] font-normal text-slate-600 mt-0.5">silence all alerts (sensors keep probing)</span>
-        </span>
-        <button type="button" id="maint-toggle" onclick="toggleMaint()" class="relative w-10 h-6 rounded-full bg-surface-800 border border-surface-700 transition-colors" title="Toggle maintenance mode">
-          <span id="maint-knob" class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-slate-400 transition-transform"></span>
+
+      <!-- Maintenance toggle -->
+      <div class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/40">
+        <div>
+          <span class="font-semibold text-slate-200 flex items-center gap-1.5">
+            <i class="ph-bold ph-wrench text-warn"></i> Maintenance Mode
+          </span>
+          <span class="block text-[11px] text-slate-500" id="maint-desc">Pause probe executions globally without deleting schedules</span>
+        </div>
+        <button type="button" id="maint-btn" onclick="toggleMaint()" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-warn text-[12px] font-mono flex items-center gap-1.5 transition">
+          <i id="maint-icon" class="ph-bold ph-pause"></i> <span id="maint-btn-txt">Pause All</span>
         </button>
       </div>
-      <div class="flex items-center justify-between text-xs font-mono">
-        <span class="text-slate-400">Alert destinations</span>
-        <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
-      </div>
-      <div class="space-y-2.5">
-        <p class="text-[11px] text-slate-600 font-mono">Each destination you enable receives every alert. A destination sends only when it's toggled on <em>and</em> has a URL.</p>
-        <div id="provider-list" class="space-y-2.5"></div>
-      </div>
-      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/50 space-y-3">
+
+      <!-- Version / Update check -->
+      <div class="border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/40">
         <div class="flex items-center justify-between">
-          <span class="text-xs font-semibold text-slate-300">Alert routing</span>
-          <span class="text-[11px] text-slate-600 font-mono">which sensors can fire alerts</span>
+          <span class="font-semibold text-slate-200 flex items-center gap-1.5">
+            <i class="ph-bold ph-git-branch text-slate-400"></i> Version
+          </span>
+          <button id="ver-refresh" onclick="checkUpdate(true)" title="Re-check for updates now" class="p-1 rounded text-slate-500 hover:text-white transition"><i class="ph ph-arrows-clockwise"></i></button>
         </div>
-        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60">
-          <option value="all">All sensors</option>
-          <option value="tags">Only sensors with selected tags</option>
-          <option value="sensors">Only selected sensors</option>
+        <div id="ver-body" class="mt-1.5 flex items-center justify-between text-[12px] font-mono text-slate-400">
+          <span>checking…</span><span>—</span>
+        </div>
+      </div>
+
+      <!-- Alert webhooks -->
+      <div class="space-y-2">
+        <div class="flex items-center justify-between font-mono text-[12px]">
+          <span class="font-semibold text-slate-300">Alert Destinations</span>
+          <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+        </div>
+        <div id="provider-list" class="space-y-2"></div>
+      </div>
+
+      <!-- Routing & Filter -->
+      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-slate-300">Alert Routing</span>
+          <span class="text-[11px] text-slate-500 font-mono">Scope alert triggers</span>
+        </div>
+        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="all">All Sensors</option>
+          <option value="tags">Sensors With Selected Tags</option>
+          <option value="sensors">Only Selected Sensors</option>
         </select>
         <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
-        <label class="text-xs text-slate-400 flex items-center justify-between gap-3">
-          <span class="flex flex-col">Re-alert interval <span class="text-[11px] text-slate-600">while still error — 0 = one alert per outage (recovery still alerts)</span></span>
-          <span class="flex items-center gap-1.5 font-mono">
-            <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-16 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-ok/60"> min
-          </span>
-        </label>
+        <div class="flex items-center justify-between pt-1">
+          <span class="text-[12px] text-slate-400">Re-Alert Interval (min)</span>
+          <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
+        </div>
       </div>
-      <div id="set-msg" class="hidden text-xs font-mono px-3 py-2 rounded-lg border"></div>
-      <div class="text-[11px] text-slate-500 font-mono leading-relaxed border border-surface-800 rounded-lg p-3 bg-surface-950/50">
-        <div class="flex items-center gap-2 mb-1 text-slate-400"><i class="ph ph-info"></i> How alerts work</div>
-        Sent when a sensor goes up → error, error → up (recovery), warning → error, or error → warning. Warning (packet loss) is shown in the dashboard but does not send an alert. While a sensor stays in error, it re-notifies at the interval above. State changes also appear in the ACTIVITY feed.
+
+      <!-- TLS / HTTPS -->
+      <div id="tls-panel" class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-slate-300">TLS / HTTPS</span>
+          <span id="tls-status" class="text-[11px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+        </div>
+        <div class="flex items-center justify-between gap-3">
+          <span class="text-[12px] text-slate-400">HTTPS Port</span>
+          <input id="f-tls-port" type="number" min="1" max="65535" value="443" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200">
+        </div>
+        <div class="space-y-1.5">
+          <div class="flex items-center gap-2">
+            <input id="f-tls-cert-file" type="file" accept=".pem,.crt,.cer,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+            <span id="tls-cert-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">no file</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <input id="f-tls-key-file" type="file" accept=".pem,.key,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+            <span id="tls-key-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">no file</span>
+          </div>
+        </div>
+        <div class="flex gap-2 pt-1">
+          <button onclick="applyTLSCert()" class="px-3 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[11px] font-mono font-semibold">Apply Cert</button>
+          <button onclick="confirmRemoveTLSCert(this)" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[11px] font-mono">Remove Cert</button>
+        </div>
+      </div>
+
+      <!-- Authentication -->
+      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <i class="ph-bold ph-lock text-slate-400"></i>
+            <span class="font-semibold text-slate-200">Authentication</span>
+            <span id="auth-badge" class="px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border bg-surface-800 border-surface-700 text-slate-500">off</span>
+          </div>
+        </div>
+        
+        <div id="auth-off-box">
+          <p class="text-[12px] text-slate-500 mb-2">Protect dashboard with secure credential gate.</p>
+          <button onclick="openFirstAccountDialog()" class="w-full py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">
+            Create First Account
+          </button>
+        </div>
+
+        <div id="auth-enabled-box" class="hidden space-y-2.5">
+          <div class="text-[12px] text-slate-400 font-mono">Current session: <span id="auth-me" class="text-slate-200 font-semibold"></span></div>
+          <div class="space-y-1.5" id="auth-user-list"></div>
+          
+          <div class="border border-surface-800 rounded-lg p-2.5 bg-surface-900/60 space-y-2">
+            <div class="text-[11px] font-mono text-slate-400 font-semibold">Add User Account</div>
+            <div class="flex flex-col sm:flex-row gap-2">
+              <input id="auth-new-username" type="text" placeholder="Username" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
+              <input id="auth-new-password" type="password" placeholder="Password (8+ chars)" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
+            </div>
+            <button onclick="addAuthUser()" class="px-3 py-1 rounded-md bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-200 text-[11px] font-mono">
+              Add User
+            </button>
+          </div>
+
+          <div class="flex flex-wrap gap-2 pt-1">
+            <button onclick="openChangePasswordDialog()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Change Password</button>
+            <button onclick="logoutAuth()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Sign Out</button>
+            <button onclick="confirmDisableAuth(this)" class="px-2.5 py-1 rounded-lg bg-bad/10 border border-bad/30 text-bad hover:bg-bad/20 text-[11px] font-mono">Disable Auth</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="set-msg" class="hidden text-[12px] font-mono px-3 py-2 rounded-lg border"></div>
+    </div>
+
+    <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+      <span class="text-[11px] text-slate-500 font-mono">persisted in pulsemon.db</span>
+      <div class="flex gap-2">
+        <button onclick="closeSettings()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
+        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Settings</button>
       </div>
     </div>
-    <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
-      <span class="text-[11px] text-slate-500 font-mono">stored in the zenmon database</span>
-      <div class="flex gap-2">
-        <button onclick="closeSettings()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-xs font-mono">Close</button>
-        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-xs font-semibold">Save</button>
-      </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: ACCOUNT CREATION (replaces window.prompt) ============ -->
+<div id="acc-modal" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
+  <div class="bg-surface-900 border border-surface-700 w-full max-w-sm rounded-xl p-5 space-y-3">
+    <h3 id="acc-modal-title" class="text-[14px] font-bold text-white">Create Admin Account</h3>
+    <div id="acc-modal-user-wrap">
+      <label class="text-[11px] font-mono text-slate-400">Username</label>
+      <input id="acc-u" type="text" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
+    </div>
+    <div>
+      <label class="text-[11px] font-mono text-slate-400">Password (8+ chars)</label>
+      <input id="acc-p" type="password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
+    </div>
+    <div>
+      <label class="text-[11px] font-mono text-slate-400">Confirm Password</label>
+      <input id="acc-p2" type="password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
+    </div>
+    <div id="acc-err" class="hidden text-[11px] font-mono text-bad"></div>
+    <div class="flex justify-end gap-2 pt-2">
+      <button onclick="$('acc-modal').classList.add('hidden')" class="px-3 py-1 rounded bg-surface-800 text-slate-300 text-[12px] font-mono">Cancel</button>
+      <button id="acc-submit-btn" onclick="submitAccountModal()" class="px-3 py-1 rounded bg-ok/15 border border-ok/40 text-ok text-[12px] font-semibold">Submit</button>
     </div>
   </div>
 </div>
 
 <!-- ============ INSPECTOR MODAL ============ -->
 <div id="insp-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
-  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[calc(100vh-2rem)] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
-    <div class="shrink-0 px-5 py-4 border-b border-surface-800 flex items-center justify-between bg-surface-850">
-      <div class="flex items-center gap-3">
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
+    <div class="shrink-0 px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <div class="flex items-center gap-2.5">
         <span id="insp-dot" class="w-3 h-3 rounded-full"></span>
         <div>
           <div class="flex items-center gap-2">
-            <h2 id="insp-name" class="text-base font-bold text-white font-mono">—</h2>
-            <span id="insp-tag" class="px-2 py-0.5 rounded text-[11px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
+            <h2 id="insp-name" class="text-[15px] font-bold text-white font-mono">—</h2>
+            <span id="insp-tag" class="px-1.5 py-0.2 rounded text-[11px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
           </div>
-          <p id="insp-target" class="text-xs text-slate-500 font-mono mt-0.5"></p>
+          <p id="insp-target" class="text-[12px] text-slate-500 font-mono mt-0.5"></p>
         </div>
       </div>
-      <button onclick="closeInspector()" class="text-slate-500 hover:text-white"><i class="ph ph-x"></i></button>
+      <button onclick="closeInspector()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
     </div>
-    <div class="p-5 space-y-5 overflow-y-auto min-h-0">
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3 font-mono">
-        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Ping last</div>
-          <div id="insp-rtt" class="text-lg font-bold text-white mt-1">—</div>
+
+    <div class="p-5 space-y-4 overflow-y-auto min-h-0">
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 font-mono">
+        <div class="p-2.5 bg-surface-950 border border-surface-800 rounded-lg">
+          <div id="insp-rtt-label" class="text-[11px] text-slate-500 uppercase tracking-wider">Resp Last</div>
+          <div id="insp-rtt" class="text-[16px] font-bold text-white mt-1">—</div>
         </div>
-        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
-          <div class="text-[11px] text-slate-500 uppercase tracking-wider">min / avg / max</div>
-          <div id="insp-minavgmax" class="text-xs font-semibold text-slate-200 mt-1.5">—</div>
+        <div class="p-2.5 bg-surface-950 border border-surface-800 rounded-lg">
+          <div class="text-[11px] text-slate-500 uppercase tracking-wider">Min / Avg / Max</div>
+          <div id="insp-minavgmax" class="text-[12px] font-semibold text-slate-200 mt-1.5 truncate">—</div>
         </div>
-        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+        <div class="p-2.5 bg-surface-950 border border-surface-800 rounded-lg">
           <div class="text-[11px] text-slate-500 uppercase tracking-wider">Loss (60p)</div>
-          <div id="insp-loss" class="text-lg font-bold text-ok mt-1">—</div>
-          <div id="insp-losssub" class="text-[11px] text-slate-500 mt-0.5"></div>
+          <div id="insp-loss" class="text-[16px] font-bold text-ok mt-1">—</div>
+          <div id="insp-losssub" class="text-[10px] text-slate-500 mt-0.5 truncate"></div>
         </div>
-        <div class="p-3 bg-surface-950 border border-surface-800 rounded-lg">
+        <div class="p-2.5 bg-surface-950 border border-surface-800 rounded-lg">
           <div class="text-[11px] text-slate-500 uppercase tracking-wider">Jitter</div>
-          <div id="insp-jitter" class="text-lg font-bold text-jit mt-1">—</div>
+          <div id="insp-jitter" class="text-[16px] font-bold text-jit mt-1">—</div>
         </div>
       </div>
+
+      <div id="insp-cert" class="hidden"></div>
+
       <div>
         <div class="flex items-center justify-between mb-2">
-          <span class="text-xs font-semibold text-slate-300 flex items-center gap-3">
-            Ping over time
+          <span class="text-[12px] font-semibold text-slate-300 flex items-center gap-2">
+            Resp Over Time
             <span id="insp-graph-up" class="text-[11px] font-mono text-slate-500"></span>
           </span>
           <div class="flex items-center gap-1">
-            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
-            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2.5 py-1 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
+            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2 py-0.5 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
+            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2 py-0.5 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
           </div>
         </div>
         <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
       </div>
     </div>
-    <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex flex-col gap-3">
-      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono text-center"></span>
-      <div class="flex items-center justify-end gap-2">
-        <button onclick="clearHistory()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-xs font-mono whitespace-nowrap transition" title="Wipe this sensor's probe history, events and alert state; the 60-probe window rebuilds from the next probe">
-          <i class="ph ph-trash"></i> Clear history
+
+    <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+      <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
+      <div class="flex items-center gap-2">
+        <button id="clear-hist-btn" onclick="confirmClearHistory(this)" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono transition">
+          <i class="ph ph-trash"></i> Clear History
         </button>
-        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-xs font-mono whitespace-nowrap">Close</button>
+        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-[12px] font-mono">Close</button>
       </div>
     </div>
   </div>
@@ -336,12 +570,91 @@ tailwind.config = {
 <script>
 let SENSORS = [], EVENTS = [], SETTINGS = {};
 let activeTags = new Set(), searchQ = '', inspectId = null, graphRange = '1h';
-let viewMode = localStorage.getItem('zenmon_view') || 'cards';
+let formTagsCache = [];
+let accountModalMode = 'create';
 
+function syncThemeIcon() {
+  const icon = $('theme-icon');
+  if (!icon) return;
+  icon.className = document.documentElement.classList.contains('light')
+    ? 'ph-bold ph-moon text-[18px]' : 'ph-bold ph-sun text-[18px]';
+}
+
+function toggleTheme() {
+  const light = document.documentElement.classList.toggle('light');
+  localStorage.setItem('pulsemon_theme', light ? 'light' : 'dark');
+  syncThemeIcon();
+}
+
+let viewMode = localStorage.getItem('pulsemon_view') || 'cards';
 const $ = id => document.getElementById(id);
+syncThemeIcon();
+
+// ---------- Authentication Flow ----------
+let authState = null;
+
+function showAuthGate() {
+  const gate = $('auth-gate');
+  if (gate) { gate.classList.remove('hidden'); $('auth-username').focus(); }
+}
+function hideAuthGate() {
+  const gate = $('auth-gate');
+  if (gate) gate.classList.add('hidden');
+}
+function authBlocking() { return authState && authState.enabled && !authState.authed; }
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/status');
+    authState = r.ok ? await r.json() : { enabled: false, authed: !r.ok };
+  } catch {
+    authState = { enabled: false, authed: false };
+  }
+  if (authBlocking()) {
+    showAuthGate();
+    return false;
+  }
+  hideAuthGate();
+  return true;
+}
+
+async function doLogin(username, password) {
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username.trim(), password: password })
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || 'login failed');
+    }
+    authState = await r.json();
+    hideAuthGate();
+    $('auth-err').classList.add('hidden');
+    $('auth-username').value = '';
+    $('auth-password').value = '';
+    await refresh();
+    return true;
+  } catch (e) {
+    const err = $('auth-err');
+    err.textContent = e.message || 'invalid username or password';
+    err.classList.remove('hidden');
+    return false;
+  }
+}
+
+$('auth-form').addEventListener('submit', e => {
+  e.preventDefault();
+  doLogin($('auth-username').value, $('auth-password').value);
+});
 
 async function api(path, opts) {
   const r = await fetch(path, opts);
+  if (r.status === 401) {
+    await checkAuth();
+    throw new Error('authentication required');
+  }
   if (!r.ok) {
     let msg = r.status + ' ' + r.statusText;
     try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
@@ -352,18 +665,22 @@ async function api(path, opts) {
 }
 
 async function refresh() {
+  if (authBlocking()) return;
   try {
     const [s, e, hz] = await Promise.all([
       api('/api/sensors'),
       api('/api/events?n=20'),
       api('/api/healthz').catch(() => null)
     ]);
-    SENSORS = s; EVENTS = e || [];
-    if (hz && hz.version) { const v = document.getElementById('app-ver'); if (v) v.textContent = hz.version; }
-    const banner = document.getElementById('probe-banner');
-    if (hz && hz.probe_error) {
-      document.getElementById('probe-banner-text').textContent =
-        'probing is broken: ' + hz.probe_error;
+    SENSORS = s || [];
+    EVENTS = e || [];
+    if (hz && hz.version) { const v = $('app-ver'); if (v) v.textContent = hz.version; }
+    const banner = $('probe-banner');
+    if (hz && hz.icmp_hint) {
+      $('probe-banner-text').textContent = 'ICMP unavailable — no pings are happening: ' + hz.icmp_hint;
+      banner.classList.remove('hidden');
+    } else if (hz && hz.probe_error) {
+      $('probe-banner-text').textContent = 'pulsing is broken: ' + hz.probe_error;
       banner.classList.remove('hidden');
     } else {
       banner.classList.add('hidden');
@@ -377,6 +694,29 @@ function fmtRtt(v) {
   return Math.round(v) + ' ms';
 }
 
+function typeLabel(s) {
+  if (s.type !== 'http') return 'PING';
+  return /^https:/i.test(s.target || '') ? 'HTTPS' : 'HTTP';
+}
+
+function httpStatusBadge(s) {
+  if (s.type !== 'http' || s.state === 'paused' || s.http_status == null) return '';
+  const code = s.http_status;
+  const cls = code >= 200 && code < 300 ? 'bg-ok/10 text-ok border-ok/30'
+            : code >= 300 && code < 400 ? 'bg-warn/10 text-warn border-warn/30'
+            : 'bg-bad/10 text-bad border-bad/30';
+  return `<span class="px-1 py-0.2 rounded border text-[10px] font-mono ${cls}">${code}</span>`;
+}
+
+function certNote(s) {
+  if (s.type !== 'http' || !s.cert_expiry) return '';
+  const days = Math.floor((new Date(s.cert_expiry).getTime() - Date.now()) / 86400000);
+  if (days < 0) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expired ' + Math.abs(days) + 'd ago</div>';
+  if (days <= 7) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
+  if (days <= 30) return '<div class="text-[11px] font-mono text-warn flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
+  return '';
+}
+
 function jitterOf(s) {
   const r = (s.stats && s.stats.recent || []).filter(x => x != null);
   if (r.length < 2) return null;
@@ -386,29 +726,33 @@ function jitterOf(s) {
 }
 
 function statusMeta(s) {
-  if (s.state === 'paused') return { label: 'PAUSED', cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', dot: 'bg-slate-500', glow: '' };
+  if (s.state === 'paused') {
+    return { label: 'PAUSED', icon: 'ph-pause-circle', cls: 'text-slate-400 bg-slate-500/10 border-slate-500/30', dot: 'bg-slate-500', glow: '' };
+  }
   switch (s.status) {
-    case 'up': return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
-    case 'warning': return { label: 'WARNING', cls: 'text-warn bg-warn/10 border-warn/25', dot: 'bg-warn', glow: 'glow-warn' };
-    case 'error': return { label: 'ERROR', cls: 'text-bad bg-bad/10 border-bad/25', dot: 'bg-bad', glow: 'glow-bad' };
-    default: return { label: 'UP', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
+    case 'up': return { label: 'UP', icon: 'ph-check-circle', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
+    case 'warning': return { label: 'WARN', icon: 'ph-warning', cls: 'text-warn bg-warn/10 border-warn/25', dot: 'bg-warn', glow: 'glow-warn' };
+    case 'error': return { label: 'ERROR', icon: 'ph-x-circle', cls: 'text-bad bg-bad/10 border-bad/25', dot: 'bg-bad', glow: 'glow-bad' };
+    default: return { label: 'UP', icon: 'ph-check-circle', cls: 'text-ok bg-ok/10 border-ok/25', dot: 'bg-ok', glow: 'glow-ok' };
   }
 }
 
 function severityRank(s) {
-  if (s.state === 'paused') return 3;
-  return { error: 0, warning: 1, up: 2 }[s.status] ?? 1;
+  const sev = s.state === 'paused' ? 3 : s.status === 'error' ? 0 : s.status === 'warning' ? 1 : 2;
+  const type = s.type === 'http' ? 0 : 1;
+  return sev * 2 + type;
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function escJs(v) { return esc(v).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
 function sparklineBars(hour) {
-  const arr = (hour || []).slice(0, 60); // 60 one-minute buckets, oldest → newest
+  const arr = (hour || []).slice(0, 60);
   const vals = arr.filter(x => typeof x === 'number' && x >= 0);
   const maxVal = Math.max(...(vals.length ? vals : [0]), 100);
   return arr.map(v => {
-    if (v === null) return '<div class="spark-bar flex-1 h-full bg-bad/80 rounded-sm" title="lost"></div>';
-    if (v === -2)   return '<div class="spark-bar flex-1 h-[8%] bg-surface-700/40 rounded-sm" title="no data"></div>';
+    if (v === null) return '<div class="spark-bar flex-1 h-full bg-bad/80 rounded-sm" title="packet lost"></div>';
+    if (v === -2) return '<div class="spark-bar flex-1 h-[10%] bg-surface-700/40 rounded-sm" title="no data"></div>';
     const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
     let cls = 'bg-ok/80';
     if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
@@ -421,23 +765,25 @@ function render() {
   const warn = SENSORS.filter(s => s.state === 'active' && s.status === 'warning').length;
   const err = SENSORS.filter(s => s.state === 'active' && s.status === 'error').length;
   const paused = SENSORS.filter(s => s.state === 'paused').length;
+
   $('c-up').textContent = up; $('c-warn').textContent = warn; $('c-error').textContent = err; $('c-paused').textContent = paused;
+  $('m-up').textContent = up; $('m-warn').textContent = warn; $('m-error').textContent = err; $('m-paused').textContent = paused;
 
   const tags = ['ALL'].concat([...new Set(SENSORS.flatMap(s => s.tags || []))]);
   const on = 'bg-surface-700 text-white font-semibold border border-surface-600';
   const off = 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800';
   $('tag-chips').innerHTML = tags.map(t => {
     if (t === 'ALL') {
-      return '<button onclick="setTag(\'ALL\')" title="Clear tag selection" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
+      return '<button onclick="setTag(\'ALL\')" class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
         (activeTags.size === 0 ? on : off) + '">ALL</button>';
     }
-    return '<button onclick="setTag(\'' + t.replace(/'/g, "\\'") + '\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
-      (activeTags.has(t) ? on : off) + '">' +
-      esc(t) + '</button>';
+    return '<button onclick="setTag(\'' + escJs(t) + '\')" class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
+      (activeTags.has(t) ? on : off) + '">' + esc(t) + '</button>';
   }).join('');
 
   let list = SENSORS.filter(s => (activeTags.size === 0 || [...activeTags].some(t => (s.tags || []).includes(t))) &&
     (!searchQ || s.name.toLowerCase().includes(searchQ) || s.target.toLowerCase().includes(searchQ) || (s.tags || []).join(' ').toLowerCase().includes(searchQ)));
+
   const sort = $('sort').value;
   list.sort((a, b) => {
     if (sort === 'severity') return severityRank(a) - severityRank(b) || a.name.localeCompare(b.name);
@@ -458,7 +804,7 @@ function render() {
   } else if (list.length === 0) {
     grid.innerHTML = ''; tableWrap.classList.add('hidden'); empty.classList.remove('hidden');
     $('empty-title').textContent = 'No sensors match your filter';
-    $('empty-sub').textContent = 'Clear the search or tag filter.';
+    $('empty-sub').textContent = 'Clear search query or active tag selections.';
   } else {
     empty.classList.add('hidden');
     if (viewMode === 'table') {
@@ -473,89 +819,86 @@ function render() {
 
   $('feed').innerHTML = EVENTS.length ? EVENTS.map(ev => {
     const icon = ev.to === 'error' ? 'ph-arrow-down text-bad' : ev.to === 'warning' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
-    const t = new Date(ev.ts).toLocaleTimeString([], { hour12: false });
-    return '<li class="px-4 py-2 flex items-center gap-2.5">' +
-      '<i class="ph ' + icon + '"></i>' +
-      '<span class="text-slate-300">' + esc(ev.sensor) + '</span>' +
+    const d = new Date(ev.ts);
+    const t = (d.toDateString() === new Date().toDateString())
+      ? d.toLocaleTimeString([], { hour12: false })
+      : d.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' }) + ' ' + d.toLocaleTimeString([], { hour12: false });
+    return '<li class="px-4 py-2 flex items-center gap-2">' +
+      '<i class="ph ' + icon + ' text-[13px]"></i>' +
+      '<span class="text-slate-300 font-semibold">' + esc(ev.sensor) + '</span>' +
       '<span class="text-slate-500">' + esc(ev.from) + ' → <span class="text-slate-300">' + esc(ev.to) + '</span></span>' +
-      '<span class="ml-auto text-slate-600">' + t + '</span></li>';
-  }).join('') : '<li class="px-4 py-3 text-slate-600">no state transitions yet</li>';
+      '<span class="ml-auto text-slate-500 text-[11px]">' + t + '</span></li>';
+  }).join('') : '<li class="px-4 py-3 text-slate-500">no recent state transitions</li>';
 }
 
 function cardHtml(s) {
   const m = statusMeta(s);
   const st = s.stats;
   const paused = s.state === 'paused';
+  const isHttp = s.type === 'http';
   const rtt = paused ? '—' : (st && st.rtt_last != null ? fmtRtt(st.rtt_last) : 'no data');
   const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
   const j = jitterOf(s);
   const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
-  const border = paused ? 'border-surface-700' : s.status === 'error' ? 'border-bad/40' : s.status === 'warning' ? 'border-warn/30' : 'border-surface-800';
-  const n = st && st.recent ? st.recent.length : 0;
-  return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-4 flex flex-col gap-3 transition-all hover:shadow-lg hover:shadow-black/30 ' + (paused ? 'opacity-70' : '') + '">' +
+  const cert = certNote(s);
+  const border = paused ? 'border-surface-700/80' : s.status === 'error' ? 'border-bad/40' : s.status === 'warning' ? 'border-warn/40' : 'border-surface-800';
+  const badge = httpStatusBadge(s);
+
+  return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-3.5 flex flex-col gap-2.5 transition hover:shadow-lg hover:shadow-black/20 ' + (paused ? 'opacity-70' : '') + '">' +
     '<div class="flex items-start justify-between gap-2">' +
-      '<div class="flex items-center gap-2.5 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
+      '<div class="flex items-center gap-2 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
         '<span class="w-2.5 h-2.5 rounded-full shrink-0 ' + m.dot + ' ' + m.glow + '"></span>' +
         '<div class="min-w-0">' +
-          '<h3 class="text-sm font-semibold text-slate-100 font-mono truncate">' + esc(s.name) + '</h3>' +
+          '<div class="flex items-center gap-1.5 min-w-0">' +
+            '<h3 class="text-[14px] font-semibold text-slate-100 font-mono truncate hover:text-ok">' + esc(s.name) + '</h3>' +
+            '<span class="px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border ' + (isHttp ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-400') + '">' + typeLabel(s) + '</span>' +
+          '</div>' +
           '<div class="flex flex-wrap items-center gap-1 mt-0.5">' +
-            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join(' ') : '') +
+            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join('') : '') +
           '</div>' +
         '</div>' +
       '</div>' +
-      '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-semibold border ' + m.cls + '">' + m.label + '</span>' +
+      '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-semibold border flex items-center gap-1 shrink-0 ' + m.cls + '"><i class="ph ' + m.icon + '"></i> ' + m.label + '</span>' +
     '</div>' +
-    '<div class="grid grid-cols-3 gap-2 p-2.5 bg-surface-950/80 rounded-lg border border-surface-800/80 font-mono text-center">' +
-      '<div><div class="text-[11px] text-slate-500 uppercase">Ping</div><div class="text-sm font-bold text-slate-100 mt-0.5">' + rtt + '</div></div>' +
-      '<div class="border-x border-surface-800"><div class="text-[11px] text-slate-500 uppercase">Jitter</div><div class="text-sm font-bold text-jit mt-0.5">' + jit + '</div></div>' +
-      '<div><div class="text-[11px] text-slate-500 uppercase">Loss</div><div class="text-sm font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div></div>' +
-    '</div>' +
-    '<div>' +
-      '<div class="flex items-center justify-between text-[11px] text-slate-600 font-mono mb-1">' +
-        '<span>past hour</span>' +
-        (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + (((st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) != null) ? ' · avg ' + fmtRtt(st.hour_rtt_avg != null ? st.hour_rtt_avg : st.rtt_avg) : '') + '</span>' : '') +
+
+    '<div class="grid grid-cols-3 gap-2 p-2 bg-surface-950/70 rounded-lg border border-surface-800/80 font-mono text-center">' +
+      '<div>' +
+        '<div class="text-[10px] text-slate-500 uppercase flex items-center justify-center gap-1">' + typeLabel(s) + ' ' + badge + '</div>' +
+        '<div class="text-[14px] font-bold text-slate-100 mt-0.5">' + rtt + '</div>' +
       '</div>' +
-      '<div class="h-7 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
-        (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused — probing stopped</span>'
+      '<div class="border-x border-surface-800/80">' +
+        '<div class="text-[10px] text-slate-500 uppercase">Jitter</div>' +
+        '<div class="text-[14px] font-bold text-jit mt-0.5">' + jit + '</div>' +
+      '</div>' +
+      '<div>' +
+        '<div class="text-[10px] text-slate-500 uppercase">Loss</div>' +
+        '<div class="text-[14px] font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div>' +
+      '</div>' +
+    '</div>' +
+
+    (cert ? cert : '') +
+
+    '<div>' +
+      '<div class="flex items-center justify-between text-[11px] text-slate-500 font-mono mb-1">' +
+        '<span>past 1h</span>' +
+        (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + '%' + '</span>' : '') +
+      '</div>' +
+      '<div class="h-6 flex items-end gap-[1.5px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+        (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
           : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
-    '<div class="flex items-center justify-between pt-2 border-t border-surface-800/60">' +
-      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now (single probe, recorded to history)" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
-      '<div class="flex items-center gap-1">' +
-        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause for maintenance') + '" class="p-1.5 rounded-md hover:bg-surface-800 ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
-        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple"></i></button>' +
-        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash"></i></button>' +
+
+    '<div class="flex items-center justify-between pt-1.5 border-t border-surface-800/60">' +
+      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
+      '<div class="flex items-center gap-0.5">' +
+        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
+        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
+        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
+        '<button onclick="confirmInlineDelete(\'' + s.id + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
       '</div>' +
     '</div>' +
   '</div>';
-}
-
-function setTag(t) {
-  if (t === 'ALL') activeTags.clear();
-  else if (activeTags.has(t)) activeTags.delete(t);
-  else activeTags.add(t);
-  render();
-}
-
-async function clearActivity() {
-  if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
-  if (!confirm('Clear the ACTIVITY log? This removes all ' + EVENTS.length + ' state-transition entries (probe history and graphs are untouched).')) return;
-  try {
-    const r = await api('/api/events', { method: 'DELETE' });
-    EVENTS = [];
-    render();
-    toast('activity log cleared' + (r && r.events_deleted != null ? ' (' + r.events_deleted + ' entries)' : ''), 'ok');
-  } catch (e) { toast(e.message, 'bad'); }
-}
-
-function setViewMode(m) {
-  viewMode = m;
-  localStorage.setItem('zenmon_view', m);
-  $('view-cards-btn').className = 'p-1.5 rounded ' + (m === 'cards' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
-  $('view-table-btn').className = 'p-1.5 rounded ' + (m === 'table' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
-  render();
 }
 
 function miniSpark(recent) {
@@ -563,11 +906,11 @@ function miniSpark(recent) {
   const vals = arr.filter(x => x != null);
   const maxVal = Math.max(...(vals.length ? vals : [0]), 20);
   return arr.map(v => {
-    if (v == null) return '<div class="w-[3px] h-5 bg-bad/70 rounded-sm"></div>';
-    const h = Math.min(20, Math.max(3, (v / maxVal) * 20));
+    if (v == null) return '<div class="w-[2.5px] h-4 bg-bad/80 rounded-sm"></div>';
+    const h = Math.min(18, Math.max(3, (v / maxVal) * 18));
     let cls = 'bg-ok/70';
     if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
-    return '<div class="w-[3px] rounded-sm ' + cls + '" style="height:' + h + 'px"></div>';
+    return '<div class="w-[2.5px] rounded-sm ' + cls + '" style="height:' + h + 'px"></div>';
   }).join('');
 }
 
@@ -581,35 +924,152 @@ function renderTable(list) {
     const jit = paused ? '—' : (j != null ? '±' + fmtRtt(j) : '—');
     const loss = paused ? '—' : (st ? st.hour_loss_pct.toFixed(1) + '%' : '—');
     const up24 = paused ? '—' : (st && st.total ? st.uptime_24h.toFixed(2) + '%' : '—');
-    return '<tr class="hover:bg-surface-850/60 transition-colors">' +
-      '<td class="py-3.5 px-4"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2.5 h-2.5 rounded-full ' + m.dot + ' ' + m.glow + '"></span>' + m.label + '</span></td>' +
-      '<td class="py-3.5 px-4 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span></td>' +
-      '<td class="py-3.5 px-4 text-slate-400 hidden sm:table-cell">' + esc(s.target) + '</td>' +
-      '<td class="py-3.5 px-4">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-2.5 py-1 rounded text-xs bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-700">—</span>') + '</td>' +
-      '<td class="py-3.5 px-4 text-right ' + (st && st.rtt_last != null ? 'text-slate-100 font-bold' : 'text-slate-500') + '">' + rtt + '</td>' +
-      '<td class="py-3.5 px-4 text-right text-jit">' + jit + '</td>' +
-      '<td class="py-3.5 px-4 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-bold' : 'text-slate-400') + '">' + loss + '</td>' +
-      '<td class="py-3.5 px-4 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-bold' : 'text-ok') + '">' + up24 + '</td>' +
-      '<td class="py-3.5 px-4 hidden lg:table-cell"><div class="flex items-end gap-[2px] h-6">' + (paused ? '<span class="text-xs text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
-      '<td class="py-3.5 px-4 text-right"><div class="flex items-center justify-end gap-0.5">' +
-        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Echo now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
-        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
-        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
-        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
+    const cert = s.type === 'http' ? (certNote(s) ? ' <span class="text-warn text-[10px]">⚠ cert</span>' : '') : '';
+    const badge = httpStatusBadge(s);
+
+    return '<tr class="hover:bg-surface-850/50 transition-colors">' +
+      '<td class="py-2 px-3.5"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2 h-2 rounded-full ' + m.dot + '"></span>' + m.label + '</span></td>' +
+      '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
+      '<td class="py-2 px-3.5 text-slate-500 text-[12px] hidden md:table-cell max-w-[200px] truncate">' + esc(s.target) + '</td>' +
+      '<td class="py-2 px-3.5">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-1.5 py-0.2 rounded text-[11px] bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-600">—</span>') + '</td>' +
+      '<td class="py-2 px-3.5 text-right font-semibold ' + (st && st.rtt_last != null ? 'text-slate-100' : 'text-slate-500') + '"><span class="mr-1">' + badge + '</span>' + rtt + cert + '</td>' +
+      '<td class="py-2 px-3.5 text-right text-jit">' + jit + '</td>' +
+      '<td class="py-2 px-3.5 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-semibold' : 'text-slate-400') + '">' + loss + '</td>' +
+      '<td class="py-2 px-3.5 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') + '">' + up24 + '</td>' +
+      '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
+      '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
+        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
+        '<button onclick="confirmInlineDelete(\'' + s.id + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
       '</div></td></tr>';
   }).join('');
 }
-document.addEventListener('input', e => { if (e.target.id === 'q') searchQ = e.target.value.trim().toLowerCase(); render(); });
+
+document.addEventListener('input', e => {
+  if (e.target.id === 'q') searchQ = e.target.value.trim().toLowerCase();
+  render();
+});
+
+function setTag(t) {
+  if (t === 'ALL') activeTags.clear();
+  else if (activeTags.has(t)) activeTags.delete(t);
+  else activeTags.add(t);
+  render();
+}
+
+function setViewMode(m) {
+  viewMode = m;
+  localStorage.setItem('pulsemon_view', m);
+  $('view-cards-btn').className = 'p-1.5 rounded transition ' + (m === 'cards' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
+  $('view-table-btn').className = 'p-1.5 rounded transition ' + (m === 'table' ? 'text-white bg-surface-800' : 'text-slate-400 hover:text-white');
+  render();
+}
+
+// ---------- Inline Confirmation Handlers (replaces blocking confirm()) ----------
+function confirmInlineDelete(id, name, btn) {
+  if (btn.dataset.confirming === "true") {
+    deleteSensor(id, name);
+    return;
+  }
+  btn.dataset.confirming = "true";
+  const origHtml = btn.innerHTML;
+  btn.innerHTML = '<span class="text-bad text-[10px] font-bold font-mono px-1">CONFIRM?</span>';
+  btn.classList.add('bg-bad/10', 'border', 'border-bad/30');
+
+  const timeout = setTimeout(() => reset(), 3000);
+  const reset = () => {
+    clearTimeout(timeout);
+    btn.dataset.confirming = "false";
+    btn.innerHTML = origHtml;
+    btn.classList.remove('bg-bad/10', 'border', 'border-bad/30');
+    document.removeEventListener('click', outside);
+  };
+  const outside = e => { if (!btn.contains(e.target)) reset(); };
+  setTimeout(() => document.addEventListener('click', outside), 20);
+}
+
+function confirmClearActivity(btn) {
+  if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
+  if (btn.dataset.confirming === "true") {
+    clearActivity();
+    btn.textContent = "Clear";
+    btn.dataset.confirming = "false";
+    return;
+  }
+  btn.dataset.confirming = "true";
+  btn.textContent = "Confirm Wipe?";
+  btn.classList.add("text-bad");
+  setTimeout(() => {
+    btn.dataset.confirming = "false";
+    btn.textContent = "Clear";
+    btn.classList.remove("text-bad");
+  }, 3000);
+}
+
+function confirmClearHistory(btn) {
+  if (btn.dataset.confirming === "true") {
+    clearHistory();
+    btn.innerHTML = '<i class="ph ph-trash"></i> Clear History';
+    btn.dataset.confirming = "false";
+    return;
+  }
+  btn.dataset.confirming = "true";
+  btn.innerHTML = '<span class="text-bad font-semibold">Confirm Purge?</span>';
+  setTimeout(() => {
+    btn.dataset.confirming = "false";
+    btn.innerHTML = '<i class="ph ph-trash"></i> Clear History';
+  }, 3000);
+}
+
+function confirmRemoveTLSCert(btn) {
+  if (btn.dataset.confirming === "true") {
+    removeTLSCert();
+    btn.textContent = "Remove Cert";
+    btn.dataset.confirming = "false";
+    return;
+  }
+  btn.dataset.confirming = "true";
+  btn.textContent = "Confirm Removal?";
+  btn.classList.add("text-bad");
+  setTimeout(() => {
+    btn.dataset.confirming = "false";
+    btn.textContent = "Remove Cert";
+    btn.classList.remove("text-bad");
+  }, 3000);
+}
+
+function confirmDisableAuth(btn) {
+  if (btn.dataset.confirming === "true") {
+    disableAuth();
+    btn.textContent = "Disable Auth";
+    btn.dataset.confirming = "false";
+    return;
+  }
+  btn.dataset.confirming = "true";
+  btn.textContent = "Confirm Disable?";
+  setTimeout(() => {
+    btn.dataset.confirming = "false";
+    btn.textContent = "Disable Auth";
+  }, 3000);
+}
 
 let echoBusy = false;
 async function echoPing(id, btn) {
-  if (echoBusy) return; echoBusy = true; if (btn) btn.disabled = true;
+  if (echoBusy) return;
+  echoBusy = true;
+  if (btn) btn.disabled = true;
   try {
     const r = await api('/api/sensors/' + id + '/ping', { method: 'POST' });
-    if (btn) { btn.classList.add(r.lost ? 'text-bad' : 'text-ok'); setTimeout(() => { btn.classList.remove('text-bad','text-ok'); btn.disabled = false; }, 1500); }
-    toast(r.lost ? 'no reply from ' + id : 'echo: ' + fmtRtt(r.rtt_ms), r.lost ? 'bad' : 'ok');
-  } catch (e) { toast('echo failed: ' + e.message, 'bad'); }
+    if (btn) {
+      btn.classList.add(r.lost ? 'text-bad' : 'text-ok');
+      setTimeout(() => { btn.classList.remove('text-bad', 'text-ok'); btn.disabled = false; }, 1500);
+    }
+    let msg = r.lost ? 'no reply from host'
+      : (r.http_status != null ? 'pulse: HTTP ' + r.http_status + ' · ' + fmtRtt(r.rtt_ms) : 'pulse: ' + fmtRtt(r.rtt_ms));
+    toast(msg, r.lost ? 'bad' : 'ok');
+  } catch (e) { toast('pulse failed: ' + e.message, 'bad'); }
   echoBusy = false;
 }
 
@@ -618,7 +1078,7 @@ async function togglePause(id) {
   const next = s.state === 'paused' ? 'active' : 'paused';
   try {
     await api('/api/sensors/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ state: next }) });
-    toast(s.name + (next === 'paused' ? ' paused (maintenance)' : ' resumed'), 'ok');
+    toast(s.name + (next === 'paused' ? ' paused' : ' resumed'), 'ok');
     await refresh();
   } catch (e) { toast(e.message, 'bad'); }
 }
@@ -632,7 +1092,6 @@ async function cloneSensor(id) {
 }
 
 async function deleteSensor(id, name) {
-  if (!confirm('Delete sensor "' + name + '"?\nThis purges its history and events.')) return;
   try {
     await api('/api/sensors/' + id, { method: 'DELETE' });
     toast(name + ' deleted', 'ok');
@@ -641,19 +1100,27 @@ async function deleteSensor(id, name) {
   } catch (e) { toast(e.message, 'bad'); }
 }
 
-// ---------- sensor form tag picker ----------
+async function clearActivity() {
+  try {
+    const r = await api('/api/events', { method: 'DELETE' });
+    EVENTS = [];
+    render();
+    toast('activity log cleared' + (r && r.events_deleted != null ? ' (' + r.events_deleted + ' entries)' : ''), 'ok');
+  } catch (e) { toast(e.message, 'bad'); }
+}
+
+// ---------- Sensor Form Tag Picker ----------
 function allExistingTags() { return [...new Set(SENSORS.flatMap(s => s.tags || []))].sort(); }
 
 function renderFormTags(selected) {
   const box = $('f-tagchips');
   if (!selected.length) {
-    box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no tags — pick or type one below</span>';
+    box.innerHTML = '<span class="text-[11px] text-slate-500 font-mono">no tags assigned</span>';
   } else {
     box.innerHTML = selected.map(t =>
-      '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-800 border border-surface-700 text-[11px] font-mono text-slate-200">' +
-      esc(t) + '<button type="button" onclick="removeFormTag(\'' + t.replace(/'/g, "\\'") + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[11px]"></i></button></span>').join('');
+      '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-[11px] font-mono text-slate-200">' +
+      esc(t) + '<button type="button" onclick="removeFormTag(\'' + escJs(t) + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x"></i></button></span>').join('');
   }
-  // dropdown: existing tags not already selected
   const pick = $('f-tagpick');
   const cur = pick.value;
   pick.innerHTML = '<option value="">+ add existing tag…</option>' +
@@ -662,8 +1129,7 @@ function renderFormTags(selected) {
 }
 
 function addFormTag(t) {
-  if (!t) return;
-  if (formTagsCache.includes(t)) return;
+  if (!t || formTagsCache.includes(t)) return;
   formTagsCache.push(t);
   renderFormTags(formTagsCache);
 }
@@ -680,30 +1146,60 @@ function openSensorModal(id) {
   formTagsCache = [];
   if (id) {
     const s = SENSORS.find(x => x.id === id); if (!s) return;
-    $('modal-title').textContent = 'Edit sensor';
+    $('modal-title').textContent = 'Edit Sensor';
     $('f-id').value = s.id; $('f-name').value = s.name; $('f-target').value = s.target;
+    $('f-type').value = s.type === 'http' ? 'http' : 'icmp';
+    onFormTypeChange();
     formTagsCache = (s.tags || []).slice();
     renderFormTags(formTagsCache);
-    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 3;
+    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after;
   } else {
-    $('modal-title').textContent = 'New sensor';
+    $('modal-title').textContent = 'New Sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
+    $('f-type').value = 'http';
+    onFormTypeChange();
     renderFormTags([]);
-    $('f-interval').value = 15; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 4; $('f-spike').value = 3;
+    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);
 }
+
+function onFormTypeChange() {
+  const isHttp = $('f-type').value === 'http';
+  $('f-target-hint').textContent = isHttp ? 'URL (http:// or https://)' : 'IP or hostname';
+  $('f-target').placeholder = isHttp ? 'https://example.com/health' : '192.168.1.1';
+  $('f-type-hint').textContent = isHttp
+    ? 'GETs URL — marks up on 2xx status code'
+    : 'pulses with ICMP echo — up when host replies';
+}
+
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }
+
+function nameErr(name) {
+  if (!name) return 'name is required';
+  if (name.length > 60) return 'name must be 60 characters or fewer';
+  let bad = /['"`\\<>]/.test(name);
+  if (!bad) {
+    for (let i = 0; i < name.length; i++) {
+      let c = name.codePointAt(i);
+      if (c < 0x20 || c === 0x7f) { bad = true; break; }
+    }
+  }
+  if (bad) return 'name may not contain quotes, backslash, < >, or control characters';
+  return '';
+}
 
 async function submitSensor(ev) {
   ev.preventDefault();
   const id = $('f-id').value;
   const body = {
-    name: $('f-name').value.trim(), target: $('f-target').value.trim(), tags: selectedFormTags(),
+    name: $('f-name').value.trim(), target: $('f-target').value.trim(), type:$('f-type').value, tags: selectedFormTags(),
     interval_s: +$('f-interval').value, timeout_ms: +$('f-timeout').value,
-    loss_warn: +$('f-loss').value, down_after: +$('f-down').value, spike_mult: +$('f-spike').value
+    loss_warn: +$('f-loss').value, down_after: +$('f-down').value
   };
+  const ne = nameErr(body.name);
+  if (ne) { $('form-err').textContent = ne; $('form-err').classList.remove('hidden'); return; }
   try {
     if (id) {
       await api('/api/sensors/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -719,10 +1215,7 @@ async function submitSensor(ev) {
   }
 }
 
-// ---------- settings ----------
-// Per-provider display metadata (labels/icons). The actual list comes from
-// the API's `providers` array, so a new backend provider shows up here
-// automatically — only the cosmetic label/icon needs a line added.
+// ---------- Settings & Alert Routing ----------
 const PROVIDER_META = {
   google_chat: { icon: '💬', name: 'Google Chat' },
   discord:     { icon: '🎮', name: 'Discord' }
@@ -731,57 +1224,273 @@ function providerMeta(kind) { return PROVIDER_META[kind] || { icon: '📡', name
 
 async function openSettings() {
   $('set-msg').classList.add('hidden');
-  $('set-summary').textContent = 'loading…';
-  $('settings-backdrop').classList.remove('hidden');
+  $('set-summary').textContent = 'loading…';$('settings-backdrop').classList.remove('hidden');
   try {
     const s = await api('/api/settings');
     SETTINGS = s;
     renderProviderList(s.providers || []);
-    $('f-scope').value = s.alert_scope || 'all';
-    $('f-realert').value = s.realert_min ?? 30;
+    $('f-scope').value = s.alert_scope || 'all';$('f-realert').value = s.realert_min ?? 30;
     renderScopeOptions();
     setMaintUI(SETTINGS.maintenance_mode === true);
+    renderTLSStatus(s.tls);
+    renderAuthPanel();
+    $('f-tls-cert-file').value = '';$('f-tls-key-file').value = '';
+    $('tls-cert-file-name').textContent = 'no file';$('tls-key-file-name').textContent = 'no file';
   } catch (e) {
-    $('set-summary').textContent = 'error';
+    $('set-summary').textContent = 'load failed';
+    $('set-summary').className = 'px-2 py-0.5 rounded bg-bad/10 border border-bad/40 text-bad';
+    // Informative empty-state so the section doesn't read as "the feature is gone"
+    const box = $('provider-list');
+    if (box) box.innerHTML = '<div class="border border-bad/40 rounded-lg px-3 py-2 bg-bad/5 text-[12px] font-mono text-bad flex items-center gap-2"><i class="ph-bold ph-warning"></i> Could not load alert settings (<span>' + esc(e.message || 'request failed') + '</span>). <button onclick="openSettings()" class="ml-auto underline hover:text-white">Retry</button></div>';
+    setMsg('Failed to load settings: ' + (e.message || 'request failed'), 'bad');
   }
+  checkUpdate(false);  // keep the Version row current when Settings opens
 }
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
 
+// ---------- Update check ----------
+async function checkUpdate(force) {
+  try {
+    const r = await api('/api/update-check' + (force ? '?refresh=1' : ''));
+    renderUpdateUI(r);
+  } catch (e) {
+    // Non-fatal: the dashboard works fine without the update check.
+    const body = $('ver-body');
+    if (body) body.innerHTML = '<span class="text-slate-500">update check unavailable</span><span class="text-slate-600">' + esc(e.message || '') + '</span>';
+  }
+}
+function renderUpdateUI(r) {
+  // Header pill: show only when an update is available and not dismissed.
+  const pill = $('update-pill');
+  const dismissed = localStorage.getItem('pulsemon_update_dismissed') === r.latest;
+  if (r.available && !dismissed) {
+    $('update-pill-ver').textContent = r.latest;
+    pill.classList.remove('hidden');
+  } else if (pill) pill.classList.add('hidden');
+  // Settings version row.
+  const body = $('ver-body');
+  if (!body) return;
+  if (r.available) {
+    body.innerHTML =
+      '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
+      '<span class="flex items-center gap-2">' +
+        '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
+        (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + esc(r.running) + '\',latest:\'' + esc(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
+          : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + esc(r.latest) + '\');renderUpdateUI({running:\'' + esc(r.running) + '\',latest:\'' + esc(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
+      '</span>';
+  } else {
+    body.innerHTML =
+      '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · up to date</span>' +
+      '<span class="text-ok"><i class="ph ph-check-circle"></i> latest</span>';
+  }
+}
+
+$('f-tls-cert-file').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $('tls-cert-file-name').textContent = f.name;
+});
+$('f-tls-key-file').addEventListener('change', async e => {
+  const f = e.target.files[0]; if (!f) return;
+  $('tls-key-file-name').textContent = f.name;
+});
+
+function renderTLSStatus(t) {
+  const badge = $('tls-status');
+  const port = $('f-tls-port');
+  const rm = $('tls-remove-btn');
+  if (!t) { badge.textContent = '—'; return; }
+  if (port.value === '') port.value = t.port || 443;
+  if (t.enabled) {
+    badge.textContent = 'ON · ' + t.port;
+    badge.className = 'text-[11px] font-mono px-2 py-0.5 rounded bg-ok/15 border border-ok/40 text-ok';
+    rm.disabled = (t.source === 'env');
+  } else {
+    badge.textContent = 'OFF';
+    badge.className = 'text-[11px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400';
+    rm.disabled = true;
+  }
+}
+
+async function renderAuthPanel() {
+  const badge = $('auth-badge');
+  const onBox = $('auth-enabled-box');
+  const offBox = $('auth-off-box');
+  const status = await api('/api/auth/status').catch(() => ({ enabled: false, authed: false }));
+  authState = status;
+  if (status.enabled && status.authed) {
+    badge.textContent = 'on';
+    badge.className = 'px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border bg-ok/15 border-ok/40 text-ok';
+    onBox.classList.remove('hidden');
+    offBox.classList.add('hidden');
+    $('auth-me').textContent = status.user || '…';
+    const users = await api('/api/auth/users').catch(() => []);
+    const list = $('auth-user-list');
+    list.innerHTML = (users.length ? users : [{ username: status.user }]).map(u =>
+      '<div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-surface-900 border border-surface-800">' +
+      '<span class="text-[12px] font-mono text-slate-200">' + esc(u.username) +
+      (u.username === status.user ? ' <span class="text-[10px] text-ok font-mono">(you)</span>' : '') +
+      '</span>' +
+      (u.username === status.user ? '' : '<button onclick="removeAuthUser(\'' + escJs(u.username) + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>') +
+      '</div>'
+    ).join('');
+  } else {
+    badge.textContent = 'off';
+    badge.className = 'px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border bg-surface-800 border-surface-700 text-slate-500';
+    onBox.classList.add('hidden');
+    offBox.classList.remove('hidden');
+  }
+}
+
+function openFirstAccountDialog() {
+  accountModalMode = 'create';
+  $('acc-modal-title').textContent = 'Create Admin Account';$('acc-modal-user-wrap').classList.remove('hidden');
+  $('acc-u').value = '';$('acc-p').value = '';
+  $('acc-p2').value = '';$('acc-err').classList.add('hidden');
+  $('acc-modal').classList.remove('hidden');$('acc-u').focus();
+}
+
+function openChangePasswordDialog() {
+  accountModalMode = 'password';
+  $('acc-modal-title').textContent = 'Change Password (' + ($('auth-me').textContent || 'User') + ')';
+  $('acc-modal-user-wrap').classList.add('hidden');$('acc-p').value = '';
+  $('acc-p2').value = '';$('acc-err').classList.add('hidden');
+  $('acc-modal').classList.remove('hidden');$('acc-p').focus();
+}
+
+async function submitAccountModal() {
+  const p = $('acc-p').value;
+  const p2 = $('acc-p2').value;
+  const err = $('acc-err');
+  if (p.length < 8) { err.textContent = 'Password must be 8+ characters'; err.classList.remove('hidden'); return; }
+  if (p !== p2) { err.textContent = 'Passwords do not match'; err.classList.remove('hidden'); return; }
+
+  try {
+    if (accountModalMode === 'create') {
+      const u = $('acc-u').value.trim();
+      if (!u) { err.textContent = 'Username is required'; err.classList.remove('hidden'); return; }
+      await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+      await doLogin(u, p);
+      setMsg('authentication enabled', 'ok');
+    } else {
+      const me = (authState && authState.user) || $('auth-me').textContent;
+      await api('/api/auth/users/' + encodeURIComponent(me) + '/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: p }) });
+      setMsg('password updated', 'ok');
+    }
+    $('acc-modal').classList.add('hidden');
+    renderAuthPanel();
+  } catch (e) {
+    err.textContent = e.message;
+    err.classList.remove('hidden');
+  }
+}
+
+async function addAuthUser() {
+  const u = $('auth-new-username').value.trim();
+  const p = $('auth-new-password').value;
+  if (!u || p.length < 8) { setMsg('username and 8+ char password required', 'bad'); return; }
+  try {
+    await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
+    $('auth-new-username').value = '';$('auth-new-password').value = '';
+    setMsg('account added: ' + u.toLowerCase(), 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('add failed: ' + e.message, 'bad'); }
+}
+
+async function removeAuthUser(username) {
+  try {
+    await api('/api/auth/users/' + encodeURIComponent(username), { method: 'DELETE' });
+    setMsg('account removed: ' + username, 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('remove failed: ' + e.message, 'bad'); }
+}
+
+async function disableAuth() {
+  try {
+    await api('/api/auth/disable', { method: 'POST' });
+    authState = { enabled: false, authed: false };
+    setMsg('authentication disabled', 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('disable failed: ' + e.message, 'bad'); }
+}
+
+async function logoutAuth() {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+  location.reload();
+}
+
+async function applyTLSCert() {
+  const port = parseInt($('f-tls-port').value || '443', 10);
+  const certF = $('f-tls-cert-file').files[0];
+  const keyF = $('f-tls-key-file').files[0];
+  if (!certF || !keyF) { setMsg('select both cert and key files', 'bad'); return; }
+  setMsg('applying certificate…', 'ok');
+  try {
+    const cert = await certF.text();
+    const key = await keyF.text();
+    const r = await api('/api/settings/tls', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ cert, key, port }) });
+    renderTLSStatus(r.tls);
+    setMsg('cert applied — running on port ' + r.tls.port, 'ok');
+  } catch (e) { setMsg('apply failed: ' + e.message, 'bad'); }
+}
+
+async function removeTLSCert() {
+  setMsg('removing certificate…', 'ok');
+  try {
+    await api('/api/settings/tls', { method: 'DELETE' });
+    renderTLSStatus({ enabled: false, http_addr: location.hostname + ':' + (location.port || '80') });
+    setMsg('certificate removed', 'ok');
+  } catch (e) { setMsg('remove failed: ' + e.message, 'bad'); }
+}
+
 function setMaintUI(on) {
-  const track = $('maint-toggle'), knob = $('maint-knob');
-  track.className = 'relative w-10 h-6 rounded-full border transition-colors ' + (on ? 'bg-warn/40 border-warn/60' : 'bg-surface-800 border-surface-700');
-  knob.className = 'absolute top-0.5 left-0.5 w-5 h-5 rounded-full transition-transform ' + (on ? 'translate-x-4 bg-warn' : 'translate-x-0 bg-slate-400');
+  const btn = $('maint-btn'), icon = $('maint-icon'), txt =$('maint-btn-txt');
+  if (on) {
+    btn.className = 'px-3 py-1.5 rounded-lg bg-warn/15 border border-warn/40 text-warn text-[12px] font-mono flex items-center gap-1.5 transition';
+    icon.className = 'ph-bold ph-play';
+    txt.textContent = 'Resume All';
+  } else {
+    btn.className = 'px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-warn text-[12px] font-mono flex items-center gap-1.5 transition';
+    icon.className = 'ph-bold ph-pause';
+    txt.textContent = 'Pause All';
+  }
+  $('maint-desc').textContent = on ? 'resume all previously-running probes' : 'pause all active probes globally';
   $('maint-banner').classList.toggle('hidden', !on);
 }
 
+let maintBusy = false;
 async function toggleMaint() {
+  if (maintBusy) return;
   const next = !(SETTINGS.maintenance_mode === true);
-  setMaintUI(next); // optimistic
+  if (next && !SENSORS.some(s => s.state === 'active')) {
+    setMsg('no active sensors to pause', 'bad');
+    return;
+  }
+  maintBusy = true;
+  setMaintUI(next);
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ maintenance_mode: next }) });
     SETTINGS = r;
     setMaintUI(!!r.maintenance_mode);
-    setMsg(next ? 'maintenance mode ON — alerts silenced (sensors keep probing). Re-alert timers reset on turn-off.' : 'maintenance mode off — alerts active again', 'ok');
+    setMsg(next ? 'Maintenance Mode active' : 'Maintenance Mode disabled', 'ok');
+    await refresh();
   } catch (e) {
     setMaintUI(SETTINGS.maintenance_mode === true);
-    setMsg('failed to update maintenance mode: ' + e.message, 'bad');
-  }
+    setMsg('failed: ' + e.message, 'bad');
+  } finally { maintBusy = false; }
 }
 
 function renderScopeOptions(selected) {
   const scope = $('f-scope').value;
   const box = $('scope-options');
   if (!selected) selected = SETTINGS.alert_filter || [];
-  if (scope === 'all') { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">every sensor can fire an alert</span>'; return; }
-  const items = scope === 'tags'
-    ? [...new Set(SENSORS.flatMap(s => s.tags || []))]
-    : SENSORS.map(s => s.id + '||' + s.name);
-  if (!items.length) { box.innerHTML = '<span class="text-[11px] text-slate-600 font-mono">no ' + (scope === 'tags' ? 'tags' : 'sensors') + ' yet</span>'; return; }
+  if (scope === 'all') { box.innerHTML = '<span class="text-[11px] text-slate-500 font-mono">all sensors trigger alerts</span>'; return; }
+  const items = scope === 'tags' ? [...new Set(SENSORS.flatMap(s => s.tags || []))] : SENSORS.map(s => s.id + '||' + s.name);
+  if (!items.length) { box.innerHTML = '<span class="text-[11px] text-slate-500 font-mono">none available</span>'; return; }
   box.innerHTML = items.map(v => {
     const val = scope === 'tags' ? v : v.split('||')[0];
     const label = scope === 'tags' ? v : v.split('||')[1];
     const on = selected.includes(val);
-    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2.5 py-1 rounded-lg text-[11px] font-mono border transition-colors ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
+    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
   }).join('');
 }
 
@@ -795,23 +1504,16 @@ function toggleScopeItem(btn) {
 function selectedFilterItems() {
   const scope = $('f-scope').value;
   if (scope === 'all') return [];
-  return [...document.querySelectorAll('#scope-options [data-val]')]
-    .filter(b => b.classList.contains('bg-ok/15'))
-    .map(b => b.dataset.val);
+  return [...document.querySelectorAll('#scope-options [data-val]')].filter(b => b.classList.contains('bg-ok/15')).map(b => b.dataset.val);
 }
 
 function setMsg(text, kind) {
   const el = $('set-msg');
   el.textContent = text;
-  el.className = 'text-xs font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
+  el.className = 'text-[12px] font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
   el.classList.remove('hidden');
 }
 
-// ---------- provider destinations ----------
-// Render one row per provider from the API's `providers` array. Each row:
-// enable toggle + URL field (masked value shown read-only until edited) +
-// Test button. The URL input is seeded with '' when the stored value is
-// masked so a plain save never clobbers the real URL.
 function renderProviderList(providers) {
   const box = $('provider-list');
   if (!box) return;
@@ -820,28 +1522,18 @@ function renderProviderList(providers) {
     const meta = providerMeta(p.kind);
     const masked = p.url && p.url.includes('***');
     const urlVal = masked ? '' : (p.url || '');
-    const statusText = p.enabled
-      ? (p.has_url ? (p.source === 'env' ? 'active (env)' : 'active') : 'on, no URL')
-      : (p.has_url ? 'off (URL stored)' : 'off');
     const row = document.createElement('div');
-    row.className = 'border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/50';
+    row.className = 'border border-surface-800 rounded-lg px-3 py-2 bg-surface-950/50';
     row.innerHTML = `
-      <div class="flex items-center justify-between mb-2">
-        <span class="text-xs font-semibold text-slate-200 flex items-center gap-2">${meta.icon} ${meta.name}</span>
-        <span class="flex items-center gap-2">
-          <span id="prov-status-${p.kind}" class="text-[11px] font-mono px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ${p.enabled ? 'text-ok' : 'text-slate-500'}">${statusText}</span>
-          <button type="button" id="prov-toggle-${p.kind}" onclick="toggleProvider('${p.kind}')" title="Toggle ${meta.name} alerts" class="relative w-10 h-6 rounded-full transition-colors ${p.enabled ? 'bg-ok/40 border border-ok/60' : 'bg-surface-800 border border-surface-700'}">
-            <span class="absolute top-0.5 ${p.enabled ? 'left-5' : 'left-0.5'} w-5 h-5 rounded-full transition-transform ${p.enabled ? 'bg-ok' : 'bg-slate-400'}"></span>
-          </button>
-        </span>
+      <div class="flex items-center justify-between mb-1.5">
+        <span class="text-[12px] font-semibold text-slate-200 flex items-center gap-1.5">${meta.icon} ${meta.name}</span>
+        <button type="button" onclick="toggleProvider('${p.kind}')" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
+          ${p.enabled ? 'Enabled' : 'Disabled'}
+        </button>
       </div>
       <div class="flex items-center gap-2">
-        <input id="prov-url-${p.kind}" type="text" placeholder="${p.kind === 'discord' ? 'https://discord.com/api/webhooks/…/…' : 'https://chat.googleapis.com/v1/spaces/…/messages?key=…'}"
-          value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-xs font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
-        ${p.has_url ? `<button type="button" onclick="clearProviderURL('${p.kind}')" title="Clear the stored ${meta.name} URL" class="px-2 py-2 rounded-lg bg-surface-800 border border-surface-700 text-slate-400 hover:text-white text-[11px] font-mono whitespace-nowrap">Clear</button>` : ''}
-        <button type="button" id="prov-test-${p.kind}" onclick="testWebhook('${p.kind}')" class="px-3 py-2 rounded-lg bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-xs font-semibold whitespace-nowrap">
-          <i class="ph-bold ph-paper-plane-tilt"></i> Test
-        </button>
+        <input id="prov-url-${p.kind}" type="text" placeholder="Webhook URL" value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        <button type="button" onclick="testWebhook('${p.kind}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
       </div>`;
     box.appendChild(row);
   });
@@ -852,29 +1544,15 @@ function updateSetSummary() {
   const el = $('set-summary');
   if (!el || !SETTINGS || !SETTINGS.providers) return;
   const active = SETTINGS.providers.filter(p => p.enabled && p.has_url);
-  el.textContent = active.length ? (active.map(p => providerMeta(p.kind).name).join(' · ')) : 'no destinations active';
-  el.className = 'px-2 py-0.5 rounded bg-surface-800 border border-surface-700 ' + (active.length ? 'text-ok' : 'text-slate-400');
+  el.textContent = active.length ? active.map(p => providerMeta(p.kind).name).join(', ') : 'no active destinations';
 }
 
-// Toggle a provider's enable flag and persist it immediately.
 async function toggleProvider(kind) {
-  const p = (SETTINGS.providers || []).find(x => x.kind === kind);
-  if (!p) return;
-  const next = !p.enabled;
+  const p = (SETTINGS.providers || []).find(x => x.kind === kind); if (!p) return;
   try {
-    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, enabled: next }] }) });
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, enabled: !p.enabled }] }) });
     SETTINGS = r;
     renderProviderList(r.providers || []);
-  } catch (e) { setMsg(e.message, 'bad'); }
-}
-
-// Clear a provider's stored URL (immediate).
-async function clearProviderURL(kind) {
-  try {
-    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, url: '' }] }) });
-    SETTINGS = r;
-    renderProviderList(r.providers || []);
-    setMsg(providerMeta(kind).name + ' URL cleared', 'ok');
   } catch (e) { setMsg(e.message, 'bad'); }
 }
 
@@ -885,18 +1563,11 @@ async function saveSettings() {
     realert_min: +$('f-realert').value,
     maintenance_mode: SETTINGS.maintenance_mode === true
   };
-  // Only send a URL for providers whose field actually has a non-masked value.
   body.providers = (SETTINGS.providers || []).filter(p => {
     const input = $('prov-url-' + p.kind);
     return input && input.value.trim() !== '';
-  }).map(p => {
-    const input = $('prov-url-' + p.kind);
-    return { kind: p.kind, url: input.value.trim() };
-  });
-  if (body.alert_scope !== 'all' && body.alert_filter.length === 0) {
-    setMsg('pick at least one ' + (body.alert_scope === 'tags' ? 'tag' : 'sensor') + ' — otherwise no alerts will fire', 'bad');
-    return;
-  }
+  }).map(p => ({ kind: p.kind, url: $('prov-url-' + p.kind).value.trim() }));
+
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     SETTINGS = r;
@@ -906,25 +1577,13 @@ async function saveSettings() {
 }
 
 async function testWebhook(kind) {
-  const input = $('prov-url-' + kind);
-  // If the user typed a fresh (non-masked) URL, save it first so the test
-  // hits the intended endpoint.
-  if (input && input.value.trim() && !input.value.includes('***')) {
-    try {
-      await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, url: input.value.trim() }] }) });
-      input.value = '';
-    } catch (e) { setMsg('save failed: ' + e.message, 'bad'); return; }
-  }
-  const btn = $('prov-test-' + kind);
-  if (btn) { btn.disabled = true; btn.textContent = 'sending…'; }
   try {
     const r = await api('/api/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
-    if (r.ok) { setMsg('✓ ' + r.detail, 'ok'); } else { setMsg(r.detail, 'bad'); }
+    setMsg(r.ok ? '✓ ' + r.detail : r.detail, r.ok ? 'ok' : 'bad');
   } catch (e) { setMsg(e.message, 'bad'); }
-  if (btn) { btn.disabled = false; btn.innerHTML = '<i class="ph-bold ph-paper-plane-tilt"></i> Test'; }
-  setTimeout(openSettings, 800);
 }
 
+// ---------- Inspector & Charting ----------
 async function openInspector(id) {
   inspectId = id;
   $('insp-backdrop').classList.remove('hidden');
@@ -933,53 +1592,52 @@ async function openInspector(id) {
 function closeInspector() { inspectId = null; $('insp-backdrop').classList.add('hidden'); }
 
 async function clearHistory() {
-  const id = inspectId;
-  if (!id) return;
-  const s = (SENSORS || []).find(x => x.id === id);
-  const label = s ? s.name : 'sensor';
-  if (!confirm('Clear all probe history for "' + label + '"?\nThe 60-probe window rebuilds from the next probe.')) return;
+  const id = inspectId; if (!id) return;
   try {
     await api('/api/sensors/' + id + '/history', { method: 'DELETE' });
-    toast('history cleared — ' + label, 'ok');
+    toast('history purged', 'ok');
     await Promise.all([refresh(), loadInspector()]);
-  } catch (e) { toast('clear failed: ' + e.message, 'bad'); }
+  } catch (e) { toast('failed: ' + e.message, 'bad'); }
 }
 
-// graph: SVG line/area of avg RTT per bucket, red ticks for loss
 function renderGraph(el, data) {
   const pts = (data.points || []).filter(p => p.total > 0);
   if (!pts.length) {
-    el.innerHTML = '<div class="flex items-center justify-center h-28 text-[11px] text-slate-600 font-mono">no data in this range yet</div>';
+    el.innerHTML = '<div class="flex items-center justify-center h-28 text-[12px] text-slate-600 font-mono">no probe entries in this window</div>';
     return;
   }
-  const W = 760, H = 120, padL = 8, padR = 8, padT = 8, padB = 14;
+  const W = Math.max(el.clientWidth || 0, 320), H = 120;
+  const padL = 40, padR = 8, padT = 8, padB = 16;
   const maxAvg = Math.max(...pts.map(p => p.avg || 0), 20);
+  const top = Math.max(40, Math.ceil(maxAvg * 1.1 / 40) * 40);
+
   const x = i => padL + (i / Math.max(pts.length - 1, 1)) * (W - padL - padR);
-  const y = v => padT + (1 - v / maxAvg) * (H - padT - padB);
+  const y = v => padT + (1 - v / top) * (H - padT - padB);
+
   const path = pts.map((p, i) => p.avg == null ? '' : (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + (p.avg != null ? y(p.avg).toFixed(1) : y(0).toFixed(1))).join(' ');
   const area = path ? path + ' L' + x(pts.length - 1).toFixed(1) + ' ' + (H - padB) + ' L' + x(0).toFixed(1) + ' ' + (H - padB) + ' Z' : '';
-  // loss ticks
+
+  const axis = [0, 0.5, 1].map(f => {
+    const v = Math.round(top * f), yy = y(v).toFixed(1);
+    return '<line x1="' + padL + '" y1="' + yy + '" x2="' + (W - padR) + '" y2="' + yy + '" stroke="var(--g-grid)" stroke-width="1"/>' +
+      '<text x="' + (padL - 4) + '" y="' + (y(v) + 3).toFixed(1) + '" font-size="9" fill="var(--g-text)" font-family="JetBrains Mono" text-anchor="end">' + v + 'ms</text>';
+  }).join('');
+
   const ticks = pts.map((p, i) => p.lost > 0
-    ? '<line x1="' + x(i).toFixed(1) + '" y1="' + (H - padB) + '" x2="' + x(i).toFixed(1) + '" y2="' + (H - padB + 7) + '" stroke="#f43f5e" stroke-width="2" opacity="' + Math.min(1, p.lost / p.total * 1.5) + '"/>'
+    ? '<line x1="' + x(i).toFixed(1) + '" y1="' + (H - padB) + '" x2="' + x(i).toFixed(1) + '" y2="' + (H - padB + 6) + '" stroke="var(--bad-solid)" stroke-width="2"/>'
     : '').join('');
-  // axis labels: start / middle / end time
+
   const t0 = new Date(pts[0].t * 1000), t1 = new Date(pts[pts.length - 1].t * 1000);
   const fmtT = t => t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-  const mid = pts[Math.floor(pts.length / 2)];
+
   el.innerHTML =
-    '<svg viewBox="0 0 ' + W + ' ' + H + '" class="w-full" preserveAspectRatio="none">' +
-      '<path d="' + area + '" fill="#10b981" opacity="0.12"/>' +
-      '<path d="' + path + '" fill="none" stroke="#10b981" stroke-width="1.5"/>' +
-      '<line x1="' + padL + '" y1="' + (H - padB) + '" x2="' + (W - padR) + '" y2="' + (H - padB) + '" stroke="#161f30" stroke-width="1"/>' +
-      ticks +
-      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace">' + fmtT(t0) + '</text>' +
-      (mid ? '<text x="' + (W / 2) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="middle">' + fmtT(new Date(mid.t * 1000)) + '</text>' : '') +
-      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="9" fill="#64748b" font-family="JetBrains Mono, monospace" text-anchor="end">' + fmtT(t1) + '</text>' +
-    '</svg>' +
-    '<div class="flex items-center justify-between text-[11px] font-mono text-slate-600 mt-1">' +
-      '<span>peak avg ' + fmtRtt(maxAvg) + '</span>' +
-      '<span>red ticks = packet loss in bucket</span>' +
-    '</div>';
+    '<svg viewBox="0 0 ' + W + ' ' + H + '" width="' + W + '" height="' + H + '" class="w-full">' +
+      '<path d="' + area + '" fill="var(--ok-solid)" opacity="0.12"/>' +
+      '<path d="' + path + '" fill="none" stroke="var(--ok-solid)" stroke-width="1.5"/>' +
+      axis + ticks +
+      '<text x="' + padL + '" y="' + (H - 2) + '" font-size="9" fill="var(--g-text)" font-family="JetBrains Mono">' + fmtT(t0) + '</text>' +
+      '<text x="' + (W - padR) + '" y="' + (H - 2) + '" font-size="9" fill="var(--g-text)" font-family="JetBrains Mono" text-anchor="end">' + fmtT(t1) + '</text>' +
+    '</svg>';
 }
 
 async function loadInspector() {
@@ -990,29 +1648,24 @@ async function loadInspector() {
     $('insp-dot').className = 'w-3 h-3 rounded-full ' + m.dot + ' ' + m.glow;
     $('insp-name').textContent = s.name;
     $('insp-tag').textContent = (s.tags && s.tags.length) ? s.tags.join(' · ') : '—';
-    $('insp-target').textContent = s.target + (s.state === 'paused' ? '   ·   PAUSED' : '');
-    $('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · error after ' + s.down_after + ' · loss warn ' + s.loss_warn + '% · spike ' + (s.spike_mult || 3) + '×';
-    const g1 = document.getElementById('grange-1h');
-    const g2 = document.getElementById('grange-24h');
-    if (g1) g1.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
-    if (g2) g2.className = 'px-2.5 py-1 rounded text-[11px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
-    $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime over ' + graphRange : 'no data in ' + graphRange;
+    $('insp-target').textContent = s.target + (s.state === 'paused' ? ' (PAUSED)' : '');$('insp-interval').textContent = s.interval_s + 's interval · ' + s.timeout_ms + 'ms timeout · loss ' + s.loss_warn + '%';
+
+    const g1 = $('grange-1h'), g2 =$('grange-24h');
+    if (g1) g1.className = 'px-2 py-0.5 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+    if (g2) g2.className = 'px-2 py-0.5 rounded text-[11px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
+
+    $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime' : 'no data';
     renderGraph($('insp-graph'), g);
+
     const st = s.stats;
-    $('insp-rtt').textContent = (st && st.rtt_last != null) ? fmtRtt(st.rtt_last) : '—';
+    $('insp-rtt').textContent = st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—';
+    const certEl = $('insp-cert');
+    const cert = certNote(s);
+    if (cert) { certEl.innerHTML = cert; certEl.classList.remove('hidden'); } else certEl.classList.add('hidden');
+
     $('insp-minavgmax').textContent = (st && st.rtt_min != null) ? fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max) : '—';
     $('insp-loss').textContent = st ? st.loss_pct.toFixed(1) + '%' : '—';
-    $('insp-loss').className = 'text-lg font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');
-    // The big number is the 60-probe window; the sub-line shows the
-    // status-window number the badge actually came from (v0.1.22 derives
-    // status from the last statusWindow probes), so an UP badge next to a
-    // high 60p loss% (a sensor recovering) is self-explanatory.
-    let sub = st ? st.lost_count + ' / ' + st.total + ' dropped (60p)' : '';
-    if (st && st.status_window_size) {
-      sub += '  ·  status window ' + st.status_window_size + 'p: ' +
-        st.status_loss_pct.toFixed(0) + '% (' + st.status_lost_count + ' lost)';
-    }
-    $('insp-losssub').textContent = sub;
+    $('insp-loss').className = 'text-[16px] font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');$('insp-losssub').textContent = st ? st.lost_count + ' / ' + st.total + ' dropped' : '';
     const j = jitterOf(s); $('insp-jitter').textContent = j != null ? '±' + fmtRtt(j) : '—';
   } catch (e) { console.error(e); }
 }
@@ -1026,17 +1679,36 @@ function toast(msg, kind) {
     document.body.appendChild(el);
   }
   const color = kind === 'bad' ? 'text-bad border-bad/40 bg-surface-900' : 'text-ok border-ok/40 bg-surface-900';
-  el.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg border text-xs font-mono shadow-xl ' + color;
+  el.className = 'fixed bottom-5 left-1/2 -translate-x-1/2 z-[60] px-4 py-2 rounded-lg border text-[12px] font-mono shadow-2xl ' + color;
   el.textContent = msg;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => el.remove(), 2500);
 }
 
-document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeInspector(); closeSettings(); } });
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') {
+    closeModal();
+    closeInspector();
+    closeSettings();
+    const acc = $('acc-modal');
+    if (acc) acc.classList.add('hidden');
+  }
+});
 
-refresh();
-setInterval(refresh, 5000);
-setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+(async function boot() {
+  const ok = await checkAuth();
+  if (ok) startPolling();
+})();
+
+function startPolling() {
+  refresh();
+  setInterval(refresh, 5000);
+  setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+  checkUpdate(false);                    // initial update check
+  setInterval(() => checkUpdate(false), 10 * 60 * 1000);  // re-check every 10 min (backend caches 30)
+}
 </script>
+
+
 </body>
 </html>

@@ -1,6 +1,8 @@
 services:
   zenmon:
-    build: .
+    build:
+      args:
+        V: v0.2.0
     container_name: zenmon
     ports:
       - "9299:9299"

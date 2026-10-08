@@ -46,7 +46,7 @@ const (
 // probePayload is the ICMP echo payload: a fixed human-readable identifier.
 // Its size is bounded by payloadSize (enforced in init) so the on-wire
 // echo request stays well under any MTU concern.
-var probePayload = []byte("ZENMON-PING-0123456789ABCDEF") // 28 bytes, <= payloadSize
+var probePayload = []byte("PULSEMON-PING-0123456789ABCDEF") // 28 bytes, <= payloadSize
 
 func init() {
 	// Enforce the payload cap at startup: a future edit that lengthens the
@@ -111,7 +111,7 @@ func LastProbeError() string {
 	if probeErrCount.Load() == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d probe send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
+	return fmt.Sprintf("%d pulse send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
 		probeErrCount.Load())
 }
 
@@ -134,7 +134,7 @@ func newDgramTransport() (*dgramTransport, error) {
 	// so the raw ICMP descriptor can never leak into a subprocess's fd table.
 	// The stdlib net package sets CLOEXEC on every socket it creates; this
 	// hand-rolled syscall should match. It's defensive, not a fix for a live
-	// bug: zenmon update does not fork/exec (installBinary renames the file in
+	// bug: pulsemon update does not fork/exec (installBinary renames the file in
 	// place and asks for a manual restart), and the socket binds to port 0, so
 	// there is no port to "reuse" — but any future subprocess would inherit a
 	// raw ICMP fd without this.
@@ -211,6 +211,14 @@ func (t *rawTransport) close() error { return t.conn.Close() }
 // 2^17, the second clears the remaining carry, and the uint16() on return
 // drops any residual carry bit.
 //
+// Why hand-rolled instead of x/net/icmp: x/net/icmp's checksum is UNEXPORTED
+// (message.go `func checksum`, no public Checksum symbol), and its only
+// public entry point is Message.Marshal(), which cannot write to the
+// SOCK_DGRAM/IPPROTO_ICMP socket the unprivileged-datagram transport uses
+// (that path hand-builds the raw packet at the byte level). The raw
+// transport (rawTransport.send) DOES use msg.Marshal(nil) and inherits
+// x/net/icmp's checksum — this function exists only for the datagram path.
+//
 // NOTE: the previous odd-length handling was already correct — this is the
 // canonical form, not a bug fix. TestIcmpChecksumMatchesReference locks it
 // against an independent reference across every length (odd and even).
@@ -278,12 +286,12 @@ func NewEngine() (*Engine, error) {
 	if t, err := newDgramTransport(); err == nil {
 		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
-		fmt.Fprintf(os.Stderr, "zenmon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
+		fmt.Fprintf(os.Stderr, "pulsemon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
 	}
 	if t, err := newRawTransport(); err == nil {
 		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{}), pollFn: unix.Poll}, nil
 	} else {
-		return nil, fmt.Errorf("icmp: cannot open socket (need root/CAP_NET_RAW or ping_group_range): %w", err)
+		return nil, fmt.Errorf("%w (need root/CAP_NET_RAW or ping_group_range): %w", errNoIcmpTransport, err)
 	}
 }
 
@@ -395,7 +403,7 @@ func (e *Engine) readDgram() {
 			// reader dies on the first interrupt and every later probe is a
 			// false loss.
 		} else if err != nil {
-			log.Printf("zenmon: icmp reader: poll: %v (reader stopping)", err)
+			log.Printf("pulsemon: icmp reader: poll: %v (reader stopping)", err)
 			return
 		}
 		if fds[0].Revents&unix.POLLIN != 0 {
@@ -412,7 +420,7 @@ func (e *Engine) readDgram() {
 				continue // defensive: the syscall layer retries EINTR, but if
 				// it ever surfaces, retry rather than kill the reader
 			} else if rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
-				log.Printf("zenmon: icmp reader: recvfrom: %v (reader stopping)", rerr)
+				log.Printf("pulsemon: icmp reader: recvfrom: %v (reader stopping)", rerr)
 				return // real error (e.g. socket closed)
 			}
 		}
@@ -438,7 +446,7 @@ func (e *Engine) readRaw() {
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
 			if err != net.ErrClosed {
-				log.Printf("zenmon: icmp reader (raw): read: %v (reader stopping)", err)
+				log.Printf("pulsemon: icmp reader (raw): read: %v (reader stopping)", err)
 			}
 			return
 		}
@@ -566,6 +574,22 @@ func EngineMode() string {
 	}
 	return ""
 }
+
+// EngineDead reports whether the shared ICMP engine was attempted and BOTH
+// transports failed (datagram: gid outside net.ipv4.ping_group_range; raw:
+// no CAP_NET_RAW / root). Once dead it stays dead for the process lifetime
+// (the open is a sync.Once), so healthz can surface it as a stable condition
+// instead of the old silent behavior: server running, healthz "ok", no
+// pings. The probe worker warms the engine at startup precisely so this is
+// visible immediately, not after the first failed probe tick.
+func EngineDead() bool {
+	return sharedEngineErr != nil
+}
+
+// errNoIcmpTransport is the sentinel for "neither ICMP transport could open".
+// It wraps the underlying errors so diagnostics still surface, but gives
+// healthz / tests a stable thing to match against (errors.Is).
+var errNoIcmpTransport = errors.New("icmp: no transport available")
 
 // pingHost is the probe worker's entry point: resolve the target, then
 // ping the resolved IP through the shared engine.
