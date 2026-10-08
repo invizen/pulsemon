@@ -185,8 +185,9 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	return tok, true
 }
 
-// ValidSession reports whether the session token is live; a hit slides the
-// expiry forward.
+// ValidSession reports whether the session token is live; a live hit
+// slides the expiry forward. An expired token is rejected AND deleted —
+// the returned value is the expiry test, never just a map hit.
 func (a *AuthState) ValidSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -197,6 +198,7 @@ func (a *AuthState) ValidSession(tok string) bool {
 		s.expiry = time.Now().Add(authSessionTTL)
 		a.sessions[tok] = s
 	} else {
+		ok = false
 		delete(a.sessions, tok)
 	}
 	a.mu.Unlock()
