@@ -1,3 +1,43 @@
+## v0.1.36
+
+A small security-hardening release from an external review round. Three
+behavior changes: the login throttle can no longer be dodged with a rotated
+`X-Forwarded-For` header, the login timing-equalization dummy is now
+precomputed, and webhook URL validation rejects IETF-reserved and carrier-NAT
+address ranges.
+
+### Security
+
+- **Login throttle ignores untrusted `X-Forwarded-For` by default.** The
+  per-IP failure counter (7 failures in 60s → 5-minute lockout) used to key on
+  the first `X-Forwarded-For` entry when present, so an attacker could rotate
+  a spoofed header on every request and never trip the lockout — enabling
+  unlimited password guessing. The throttle now keys on the **direct TCP
+  peer** by default. If pulsemon sits behind a reverse proxy and you want
+  attempts attributed to the real client, set the new
+  `PULSEMON_TRUSTED_PROXIES` env var (comma-separated CIDRs or bare IPs, e.g.
+  `127.0.0.1`); the header is read only when the connection's source address
+  is in that list. A typo'd entry is logged and skipped — it can't break
+  startup.
+- **Precomputed login-timing dummy.** The dummy bcrypt hash that keeps
+  unknown-user logins timing the same as wrong-password ones (so the
+  username can't be guessed from response time) is now built once at
+  startup from the configured bcrypt cost, instead of reformatted on every
+  unknown-user lookup.
+- **Webhook URL validation rejects reserved ranges.** Alert-destination
+  URLs now reject IETF reserved-for-testing addresses (198.18.0.0/15) and
+  carrier-grade NAT (100.64.0.0/10) in addition to loopback, link-local, and
+  unspecified. Private (LAN) ranges stay allowed — a self-hosted relay in
+  your own network remains a valid destination.
+
+### Verified
+
+- Full test suite passes under `-race`, `go vet` and `gofmt` clean.
+- XFF rotation verified live: 8 login attempts each carrying a different
+  spoofed `X-Forwarded-For` → the 8th is rejected with 429.
+
+---
+
 ## v0.1.30
 
 A focused HTTPS-sensor bugfix release: the certificate hostname check now
