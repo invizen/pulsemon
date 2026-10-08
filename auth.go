@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,9 +37,13 @@ import (
 // removed through the user-management endpoints — that is reserved for the
 // explicit disable action, so a typo can't silently open the dashboard.
 //
-// No brute-force lockout: this is a self-hosted tool behind a real
-// credential; the threat model is "a public URL must not expose the
-// dashboard", not "an anonymous internet scanner must not probe it".
+// No per-ACCOUNT brute-force lockout (a typo'd password won't lock the
+// operator out), but the login endpoint DOES apply a per-IP failure
+// throttle (loginFailMax failures in a rolling window → lockout) plus a
+// constant-time delay on every 401, so an internet-reachable install is
+// not a free online password-cracking target against the 8-char minimum.
+// The threat model is "a public URL must not expose the dashboard", not
+// "an anonymous internet scanner must not probe it".
 
 const (
 	authSessionName = "pulsemon_session"
@@ -45,6 +51,20 @@ const (
 	bcryptCost      = bcrypt.DefaultCost
 	minPasswordLen  = 8
 	maxUsernameLen  = 32
+
+	// Login throttling (see AuthState.loginThrottle). An internet-reachable
+	// install must not be a free online password-cracking target against the
+	// 8-char minimum. Per-IP: up to loginFailMax failures in a rolling
+	// loginFailWindow, then the IP is locked for loginLockout. In-memory only
+	// (restarts clear it) — the threat model is "don't let an attacker spray
+	// passwords", not "survive a restart mid-attack".
+	loginFailMax    = 7
+	loginFailWindow = 60 * time.Second
+	loginLockout    = 5 * time.Minute
+	// loginSlowDown is a constant-time-ish delay applied to every rejected
+	// login (401) so the response time doesn't depend on which path ran, and
+	// an online attacker gets at most ~5 guesses/second per IP.
+	loginSlowDown = 200 * time.Millisecond
 )
 
 // usernameRe: starts with a letter, then letters/digits/._- . Stored
@@ -61,6 +81,17 @@ type AuthState struct {
 
 	mu       sync.Mutex
 	sessions map[string]authSession // session token → owner + expiry
+
+	// loginThrottle: per-client-IP login failure accounting. Keyed by the
+	// request's source IP (X-Forwarded-For's first entry when present, so a
+	// reverse-proxied install still attributes attempts to the client, not
+	// the proxy). failAt holds the timestamps of recent failed attempts;
+	// lockUntil holds the time at which the IP is released from lockout.
+	loginThrottle struct {
+		sync.Mutex
+		fails   map[string][]time.Time
+		lockout map[string]time.Time
+	}
 }
 
 func NewAuthState(db *DB) *AuthState {
@@ -155,10 +186,13 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 	username = strings.ToLower(username)
 	hash, err := a.db.UserHash(username)
 	if err != nil || hash == "" {
-		// Fail with a constant-time-ish bcrypt compare against a dummy
-		// hash so the "unknown user" and "wrong password" paths take the
-		// same time (no username enumeration via timing).
-		dummy := "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+		// Fail with a constant-time-ish bcrypt compare against a dummy hash
+		// so the "unknown user" and "wrong password" paths take the same time
+		// (no username enumeration via timing). The dummy's cost is built from
+		// bcryptCost — the same cost every stored hash is generated at — so the
+		// two paths ALWAYS run at the same KDF cost and can never diverge into
+		// a timing oracle if bcryptCost is ever raised.
+		dummy := fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost)
 		bcrypt.CompareHashAndPassword([]byte(dummy), []byte(password))
 		return "", false
 	}
@@ -183,6 +217,95 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	a.sessions[tok] = authSession{user: user, expiry: time.Now().Add(authSessionTTL)}
 	a.mu.Unlock()
 	return tok, true
+}
+
+// clientIP extracts the best guess at the client's IP for throttling: the
+// first entry of X-Forwarded-For when the request came through a proxy (so a
+// reverse-proxied install attributes attempts to the client, not the proxy),
+// else the direct TCP peer. X-Forwarded-For is trusted ONLY for rate-limiting
+// — it is never used for authentication.
+func clientIP(r *http.Request) string {
+	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		if ip := net.ParseIP(strings.TrimSpace(strings.Split(xf, ",")[0])); ip != nil {
+			return ip.String()
+		}
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// ensureThrottleMaps lazily initializes the throttle maps (cheap, idempotent).
+func (a *AuthState) ensureThrottleMaps() {
+	if a.loginThrottle.fails == nil {
+		a.loginThrottle.fails = map[string][]time.Time{}
+	}
+	if a.loginThrottle.lockout == nil {
+		a.loginThrottle.lockout = map[string]time.Time{}
+	}
+}
+
+// loginAllowed reports whether ip may attempt a login now, and if not, how
+// long until the lockout lifts. It prunes failed-attempt timestamps older
+// than loginFailWindow so a long-ago burst can't pin an IP.
+func (a *AuthState) loginAllowed(ip string) (bool, time.Duration) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.ensureThrottleMaps()
+	now := time.Now()
+	if until, ok := a.loginThrottle.lockout[ip]; ok {
+		if now.Before(until) {
+			return false, until.Sub(now)
+		}
+		// Lockout elapsed: clear it and the stale failures.
+		delete(a.loginThrottle.lockout, ip)
+		delete(a.loginThrottle.fails, ip)
+	}
+	cutoff := now.Add(-loginFailWindow)
+	fails := a.loginThrottle.fails[ip]
+	kept := fails[:0]
+	for _, t := range fails {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	a.loginThrottle.fails[ip] = kept
+	return len(kept) < loginFailMax, 0
+}
+
+// loginFailed records a failed attempt for ip; once the rolling window hits
+// loginFailMax the IP is locked out for loginLockout.
+func (a *AuthState) loginFailed(ip string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.ensureThrottleMaps()
+	now := time.Now()
+	cutoff := now.Add(-loginFailWindow)
+	fails := a.loginThrottle.fails[ip]
+	kept := fails[:0]
+	for _, t := range fails {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	if len(kept) >= loginFailMax {
+		a.loginThrottle.lockout[ip] = now.Add(loginLockout)
+		a.loginThrottle.fails[ip] = kept
+		return
+	}
+	a.loginThrottle.fails[ip] = kept
+}
+
+// loginSuccess clears all failure accounting for ip.
+func (a *AuthState) loginSuccess(ip string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.ensureThrottleMaps()
+	delete(a.loginThrottle.fails, ip)
+	delete(a.loginThrottle.lockout, ip)
 }
 
 // ValidSession reports whether the session token is live; a live hit
@@ -313,14 +436,38 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
+		// Malformed / missing credentials: 400, and NOT counted against the
+		// login throttle — these never run the bcrypt KDF, so they're not a
+		// credential attempt (and not an online-cracking vector).
 		respondWithError(w, http.StatusBadRequest, "username and password required")
 		return
 	}
+
+	// Per-IP failure throttle: reject a locked-out client FAST, before any
+	// bcrypt work (the KDF is the expensive part, and a locked-out attacker
+	// shouldn't get to run it at all).
+	ip := clientIP(r)
+	if ok, wait := s.auth.loginAllowed(ip); !ok {
+		secs := int((wait + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		respondWithError(w, http.StatusTooManyRequests, "too many failed login attempts — try again in a few minutes")
+		return
+	}
+
 	tok, ok := s.auth.CreateSession(req.Username, req.Password)
 	if !ok {
+		s.auth.loginFailed(ip)
+		// Constant-time-ish delay on rejection: equalizes response time across
+		// the unknown-user / wrong-password paths (closes the timing oracle)
+		// and caps an online attacker at ~5 guesses/second per IP.
+		time.Sleep(loginSlowDown)
 		respondWithError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
+	s.auth.loginSuccess(ip)
 	setAuthCookie(w, r, tok)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username)})
 }
