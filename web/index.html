@@ -69,6 +69,31 @@ tailwind.config = {
 </head>
 <body class="bg-surface-950 text-slate-200 font-sans min-h-screen antialiased">
 
+<!-- ============ AUTH GATE (login overlay) ============ -->
+<div id="auth-gate" class="hidden fixed inset-0 z-[100] bg-surface-950 flex items-center justify-center p-4">
+  <div class="w-full max-w-sm">
+    <div class="flex items-center gap-3 mb-6 justify-center">
+      <div class="h-10 w-10 rounded-lg bg-surface-800 border border-surface-700/60 flex items-center justify-center text-ok">
+        <i class="ph-bold ph-activity text-[20px]"></i>
+      </div>
+      <div class="text-left">
+        <div class="font-extrabold tracking-tight text-[18px]"><span class="text-ok">pulse</span><span class="text-[#808080]">mon</span></div>
+        <p class="text-[12px] text-slate-500">network sensor monitor</p>
+      </div>
+    </div>
+    <form id="auth-form" class="bg-surface-900 border border-surface-800 rounded-2xl p-5 space-y-3">
+      <p class="text-[13px] text-slate-400">Sign in to unlock the dashboard.</p>
+      <input id="auth-username" type="text" autocomplete="username" spellcheck="false" placeholder="username"
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-[14px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-surface-600" />
+      <input id="auth-password" type="password" autocomplete="current-password" spellcheck="false" placeholder="password"
+        class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-2 text-[14px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-surface-600" />
+      <p id="auth-err" class="hidden text-[12px] font-mono text-bad"></p>
+      <button type="submit" class="w-full py-2 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[13px] font-semibold transition">Sign In</button>
+    </form>
+    <p class="text-[11px] text-slate-600 mt-4 text-center font-mono">no account yet? run <span class="text-slate-500">pulsemon auth-user add &lt;user&gt; &lt;pass&gt;</span> on the server</p>
+  </div>
+</div>
+
 <!-- ============ HEADER ============ -->
 <header class="border-b border-surface-800 bg-surface-900/80 backdrop-blur sticky top-0 z-30">
   <div class="max-w-[1700px] mx-auto px-4 sm:px-6 h-16 flex items-center justify-between gap-4">
@@ -330,6 +355,40 @@ tailwind.config = {
           <button onclick="removeTLSCert()" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-bad/20 hover:border-bad/40 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono">Remove Certificate</button>
         </div>
       </div>
+      <div class="border border-surface-800 rounded-lg p-3.5 bg-surface-950/40 space-y-3">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-2">
+            <i class="ph-bold ph-lock text-slate-400"></i>
+            <span class="text-[13px] font-bold text-slate-200">Authentication</span>
+            <span id="auth-badge" class="px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border bg-surface-800 border-surface-700 text-slate-500">off</span>
+          </div>
+        </div>
+        <p class="text-[12px] text-slate-500 leading-relaxed">
+          Username + password accounts protect the whole dashboard. Recommended for anything reachable beyond your LAN. Sessions last 30 days in the browser.
+        </p>
+        <div id="auth-off-box">
+          <button id="auth-enable-btn" onclick="enableAuth()" class="w-full py-2 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono">Create First Account</button>
+        </div>
+        <div id="auth-enabled-box" class="hidden space-y-3">
+          <div class="text-[12px] text-slate-400 font-mono">Signed in as <span id="auth-me" class="text-slate-200"></span></div>
+          <div class="space-y-1.5" id="auth-user-list"></div>
+          <div class="border border-surface-800 rounded-lg p-2.5 bg-surface-950/40 space-y-2">
+            <div class="text-[11px] font-mono text-slate-500">Add account</div>
+            <div class="flex gap-2">
+              <input id="auth-new-username" type="text" spellcheck="false" placeholder="username"
+                class="flex-1 min-w-0 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-surface-600" />
+              <input id="auth-new-password" type="password" spellcheck="false" placeholder="password (8+ chars)"
+                class="flex-1 min-w-0 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 placeholder-slate-600 focus:outline-none focus:border-surface-600" />
+            </div>
+            <button onclick="addAuthUser()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-300 text-[12px] font-mono">Add Account</button>
+          </div>
+          <div class="flex gap-2">
+            <button onclick="changeMyPassword()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-300 text-[12px] font-mono">Change My Password</button>
+            <button onclick="logoutAuth()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-300 text-[12px] font-mono">Log Out</button>
+            <button onclick="disableAuth()" class="px-3 py-1.5 rounded-lg bg-bad/10 hover:bg-bad/20 border border-bad/40 text-bad text-[12px] font-mono">Disable Authentication</button>
+          </div>
+        </div>
+      </div>
       <div id="set-msg" class="hidden text-[13px] font-mono px-3 py-2 rounded-lg border"></div>
     </div>
     <div class="shrink-0 px-5 py-3.5 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
@@ -428,8 +487,78 @@ let viewMode = localStorage.getItem('pulsemon_view') || 'cards';
 const $ = id => document.getElementById(id);
 syncThemeIcon();
 
+// ---------- authentication ----------
+// authState: null = not yet checked, else {enabled, authed} from /api/auth/status.
+// While auth is enabled and unauthenticated, the login gate covers the UI and
+// data polling is suspended (every API call would just 401).
+let authState = null;
+
+function showAuthGate() {
+  const gate = $('auth-gate');
+  if (gate) { gate.classList.remove('hidden'); $('auth-username').focus(); }
+}
+function hideAuthGate() {
+  const gate = $('auth-gate');
+  if (gate) gate.classList.add('hidden');
+}
+function authBlocking() { return authState && authState.enabled && !authState.authed; }
+
+async function checkAuth() {
+  try {
+    const r = await fetch('/api/auth/status');
+    authState = r.ok ? await r.json() : { enabled: false, authed: !r.ok };
+  } catch {
+    // Server unreachable — let the normal refresh error path handle it.
+    authState = { enabled: false, authed: false };
+  }
+  if (authBlocking()) {
+    showAuthGate();
+    return false;
+  }
+  hideAuthGate();
+  return true;
+}
+
+async function doLogin(username, password) {
+  try {
+    const r = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: username.trim(), password: password })
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || 'login failed');
+    }
+    authState = await r.json();
+    hideAuthGate();
+    const err = $('auth-err');
+    err.classList.add('hidden');
+    $('auth-username').value = '';
+    $('auth-password').value = '';
+    await refresh();
+    return true;
+  } catch (e) {
+    const err = $('auth-err');
+    err.textContent = e.message || 'invalid username or password';
+    err.classList.remove('hidden');
+    return false;
+  }
+}
+
+$('auth-form').addEventListener('submit', e => {
+  e.preventDefault();
+  doLogin($('auth-username').value, $('auth-password').value);
+});
+
 async function api(path, opts) {
   const r = await fetch(path, opts);
+  if (r.status === 401) {
+    // Session gone (expired, regenerated, or auth just enabled) — re-check
+    // and show the gate instead of surfacing an error toast.
+    await checkAuth();
+    throw new Error('authentication required');
+  }
   if (!r.ok) {
     let msg = r.status + ' ' + r.statusText;
     try { const j = await r.json(); if (j.error) msg = j.error; } catch {}
@@ -440,6 +569,7 @@ async function api(path, opts) {
 }
 
 async function refresh() {
+  if (authBlocking()) return;
   try {
     const [s, e, hz] = await Promise.all([
       api('/api/sensors'),
@@ -922,6 +1052,7 @@ async function openSettings() {
     renderScopeOptions();
     setMaintUI(SETTINGS.maintenance_mode === true);
     renderTLSStatus(s.tls);
+    renderAuthPanel();
     // Reset the file pickers so a previously-chosen file isn't re-uploaded
     // on a later "Apply" without the user noticing.
     $('f-tls-cert-file').value = '';
@@ -969,6 +1100,114 @@ function renderTLSStatus(t) {
     rm.disabled = true;
     rm.title = 'No certificate installed';
   }
+}
+
+async function renderAuthPanel() {
+  const badge = $('auth-badge');
+  const onBox = $('auth-enabled-box');
+  const offBox = $('auth-off-box');
+  const status = await api('/api/auth/status').catch(() => ({ enabled: false, authed: false }));
+  authState = status;
+  if (status.enabled && status.authed) {
+    badge.textContent = 'on';
+    badge.className = 'px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border bg-ok/15 border-ok/40 text-ok';
+    onBox.classList.remove('hidden');
+    offBox.classList.add('hidden');
+    $('auth-me').textContent = status.user || '…';
+    const users = await api('/api/auth/users').catch(() => []);
+    const list = $('auth-user-list');
+    list.innerHTML = (users.length ? users : [{ username: status.user }]).map(u =>
+      '<div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-surface-900 border border-surface-800">' +
+      '<span class="text-[12px] font-mono text-slate-200">' + esc(u.username) +
+      (u.username === status.user ? ' <span class="text-[10px] text-ok font-mono">(you)</span>' : '') +
+      '</span>' +
+      (u.username === status.user
+        ? ''
+        : '<button onclick="removeAuthUser(\'' + esc(u.username).replace(/'/g, "\\'") + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>') +
+      '</div>'
+    ).join('');
+  } else if (status.enabled) {
+    // Auth on but this browser isn't signed in — the gate owns the screen;
+    // this panel only matters once logged in, so mirror the "on" state.
+    badge.textContent = 'on';
+    badge.className = 'px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border bg-ok/15 border-ok/40 text-ok';
+  } else {
+    badge.textContent = 'off';
+    badge.className = 'px-1.5 py-0.5 rounded text-[10px] font-mono font-semibold border bg-surface-800 border-surface-700 text-slate-500';
+    onBox.classList.add('hidden');
+    offBox.classList.remove('hidden');
+  }
+}
+
+async function enableAuth() {
+  const u = prompt('Choose a username for the first account:');
+  if (u === null || !u.trim()) return;
+  const p = prompt('Choose a password (8+ characters):');
+  if (p === null || p.length < 8) { if (p !== null) alert('Password must be at least 8 characters.'); return; }
+  const p2 = prompt('Re-enter the password:');
+  if (p2 !== p) { alert('Passwords do not match.'); return; }
+  try {
+    await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u.trim(), password: p }) });
+    // Creating the first account enabled auth; sign straight in.
+    const ok = await doLogin(u.trim(), p);
+    if (ok) {
+      setMsg('authentication enabled — signed in as ' + u.trim().toLowerCase(), 'ok');
+      renderAuthPanel();
+    }
+  } catch (e) { setMsg('could not create account: ' + e.message, 'bad'); }
+}
+
+async function addAuthUser() {
+  const u = $('auth-new-username').value.trim();
+  const p = $('auth-new-password').value;
+  if (!u || p.length < 8) { setMsg('username and an 8+ character password required', 'bad'); return; }
+  if (!confirm('Add account "' + u + '"? They will be able to sign in and use the dashboard.')) return;
+  try {
+    await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p }) });
+    $('auth-new-username').value = '';
+    $('auth-new-password').value = '';
+    setMsg('account added: ' + u.toLowerCase(), 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('add failed: ' + e.message, 'bad'); }
+}
+
+async function removeAuthUser(username) {
+  if (!confirm('Remove account "' + username + '"? They will be locked out immediately.')) return;
+  try {
+    await api('/api/auth/users/' + encodeURIComponent(username), { method: 'DELETE' });
+    setMsg('account removed: ' + username, 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('remove failed: ' + e.message, 'bad'); }
+}
+
+async function changeMyPassword() {
+  const p = prompt('New password (8+ characters):');
+  if (p === null || p.length < 8) { if (p !== null) alert('Password must be at least 8 characters.'); return; }
+  const p2 = prompt('Re-enter the new password:');
+  if (p2 !== p) { alert('Passwords do not match.'); return; }
+  const me = (authState && authState.user) || $('auth-me').textContent;
+  try {
+    await api('/api/auth/users/' + encodeURIComponent(me) + '/password', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: p }) });
+    setMsg('password updated', 'ok');
+  } catch (e) { setMsg('password change failed: ' + e.message, 'bad'); }
+}
+
+async function disableAuth() {
+  if (!confirm('Disable authentication? ALL accounts are removed and the dashboard becomes open to anyone who can reach it.')) return;
+  try {
+    await api('/api/auth/disable', { method: 'POST' });
+    authState = { enabled: false, authed: false };
+    setMsg('authentication disabled — all accounts removed', 'ok');
+    renderAuthPanel();
+  } catch (e) { setMsg('disable failed: ' + e.message, 'bad'); }
+}
+
+async function logoutAuth() {
+  try { await api('/api/auth/logout', { method: 'POST' }); } catch {}
+  location.reload();
 }
 
 let tlsBusy = false;
@@ -1355,9 +1594,18 @@ function toast(msg, kind) {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') { closeModal(); closeInspector(); closeSettings(); } });
 
-refresh();
-setInterval(refresh, 5000);
-setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+// Boot: check auth first; when it's on and we have no session, the login
+// gate covers the UI and data polling stays suspended.
+(async function boot() {
+  const ok = await checkAuth();
+  if (ok) startPolling();
+})();
+
+function startPolling() {
+  refresh();
+  setInterval(refresh, 5000);
+  setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+}
 </script>
 </body>
 </html>

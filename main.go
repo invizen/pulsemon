@@ -88,6 +88,9 @@ func dispatch(args []string) dispatchKind {
 	case "restart":
 		// Apply a config that needs a fresh process (listener/TLS).
 		return runRestartCommand()
+	case "auth-user":
+		// Dashboard accounts: pulsemon auth-user add|remove|list [NAME]
+		return runAuthUser(args[2:])
 	case "-v", "-version", "--version", "version":
 		fmt.Println("pulsemon", Version)
 		return dExit0
@@ -98,7 +101,7 @@ func dispatch(args []string) dispatchKind {
 	// error.
 	if strings.HasPrefix(args[1], "-") {
 		fmt.Fprintf(os.Stderr, "pulsemon: unknown flag %q\n\n", args[1])
-		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  pulsemon auth-user add <user> <pass>   create a dashboard account (first account enables auth)\n  pulsemon auth-user remove <user>       delete a dashboard account\n  pulsemon auth-user list                list dashboard accounts\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
 		if os.Getenv("PULSEMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
@@ -211,6 +214,86 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 	return <-errCh
 }
 
+// runAuthUser manages dashboard accounts from the host:
+//
+//	pulsemon auth-user add <username> <password>
+//	pulsemon auth-user remove <username>
+//	pulsemon auth-user list
+//
+// add on an open (no-users) dashboard is what enables authentication.
+// remove is refused for the last remaining user — `auth-user remove` on
+// the final account errors, and the "disable authentication" action in the
+// dashboard (which removes all users) is the explicit off-switch.
+func runAuthUser(args []string) dispatchKind {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user add <username> <password> | remove <username> | list")
+		return dExit2
+	}
+	db, err := NewDB(dbPathFromEnv())
+	if err != nil {
+		log.Printf("auth-user: open: %v", err)
+		return dExit1
+	}
+	defer db.Close()
+	// The users table is created by InitSchema (the server runs it on
+	// startup); run it here too so the CLI works on a store that has
+	// never had a server boot (idempotent).
+	if err := db.InitSchema(); err != nil {
+		log.Printf("auth-user: schema: %v", err)
+		return dExit1
+	}
+	a := NewAuthState(db)
+	switch args[0] {
+	case "add":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user add <username> <password>")
+			return dExit2
+		}
+		if err := a.AddUser(args[1], args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "auth-user add:", err)
+			return dExit1
+		}
+		if n, _ := db.UserCount(); n == 1 {
+			fmt.Println("Dashboard authentication is now ENABLED —", args[1], "can log in at the dashboard URL.")
+		} else {
+			fmt.Println("User added:", args[1])
+		}
+		return dExit0
+	case "remove":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user remove <username>")
+			return dExit2
+		}
+		if err := a.RemoveUser(args[1]); err != nil {
+			fmt.Fprintln(os.Stderr, "auth-user remove:", err)
+			return dExit1
+		}
+		if n, _ := db.UserCount(); n == 0 {
+			fmt.Println("Dashboard authentication is now DISABLED — no users remain.")
+		} else {
+			fmt.Println("User removed:", args[1])
+		}
+		return dExit0
+	case "list":
+		users, err := db.ListUsers()
+		if err != nil {
+			log.Printf("auth-user list: %v", err)
+			return dExit1
+		}
+		if len(users) == 0 {
+			fmt.Println("No dashboard users — authentication is disabled.")
+			return dExit0
+		}
+		for _, u := range users {
+			fmt.Println(u.Username)
+		}
+		return dExit0
+	default:
+		fmt.Fprintf(os.Stderr, "unknown auth-user action %q\nusage: pulsemon auth-user add <username> <password> | remove <username> | list\n", args[0])
+		return dExit2
+	}
+}
+
 func main() {
 	// Self-update, healthcheck, and version are dispatched before the server
 	// starts; unknown flags are rejected there (see dispatch).
@@ -250,7 +333,10 @@ func main() {
 
 	server := NewServer(db, pw)
 	srv := &http.Server{
-		Handler:           server.Mux(),
+		// authGate re-checks the enabled state (user count) per request:
+		// a host `pulsemon auth-user add/remove` must take effect on the
+		// very next request without a restart.
+		Handler:           server.authGate(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	startListener(srv, db)

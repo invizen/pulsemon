@@ -27,6 +27,10 @@ pulsemon
   (0 = alert once only), one-click **maintenance mode**
 - **Dashboard** — card ⇄ table views, inspector with history, activity feed,
   optimized for 1080p and up
+- **Authentication** — optional username/password gate (Settings →
+  Authentication): create the first account to turn it on, add/remove more,
+  change your password, or disable it (removes all accounts). Sessions last
+  30 days; `/api/healthz` stays open for external monitors
 
 ## Requirements
 
@@ -127,8 +131,9 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
 | env | `PULSEMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
 | env | `PULSEMON_CERT` + `PULSEMON_KEY` — optional TLS certificate and key file paths (PEM). Set **both** together to serve HTTPS directly (`https://host:9299`); omit both for plain HTTP. If the files are missing, pulsemon warns and serves plain HTTP (so a fresh clone with no `certs/` dir doesn't crash-loop); if they exist but are corrupt or mismatched, startup fails — TLS is never silently degraded when a pair is in place. A self-signed or wildcard cert works for LAN use; use a real cert if the dashboard is reachable from outside. |
-| Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode |
+| Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode, TLS certificate, **Authentication** (create the first account, add/remove accounts, change password, disable) |
 | Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
+| CLI | `pulsemon auth-user add <user> <pass>` — create a dashboard account (the FIRST account is what turns authentication on). `pulsemon auth-user remove <user>` — delete an account (the last one is refused; use the dashboard's "Disable Authentication" for that). `pulsemon auth-user list` — list accounts. Auth is opt-in; with no accounts the dashboard is open, as before. |
 
 ### Alert behavior
 
@@ -190,8 +195,25 @@ DELETE /api/events                 clear activity feed
 GET    /api/settings               webhook + alert settings
 PUT    /api/settings               update
 POST   /api/settings/test          send a test alert
-GET    /api/healthz                liveness
+POST   /api/settings/tls           install the dashboard TLS certificate (restarts)
+DELETE /api/settings/tls           remove the dashboard TLS certificate (restarts)
+GET    /api/auth/status            auth enabled? current session valid? + username
+POST   /api/auth/login             {"username": "...", "password": "..."} → session cookie (30d)
+POST   /api/auth/logout            end the current session
+GET    /api/auth/users             list accounts (session)
+POST   /api/auth/users             {"username","password"} create an account (session; open while auth is off — bootstrap)
+POST   /api/auth/users/{u}/password  change the CALLER's own password (session)
+DELETE /api/auth/users/{u}         delete an account; the last one is refused (session)
+POST   /api/auth/disable           remove ALL accounts — turns auth off (session)
+GET    /api/healthz                liveness (always open, even with auth on)
 ```
+
+When authentication is enabled (at least one account exists), every `/api/*`
+route requires a session cookie (or is one of the auth endpoints above) and
+returns 401 without one; `/api/healthz` stays open so external monitors keep
+working. Passwords are stored as bcrypt hashes; sessions are in-memory (a
+restart clears them). A legacy single-token install migrates automatically on
+first boot: the stored token becomes the password of an `admin` account.
 
 ## Building without Docker
 
@@ -203,11 +225,14 @@ PULSEMON_DB=./data/pulsemon.db ./pulsemon
 ## Project layout
 
 ```
-api.go      REST API + sensor CRUD + settings
+api.go      REST API + sensor CRUD + settings + auth gate
 probe.go    probe worker, status derivation, alerting, webhooks
 ping.go     ICMP ping (shared socket: unprivileged datagram socket, raw fallback; seq dispatch)
 db.go       SQLite schema, migrations, seed
-main.go     entrypoint, -healthz flag
+main.go     entrypoint, -healthz flag, CLI subcommands
+listener.go HTTP/HTTPS listener + restart orchestration
+tls_settings.go   dashboard TLS certificate install (validate + store + restart)
+auth.go     dashboard authentication (username/password, sessions, gate middleware)
 web/        single-page dashboard (no build step)
 Dockerfile  golang:1.26-alpine → FROM scratch
 compose.yaml

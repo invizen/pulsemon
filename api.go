@@ -94,6 +94,7 @@ type Server struct {
 	db          *DB
 	probeWorker *ProbeWorker
 	mux         *http.ServeMux
+	auth        *AuthState
 }
 
 func NewServer(db *DB, pw *ProbeWorker) *Server {
@@ -101,6 +102,7 @@ func NewServer(db *DB, pw *ProbeWorker) *Server {
 		db:          db,
 		probeWorker: pw,
 		mux:         http.NewServeMux(),
+		auth:        NewAuthState(db),
 	}
 	s.routes()
 	return s
@@ -108,6 +110,37 @@ func NewServer(db *DB, pw *ProbeWorker) *Server {
 
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
+}
+
+// authGate wraps the mux with a per-request auth check. The enabled state
+// (at least one user in the users table) is re-read per request, so an
+// out-of-band `pulsemon auth-user add/remove` on the host takes effect on
+// the very next request, no restart required.
+func (s *Server) authGate() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.auth.Enabled() || r.URL.Path == "/api/healthz" {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
+			s.mux.ServeHTTP(w, r)
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			// The login/status endpoints must be reachable WITHOUT a
+			// session — the UI's gate calls them to decide whether to
+			// show the login form.
+			if r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/logout" {
+				s.mux.ServeHTTP(w, r)
+				return
+			}
+			respondWithError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		// Document requests still get the page; the UI's own login overlay
+		// handles the unauthenticated experience.
+		s.mux.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) routes() {
@@ -127,6 +160,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /api/settings/test", s.handleSettingsTest)
 	s.mux.HandleFunc("POST /api/settings/tls", s.handleTLSSettingsPut)
 	s.mux.HandleFunc("DELETE /api/settings/tls", s.handleTLSSettingsDelete)
+	s.mux.HandleFunc("GET /api/auth/status", s.handleAuthStatus)
+	s.mux.HandleFunc("POST /api/auth/login", s.handleAuthLogin)
+	s.mux.HandleFunc("POST /api/auth/logout", s.handleAuthLogout)
+	s.mux.HandleFunc("GET /api/auth/users", s.requireAuth(s.handleAuthUsers))
+	s.mux.HandleFunc("POST /api/auth/users", s.requireAuth(s.handleAuthUsers))
+	s.mux.HandleFunc("POST /api/auth/users/{username}/password", s.requireAuth(s.handleAuthUserPassword))
+	s.mux.HandleFunc("DELETE /api/auth/users/{username}", s.requireAuth(s.handleAuthUserDelete))
+	s.mux.HandleFunc("POST /api/auth/disable", s.requireAuth(s.handleAuthDisable))
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 
@@ -177,7 +218,8 @@ func (s *Server) fetchSensors() []Sensor {
 	}
 	defer rows.Close()
 
-	var out []Sensor
+	out := []Sensor{} // non-nil even when empty: nil is the error sentinel
+	// the handler distinguishes from a genuinely empty fleet.
 	for rows.Next() {
 		var sn Sensor
 		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {

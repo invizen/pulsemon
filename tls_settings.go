@@ -256,9 +256,9 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// so the client must already have the answer. The 200ms delay gives
 	// net/http time to write the response to the wire.
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
-		"status":    "applied",
+		"status":     "applied",
 		"restarting": true,
-		"tls":       s.tlsPayload(),
+		"tls":        s.tlsPayload(),
 	})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
