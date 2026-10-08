@@ -515,12 +515,15 @@ function statusMeta(s) {
 }
 
 function severityRank(s) {
-  // Group by sensor type so homogeneous fleets (all the HTTP servers) stay
-  // together in the Severity sort. Within a type, errors/warnings rise to
-  // the top; up and paused hold their place (paused last, as before).
+  // Severity takes precedence (error > warning > up > paused); within each
+  // band, sensor types stay grouped together so homogeneous fleets cluster.
+  // Paused is always its own lowest band, regardless of last status.
+  const sev = s.state === 'paused' ? 3
+    : s.status === 'error' ? 0
+    : s.status === 'warning' ? 1
+    : 2;
   const type = s.type === 'http' ? 0 : 1;
-  const sev = s.status === 'error' ? 0 : s.status === 'warning' ? 1 : s.state === 'paused' ? 3 : 2;
-  return type * 4 + sev;
+  return sev * 2 + type;
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
