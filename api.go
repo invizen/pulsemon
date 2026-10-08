@@ -1024,6 +1024,11 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			n = p
 		}
 	}
+	// Cap like the sensor-history endpoint (500): a huge n must not turn this
+	// into an unbounded full-table read on a long-running instance.
+	if n > 500 {
+		n = 500
+	}
 	rows, err := s.db.Query(`SELECT e.id, e.sensor_id, COALESCE(s.name, e.sensor_id), e.ts, e.from_status, e.to_status, e.note
 		FROM events e LEFT JOIN sensors s ON s.id = e.sensor_id
 		ORDER BY e.ts DESC LIMIT ?`, n)
