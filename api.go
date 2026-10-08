@@ -17,6 +17,12 @@ import (
 //go:embed web/*
 var content embed.FS
 
+// maxRequestBytes bounds every incoming request body (authGate wraps
+// r.Body with http.MaxBytesReader). The largest real payload — a TLS
+// cert+key upload — is ~16 KB; sensor/user/settings payloads are bytes.
+// Anything past 1 MiB is either a bug or a DoS attempt.
+const maxRequestBytes = 1 << 20
+
 // Sensor mirrors the sensors table. JSON is snake_case per SPEC §4.
 type Sensor struct {
 	ID        string   `json:"id"`
@@ -84,6 +90,19 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 	json.NewEncoder(w).Encode(APIError{Error: message})
 }
 
+// requestBodyErr maps the MaxBytesReader limit (authGate bounds every body
+// to maxRequestBytes) to a clean 413; any other decode error is a plain 400.
+// Every JSON handler routes its json.Decoder error through this, so an
+// oversized body never surfaces as "invalid request body: http: request
+// body too large".
+func requestBodyErr(err error) (int, string) {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return http.StatusRequestEntityTooLarge, "request body too large (limit 1 MiB)"
+	}
+	return http.StatusBadRequest, "invalid request body: " + err.Error()
+}
+
 func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -116,8 +135,18 @@ func (s *Server) Mux() *http.ServeMux {
 // (at least one user in the users table) is re-read per request, so an
 // out-of-band `pulsemon auth-user add/remove` on the host takes effect on
 // the very next request, no restart required.
+//
+// Every request body is additionally bounded to maxRequestBytes via
+// http.MaxBytesReader: a malformed or malicious client can no longer stream
+// an arbitrarily large body into the JSON decoders (sensors, users, TLS
+// upload, settings). The largest real payload — a TLS cert+key upload — fits
+// in ~16 KB, so 1 MiB is generous. Oversized bodies surface as a clean 413
+// instead of a generic decode error.
 func (s *Server) authGate() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		}
 		if !s.auth.Enabled() || r.URL.Path == "/api/healthz" {
 			s.mux.ServeHTTP(w, r)
 			return
@@ -291,7 +320,8 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			SpikeMult int      `json:"spike_mult"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			code, msg := requestBodyErr(err)
+			respondWithError(w, code, msg)
 			return
 		}
 		req.Name = strings.TrimSpace(req.Name)
@@ -463,7 +493,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			State     *string   `json:"state"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			code, msg := requestBodyErr(err)
+			respondWithError(w, code, msg)
 			return
 		}
 
@@ -1101,7 +1132,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		MaintMode   *bool    `json:"maintenance_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
 		return
 	}
 	// Per-provider updates. The legacy top-level webhook_url maps to the

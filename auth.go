@@ -515,7 +515,8 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			Password string `json:"password"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+			code, msg := requestBodyErr(err)
+			respondWithError(w, code, msg)
 			return
 		}
 		if err := s.auth.AddUser(req.Username, req.Password); err != nil {
@@ -547,7 +548,8 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
 		return
 	}
 	keep := ""

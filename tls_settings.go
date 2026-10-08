@@ -203,7 +203,8 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		Port *int   `json:"port"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
 		return
 	}
 	if req.Cert == "" && req.Key == "" && req.Port == nil {
