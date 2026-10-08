@@ -1,9 +1,8 @@
 # pulsemon
 
 A single-container ICMP network sensor monitor for your homelab. One Go binary,
-one SQLite file, one dark dashboard — built to replace Uptime Kuma with
-something that pings exactly what you care about and says nothing until
-something changes.
+one SQLite file, one dark dashboard — built to monitor exactly what you care about
+and says nothing until something changes.
 
 ```
 pulsemon
