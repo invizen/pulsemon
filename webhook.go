@@ -186,6 +186,34 @@ func httpAllowsPrivate(host string) bool {
 	return false
 }
 
+// blockedSubnets are address ranges a webhook must NEVER target. They are
+// not covered by net.IP.IsPrivate() (which is only RFC1918 + ULA), so they
+// need an explicit check:
+//
+//   - 198.18.0.0/15 (RFC 2544) — IETF-reserved-for-testing; never a valid
+//     destination.
+//   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. This is the ISP's
+//     carrier range, NOT the user's LAN: a self-hosted relay reachable from
+//     the homelab sits in RFC1918 space (still allowed, see
+//     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth
+//     without breaking the documented use case. A webhook pointed at a CGNAT
+//     address can never be a working relay.
+//
+// RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are deliberately
+// NOT here: the design allows them so a LAN relay works.
+var blockedSubnets = []*net.IPNet{
+	mustCIDR("198.18.0.0/15"),
+	mustCIDR("100.64.0.0/10"),
+}
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic("pulsemon: bad hardcoded CIDR " + s + ": " + err.Error())
+	}
+	return n
+}
+
 func checkWebhookIP(ip net.IP, host string) error {
 	// Also judge the IPv4 view of the address, so IPv4-mapped IPv6 forms
 	// (::ffff:127.0.0.1, ::ffff:169.254.1.1) cannot slip past the IPv6
@@ -196,6 +224,13 @@ func checkWebhookIP(ip net.IP, host string) error {
 	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsUnspecified() || ip.IsMulticast() {
 		return fmt.Errorf("host %q resolves to a blocked address (%s)", host, ip)
+	}
+	// Reserved-for-testing (198.18/15) and carrier-NAT (100.64/10) ranges:
+	// never a valid destination (see blockedSubnets).
+	for _, n := range blockedSubnets {
+		if n.Contains(ip) {
+			return fmt.Errorf("host %q resolves to a reserved or carrier-NAT address (%s)", host, ip)
+		}
 	}
 	return nil
 }

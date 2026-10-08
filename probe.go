@@ -1227,16 +1227,32 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 // nothing on screen ever needs older data. Revisit if historical reporting
 // is added later.
 //
-// The comparison is a string compare, but that is EXACT here because both
-// sides use the same format: the stored ts is RFC3339Nano (written by the
-// probe loop) and the cutoff is built in the same format, so the
-// lexicographic order matches the chronological order for all real instants.
-// (The v0.1.18 window bug was different: it compared RFC3339 against
-// datetime('now')'s space-separated output — two DIFFERENT formats — which
-// is what made the string compare wrong. Same-format string compares are
-// safe; mixed-format ones are not.) An epoch compare was considered and
-// rejected: strftime('%s') truncates fractional seconds, introducing a
-// 1-second boundary error that the same-format string compare does not have.
+// The comparison is a string compare. That is safe for every instant EXCEPT
+// one bounded case: a row stamped at exactly an integer second in the boundary
+// second (no fractional part, "...SSZ") sorts AFTER a fractional row
+// ("...SS.5Z") because 'Z' (0x5A) > '.' (0x2E). The consequence is
+// over-retention only — such a row survives ~1h longer than intended, on the
+// next hourly purge it is well past the boundary and is deleted. It is NEVER
+// early-deletion: a row is deleted iff ts < cutoff, and the cutoff is built
+// from time.Now(), which is sub-second, so the cutoff is never an integer
+// second and the ordering that would delete a young row never arises. The
+// window is at most the single boundary second, so it is not user-visible.
+//
+// The v0.1.18 window bug was different: it compared RFC3339 against
+// datetime('now')'s space-separated output — two DIFFERENT formats — which is
+// what made the string compare wrong. Same-format string compares are safe
+// (with the one integer-second boundary case above); mixed-format ones are not.
+//
+// Why not a fixed-width cutoff: the divergence is on the STORED side
+// (integer-second rows), not the cutoff side. Formatting only the cutoff to
+// 9 fractional digits does not make "...SSZ" sort before "...SS.5Z" — the
+// stored row still carries a 'Z' where a '.' is needed. A fixed-width cutoff
+// would just shift where the boundary lands.
+//
+// Why not integer epoch seconds: strftime('%s') truncates the fractional part,
+// so a row at 15:13:11.900 is treated as 15:13:11 — a 1-second boundary error
+// on EVERY row, not just the rare integer-second one. The string compare is
+// strictly better.
 func (pw *ProbeWorker) purgeOld() {
 	cutoff := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	for _, table := range []string{"probes", "events"} {
