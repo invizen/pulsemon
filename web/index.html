@@ -752,7 +752,7 @@ function sparklineBars(hour) {
   const maxVal = Math.max(...(vals.length ? vals : [0]), 100);
   return arr.map(v => {
     if (v === null) return '<div class="spark-bar flex-1 h-full bg-bad/80 rounded-sm" title="packet lost"></div>';
-    if (v === -2) return '<div class="spark-bar flex-1 h-[10%] bg-surface-700/40 rounded-sm" title="no data"></div>';
+    if (v === -2) return '<div class="spark-bar flex-1 h-[8%] bg-surface-700/40 rounded-sm" title="no data"></div>';
     const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
     let cls = 'bg-ok/80';
     if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
@@ -884,7 +884,7 @@ function cardHtml(s) {
         '<span>past 1h</span>' +
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + '%' + '</span>' : '') +
       '</div>' +
-      '<div class="h-9 flex items-end gap-[1.5px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+      '<div class="h-9 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
           : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
