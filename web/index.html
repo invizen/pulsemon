@@ -596,11 +596,13 @@ function render() {
 
   $('feed').innerHTML = EVENTS.length ? EVENTS.map(ev => {
     const icon = ev.to === 'error' ? 'ph-arrow-down text-bad' : ev.to === 'warning' ? 'ph-arrow-up text-warn' : 'ph-arrow-up text-ok';
-    // Every entry carries a date so today's log is unambiguous and an old
-    // entry is never mistaken for a fresh one (24h retention crosses midnight).
+    // Same day → time only; earlier → "MM/DD/YY · HH:MM:SS" so an old entry
+    // is never mistaken for a fresh one (24h retention crosses midnight).
     const d = new Date(ev.ts);
-    const t = d.toLocaleDateString([], { weekday: 'short', day: '2-digit', month: 'short' }) + ' · '
-      + d.toLocaleTimeString([], { hour12: false });
+    const t = (d.toDateString() === new Date().toDateString())
+      ? d.toLocaleTimeString([], { hour12: false })
+      : d.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: '2-digit' }) + ' · '
+        + d.toLocaleTimeString([], { hour12: false });
     return '<li class="px-4 py-2 flex items-center gap-2.5">' +
       '<i class="ph ' + icon + '"></i>' +
       '<span class="text-slate-300">' + esc(ev.sensor) + '</span>' +
