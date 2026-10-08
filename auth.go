@@ -8,6 +8,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -104,22 +105,65 @@ type AuthState struct {
 	enabledAt time.Time
 
 	// loginThrottle: per-client-IP login failure accounting. Keyed by the
-	// request's source IP (X-Forwarded-For's first entry when present, so a
-	// reverse-proxied install still attributes attempts to the client, not
-	// the proxy). failAt holds the timestamps of recent failed attempts;
+	// request's source IP as resolved by ClientIP — the TCP peer by default,
+	// or the first X-Forwarded-For entry ONLY when the immediate TCP peer is
+	// inside a trusted-proxy CIDR (PULSEMON_TRUSTED_PROXIES) — so a reverse-
+	// proxied install still attributes attempts to the real client. An
+	// untrusted peer's XFF header is ignored, so it can't be rotated to dodge
+	// the throttle. failAt holds the timestamps of recent failed attempts;
 	// lockUntil holds the time at which the IP is released from lockout.
 	loginThrottle struct {
 		sync.Mutex
 		fails   map[string][]time.Time
 		lockout map[string]time.Time
 	}
+
+	// trustedProxies: CIDRs of immediate TCP peers whose X-Forwarded-For is
+	// trusted for rate-limiting. Loaded from PULSEMON_TRUSTED_PROXIES at
+	// construction; empty (the default) means the header is never trusted.
+	trustedProxies []*net.IPNet
 }
 
 func NewAuthState(db *DB) *AuthState {
-	return &AuthState{
+	a := &AuthState{
 		db:       db,
 		sessions: map[string]authSession{},
 	}
+	a.trustedProxies = parseTrustedProxies(os.Getenv("PULSEMON_TRUSTED_PROXIES"))
+	return a
+}
+
+// parseTrustedProxies turns a comma-separated list of CIDRs (or bare IPs,
+// which become /32 / /128) into matchable networks. Entries that don't parse
+// are dropped with a warning rather than failing startup — a typo must not
+// take the dashboard down, it just means that entry isn't trusted.
+func parseTrustedProxies(raw string) []*net.IPNet {
+	var out []*net.IPNet
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		var cidr string
+		if strings.Contains(part, "/") {
+			cidr = part
+		} else if ip := net.ParseIP(part); ip != nil {
+			ones := 32
+			if ip.To4() == nil {
+				ones = 128
+			}
+			cidr = fmt.Sprintf("%s/%d", ip.String(), ones)
+		} else {
+			log.Printf("auth: PULSEMON_TRUSTED_PROXIES: ignoring unparseable entry %q", part)
+			continue
+		}
+		if _, n, err := net.ParseCIDR(cidr); err == nil {
+			out = append(out, n)
+		} else {
+			log.Printf("auth: PULSEMON_TRUSTED_PROXIES: ignoring invalid CIDR %q: %v", part, err)
+		}
+	}
+	return out
 }
 
 // Enabled reports whether at least one user exists. The answer is memoized
@@ -277,22 +321,62 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	return tok, true
 }
 
-// clientIP extracts the best guess at the client's IP for throttling: the
-// first entry of X-Forwarded-For when the request came through a proxy (so a
-// reverse-proxied install attributes attempts to the client, not the proxy),
-// else the direct TCP peer. X-Forwarded-For is trusted ONLY for rate-limiting
-// — it is never used for authentication.
-func clientIP(r *http.Request) string {
-	if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-		if ip := net.ParseIP(strings.TrimSpace(strings.Split(xf, ",")[0])); ip != nil {
-			return ip.String()
-		}
-	}
+// peerIP extracts the client's IP from the request's direct TCP peer
+// (r.RemoteAddr), stripping the port. This is the ONLY source of truth for
+// the login throttle unless the peer is a configured trusted proxy — see
+// ClientIP. Using the peer (and not X-Forwarded-For) means an attacker can't
+// rotate a spoofed X-Forwarded-For header to dodge the per-IP lockout.
+func peerIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// ClientIP resolves the client's IP for the login throttle. The default is
+// the direct TCP peer (peerIP) — a spoofed X-Forwarded-For from an untrusted
+// peer is IGNORED, so an attacker cannot rotate it to reset the per-IP
+// counter and brute-force past loginFailMax.
+//
+// When PULSEMON_TRUSTED_PROXIES lists the CIDR(s) of the immediate TCP peer
+// (a reverse proxy in front of pulsemon), the first X-Forwarded-For entry is
+// used instead — attributing attempts to the real client, not the proxy.
+// Trusting the header is gated on the PEER being in a trusted CIDR, so the
+// header is only ever read from a connection we know is our proxy; a direct
+// attacker (peer not in the list) gets the peer address and their rotation
+// attempt is pointless.
+//
+// X-Forwarded-For is trusted ONLY for rate-limiting — it is never used for
+// authentication.
+func (a *AuthState) ClientIP(r *http.Request) string {
+	peer := peerIP(r)
+	if a.trustedPeer(peer) {
+		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+			if ip := net.ParseIP(strings.TrimSpace(strings.Split(xf, ",")[0])); ip != nil {
+				return ip.String()
+			}
+		}
+	}
+	return peer
+}
+
+// trustedPeer reports whether the IP string (host, no port) is inside any of
+// the trusted-proxy CIDRs. An unparseable IP is never trusted.
+func (a *AuthState) trustedPeer(ip string) bool {
+	if len(a.trustedProxies) == 0 {
+		return false
+	}
+	p := net.ParseIP(ip)
+	if p == nil {
+		return false
+	}
+	for _, n := range a.trustedProxies {
+		if n.Contains(p) {
+			return true
+		}
+	}
+	return false
 }
 
 // ensureThrottleMaps lazily initializes the throttle maps (cheap, idempotent).
@@ -505,7 +589,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// Per-IP failure throttle: reject a locked-out client FAST, before any
 	// bcrypt work (the KDF is the expensive part, and a locked-out attacker
 	// shouldn't get to run it at all).
-	ip := clientIP(r)
+	ip := s.auth.ClientIP(r)
 	if ok, wait := s.auth.loginAllowed(ip); !ok {
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
