@@ -301,6 +301,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "name and target are required")
 			return
 		}
+		if !validSensorName(req.Name) {
+			respondWithError(w, http.StatusBadRequest, "name must be 1-60 characters and may not contain quotes, angle brackets, backslash, or control characters")
+			return
+		}
 		if req.Type == "http" {
 			if !validURL(req.Target) {
 				respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
@@ -371,6 +375,33 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 	default:
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// validSensorName rejects sensor names that are empty, overlong, or contain
+// characters that would let a stored value escape its string context when the
+// dashboard interpolates it into an inline event handler or alert card.
+// Names are operator labels, not free text: no quotes, angle brackets,
+// backslash, or control characters. Belt-and-braces alongside the
+// frontend escJs() — it keeps the stored data clean for every consumer
+// (alert cards, logs, the inspector) and stops a malicious account from
+// planting a sensor whose name runs JS in other operators' browsers.
+func validSensorName(name string) bool {
+	if name == "" || len(name) > 60 {
+		return false
+	}
+	// Reject the string-escape-relevant characters (quotes, backslash, angle
+	// brackets, backtick) so a stored name can't break out of its string
+	// context in any consumer.
+	if strings.ContainsAny(name, "'\"`\\<>") {
+		return false
+	}
+	// No control characters (newlines, tabs, NUL, …).
+	for _, r := range name {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // cleanTags trims, dedupes and caps sensor tags.
@@ -467,7 +498,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				respondWithError(w, http.StatusBadRequest, "name cannot be empty")
 				return
 			}
-			add("name", strings.TrimSpace(*req.Name))
+			trimmed := strings.TrimSpace(*req.Name)
+			if !validSensorName(trimmed) {
+				respondWithError(w, http.StatusBadRequest, "name must be 1-60 characters and may not contain quotes, angle brackets, backslash, or control characters")
+				return
+			}
+			add("name", trimmed)
 		}
 		if req.Target != nil {
 			if resultTarget == "" {

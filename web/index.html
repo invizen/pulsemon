@@ -656,6 +656,17 @@ function severityRank(s) {
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+// escJs: for interpolating a user-controlled value into a JS string literal
+// that sits INSIDE a double-quoted inline event-handler attribute, e.g.
+//   onclick="deleteSensor('id', 'NAME')"
+// esc() handles the HTML-attribute side (& < > "), but the JS string is
+// single-quoted, so it ALSO needs backslash + single-quote escaped at the
+// JS level. Note: &#39; is NOT enough — the HTML parser decodes &#39; back
+// to ' before the JS engine parses the handler, so a ' in the value still
+// breaks out (verified: payload x');…// executes under esc()&#39;). Only a
+// JS-level \' survives the HTML decode. Backslash must be doubled FIRST so
+// it can't escape the quote-escape.
+function escJs(v) { return esc(v).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
 function sparklineBars(hour) {
   const arr = (hour || []).slice(0, 60); // 60 one-minute buckets, oldest → newest
@@ -686,7 +697,7 @@ function render() {
       return '<button onclick="setTag(\'ALL\')" title="Clear tag selection" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
         (activeTags.size === 0 ? on : off) + '">ALL</button>';
     }
-    return '<button onclick="setTag(\'' + t.replace(/'/g, "\\'") + '\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
+    return '<button onclick="setTag(\'' + escJs(t) + '\')" class="px-2.5 py-1 rounded-lg whitespace-nowrap transition-colors ' +
       (activeTags.has(t) ? on : off) + '">' +
       esc(t) + '</button>';
   }).join('');
@@ -800,7 +811,7 @@ function cardHtml(s) {
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause for maintenance') + '" class="p-1.5 rounded-md hover:bg-surface-800 ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
         '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple"></i></button>' +
         '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash"></i></button>' +
+        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + escJs(s.name) + '\')" title="Delete" class="p-1.5 rounded-md hover:bg-surface-800 text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash"></i></button>' +
       '</div>' +
     '</div>' +
   '</div>';
@@ -878,7 +889,7 @@ function renderTable(list) {
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
         '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
         '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + esc(s.name) + '\')" title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
+        '<button onclick="deleteSensor(\'' + s.id + '\', \'' + escJs(s.name) + '\')" title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
       '</div></td></tr>';
   }).join('');
   // Update the Ping header to Resp when any HTTP sensor is visible.
@@ -940,7 +951,7 @@ function renderFormTags(selected) {
   } else {
     box.innerHTML = selected.map(t =>
       '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-surface-800 border border-surface-700 text-[12px] font-mono text-slate-200">' +
-      esc(t) + '<button type="button" onclick="removeFormTag(\'' + t.replace(/'/g, "\\'") + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[12px]"></i></button></span>').join('');
+      esc(t) + '<button type="button" onclick="removeFormTag(\'' + escJs(t) + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x text-[12px]"></i></button></span>').join('');
   }
   // dropdown: existing tags not already selected
   const pick = $('f-tagpick');
@@ -1001,6 +1012,23 @@ function onFormTypeChange() {
 
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }
 
+// Mirror of the server's validSensorName: reject names with string-escape
+// characters or control chars before the round-trip, so the form gives
+// instant feedback. The server still enforces it (the real gate).
+function nameErr(name) {
+  if (!name) return 'name is required';
+  if (name.length > 60) return 'name must be 60 characters or fewer';
+  var bad = /['"`\\<>]/.test(name);
+  if (!bad) {
+    for (var i = 0; i < name.length; i++) {
+      var c = name.codePointAt(i);
+      if (c < 0x20 || c === 0x7f) { bad = true; break; }
+    }
+  }
+  if (bad) return 'name may not contain quotes, backslash, < >, or control characters';
+  return '';
+}
+
 // Target input: heavier strokes + a small letter gap (see the inline style
 // on #f-target) so the thin "//" in URLs doesn't fail to rasterize on some
 // high-DPI displays — the value was always intact, one slash just looked gone.
@@ -1013,6 +1041,8 @@ async function submitSensor(ev) {
     interval_s: +$('f-interval').value, timeout_ms: +$('f-timeout').value,
     loss_warn: +$('f-loss').value, down_after: +$('f-down').value
   };
+  const ne = nameErr(body.name);
+  if (ne) { $('form-err').textContent = ne; $('form-err').classList.remove('hidden'); return; }
   try {
     if (id) {
       await api('/api/sensors/' + id, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
@@ -1122,7 +1152,7 @@ async function renderAuthPanel() {
       '</span>' +
       (u.username === status.user
         ? ''
-        : '<button onclick="removeAuthUser(\'' + esc(u.username).replace(/'/g, "\\'") + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>') +
+        : '<button onclick="removeAuthUser(\'' + escJs(u.username) + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>') +
       '</div>'
     ).join('');
   } else if (status.enabled) {
