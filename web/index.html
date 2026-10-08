@@ -254,7 +254,7 @@ tailwind.config = {
           <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-[13px] text-slate-400 flex flex-col gap-1">Timeout (ms)
-          <input id="f-timeout" type="number" min="100" max="30000" value="1000" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+          <input id="f-timeout" type="number" min="100" max="30000" value="1000" title="Caps the pulse round-trip. The DNS lookup that runs first has its own 5s cap, so timeouts under ~6s don't bound DNS — a slow-but-resolving name can take the whole probe past the timeout." class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
         <label class="text-[13px] text-slate-400 flex flex-col gap-1">Loss warn (%)
           <input id="f-loss" type="number" min="1" max="100" value="25" class="bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[15px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
