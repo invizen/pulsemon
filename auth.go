@@ -753,15 +753,21 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 }
 
 // setAuthCookie sets (or, with an empty value, clears) the session cookie.
-// Secure is applied on HTTPS requests; on plain HTTP it is omitted so a
-// LAN-only install keeps working.
+// A clear uses a past Expires so the browser drops the cookie outright
+// (the value alone is not enough — an empty-valued cookie with a future
+// expiry is retained by some browsers). Secure is applied on HTTPS
+// requests; on plain HTTP it is omitted so a LAN-only install keeps working.
 func setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
+	expires := time.Now().Add(authSessionTTL)
+	if value == "" {
+		expires = time.Unix(0, 0) // past: delete the cookie
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     authSessionName,
 		Value:    value,
 		Path:     "/",
 		Domain:   "",
-		Expires:  time.Now().Add(authSessionTTL),
+		Expires:  expires,
 		Secure:   r.TLS != nil,
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,

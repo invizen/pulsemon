@@ -1,8 +1,6 @@
 services:
   pulsemon:
-    build:
-      args:
-        V: v0.2.0
+    build: .
     container_name: pulsemon
     ports:
       - "9299:9299"

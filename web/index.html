@@ -1342,8 +1342,8 @@ function renderUpdateUI(r) {
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
       '<span class="flex items-center gap-2">' +
         '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
-        (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + esc(r.running) + '\',latest:\'' + esc(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
-          : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + esc(r.latest) + '\');renderUpdateUI({running:\'' + esc(r.running) + '\',latest:\'' + esc(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
+        (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
+          : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + escJs(r.latest) + '\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
       '</span>';
   } else {
     body.innerHTML =

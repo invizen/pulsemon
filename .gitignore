@@ -21,4 +21,4 @@ bin/
 *.bak-*
 
 # release build output
- dist/
+dist/
