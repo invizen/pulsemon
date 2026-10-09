@@ -1143,9 +1143,10 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		WebhookURL *string `json:"webhook_url"` // legacy alias for the google_chat URL
 		Providers  []struct {
-			Kind    string  `json:"kind"`
-			URL     *string `json:"url"`     // nil = keep existing; "" = clear; full URL = set
-			Enabled *bool   `json:"enabled"` // nil = keep; else set
+			Kind    string            `json:"kind"`
+			URL     *string           `json:"url"`     // nil = keep existing; "" = clear; full URL = set
+			Enabled *bool             `json:"enabled"` // nil = keep; else set
+			Extra   map[string]string `json:"extra"`   // non-URL fields (e.g. telegram chat_id)
 		} `json:"providers"`
 		AlertScope  string   `json:"alert_scope"`
 		AlertFilter []string `json:"alert_filter"`
@@ -1160,13 +1161,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// Per-provider updates. The legacy top-level webhook_url maps to the
 	// google_chat provider so an older dashboard keeps working.
 	for _, prov := range req.Providers {
-		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled); err != nil {
+		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil); err != nil {
+		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1280,7 +1281,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // changed); an empty string clears; a non-empty value is validated first.
 // This is the single write path for provider config, so the validation and
 // key-naming stay consistent no matter how many providers exist.
-func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool) error {
+func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
 	if _, ok := providerByKey(kind); !ok {
 		return fmt.Errorf("unknown alert provider: %q", kind)
 	}
@@ -1304,7 +1305,24 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool) er
 			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
 		}
 	}
+	// Non-URL fields (e.g. telegram chat_id): only known keys persist, so a
+	// client can't write arbitrary settings keys.
+	for k, v := range extra {
+		if !extraFields[kind][k] {
+			return fmt.Errorf("unknown field %q for %s", k, kind)
+		}
+		if err := s.db.SetSetting(kind+"_"+k, strings.TrimSpace(v)); err != nil {
+			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
+		}
+	}
 	return nil
+}
+
+// extraFields maps a provider kind to the non-URL settings keys it accepts.
+// chat_id is free-form (a numeric user/group ID or an @channel name); no URL
+// validation applies.
+var extraFields = map[string]map[string]bool{
+	"telegram": {"chat_id": true},
 }
 
 func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {

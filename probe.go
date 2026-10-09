@@ -1305,6 +1305,13 @@ var providerList = []providerMeta{
 		Enabled:     flagEnabled("discord"),
 		HasURL:      flagHasURL("discord"),
 	},
+	{
+		Kind: "telegram", Label: "Telegram", URLField: "telegram_url",
+		Placeholder: "https://api.telegram.org/bot<TOKEN>/sendMessage",
+		EnvFallback: "",
+		Enabled:     flagEnabled("telegram"),
+		HasURL:      telegramHasURL,
+	},
 }
 
 func providerByKey(kind string) (providerMeta, bool) {
@@ -1349,6 +1356,12 @@ func flagHasURL(kind string) func(db *DB) bool {
 	return func(db *DB) bool { return db.GetSetting(kind+"_url") != "" }
 }
 
+// telegramHasURL: Telegram needs BOTH the bot endpoint and a chat_id to
+// deliver; a URL alone can't reach anyone.
+func telegramHasURL(db *DB) bool {
+	return db.GetSetting("telegram_url") != "" && db.GetSetting("telegram_chat_id") != ""
+}
+
 // activeProviders returns every provider currently receiving alerts.
 func (pw *ProbeWorker) activeProviders() []providerMeta {
 	var out []providerMeta
@@ -1363,11 +1376,24 @@ func (pw *ProbeWorker) activeProviders() []providerMeta {
 // providerStatus is the per-provider read the settings API returns to the
 // dashboard.
 type providerStatus struct {
-	Kind    string `json:"kind"`
-	Enabled bool   `json:"enabled"`
-	HasURL  bool   `json:"has_url"`
-	URL     string `json:"url"` // masked; empty when none
-	Source  string `json:"source"`
+	Kind    string            `json:"kind"`
+	Enabled bool              `json:"enabled"`
+	HasURL  bool              `json:"has_url"`
+	URL     string            `json:"url"` // masked; empty when none
+	Source  string            `json:"source"`
+	Extra   map[string]string `json:"extra,omitempty"` // non-secret fields (e.g. telegram chat_id)
+}
+
+// providerExtra returns a provider's non-secret, non-URL fields for the
+// dashboard to pre-fill. chat_id is not a credential — the token lives in
+// the masked URL — so it is returned in the clear.
+func providerExtra(p providerMeta, db *DB) map[string]string {
+	if p.Kind == "telegram" {
+		if cid := db.GetSetting("telegram_chat_id"); cid != "" {
+			return map[string]string{"chat_id": cid}
+		}
+	}
+	return nil
 }
 
 func (pw *ProbeWorker) providerStatuses() []providerStatus {
@@ -1384,9 +1410,10 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 		out = append(out, providerStatus{
 			Kind:    p.Kind,
 			Enabled: p.Enabled(pw.db),
-			HasURL:  url != "",
+			HasURL:  p.HasURL(pw.db),
 			URL:     webhookMasked(url),
 			Source:  source,
+			Extra:   providerExtra(p, pw.db),
 		})
 	}
 	return out
@@ -1414,6 +1441,16 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 				card = discordCardRe(state, name, target, rttMs)
 			}
 			pw.postJSON(url, map[string]string{"content": card})
+		case "telegram":
+			card := telegramCard(oldState, state, name, target, rttMs)
+			if reAlert {
+				card = telegramCardRe(state, name, target, rttMs)
+			}
+			pw.postJSON(url, map[string]string{
+				"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+				"text":       card,
+				"parse_mode": "HTML",
+			})
 		}
 	}
 }
@@ -1438,6 +1475,12 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	var body map[string]string
 	if p.Kind == "discord" {
 		body = map[string]string{"content": "🟢 **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
+	} else if p.Kind == "telegram" {
+		body = map[string]string{
+			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+			"text":       "🟢 <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings\n<b>Target:</b> webhook-verify\n<b>State:</b> <b>test</b> — your Telegram bot works.",
+			"parse_mode": "HTML",
+		}
 	} else {
 		body = map[string]string{"text": "🟢 *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}

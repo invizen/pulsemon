@@ -153,6 +153,9 @@
       <button onclick="toggleTheme()" id="theme-toggle" title="Toggle light/dark theme" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i id="theme-icon" class="ph-bold ph-sun text-[19px]"></i>
       </button>
+      <button onclick="openAlerts()" title="Alerts" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+        <i class="ph-bold ph-bell text-[19px]"></i>
+      </button>
       <button onclick="openSettings()" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i class="ph-bold ph-gear text-[19px]"></i>
       </button>
@@ -370,33 +373,6 @@
         </div>
       </div>
 
-      <!-- Alert webhooks -->
-      <div class="space-y-2">
-        <div class="flex items-center justify-between font-mono text-[12px]">
-          <span class="font-semibold text-slate-300">Alert Destinations</span>
-          <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
-        </div>
-        <div id="provider-list" class="space-y-2"></div>
-      </div>
-
-      <!-- Routing & Filter -->
-      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-2.5">
-        <div class="flex items-center justify-between">
-          <span class="font-semibold text-slate-300">Alert Routing</span>
-          <span class="text-[11px] text-slate-500 font-mono">Scope alert triggers</span>
-        </div>
-        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
-          <option value="all">All Sensors</option>
-          <option value="tags">Sensors With Selected Tags</option>
-          <option value="sensors">Only Selected Sensors</option>
-        </select>
-        <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
-        <div class="flex items-center justify-between pt-1">
-          <span class="text-[12px] text-slate-400">Re-Alert Interval (min)</span>
-          <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
-        </div>
-      </div>
-
       <!-- TLS / HTTPS -->
       <div id="tls-panel" class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-2.5">
         <div class="flex items-center justify-between">
@@ -470,7 +446,55 @@
       <span class="text-[11px] text-slate-500 font-mono">persisted in pulsemon.db</span>
       <div class="flex gap-2">
         <button onclick="closeSettings()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
-        <button onclick="saveSettings()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Settings</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ MODAL: ALERTS (destinations + routing) ============ -->
+<div id="alerts-backdrop" class="hidden fixed inset-0 z-50 bg-black/70 backdrop-blur-sm modal-backdrop flex items-center justify-center p-4">
+  <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
+    <div class="shrink-0 px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
+      <h2 class="text-[14px] font-bold text-white flex items-center gap-2"><i class="ph-bold ph-bell text-slate-400"></i> Alerts</h2>
+      <button onclick="closeAlerts()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
+    </div>
+
+    <div class="p-5 space-y-4 overflow-y-auto min-h-0 text-[13px]">
+      <!-- Alert Destinations -->
+      <div class="space-y-2">
+        <div class="flex items-center justify-between font-mono text-[12px]">
+          <span class="font-semibold text-slate-300">Alert Destinations</span>
+          <span id="set-summary" class="px-2 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400">—</span>
+        </div>
+        <div id="provider-list" class="space-y-2"></div>
+      </div>
+
+      <!-- Routing & Filter -->
+      <div class="border border-surface-800 rounded-lg p-3 bg-surface-950/40 space-y-2.5">
+        <div class="flex items-center justify-between">
+          <span class="font-semibold text-slate-300">Alert Routing</span>
+          <span class="text-[11px] text-slate-500 font-mono">Scope alert triggers</span>
+        </div>
+        <select id="f-scope" onchange="renderScopeOptions()" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
+          <option value="all">All Sensors</option>
+          <option value="tags">Sensors With Selected Tags</option>
+          <option value="sensors">Only Selected Sensors</option>
+        </select>
+        <div id="scope-options" class="flex flex-wrap gap-1.5"></div>
+        <div class="flex items-center justify-between pt-1">
+          <span class="text-[12px] text-slate-400">Re-Alert Interval (min)</span>
+          <input id="f-realert" type="number" min="0" max="1440" value="30" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200 focus:outline-none focus:border-ok/60">
+        </div>
+      </div>
+
+      <div id="alert-msg" class="hidden text-[12px] font-mono px-3 py-2 rounded-lg border"></div>
+    </div>
+
+    <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
+      <span class="text-[11px] text-slate-500 font-mono">persisted in pulsemon.db</span>
+      <div class="flex gap-2">
+        <button onclick="closeAlerts()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
+        <button onclick="saveAlerts()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Alerts</button>
       </div>
     </div>
   </div>
@@ -845,7 +869,7 @@ function cardHtml(s) {
   const border = paused ? 'border-surface-700/80' : s.status === 'error' ? 'border-bad/40' : s.status === 'warning' ? 'border-warn/40' : 'border-surface-800';
   const badge = httpStatusBadge(s);
 
-  return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-3.5 flex flex-col gap-2.5 transition hover:shadow-lg hover:shadow-black/20 ' + (paused ? 'opacity-70' : '') + '">' +
+  return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-2.5 pb-1 flex flex-col gap-2 transition hover:shadow-lg hover:shadow-black/20 ' + (paused ? 'opacity-70' : '') + '">' +
     '<div class="flex items-start justify-between gap-2">' +
       '<div class="flex items-start gap-2 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
         '<i class="ph-bold ' + m.icon + ' text-[16px] shrink-0 mt-px ' + (m.label === 'PAUSED' ? 'text-slate-500' : m.label === 'UP' ? 'text-ok' : m.label === 'WARN' ? 'text-warn' : 'text-bad') + '"></i>' +
@@ -854,12 +878,13 @@ function cardHtml(s) {
             '<h3 class="text-[14px] font-semibold text-slate-100 font-mono truncate hover:text-ok">' + esc(s.name) + '</h3>' +
             '<span class="px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border ' + (isHttp ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-400') + '">' + typeLabel(s) + '</span>' +
           '</div>' +
-          '<div class="flex flex-wrap items-center gap-1 mt-0.5 min-h-[2.75rem]">' +
-            ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join('') : '') +
-          '</div>' +
         '</div>' +
       '</div>' +
       '<span class="px-2 py-0.5 rounded text-[11px] font-mono font-semibold border flex items-center gap-1 shrink-0 ' + m.cls + '"><i class="ph ' + m.icon + '"></i> ' + m.label + '</span>' +
+    '</div>' +
+
+    '<div class="flex flex-wrap items-start gap-1 min-h-[2.5rem]">' +
+      ((s.tags || []).length ? (s.tags || []).map(t => '<span class="text-[11px] font-mono text-slate-500 px-1.5 py-0.2 rounded bg-surface-950 border border-surface-800">' + esc(t) + '</span>').join('') : '') +
     '</div>' +
 
     '<div class="grid grid-cols-3 gap-2 p-2 bg-surface-950/70 rounded-lg border border-surface-800/80 font-mono text-center">' +
@@ -884,13 +909,13 @@ function cardHtml(s) {
         '<span>past 1h</span>' +
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + '%' + '</span>' : '') +
       '</div>' +
-      '<div class="h-9 flex items-end gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+      '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end') + ' gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
           : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
 
-    '<div class="flex items-center justify-between pt-2.5 border-t border-surface-800/60">' +
+    '<div class="flex items-end justify-between mt-auto pt-1.5 border-t border-surface-800/60">' +
       '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
       '<div class="flex items-center gap-0.5">' +
         '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
@@ -1219,35 +1244,50 @@ async function submitSensor(ev) {
 // ---------- Settings & Alert Routing ----------
 const PROVIDER_META = {
   google_chat: { icon: '💬', name: 'Google Chat' },
-  discord:     { icon: '🎮', name: 'Discord' }
+  discord:     { icon: '🎮', name: 'Discord' },
+  telegram:    { icon: '✈️', name: 'Telegram' }
 };
 function providerMeta(kind) { return PROVIDER_META[kind] || { icon: '📡', name: kind.replace(/_/g, ' ') }; }
 
 async function openSettings() {
   $('set-msg').classList.add('hidden');
-  $('set-summary').textContent = 'loading…';$('settings-backdrop').classList.remove('hidden');
+  $('settings-backdrop').classList.remove('hidden');
   try {
     const s = await api('/api/settings');
     SETTINGS = s;
-    renderProviderList(s.providers || []);
-    $('f-scope').value = s.alert_scope || 'all';$('f-realert').value = s.realert_min ?? 30;
-    renderScopeOptions();
     setMaintUI(SETTINGS.maintenance_mode === true);
     renderTLSStatus(s.tls);
     renderAuthPanel();
     $('f-tls-cert-file').value = '';$('f-tls-key-file').value = '';
     $('tls-cert-file-name').textContent = 'no file';$('tls-key-file-name').textContent = 'no file';
   } catch (e) {
-    $('set-summary').textContent = 'load failed';
-    $('set-summary').className = 'px-2 py-0.5 rounded bg-bad/10 border border-bad/40 text-bad';
-    // Informative empty-state so the section doesn't read as "the feature is gone"
-    const box = $('provider-list');
-    if (box) box.innerHTML = '<div class="border border-bad/40 rounded-lg px-3 py-2 bg-bad/5 text-[12px] font-mono text-bad flex items-center gap-2"><i class="ph-bold ph-warning"></i> Could not load alert settings (<span>' + esc(e.message || 'request failed') + '</span>). <button onclick="openSettings()" class="ml-auto underline hover:text-white">Retry</button></div>';
     setMsg('Failed to load settings: ' + (e.message || 'request failed'), 'bad');
   }
   checkUpdate(false);  // keep the Version row current when Settings opens
 }
 function closeSettings() { $('settings-backdrop').classList.add('hidden'); }
+
+async function openAlerts() {
+  $('alert-msg').classList.add('hidden');
+  $('set-summary').textContent = 'loading…';
+  $('alerts-backdrop').classList.remove('hidden');
+  try {
+    const s = await api('/api/settings');
+    SETTINGS = s;
+    renderProviderList(s.providers || []);
+    $('f-scope').value = s.alert_scope || 'all';
+    $('f-realert').value = s.realert_min ?? 30;
+    renderScopeOptions();
+  } catch (e) {
+    $('set-summary').textContent = 'load failed';
+    $('set-summary').className = 'px-2 py-0.5 rounded bg-bad/10 border border-bad/40 text-bad';
+    // Informative empty-state so the section doesn't read as "the feature is gone"
+    const box = $('provider-list');
+    if (box) box.innerHTML = '<div class="border border-bad/40 rounded-lg px-3 py-2 bg-bad/5 text-[12px] font-mono text-bad flex items-center gap-2"><i class="ph-bold ph-warning"></i> Could not load alert settings (<span>' + esc(e.message || 'request failed') + '</span>). <button onclick="openAlerts()" class="ml-auto underline hover:text-white">Retry</button></div>';
+    setMsg('Failed to load alert settings: ' + (e.message || 'request failed'), 'bad', 'alerts');
+  }
+}
+function closeAlerts() { $('alerts-backdrop').classList.add('hidden'); }
 
 // ---------- Update check ----------
 async function checkUpdate(force) {
@@ -1508,8 +1548,9 @@ function selectedFilterItems() {
   return [...document.querySelectorAll('#scope-options [data-val]')].filter(b => b.classList.contains('bg-ok/15')).map(b => b.dataset.val);
 }
 
-function setMsg(text, kind) {
-  const el = $('set-msg');
+function setMsg(text, kind, target) {
+  const el = $(target === 'alerts' ? 'alert-msg' : 'set-msg');
+  if (!el) return;
   el.textContent = text;
   el.className = 'text-[12px] font-mono px-3 py-2 rounded-lg border ' + (kind === 'bad' ? 'text-bad border-bad/40 bg-bad/5' : 'text-ok border-ok/40 bg-ok/5');
   el.classList.remove('hidden');
@@ -1523,6 +1564,13 @@ function renderProviderList(providers) {
     const meta = providerMeta(p.kind);
     const masked = p.url && p.url.includes('***');
     const urlVal = masked ? '' : (p.url || '');
+    const isTg = p.kind === 'telegram';
+    const chatId = (p.extra && p.extra.chat_id) || '';
+    const urlPlaceholder = isTg ? 'Bot endpoint (api.telegram.org/bot…/sendMessage)' : 'Webhook URL';
+    const extraRow = isTg ? `
+        <div class="mt-1.5 flex items-center gap-2">
+          <input id="prov-chatid-telegram" type="text" placeholder="Chat ID (123456789 or @channel)" value="${chatId}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        </div>` : '';
     const row = document.createElement('div');
     row.className = 'border border-surface-800 rounded-lg px-3 py-2 bg-surface-950/50';
     row.innerHTML = `
@@ -1533,9 +1581,10 @@ function renderProviderList(providers) {
         </button>
       </div>
       <div class="flex items-center gap-2">
-        <input id="prov-url-${p.kind}" type="text" placeholder="Webhook URL" value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        <input id="prov-url-${p.kind}" type="text" placeholder="${urlPlaceholder}" value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
         <button type="button" onclick="testWebhook('${p.kind}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
-      </div>`;
+      </div>
+      ${extraRow}`;
     box.appendChild(row);
   });
   updateSetSummary();
@@ -1554,34 +1603,40 @@ async function toggleProvider(kind) {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ providers: [{ kind, enabled: !p.enabled }] }) });
     SETTINGS = r;
     renderProviderList(r.providers || []);
-  } catch (e) { setMsg(e.message, 'bad'); }
+  } catch (e) { setMsg(e.message, 'bad', 'alerts'); }
 }
 
-async function saveSettings() {
+async function saveAlerts() {
   const body = {
     alert_scope: $('f-scope').value,
     alert_filter: selectedFilterItems(),
-    realert_min: +$('f-realert').value,
-    maintenance_mode: SETTINGS.maintenance_mode === true
+    realert_min: +$('f-realert').value
   };
   body.providers = (SETTINGS.providers || []).filter(p => {
     const input = $('prov-url-' + p.kind);
     return input && input.value.trim() !== '';
-  }).map(p => ({ kind: p.kind, url: $('prov-url-' + p.kind).value.trim() }));
+  }).map(p => {
+    const pb = { kind: p.kind, url: $('prov-url-' + p.kind).value.trim() };
+    if (p.kind === 'telegram') {
+      const ci = $('prov-chatid-telegram');
+      pb.extra = { chat_id: ci ? ci.value.trim() : '' };
+    }
+    return pb;
+  });
 
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     SETTINGS = r;
     renderProviderList(r.providers || []);
-    setMsg('settings saved', 'ok');
-  } catch (e) { setMsg(e.message, 'bad'); }
+    setMsg('alerts saved', 'ok', 'alerts');
+  } catch (e) { setMsg(e.message, 'bad', 'alerts'); }
 }
 
 async function testWebhook(kind) {
   try {
     const r = await api('/api/settings/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ kind }) });
-    setMsg(r.ok ? '✓ ' + r.detail : r.detail, r.ok ? 'ok' : 'bad');
-  } catch (e) { setMsg(e.message, 'bad'); }
+    setMsg(r.ok ? '✓ ' + r.detail : r.detail, r.ok ? 'ok' : 'bad', 'alerts');
+  } catch (e) { setMsg(e.message, 'bad', 'alerts'); }
 }
 
 // ---------- Inspector & Charting ----------

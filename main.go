@@ -39,14 +39,18 @@ func dbPathFromEnv() string {
 // ("", "") for plain HTTP. Both PULSEMON_CERT and PULSEMON_KEY must be set
 // together — a cert without a key (or vice versa) is a misconfiguration
 // worth failing on at startup, not a half-working listener.
+// certFatal is the failure path for a partial TLS env config; stubbed in
+// tests so log.Fatalf (which exits) does not kill the test process.
+var certFatal = func(msg string) { log.Fatal(msg) }
+
 func certPaths() (string, string) {
 	cert := os.Getenv("PULSEMON_CERT")
 	key := os.Getenv("PULSEMON_KEY")
+	if cert == "" && key == "" {
+		return "", "" // plain HTTP
+	}
 	if cert == "" || key == "" {
-		if cert != "" || key != "" {
-			log.Printf("WARNING: PULSEMON_CERT and PULSEMON_KEY must be set together; running plain HTTP")
-		}
-		return "", ""
+		certFatal("CRITICAL: PULSEMON_CERT and PULSEMON_KEY must be set together")
 	}
 	return cert, key
 }
