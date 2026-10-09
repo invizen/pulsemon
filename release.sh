@@ -25,35 +25,36 @@ PUBLISH=0
 echo "pulsemon: releasing $VERSION (publish=$PUBLISH)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
+mkdir -p dist
 
 # --- 1. build both architectures ---------------------------------------------
 for ARCH in amd64 arm64; do
-  OUT="$TMP/pulsemon-linux-$ARCH"
+  OUT="dist/pulsemon-linux-$ARCH"
   echo "pulsemon: building linux/$ARCH ..."
   CGO_ENABLED=0 GOOS=linux GOARCH="$ARCH" \
     go build -trimpath -ldflags "-s -w -X main.Version=$VERSION" -o "$OUT" .
   file "$OUT" | grep -q "ARM aarch64\|x86-64" || { echo "release.sh: bad ELF for $ARCH"; exit 1; }
-  ( cd "$TMP" && sha256sum "pulsemon-linux-$ARCH" > "pulsemon-linux-$ARCH.sha256" )
+  ( cd "dist" && sha256sum "pulsemon-linux-$ARCH" > "pulsemon-linux-$ARCH.sha256" )
 done
 
 # --- 2. verify: the built binaries must satisfy the update verifier -----------
 # Re-check each binary against its own sidecar the way runUpdate/install.sh do.
 for ARCH in amd64 arm64; do
-  ( cd "$TMP" && sha256sum -c "pulsemon-linux-$ARCH.sha256" ) >/dev/null \
+  ( cd "dist" && sha256sum -c "pulsemon-linux-$ARCH.sha256" ) >/dev/null \
     || { echo "release.sh: sidecar verification failed for $ARCH"; exit 1; }
 done
 # And the version stamp actually landed.
 for ARCH in amd64 arm64; do
   # The binary cannot run on the wrong arch; check the stamp in the binary
   # itself (main.Version is a string constant baked into the binary).
-  grep -q "pulsemon: $VERSION" "$TMP/pulsemon-linux-$ARCH" \
-    || grep -q "$VERSION" "$TMP/pulsemon-linux-$ARCH" \
+  grep -q "pulsemon: $VERSION" "dist/pulsemon-linux-$ARCH" \
+    || grep -q "$VERSION" "dist/pulsemon-linux-$ARCH" \
     || { echo "release.sh: version stamp $VERSION not found in linux/$ARCH binary"; exit 1; }
 done
 
 echo
 echo "=== assets ready ==="
-for f in "$TMP"/pulsemon-linux-*; do
+for f in dist/pulsemon-linux-*; do
   echo "  $(basename "$f")  $(sha256sum "$f" | cut -c1-16)…  $(du -h "$f" | cut -f1)"
 done
 echo "  install.sh  (from repo, $(sha256sum install.sh | cut -c1-16)…)"
@@ -75,10 +76,10 @@ git push origin "$VERSION"
 gh release create "$VERSION" \
   --title "pulsemon $VERSION" \
   --notes-file RELEASE_NOTES.md \
-  "$TMP"/pulsemon-linux-amd64 \
-  "$TMP"/pulsemon-linux-amd64.sha256 \
-  "$TMP"/pulsemon-linux-arm64 \
-  "$TMP"/pulsemon-linux-arm64.sha256 \
+  dist/pulsemon-linux-amd64 \
+  dist/pulsemon-linux-amd64.sha256 \
+  dist/pulsemon-linux-arm64 \
+  dist/pulsemon-linux-arm64.sha256 \
   install.sh
 
 echo
