@@ -853,6 +853,28 @@ function render() {
       '<span class="text-slate-500">' + esc(ev.from) + ' → <span class="text-slate-300">' + esc(ev.to) + '</span></span>' +
       '<span class="ml-auto text-slate-500 text-[11px]">' + t + '</span></li>';
   }).join('') : '<li class="px-4 py-3 text-slate-500">no recent state transitions</li>';
+  layoutSparklines();
+}
+
+function layoutSparklines() {
+  // Round each bar to a whole number of PHYSICAL (device) pixels so the browser
+  // rasterizes every bar identically. A fractional CSS width (e.g. 4.14px) is
+  // invisible on a 1x screen but, on fractionally-scaled high-DPI displays
+  // (1.25x / 1.5x), beats against the pixel grid and produces a periodic
+  // "wide bar every Nth" pattern. Snapping to device pixels kills it.
+  const dpr = window.devicePixelRatio || 1;
+  document.querySelectorAll('.h-9.flex').forEach(c => {
+    const bars = c.querySelectorAll('.spark-bar');
+    if (bars.length !== 60) return;
+    const cs = getComputedStyle(c);
+    const inner = c.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    const gap = 2;
+    const innerD = inner * dpr;
+    const gapD = gap * dpr;
+    const barD = Math.max(1, Math.round((innerD - (bars.length - 1) * gapD) / bars.length));
+    const w = barD / dpr;
+    bars.forEach(b => { b.style.flex = 'none'; b.style.width = w + 'px'; });
+  });
 }
 
 function cardHtml(s) {
@@ -909,7 +931,7 @@ function cardHtml(s) {
         '<span>past 1h</span>' +
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + '%' + '</span>' : '') +
       '</div>' +
-      '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end') + ' gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+      '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end justify-center') + ' gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
           : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
@@ -1799,6 +1821,7 @@ document.addEventListener('keydown', e => {
 function startPolling() {
   refresh();
   setInterval(refresh, 5000);
+  let _sparkRt; window.addEventListener('resize', () => { clearTimeout(_sparkRt); _sparkRt = setTimeout(layoutSparklines, 120); });
   setInterval(() => { if (inspectId) loadInspector(); }, 5000);
   checkUpdate(false);                    // initial update check
   setInterval(() => checkUpdate(false), 10 * 60 * 1000);  // re-check every 10 min (backend caches 30)
