@@ -149,12 +149,30 @@ func validateWebhookURL(raw string) error {
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
 		return fmt.Errorf("host %q cannot be used for alerts", host)
 	}
-	if u.Scheme == "http" && !httpAllowsPrivate(host) {
-		return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
-	}
+	// Resolve ONCE and reuse the answers for both the private-check (http
+	// relaxation) and the blocklist pass — the old code resolved twice
+	// (httpAllowsPrivate + LookupIP), doubling DNS and letting the two
+	// answers disagree across a round-robin/rebind boundary.
 	ips, err := net.LookupIP(host)
 	if err != nil {
+		if u.Scheme == "http" {
+			// Match the old failure shape: an http host whose privacy
+			// cannot be established is refused the same as a public one.
+			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+		}
 		return fmt.Errorf("cannot resolve host %q: %v", host, err)
+	}
+	if u.Scheme == "http" {
+		private := false
+		for _, ip := range ips {
+			if ip.IsPrivate() {
+				private = true
+				break
+			}
+		}
+		if !private {
+			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+		}
 	}
 	for _, ip := range ips {
 		if err := checkWebhookIP(ip, host); err != nil {
@@ -164,32 +182,18 @@ func validateWebhookURL(raw string) error {
 	return nil
 }
 
-// httpAllowsPrivate reports whether host may be reached over plain http
-// because it is, or resolves to, a private RFC1918 / ULA address.
-// checkWebhookIP still runs on every address afterwards, so loopback,
-// link-local (169.254/16), unspecified and multicast addresses are rejected
-// here regardless of scheme — http is only a relaxation for addresses
-// already allowed on https.
-func httpAllowsPrivate(host string) bool {
-	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsPrivate()
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		return false
-	}
-	for _, ip := range ips {
-		if ip.IsPrivate() {
-			return true
-		}
-	}
-	return false
-}
+// httpAllowsPrivate was the pre-consolidation double-resolve helper (DNS
+// query #2 at save time, whose answer could disagree with the blocklist
+// pass). validateWebhookURL now resolves once and judges the same answers;
+// the helper is gone.
 
 // blockedSubnets are address ranges a webhook must NEVER target. They are
 // not covered by net.IP.IsPrivate() (which is only RFC1918 + ULA), so they
 // need an explicit check:
 //
+//   - 0.0.0.0/8 — on Linux the whole block (not just 0.0.0.0) routes to the
+//     local table, so net.IP.IsUnspecified() alone leaves http://0.1.2.3
+//     reaching local services.
 //   - 198.18.0.0/15 (RFC 2544) — IETF-reserved-for-testing; never a valid
 //     destination.
 //   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. This is the ISP's
@@ -202,6 +206,7 @@ func httpAllowsPrivate(host string) bool {
 // RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are deliberately
 // NOT here: the design allows them so a LAN relay works.
 var blockedSubnets = []*net.IPNet{
+	mustCIDR("0.0.0.0/8"),
 	mustCIDR("198.18.0.0/15"),
 	mustCIDR("100.64.0.0/10"),
 }

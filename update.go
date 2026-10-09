@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -67,6 +68,29 @@ func parseVer(s string) (maj, min, pat int, ok bool) {
 		}
 	}
 	return maj, min, pat, true
+}
+
+// validVersionToken reports whether v is safe to interpolate into the
+// GitHub releases URL path as a tag name: "v" + [A-Za-z0-9.+-] only, up to
+// 40 chars (semver releases incl. pre-release/build suffixes: v1.2.3,
+// v1.2.3-rc1, v1.2.3+build5). It blocks path traversal ("../evil"),
+// whitespace and control characters (which make http.NewRequest error)
+// from reaching the URL at all. GitHub tags are free-form, but pulsemon's
+// own releases are semver — pinning the accepted shape keeps the URL
+// surface closed.
+func validVersionToken(v string) bool {
+	if len(v) < 2 || len(v) > 40 || v[0] != 'v' {
+		return false
+	}
+	for i := 1; i < len(v); i++ {
+		c := v[i]
+		ok := (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			c == '.' || c == '-' || c == '+'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // newerRelease reports whether the release tag is strictly newer than the
@@ -347,9 +371,15 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 		if !strings.HasPrefix(version, "v") {
 			version = "v" + version
 		}
+		if !validVersionToken(version) {
+			return nil, fmt.Errorf("invalid version %q: expected a release tag like v0.2.2", version)
+		}
 		url = releaseBase + "/tags/" + version
 	}
-	req, _ := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid request for %q: %v", url, err)
+	}
 	req.Header.Set("User-Agent", userAgent())
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := client.Do(req)
@@ -476,10 +506,20 @@ func downloadAsset(client *http.Client, url string) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+	// Hard byte cap: the Content-Length cross-check below only catches
+	// truncation, not a lying CDN that streams an enormous body (or a
+	// mismatched-but-claimed-large one), which would fill the temp
+	// filesystem before any verification could fail. 512 MiB is far past
+	// any plausible pulsemon release.
+	const maxAssetBytes = 512 << 20
 	var got int64
-	if got, err = io.Copy(f, resp.Body); err != nil {
+	if got, err = io.Copy(f, io.LimitReader(resp.Body, maxAssetBytes+1)); err != nil {
 		os.Remove(f.Name())
 		return "", err
+	}
+	if got > maxAssetBytes {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("release asset exceeds %d bytes", maxAssetBytes)
 	}
 	if cl := resp.Header.Get("Content-Length"); cl != "" {
 		if want, perr := strconv.ParseInt(cl, 10, 64); perr == nil && got != want {
@@ -666,22 +706,35 @@ var healthzTimeout = 15 * time.Second
 
 // waitHealthy polls the pulsemon healthz endpoint until it answers a 2xx/3xx or
 // the timeout elapses. It returns ok plus a short detail for the log line.
+//
+// HTTPS is tried BEFORE HTTP: once a cert is installed the plain-HTTP port
+// is deliberately not bound (listener.go serves TLS only), so an http://
+// poll would get connection-refused forever and falsely report the service
+// down after every cert change. TLS verification is skipped because the
+// question here is "did the new process come up and answer", not "is the
+// certificate trusted" — and a self-signed homelab cert must pass too.
 func waitHealthy() (bool, string) {
 	target := healthzTarget()
-	url := "http://" + target + "/api/healthz"
 	deadline := time.Now().Add(healthzTimeout)
-	client := &http.Client{Timeout: 3 * time.Second}
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
 	var lastErr error
 	for {
-		resp, err := client.Get(url)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode < 400 {
-				return true, target
+		for _, scheme := range []string{"https", "http"} {
+			resp, err := client.Get(scheme + "://" + target + "/api/healthz")
+			if err == nil {
+				resp.Body.Close()
+				if resp.StatusCode < 400 {
+					return true, target
+				}
+				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			} else {
+				lastErr = err
 			}
-			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
-		} else {
-			lastErr = err
 		}
 		if time.Now().After(deadline) {
 			return false, target + " — " + lastErr.Error()

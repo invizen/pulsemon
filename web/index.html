@@ -1169,7 +1169,7 @@ function openSensorModal(id) {
 function onFormTypeChange() {
   const isHttp = $('f-type').value === 'http';
   $('f-target-hint').textContent = isHttp ? 'URL (http:// or https://)' : 'IP or hostname';
-  $('f-target').placeholder = isHttp ? 'https://example.com/health' : '192.168.1.1';
+  $('f-target').placeholder = isHttp ? 'https://example.com/health' : '10.0.0.1';
   $('f-type-hint').textContent = isHttp
     ? 'GETs URL — marks up on 2xx status code'
     : 'pulses with ICMP echo — up when host replies';

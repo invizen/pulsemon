@@ -298,20 +298,35 @@ func NewEngine() (*Engine, error) {
 // Mode reports the active transport: "unprivileged-datagram" or "raw".
 func (e *Engine) Mode() string { return e.mode }
 
-// Close stops the engine: it signals the reader to exit (done), blocks until
-// the reader goroutine has actually stopped, then closes the socket. This
-// ordering matters — closing the socket FIRST does not reliably wake the
-// reader (a goroutine blocked in a blocking Recvfrom is NOT interrupted by
-// close(); verified empirically), so we signal via done and WAIT before
-// closing. wg.Wait() guarantees no stale reader is left delivering into the
+// Close stops the engine: it signals the reader to exit (done), then
+// ensures the reader's blocking read is interrupted, then blocks until the
+// reader goroutine has actually stopped. The interruption step is
+// transport-specific:
+//
+//   - datagram: the reader is a Poll loop with a 500ms slice and a done
+//     select, so the done signal alone stops it within one slice — closing
+//     the fd after wg.Wait() is fine (and keeps the socket alive for any
+//     in-flight Sendto until the reader is confirmed stopped).
+//   - raw: ReadFrom blocks indefinitely and is NOT woken by the done
+//     channel alone — closing the conn is what makes it return
+//     net.ErrClosed. Closing AFTER wg.Wait() therefore deadlocks (wait
+//     for the reader ⇄ reader waits for the close). The conn must be
+//     closed BEFORE the wait for this transport.
+//
+// wg.Wait() guarantees no stale reader is left delivering into the
 // package-global pending map. Safe to call when run() was never called (no
 // reader to wait for) and safe to call twice (closeOnce).
 func (e *Engine) Close() {
 	e.closeOnce.Do(func() {
 		e.closeDone()
+		if !e.isDgram && e.closeFn != nil {
+			// raw transport: closing the conn is the wake-up, so it
+			// must happen before wg.Wait(), not after.
+			_ = e.closeFn()
+		}
 		e.wg.Wait()
-		if e.closeFn != nil {
-			e.closeFn()
+		if e.isDgram && e.closeFn != nil {
+			_ = e.closeFn()
 		}
 	})
 }
@@ -430,9 +445,10 @@ func (e *Engine) readDgram() {
 // readRaw is the reader for the raw socket: parse IP/ICMP, filter by our
 // constant ID, dispatch by seq (source-IP verified in deliver).
 //
-// The raw conn is blocking, but Close() closes the connection after the done
-// signal, which makes the pending ReadFrom return an error — so this reader
-// always terminates. The done check also gives a fast exit between reads.
+// The raw conn is blocking, and Close() closes the connection (before
+// waiting for this reader) precisely because that is what makes the pending
+// ReadFrom return net.ErrClosed — so this reader always terminates. The done
+// check also gives a fast exit between reads.
 func (e *Engine) readRaw() {
 	atomic.StoreInt32(&e.readerAlive, 1)
 	defer atomic.StoreInt32(&e.readerAlive, 0)
@@ -569,6 +585,11 @@ func getSharedConn() (*icmp.PacketConn, error) {
 // ("unprivileged-datagram", "raw", or "" if the engine has not started).
 // Shown in /api/healthz.
 func EngineMode() string {
+	// Join the Once first: sharedEngineInst is only written inside it, so
+	// reading it without having passed through Do is an unsynchronized
+	// read racing a concurrent first SharedEngine() call (healthz polled
+	// vs first probe tick). Do on an already-run Once is a no-op load.
+	sharedEngineOnce.Do(func() {})
 	if sharedEngineInst != nil {
 		return sharedEngineInst.mode
 	}
@@ -583,6 +604,7 @@ func EngineMode() string {
 // pings. The probe worker warms the engine at startup precisely so this is
 // visible immediately, not after the first failed probe tick.
 func EngineDead() bool {
+	sharedEngineOnce.Do(func() {}) // see EngineMode: synchronize with the Once's writes
 	return sharedEngineErr != nil
 }
 

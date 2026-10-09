@@ -28,9 +28,12 @@ import (
 //     Settings → TLS upload; lives in the data volume so it survives
 //     container rebuilds)
 //
-// A corrupt or mismatched pair in place at startup must NOT fail the
-// process: pulsemon keeps serving plain HTTP and the user fixes it from
-// the dashboard.
+// A pair that is merely ABSENT at startup is fine: plain HTTP. A pair that
+// is present but unreadable is also tolerated (WARNING, plain HTTP until
+// the files appear — supports an install that stages certs after first
+// boot). But a pair that is in place AND unparseable/mismatched fails the
+// process at startup (log.Fatalf in startListener): silently serving
+// plaintext when the operator believes TLS is on is the worse failure.
 
 const defaultHTTPSPort = 443
 
@@ -165,27 +168,42 @@ func requestRestart() restartOutcome {
 			hint:      "if the dashboard does not return on HTTPS shortly, run: docker restart pulsemon",
 		}
 	default:
-		reexec()
-		syscall.Kill(os.Getpid(), syscall.SIGTERM)
+		// Only SIGTERM ourselves if the child actually started: a failed
+		// re-exec must NOT leave us dead with no successor (the previous
+		// fire-and-forget killed the monitor on any fork/exec failure —
+		// fd exhaustion, deleted binary — turning a TLS settings change
+		// into a permanent outage).
+		if err := reexecFn(); err != nil {
+			return restartOutcome{hint: "re-exec failed: " + err.Error() + " — restart pulsemon manually to apply the change"}
+		}
+		killSelf()
 		return restartOutcome{restarted: true}
 	}
 }
 
+// reexecFn and killSelf are the two side effects of the bare-process
+// restart path. They are vars (like update.go's detectRestart /
+// performRestart) so tests can inject outcomes WITHOUT spawning a real
+// child or SIGTERMing the test process.
+var (
+	reexecFn = reexec
+	killSelf = func() { syscall.Kill(os.Getpid(), syscall.SIGTERM) }
+)
+
 // reexec forks a fresh copy of this process. The child sets
 // PULSEMON_RESTARTING=1 so its listen loop retries the bind for 30s
-// while this process still holds the port.
-func reexec() {
+// while this process still holds the port. It RETURNS any exec error so
+// the caller can keep the old process running instead of SIGTERMing
+// itself into a void with no successor.
+func reexec() error {
 	exe, err := os.Executable()
 	if err != nil {
-		return
+		return err
 	}
 	cmd := exec.Command(exe, os.Args[1:]...)
 	cmd.Env = append(os.Environ(), "PULSEMON_RESTARTING=1")
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Start(); err != nil {
-		// re-exec failed — keep the old config running rather than die
-		return
-	}
+	return cmd.Start()
 }
 
 // runRestartCommand is the manual `pulsemon restart` subcommand: restart

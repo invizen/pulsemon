@@ -212,6 +212,26 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Pair validation comes FIRST: when a cert+key arrive together with a
+	// port, a rejected pair must not have silently moved the stored port
+	// already (the running listener would then differ from the stored
+	// config with no restart applied to reconcile them).
+	cert := req.Cert
+	key := req.Key
+	if (cert == "") != (key == "") {
+		respondWithError(w, http.StatusBadRequest, "cert and key must be sent together")
+		return
+	}
+	var parsed *x509.Certificate
+	var err error
+	if cert != "" {
+		parsed, err = tlsValidatePair(cert, key)
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, "invalid certificate/key pair: "+err.Error())
+			return
+		}
+	}
+
 	// Port validation.
 	if req.Port != nil {
 		if *req.Port < 1 || *req.Port > 65535 {
@@ -224,18 +244,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cert := req.Cert
-	key := req.Key
-	if cert != "" != (key != "") {
-		respondWithError(w, http.StatusBadRequest, "cert and key must be sent together")
-		return
-	}
 	if cert != "" {
-		parsed, err := tlsValidatePair(cert, key)
-		if err != nil {
-			respondWithError(w, http.StatusBadRequest, "invalid certificate/key pair: "+err.Error())
-			return
-		}
 		dir := tlsDir(s.db)
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			respondWithError(w, http.StatusInternalServerError, "create cert dir: "+err.Error())

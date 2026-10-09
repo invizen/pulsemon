@@ -15,5 +15,7 @@ pulsemon-bin
 pingmon
 bin/
 
-# test files stay local (zenai + zentest QA harness) — never in the public repo
-*_test.go
+# test files are COMMITTED since v0.2.3 (security test suite is public)
+
+# local rollback backups — never publish
+*.bak-*

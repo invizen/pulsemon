@@ -49,6 +49,70 @@ const maxHTTPRedirects = 5
 // roots OR genuinely self-signed with a hostname and validity matching the
 // target. That is how self-signed homelab web UIs become monitorable without
 // accepting every certificate.
+//
+// Redirect guard: a monitored public host can 302 the probe anywhere,
+// including cloud metadata (169.254.169.254) or loopback services — the
+// same pivot the webhook client refuses outright. Redirect hops are judged
+// against the same never-reachable ranges (loopback, link-local,
+// unspecified, multicast, plus the webhook blocklist). RFC1918/ULA redirect
+// targets stay allowed on purpose: a LAN device redirecting to its LAN
+// UI is the common legitimate case, and the initial target is
+// admin-configured anyway. The INITIAL request is not guarded — it is the
+// operator's own configured target; only hops the operator did not choose
+// are vetted.
+// redirectTargetAllowed judges a redirect hop for the probe client.
+// Same-host hops (host == origHost, the host of the FIRST request in the
+// chain) pass untouched: router.local/ → router.local/login is the shape of
+// most real web UIs and the operator configured that host anyway. A
+// cross-host hop is resolved and refused if ANY resolved address is in a
+// never-monitorable range (loopback, link-local incl. cloud metadata
+// 169.254.169.254, unspecified, multicast, or a webhook blockedSubnets
+// range). RFC1918/ULA cross-host hops pass: LAN-to-LAN redirects are
+// legitimate for monitoring.
+//
+// Known limitation (stated, not hidden): hostname resolution here has a
+// TOCTOU window that the webhook path closes by pinning its dial to the
+// checked IPs. The probe client cannot pin without a per-probe
+// DialContext, and the attacker would already need sensor-create rights
+// (or LAN access before any user exists). This raises the bar
+// substantially, which is the point.
+func redirectTargetAllowed(host, origHost string) error {
+	if host == "" {
+		return errors.New("redirect with empty host")
+	}
+	if strings.EqualFold(host, origHost) {
+		return nil // same-host hop: the operator's own target
+	}
+	judge := func(ip net.IP) error {
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+			ip.IsUnspecified() || ip.IsMulticast() {
+			return fmt.Errorf("redirect target %q resolves to a blocked address (%s)", host, ip)
+		}
+		for _, n := range blockedSubnets {
+			if n.Contains(ip) {
+				return fmt.Errorf("redirect target %q resolves to a reserved address (%s)", host, ip)
+			}
+		}
+		return nil
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return judge(ip)
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
+	}
+	for _, ip := range ips {
+		if err := judge(ip); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -56,6 +120,13 @@ var httpClient = &http.Client{
 		// requests already made; the next one would be the (len+1)th.
 		if len(via) > maxHTTPRedirects {
 			return http.ErrUseLastResponse
+		}
+		origHost := ""
+		if len(via) > 0 {
+			origHost = via[0].URL.Hostname()
+		}
+		if err := redirectTargetAllowed(req.URL.Hostname(), origHost); err != nil {
+			return err
 		}
 		return nil
 	},
@@ -294,7 +365,7 @@ func validURL(t string) bool {
 	// is accepted. The dotted-host rule otherwise rejects bare single-label
 	// names ("router") that are almost always typos — but a port makes the
 	// target deliberate and unambiguous (e.g. an internal server at
-	// http://zensrv:8080), so a port overrides the dot requirement.
+	// http://nas:8080), so a port overrides the dot requirement.
 	if strings.Contains(host, ".") || strings.Contains(host, ":") || u.Port() != "" {
 		return true
 	}
