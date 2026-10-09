@@ -491,7 +491,7 @@
     </div>
 
     <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
-      <span class="text-[11px] text-slate-500 font-mono">persisted in pulsemon.db</span>
+      <span class="text-[11px] text-slate-500 font-mono flex items-center gap-2"><a href="https://pulsemon.net/alerts" target="_blank" rel="noopener" class="text-ok/80 hover:text-ok hover:underline">Setup guide for each destination →</a><span class="text-slate-600">·</span>persisted in pulsemon.db</span>
       <div class="flex gap-2">
         <button onclick="closeAlerts()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
         <button onclick="saveAlerts()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Alerts</button>
@@ -1245,9 +1245,13 @@ async function submitSensor(ev) {
 const PROVIDER_META = {
   google_chat: { icon: '💬', name: 'Google Chat' },
   discord:     { icon: '🎮', name: 'Discord' },
-  telegram:    { icon: '✈️', name: 'Telegram' }
+  telegram:    { icon: '✈️', name: 'Telegram' },
+  smtp:        { icon: '📧', name: 'Email (SMTP)' }
 };
 function providerMeta(kind) { return PROVIDER_META[kind] || { icon: '📡', name: kind.replace(/_/g, ' ') }; }
+// Safe value readers for the provider extra-field inputs (undefined → '').
+function val(id) { const el = $(id); return el ? el.value.trim() : ''; }
+function sel(id) { const el = $(id); return el ? el.value : ''; }
 
 async function openSettings() {
   $('set-msg').classList.add('hidden');
@@ -1565,12 +1569,37 @@ function renderProviderList(providers) {
     const masked = p.url && p.url.includes('***');
     const urlVal = masked ? '' : (p.url || '');
     const isTg = p.kind === 'telegram';
+    const isSmtp = p.kind === 'smtp';
+    const ex = p.extra || {};
     const chatId = (p.extra && p.extra.chat_id) || '';
-    const urlPlaceholder = isTg ? 'Bot endpoint (api.telegram.org/bot…/sendMessage)' : 'Webhook URL';
-    const extraRow = isTg ? `
+    const urlPlaceholder = isTg ? 'Bot endpoint (api.telegram.org/bot…/sendMessage)' : (isSmtp ? 'SMTP host (smtp.example.com)' : 'Webhook URL');
+    let extraRow = '';
+    if (isTg) {
+      extraRow = `
         <div class="mt-1.5 flex items-center gap-2">
           <input id="prov-chatid-telegram" type="text" placeholder="Chat ID (123456789 or @channel)" value="${chatId}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
-        </div>` : '';
+        </div>`;
+    } else if (isSmtp) {
+      const inp = (id, ph, val, type='text') =>
+        `<input id="${id}" type="${type}" placeholder="${ph}" value="${val||''}" class="flex-1 min-w-0 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">`;
+      const lbl = (t) => `<span class="w-14 shrink-0 text-[10px] uppercase tracking-wide text-slate-500 pt-1">${t}</span>`;
+      extraRow = `
+        <div class="mt-1.5 space-y-1.5">
+          <div class="flex items-center gap-2">${lbl('Port')}${inp('prov-smtp-port','587',ex.port,'number')}</div>
+          <div class="flex items-center gap-2">${lbl('From')}${inp('prov-smtp-from','pulsemon@home.lan',ex.from)}</div>
+          <div class="flex items-center gap-2">${lbl('To')}${inp('prov-smtp-to','ops@home.lan',ex.to)}</div>
+          <div class="flex items-center gap-2">${lbl('User')}${inp('prov-smtp-user','(optional)',ex.username)}</div>
+          <div class="flex items-center gap-2">${lbl('Pass')}${inp('prov-smtp-pass','(app password)',ex.password,'password')}</div>
+          <div class="flex items-center gap-2">${lbl('TLS')}
+            <select id="prov-smtp-tls" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+              <option value="auto" ${ex.tls_mode==='auto'?'selected':''}>auto (465 TLS / else STARTTLS)</option>
+              <option value="starttls" ${ex.tls_mode==='starttls'?'selected':''}>STARTTLS</option>
+              <option value="tls" ${ex.tls_mode==='tls'?'selected':''}>implicit TLS</option>
+              <option value="none" ${ex.tls_mode==='none'?'selected':''}>none (plaintext)</option>
+            </select>
+          </div>
+        </div>`;
+    }
     const row = document.createElement('div');
     row.className = 'border border-surface-800 rounded-lg px-3 py-2 bg-surface-950/50';
     row.innerHTML = `
@@ -1620,6 +1649,17 @@ async function saveAlerts() {
     if (p.kind === 'telegram') {
       const ci = $('prov-chatid-telegram');
       pb.extra = { chat_id: ci ? ci.value.trim() : '' };
+    }
+    if (p.kind === 'smtp') {
+      pb.extra = {
+        host:     pb.url,
+        port:     val('prov-smtp-port'),
+        from:     val('prov-smtp-from'),
+        to:       val('prov-smtp-to'),
+        username: val('prov-smtp-user'),
+        password: val('prov-smtp-pass'),
+        tls_mode: sel('prov-smtp-tls')
+      };
     }
     return pb;
   });

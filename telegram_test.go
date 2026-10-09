@@ -10,7 +10,7 @@ import (
 func TestTelegramCard(t *testing.T) {
 	c := telegramCard("up", "error", "zenkub1", "192.168.1.10", 0)
 	for _, want := range []string{
-		"🔴", "<b>pulsemon: error</b>",
+		"❌", "<b>pulsemon: error</b>",
 		"<b>Sensor:</b> zenkub1", "<b>Target:</b> 192.168.1.10",
 		"<b>State:</b> error",
 	} {
@@ -34,7 +34,7 @@ func TestTelegramCardWithRTT(t *testing.T) {
 func TestTelegramCardRe(t *testing.T) {
 	c := telegramCardRe("error", "zenkub1", "192.168.1.10", 0)
 	for _, want := range []string{
-		"🔴", "re-alert", "<b>State:</b> error",
+		"❌", "re-alert", "<b>State:</b> error",
 	} {
 		if !strings.Contains(c, want) {
 			t.Fatalf("telegramCardRe missing %q in:\n%s", want, c)
@@ -44,9 +44,9 @@ func TestTelegramCardRe(t *testing.T) {
 
 func TestTelegramCardIcons(t *testing.T) {
 	cases := map[string]string{
-		"up":      "🟢",
-		"warning": "🟡",
-		"error":   "🔴",
+		"up":      "✅",
+		"warning": "⚠️",
+		"error":   "❌",
 	}
 	for state, icon := range cases {
 		c := telegramCard("up", state, "s", "t", 0)

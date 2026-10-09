@@ -1,23 +1,39 @@
-# pulsemon v0.2.5
+# v0.2.6
 
-## New: Telegram notification provider
-- Full Telegram bot support: paste the BotFather endpoint URL + Chat ID in the Alerts modal
-- Token stays masked in the UI; chat_id stored as a gated `extra` field
-- Unknown extra keys rejected with 400 (no silent data leakage)
+## New: Email (SMTP) alert provider
 
-## New: Dedicated Alerts modal
-- Alert Destinations, Routing, and Re-Alert Interval moved out of Settings into a dedicated 🔔 Alerts modal (bell icon in header)
-- Settings modal now focuses on Maintenance, Version, TLS, and Authentication
-- Self-saving sections (no aggregate "Save Settings" button)
+pulsemon can now send alerts to an email address. The fifth destination in the
+🔔 Alerts panel alongside Google Chat, Discord, and Telegram.
 
-## UI: Card layout tightening
-- Reduced card padding (`p-2.5 pb-1`) and section gaps for a more compact feel
-- Tags row: now full-width (aligns with metrics box + sparkline), top-aligned, 2-row height reserved
-- Sparkline: "paused" / "collecting…" text centered in the box
-- Footer: `mt-auto` + `items-end` — action icons hug the bottom edge (5px gap)
+- **Transport**: pure-Go `net/smtp` — no new dependencies, no agents.
+- **TLS modes**: `auto` (implicit TLS on 465, opportunistic STARTTLS elsewhere),
+  `starttls`, `tls` (implicit on any port), `none` (trusted LAN relay).
+- **Config**: host, port, from, to, user, password, TLS mode — all editable in
+  the dashboard.
+- **Password handling**: stored in the local database, masked in the API and UI
+  (never returned in the clear). Re-saving the mask is a no-op, so the real
+  credential is never clobbered.
+- **Works with**: Gmail (port 587 + App Password), Fastmail, Proton, and any
+  standard SMTP submission relay.
 
-## Security: Partial TLS config is now fatal
-- `certPaths()` returns a fatal error if only one of `PULSEMON_CERT` / `PULSEMON_KEY` is set
-- Previously: warning + silent fallback to plain HTTP
-- Now: process exits with a clear message (no silent plaintext degradation)
-- Stubbed `certFatal` var for testability; `certpaths_test.go` covers all 4 cases
+## New: alerts setup guide
+
+The Alerts panel now links to a per-destination setup guide at
+[pulsemon.net/alerts](https://pulsemon.net/alerts) — step-by-step for Discord
+webhooks, Google Chat connectors, Telegram bots (token + chat ID), and Gmail
+App Passwords.
+
+## Alert icons now match the dashboard
+
+Alert cards (Discord, Google Chat, Telegram, email) use the same status emoji
+as the dashboard: ✅ up/recovered, ⚠️ warning, ❌ error, ⏸️ paused. The six
+per-provider card builders were consolidated around a single `statusIcon()`
+helper.
+
+## Tests
+
+- 9 new SMTP tests, including an end-to-end delivery test against an
+  in-process SMTP server (real TCP socket, no transport mocking).
+- Settings round-trip tests for the SMTP extra fields (host, port, from, to,
+  user, TLS mode), port/TLS-mode validation, and unknown-key rejection.
+- Full suite green under `go test -race`.

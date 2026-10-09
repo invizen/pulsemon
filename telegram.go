@@ -12,9 +12,9 @@ import "fmt"
 // {chat_id, text, parse_mode:"HTML"} to that endpoint — no SDK, no auth
 // beyond the token already in the URL.
 func telegramCard(oldState, state, name, target string, rttMs float64) string {
-	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	title := recoveryTitle(oldState, state)
 	card := fmt.Sprintf("%s <b>pulsemon: %s</b>\n<b>Sensor:</b> %s\n<b>Target:</b> %s\n<b>State:</b> %s", icon, title, name, target, state)
@@ -25,9 +25,9 @@ func telegramCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func telegramCardRe(state, name, target string, rttMs float64) string {
-	icon := map[string]string{"warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	card := fmt.Sprintf("%s <b>pulsemon: still %s (re-alert)</b>\n<b>Sensor:</b> %s\n<b>Target:</b> %s\n<b>State:</b> %s — no change, re-notifying", icon, state, name, target, state)
 	if rttMs > 0 {

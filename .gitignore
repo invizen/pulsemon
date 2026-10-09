@@ -19,3 +19,6 @@ bin/
 
 # local rollback backups — never publish
 *.bak-*
+
+# release build output
+ dist/

@@ -1312,6 +1312,13 @@ var providerList = []providerMeta{
 		Enabled:     flagEnabled("telegram"),
 		HasURL:      telegramHasURL,
 	},
+	{
+		Kind: "smtp", Label: "Email (SMTP)", URLField: "smtp_host",
+		Placeholder: "smtp.example.com",
+		EnvFallback: "",
+		Enabled:     smtpEnabled,
+		HasURL:      smtpHasURL,
+	},
 }
 
 func providerByKey(kind string) (providerMeta, bool) {
@@ -1393,6 +1400,33 @@ func providerExtra(p providerMeta, db *DB) map[string]string {
 			return map[string]string{"chat_id": cid}
 		}
 	}
+	if p.Kind == "smtp" {
+		extra := map[string]string{}
+		if v := db.GetSetting("smtp_port"); v != "" {
+			extra["port"] = v
+		}
+		if v := db.GetSetting("smtp_from"); v != "" {
+			extra["from"] = v
+		}
+		if v := db.GetSetting("smtp_to"); v != "" {
+			extra["to"] = v
+		}
+		if v := db.GetSetting("smtp_username"); v != "" {
+			extra["username"] = v
+		}
+		if v := db.GetSetting("smtp_tls_mode"); v != "" {
+			extra["tls_mode"] = v
+		}
+		// The password is never returned in the clear. A stored password is
+		// surfaced as a fixed mask ("••••••••") so the UI knows the field is
+		// filled; the save path treats the mask as "unchanged" and omits it.
+		if db.GetSetting("smtp_password") != "" {
+			extra["password"] = "••••••••"
+		}
+		if len(extra) > 0 {
+			return extra
+		}
+	}
 	return nil
 }
 
@@ -1400,6 +1434,11 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 	out := []providerStatus{}
 	for _, p := range providerList {
 		url := pw.db.GetSetting(p.Kind + "_url")
+		if p.Kind == "smtp" {
+			// SMTP stores the mail server under smtp_host (not smtp_url);
+			// surface it as the display URL so the UI shows the host.
+			url = pw.db.GetSetting("smtp_host")
+		}
 		source := "none"
 		if url != "" {
 			source = "dashboard"
@@ -1451,6 +1490,19 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 				"text":       card,
 				"parse_mode": "HTML",
 			})
+		case "smtp":
+			// SMTP is not a webhook POST — it dials the mail server. The url
+			// variable is the host here (URLField: smtp_host); delivery is a
+			// plain-text email via sendSMTP.
+			subject := smtpSubject(oldState, state)
+			body := smtpBody(oldState, state, name, target, rttMs)
+			if reAlert {
+				subject = smtpSubject(state, state) + " (re-alert)"
+				body = smtpBodyRe(state, name, target, rttMs)
+			}
+			if err := pw.sendSMTP(pw.stopCtx, subject, body); err != nil {
+				log.Printf("smtp alert to %s: %v", url, err)
+			}
 		}
 	}
 }
@@ -1469,20 +1521,34 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	if url == "" && p.EnvFallback != "" {
 		url = os.Getenv(p.EnvFallback)
 	}
-	if url == "" {
+	if p.Kind == "smtp" {
+		// SMTP has no URL field; the host+recipient gate is smtpHasURL.
+		if !smtpHasURL(pw.db) {
+			return false, "no SMTP host and recipient configured"
+		}
+	} else if url == "" {
 		return false, "no " + p.Label + " webhook URL configured"
 	}
 	var body map[string]string
 	if p.Kind == "discord" {
-		body = map[string]string{"content": "🟢 **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
+		body = map[string]string{"content": "✅ **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
 	} else if p.Kind == "telegram" {
 		body = map[string]string{
 			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
-			"text":       "🟢 <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings\n<b>Target:</b> webhook-verify\n<b>State:</b> <b>test</b> — your Telegram bot works.",
+			"text":       "✅ <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings\n<b>Target:</b> webhook-verify\n<b>State:</b> <b>test</b> — your Telegram bot works.",
 			"parse_mode": "HTML",
 		}
+	} else if p.Kind == "smtp" {
+		// SMTP test: send a real email (no JSON body). Returns after the
+		// protocol round-trip, not the shared http.Client path below.
+		subject := "✅ pulsemon: test alert"
+		bodyTxt := "✅ pulsemon: test alert\nSensor: settings\nTarget: webhook-verify\nState: test — your SMTP relay works."
+		if err := pw.sendSMTP(ctx, subject, bodyTxt); err != nil {
+			return false, err.Error()
+		}
+		return true, "test email sent via " + p.Label + " (SMTP 250 OK)"
 	} else {
-		body = map[string]string{"text": "🟢 *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
+		body = map[string]string{"text": "✅ *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
 	if err != nil {
@@ -1572,10 +1638,16 @@ func recoveryTitle(oldState, state string) string {
 	return state
 }
 
+// statusIcon maps a sensor state to the alert-card emoji, matching the
+// dashboard's icon language (check-circle / warning / x-circle / pause-circle).
+func statusIcon(state string) string {
+	return map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}[state]
+}
+
 func cardFor(oldState, state, name, target string, rttMs float64) string {
-	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	title := recoveryTitle(oldState, state)
 	card := fmt.Sprintf("%s *pulsemon: %s*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s**",
@@ -1587,9 +1659,9 @@ func cardFor(oldState, state, name, target string, rttMs float64) string {
 }
 
 func cardForRe(state, name, target string, rttMs float64) string {
-	icon := map[string]string{"warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	card := fmt.Sprintf("%s *pulsemon: still %s (re-alert)*\n*Sensor*: %s\n*Target*: %s\n*State*: **%s** — no change, re-notifying",
 		icon, state, name, target, state)
@@ -1602,9 +1674,9 @@ func cardForRe(state, name, target string, rttMs float64) string {
 // Discord uses Markdown (**bold**, no *italic* emphasis); the card is plain
 // content. Same information, Discord-flavored.
 func discordCard(oldState, state, name, target string, rttMs float64) string {
-	icon := map[string]string{"up": "🟢", "warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	title := recoveryTitle(oldState, state)
 	card := fmt.Sprintf("%s **pulsemon: %s**\n**Sensor:** %s\n**Target:** %s\n**State:** %s", icon, title, name, target, state)
@@ -1615,9 +1687,9 @@ func discordCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func discordCardRe(state, name, target string, rttMs float64) string {
-	icon := map[string]string{"warning": "🟡", "error": "🔴"}[state]
+	icon := statusIcon(state)
 	if icon == "" {
-		icon = "🟢"
+		icon = "✅"
 	}
 	card := fmt.Sprintf("%s **pulsemon: still %s (re-alert)**\n**Sensor:** %s\n**Target:** %s\n**State:** %s — no change, re-notifying", icon, state, name, target, state)
 	if rttMs > 0 {

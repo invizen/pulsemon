@@ -1287,13 +1287,24 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 	}
 	if url != nil {
 		u := strings.TrimSpace(*url)
-		if u != "" {
+		if u != "" && kind != "smtp" {
+			// SMTP's url field carries the mail-server host (a hostname), not
+			// an http(s):// webhook — it is validated as host+port in the
+			// extra-fields pass below, not as a URL.
 			if err := validateWebhookURL(u); err != nil {
 				return fmt.Errorf("%s url: %s", kind, err.Error())
 			}
 		}
-		if err := s.db.SetSetting(kind+"_url", u); err != nil {
-			return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
+		if kind == "smtp" {
+			// Persist the host under smtp_host (not smtp_url) so the SMTP
+			// transport reads it from the right key.
+			if err := s.db.SetSetting("smtp_host", u); err != nil {
+				return fmt.Errorf("failed to save smtp host: %s", err.Error())
+			}
+		} else {
+			if err := s.db.SetSetting(kind+"_url", u); err != nil {
+				return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
+			}
 		}
 	}
 	if enabled != nil {
@@ -1311,7 +1322,26 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 		if !extraFields[kind][k] {
 			return fmt.Errorf("unknown field %q for %s", k, kind)
 		}
-		if err := s.db.SetSetting(kind+"_"+k, strings.TrimSpace(v)); err != nil {
+		vv := strings.TrimSpace(v)
+		// SMTP password: the mask value means "unchanged" (the UI returns the
+		// fixed mask for a stored password). Skip the write so we never clobber
+		// the real credential with the mask string.
+		if kind == "smtp" && k == "password" && vv == "••••••••" {
+			continue
+		}
+		if kind == "smtp" && k == "port" && vv != "" {
+			if _, err := smtpPort(vv); err != nil {
+				return fmt.Errorf("smtp %s: %s", k, err.Error())
+			}
+		}
+		if kind == "smtp" && k == "tls_mode" && vv != "" {
+			switch vv {
+			case "auto", "starttls", "tls", "none":
+			default:
+				return fmt.Errorf("smtp tls_mode: %q (valid: auto, starttls, tls, none)", vv)
+			}
+		}
+		if err := s.db.SetSetting(kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
 		}
 	}
@@ -1323,6 +1353,8 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // validation applies.
 var extraFields = map[string]map[string]bool{
 	"telegram": {"chat_id": true},
+	"smtp": {"host": true, "port": true, "from": true, "to": true,
+		"username": true, "password": true, "tls_mode": true},
 }
 
 func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
