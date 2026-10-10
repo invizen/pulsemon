@@ -362,6 +362,74 @@ func (db *DB) SetSensorTags(id string, tags []string) error {
 	return tx.Commit()
 }
 
+// SetMaintenanceMode atomically applies a maintenance mode transition in ONE
+// transaction: pauses/resumes the given sensors AND updates the
+// maintenance_mode + maintenance_active_ids settings, so a crash mid-write
+// can't leave sensors paused without the mode flag (or vice versa). Without
+// this, the three separate autocommit writes (SetSensorStates, snapshot,
+// mode) could tear: a crash after pausing but before setting mode=1 orphans
+// the sensors in paused state with no maintenance banner and no toggle to
+// trigger the resume path. Mirrors the SetSensorTags transaction idiom
+// above: a mid-write error (or crash) rolls back cleanly.
+//
+// on=true:  pause ids, save snapJSON as maintenance_active_ids, set mode=1.
+// on=false: resume ids, clear maintenance_active_ids, set mode=0.
+//
+// The chunked sensor-state UPDATE mirrors SetSensorStates so an unbounded
+// id list can't exceed SQLite's parameter limit.
+func (db *DB) SetMaintenanceMode(on bool, ids []string, snapJSON string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+
+	state := "paused"
+	modeVal := "1"
+	if !on {
+		state = "active"
+		modeVal = "0"
+		snapJSON = "" // clear the snapshot on resume
+	}
+
+	// 1. Pause/resume the sensors (chunked to stay under SQLite's param limit).
+	if len(ids) > 0 {
+		for start := 0; start < len(ids); start += inQueryChunk {
+			end := start + inQueryChunk
+			if end > len(ids) {
+				end = len(ids)
+			}
+			chunk := ids[start:end]
+			q := make([]string, len(chunk))
+			args := make([]any, 0, len(chunk)+1)
+			args = append(args, state)
+			for j, id := range chunk {
+				q[j] = "?"
+				args = append(args, id)
+			}
+			if _, err := tx.Exec("UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...); err != nil {
+				return err
+			}
+		}
+	}
+
+	// 2. Save/clear the snapshot.
+	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		"maintenance_active_ids", snapJSON, tsNow()); err != nil {
+		return err
+	}
+
+	// 3. Set the mode flag.
+	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		"maintenance_mode", modeVal, tsNow()); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
 // AllTags returns each distinct tag with the number of sensors using it.
 func (db *DB) AllTags() map[string]int {
 	rows, err := db.Query(`SELECT tag, COUNT(DISTINCT sensor_id) FROM sensor_tags GROUP BY tag ORDER BY tag`)

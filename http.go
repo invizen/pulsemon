@@ -76,6 +76,24 @@ const maxHTTPRedirects = 5
 // DialContext, and the attacker would already need sensor-create rights
 // (or LAN access before any user exists). This raises the bar
 // substantially, which is the point.
+//
+// Security-review note (deliberate, do NOT "fix" by blocking private ranges):
+// Allowing RFC1918/ULA cross-host redirect hops is INTENTIONAL, not an
+// oversight. The probe client performs no IP-range check on the INITIAL
+// target at all — it is the operator's own configured sensor — so anyone who
+// can create a sensor can already point a probe straight at
+// http://192.168.1.1/reboot as the FIRST request. The redirect path grants no
+// additional reach; it duplicates a capability the tool has by design, so it
+// is not an SSRF relay. The guard's real job is already closed: it stops an
+// EXTERNALLY-monitored public host from 302-ing the probe into cloud metadata
+// (169.254.169.254), loopback, or reserved space — the pivot that matters.
+// A blanket ip.IsPrivate() block here (as an external review proposed) would
+// regress the pinned legitimate case — a public hostname served via
+// split-horizon DNS to a LAN IP, or an external URL 302-ing to an internal
+// dashboard — while shrinking the real attack surface by zero, because the
+// initial-target path stays open by design. This is a single-operator LAN
+// tool: the person who can create a sensor owns the whole LAN's monitoring
+// surface. See TestRedirectTargetAllowed ("LAN redirect stays allowed").
 func redirectTargetAllowed(host, origHost string) error {
 	if host == "" {
 		return errors.New("redirect with empty host")

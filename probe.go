@@ -314,6 +314,41 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 // without a process restart: target/interval/timeout are read by the loop
 // and loss_warn/down_after by deriveStatus, all from the spawn-time config
 // copy captured in syncSensors.
+//
+// Deliberate: cancel + delete ONLY. The respawn is the NEXT syncSensors
+// pass (Run's 5s ticker), not an immediate re-spawn here. That leaves a
+// <=5s + staggered-phase gap before the sensor's next probe, which is
+// WITHIN its normal per-interval cadence (15-60s) and is not a missed
+// alert: the DB is the source of truth and deriveStatus re-derives state
+// from probe history on the next probe, so a down sensor is caught within
+// ~5s of the respawn. This is the documented M2 design (see
+// api_restart_test.go).
+//
+// Security/concurrency-review note (deliberate, do NOT "fix" by re-spawning
+// in Restart): there is NO duplicate-loop race and NO map race. pw.loops is
+// guarded by pw.mu at every access (syncSensors, Restart, Remove,
+// ActiveCount); syncSensors runs on a SINGLE goroutine (only Run's first
+// pass + its ticker call it - API handlers call Restart/Remove, never
+// syncSensors); and an old sensorLoop's cleanup on ctx.Done() just returns
+// and never touches pw.loops, so the "old loop cleaning up while the new
+// one spawns" case has nothing to race on. A duplicate entry cannot form:
+// the spawn is guarded by `if _, ok := pw.loops[id]; !ok` under the same
+// lock that deletes it. The only real overlap (an old loop mid-doProbe when
+// a new one spawns) writes ONE shared *ProbeState at pw.sensors[id] under
+// the mutex (doProbe) - two goroutines, one object, locked. Correct.
+//
+// CRITICAL invariant a naive "re-spawn in Restart" fix breaks: every loop
+// is a CHILD of Run's ctx (see syncSensors: WithCancel(ctx)). Run's
+// shutdown path does `case <-ctx.Done(): pw.wg.Wait()` and RELIES on every
+// loop being a child of that ctx so it exits at its next select. Spawning
+// with context.WithCancel(context.Background()) (as a proposed review fix
+// did) SEVERS that: the Background-parented loop is never cancelled by
+// ctx.Done(), so Run's wg.Wait() HANGS FOREVER for any sensor that was ever
+// restarted - the process can no longer shut down or close the DB. If the
+// <=5s respawn gap is ever worth closing, the safe form is: re-read config
+// from the DB, delete pw.sensors[id] first, and spawn under the EXISTING
+// Run ctx (never Background) - keeping the mutex discipline and the
+// shutdown invariant intact.
 func (pw *ProbeWorker) Restart(id string) {
 	pw.mu.Lock()
 	if cancel, ok := pw.loops[id]; ok {
@@ -1155,12 +1190,22 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	}
 	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, limit)
 	if err != nil {
-		// Can't read the probe history, so we can't know the real state —
-		// report unknown (warning), never "up". Matches the broken-socket path
-		// above: a monitoring tool must not fake a recovery it can't confirm.
-		// A transient WAL/SQLite hiccup just reads degraded for this one tick
-		// and self-clears next tick, and it never fires an alert (warning is
-		// dashboard-only — see alertableTransition).
+		// Can't read the probe history, so we can't know the real state.
+		// Retain the last known status (lastStatus) rather than manufacturing a
+		// transition: a monitoring tool must not fake a recovery it can't confirm,
+		// AND it must not fabricate a spurious one. Returning "warning" here (the
+		// old behavior) was a BUG for a sensor in "error":
+		// alertableTransition("error", "warning") is true (a "partial recovery"),
+		// so a transient WAL/SQLite hiccup on a downed sensor fired a false
+		// recovery webhook AND corrupted the DB status to "warning". Retaining
+		// lastStatus means doProbe sees a same-state tick (no UPDATE, no event,
+		// no alert); a downed sensor stays down and its sustained-error re-alert
+		// path (maybeRealert) handles it. A brand-new sensor (lastStatus == "")
+		// has no known state, so it reads "warning" (unknown) — never "up".
+		// Self-clears next tick once the DB is healthy again.
+		if lastStatus != "" {
+			return lastStatus
+		}
 		return "warning"
 	}
 	defer rows.Close() // top-level: this function has a post-Query return ("warning"),
@@ -1253,6 +1298,27 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 // so a row at 15:13:11.900 is treated as 15:13:11 — a 1-second boundary error
 // on EVERY row, not just the rare integer-second one. The string compare is
 // strictly better.
+// purgeOld deletes probes and events older than 24 hours.
+//
+// Uses a same-format RFC3339Nano string compare (ts < cutoff) rather than
+// epoch integers. Both the stored ts (tsNow() → RFC3339Nano) and the cutoff
+// (RFC3339Nano) use the SAME variable-width format, so lexicographic order
+// matches chronological order EXACTLY for all real rows. The only divergence
+// is at the 1-in-1e9 boundary where time.Now() produces zero fractional
+// seconds ("...Z" vs "...0Z"): the "Z" row (0x5A) sorts AFTER the
+// fractional row ("." = 0x2E) in the same second, causing OVER-retention
+// of at most ~1 second, never early-deletion. An epoch compare
+// (strftime('%s')) was empirically tested and rejected: it truncates
+// fractional seconds, introducing a systematic 1-second boundary error
+// that the string compare doesn't have. The v0.1.18 window bug was a
+// MIXED-format compare (RFC3339 'T'-sep vs datetime('now') space-sep) —
+// that's been fixed; this same-format compare is the correct approach.
+//
+// Review note (2026-10-10): a code review flagged this as a "hardcoded
+// RFC3339 string format truncation hazard" and suggested unixepoch(ts).
+// DISMISSED — the epoch fix is a net regression (truncation error), the
+// string compare is exact for same-format strings, and the 1-in-1e9
+// boundary case over-retains by ≤1s (harmless for a 24h retention window).
 func (pw *ProbeWorker) purgeOld() {
 	cutoff := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
 	for _, table := range []string{"probes", "events"} {

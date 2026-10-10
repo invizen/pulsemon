@@ -1219,17 +1219,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				respondWithError(w, http.StatusBadRequest, "no active sensors to pause")
 				return
 			}
-			if _, err := s.db.SetSensorStates(ids, "paused"); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to pause sensors: "+err.Error())
-				return
-			}
+			// Atomic: pause + snapshot + mode flag in ONE transaction so a
+			// crash can't leave sensors paused without the mode flag (or
+			// vice versa). See SetMaintenanceMode in db.go.
 			snapJSON, _ := json.Marshal(ids)
-			if err := s.db.SetSetting("maintenance_active_ids", string(snapJSON)); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-				return
-			}
-			if err := s.db.SetSetting("maintenance_mode", "1"); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+			if err := s.db.SetMaintenanceMode(true, ids, string(snapJSON)); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to enter maintenance mode: "+err.Error())
 				return
 			}
 			// Paused sensors don't probe, so their alert state can't drift;
@@ -1250,16 +1245,10 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 					ids = nil
 				}
 			}
-			if _, err := s.db.SetSensorStates(ids, "active"); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to resume sensors: "+err.Error())
-				return
-			}
-			if err := s.db.SetSetting("maintenance_active_ids", ""); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-				return
-			}
-			if err := s.db.SetSetting("maintenance_mode", "0"); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+			// Atomic: resume + clear snapshot + mode flag in ONE transaction.
+			// See SetMaintenanceMode in db.go.
+			if err := s.db.SetMaintenanceMode(false, ids, ""); err != nil {
+				respondWithError(w, http.StatusInternalServerError, "failed to leave maintenance mode: "+err.Error())
 				return
 			}
 			s.probeWorker.ResetAlertStates()

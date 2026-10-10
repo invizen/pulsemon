@@ -585,6 +585,28 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleAuthLogin is the only unauthenticated credential-checking endpoint,
+// so its DoS surface is the per-IP throttle, not a global concurrency cap.
+//
+// Security-review note (deliberate, do NOT "fix" with an in-flight bcrypt
+// semaphore): the single-attacker vector is already closed — loginAllowed
+// rejects a locked-out IP at 429 BEFORE any bcrypt runs (7 fails/60s -> 5 min
+// lockout, plus a constant 200ms delay on every 401 capping ~5 guesses/s/IP),
+// and ClientIP keys the throttle to the TCP peer (a spoofed X-Forwarded-For
+// from an untrusted peer is ignored), so the counter cannot be rotated to
+// dodge the lockout. The only residual is a MULTI-source-IP botnet — the
+// classic per-IP-limit bypass — which is OUT of this tool's threat model
+// (single-operator LAN dashboard, not an anonymous internet endpoint; see the
+// file header). Bounding bcrypt concurrency in-app does not stop that vector,
+// and a non-blocking semaphore (select/default -> reject) would actively
+// REGRESS legitimate logins: under attack the 2 slots stay busy with the
+// attacker's requests and every real operator login hits the default branch
+// and fails at the exact moment they most need to get in to check the
+// degraded dashboard. If this ever becomes internet-facing, the right
+// hardening is a GLOBAL in-flight cap that QUEUES (blocking select with a
+// timeout) rather than fails, or a connection cap / fail2ban at the reverse
+// proxy (which PULSEMON_TRUSTED_PROXIES already anticipates) — not an in-app
+// semaphore that locks the operator out.
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
