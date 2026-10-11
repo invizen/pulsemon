@@ -1,0 +1,89 @@
+name: Windows release
+
+# Builds the Windows amd64 binary + Inno Setup installer and attaches them to
+# the GitHub release. Composes with the existing Linux release flow (cut from
+# zenai via `gh release create`): this workflow just ADDS the Windows assets to
+# the same release. Triggered on a version tag push (automatic) or manually
+# (workflow_dispatch, e.g. to add Windows assets to an already-published
+# release).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to attach Windows assets to (e.g. v0.3.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      # Tag push -> the tag name; manual run -> the provided version.
+      VER: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: Build pulsemon-windows-amd64.exe
+        shell: pwsh
+        run: |
+          if (-not $env:VER) { throw "no version resolved (VER is empty)" }
+          $env:CGO_ENABLED = '0'
+          $env:GOOS = 'windows'
+          $env:GOARCH = 'amd64'
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          go build -trimpath -ldflags "-s -w -X main.Version=$env:VER" -o "dist/pulsemon-windows-amd64.exe" .
+          if ($LASTEXITCODE -ne 0) { throw "go build failed" }
+          $hash = (Get-FileHash -Algorithm SHA256 "dist/pulsemon-windows-amd64.exe").Hash.ToLower()
+          "$hash  pulsemon-windows-amd64.exe" | Out-File -Encoding ascii "dist/pulsemon-windows-amd64.exe.sha256"
+          Write-Host "Built dist/pulsemon-windows-amd64.exe  sha256=$hash"
+
+      - name: Build Inno Setup installer
+        shell: pwsh
+        run: |
+          $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
+          if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
+          & $iscc "/DMyAppVersion=$env:VER" "installer/pulsemon.iss"
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          Write-Host "Installer output:"
+          Get-ChildItem "installer\output" | ForEach-Object { Write-Host ("  " + $_.Name) }
+
+      - name: Verify installer present
+        shell: pwsh
+        run: |
+          $setup = "installer\output\pulsemon-setup-$env:VER.exe"
+          if (-not (Test-Path $setup)) { throw "expected installer not found: $setup" }
+
+      - name: Upload to GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $assets = @(
+            "dist\pulsemon-windows-amd64.exe",
+            "dist\pulsemon-windows-amd64.exe.sha256",
+            "installer\output\pulsemon-setup-$env:VER.exe"
+          )
+          # On a tag push the Linux release (cut from zenai) may not exist yet,
+          # so retry the upload for a couple of minutes. On a manual run the
+          # release already exists and this succeeds on the first attempt.
+          $ok = $false
+          for ($i = 0; $i -lt 10; $i++) {
+            if (gh release upload $env:VER @assets --clobber) { $ok = $true; break }
+            Write-Host "release $env:VER not ready (attempt $($i+1)/10); retrying in 15s"
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw "could not upload Windows assets to release $env:VER" }
+          Write-Host "Uploaded Windows assets to $env:VER"
