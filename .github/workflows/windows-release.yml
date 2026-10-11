@@ -88,6 +88,7 @@ jobs:
         shell: pwsh
         run: |
           $ver = $env:VER -replace '^v',''
+          $tag = "v$ver"   # GitHub releases are always tagged with the v prefix
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",
@@ -99,10 +100,10 @@ jobs:
           # release already exists and this succeeds on the first attempt.
           $ok = $false
           for ($i = 0; $i -lt 10; $i++) {
-            $out = & gh release upload $env:VER @assets --clobber 2>&1
+            $out = & gh release upload $tag @assets --clobber 2>&1
             if ($LASTEXITCODE -eq 0) { $ok = $true; break }
             Write-Host "upload attempt $($i+1)/10 failed: $out"
             Start-Sleep -Seconds 15
           }
-          if (-not $ok) { throw "could not upload Windows assets to release $env:VER" }
-          Write-Host "Uploaded Windows assets to $env:VER"
+          if (-not $ok) { throw "could not upload Windows assets to release $tag" }
+          Write-Host "Uploaded Windows assets to $tag"
