@@ -107,9 +107,10 @@ func TestEngineReaderRetriesEINTR(t *testing.T) {
 		t.Skip("datagram transport unavailable; EINTR path is datagram-only")
 	}
 
-	// Inject EINTR on the first 3 poll calls, then real behavior.
+	// Inject EINTR on the first 3 poll calls, then real behavior. The poll
+	// seam lives on the Linux datagram driver (ping_linux.go), not the Engine.
 	var calls int32
-	e.pollFn = func(fds []unix.PollFd, timeout int) (int, error) {
+	e.dgram.(*dgramTransport).pollFn = func(fds []unix.PollFd, timeout int) (int, error) {
 		if atomic.AddInt32(&calls, 1) <= 3 {
 			return 0, unix.EINTR
 		}

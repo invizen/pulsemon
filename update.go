@@ -15,7 +15,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -552,14 +551,7 @@ func installBinary(src, dst string) error {
 	// inode with one owned by the executing user, so restore the recorded
 	// owner on EVERY original — including 0:0, which the previous
 	// "uid != 0 || gid != 0" guard silently skipped.
-	var wantUID, wantGID uint32
-	haveOwner := false
-	if fi, err := os.Stat(dst); err == nil && fi.Sys() != nil {
-		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
-			wantUID, wantGID = st.Uid, st.Gid
-			haveOwner = true
-		}
-	}
+	wantUID, wantGID, haveOwner := binaryOwner(dst)
 
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, ".pulsemon-swap-*")
@@ -590,7 +582,7 @@ func installBinary(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
+	if err := swapBinary(tmpName, dst); err != nil {
 		return err
 	}
 	if haveOwner {

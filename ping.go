@@ -10,12 +10,10 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"golang.org/x/sys/unix"
 )
 
 // One shared ICMP socket for the whole process.
@@ -25,16 +23,15 @@ import (
 // replies being attributed to the wrong sensor under load):
 //
 //  1. "unprivileged-datagram" (preferred): a SOCK_DGRAM / IPPROTO_ICMP
-//     socket — the same kind the `ping` binary uses as a normal user.
-//     Gated by the kernel's `ping_group_range` (readable as non-root),
-//     NO CAP_NET_RAW, NO root. On Linux the kernel overwrites the ICMP
-//     identifier with a per-socket value and only delivers replies for
-//     OUR socket, so on this path we dispatch by sequence number +
-//     source IP (no constant-ID filter).
+//     socket — the same kind the `ping` binary uses as a normal user. On
+//     Linux it is gated by the kernel's `ping_group_range` (NO CAP_NET_RAW,
+//     NO root); on Windows the IP driver allows it for any user. The
+//     datagram driver is platform-specific (ping_linux.go / ping_windows.go)
+//     and implements the dgramState interface below.
 //
 //  2. "raw" (fallback): icmp.ListenPacket("ip4:icmp") — SOCK_RAW, needs
-//     root or CAP_NET_RAW. Kept so the tool also works where the
-//     datagram socket is unavailable (ping_group_range not configured).
+//     root / CAP_NET_RAW (Linux) or an elevated process (Windows). Kept so
+//     the tool also works where the datagram socket is unavailable.
 //
 // EngineMode() reports which transport is active (shown in /api/healthz).
 
@@ -122,57 +119,21 @@ func LastProbeError() string {
 type sendFunc func(dst net.IP, seq uint16) error
 type closeFunc func() error
 
-// dgramTransport: unprivileged SOCK_DGRAM ICMP. The kernel fills in the
-// ICMP identifier itself, so callers must not assume a constant ID in
-// replies (dispatch is by seq).
-type dgramTransport struct {
-	fd int
+// dgramState is the platform-specific unprivileged-datagram transport driver:
+// the socket handle plus the reply-reader it runs. Implemented in
+// ping_linux.go (non-blocking fd + Poll loop) and ping_windows.go (blocking
+// Recvfrom). The portable Engine drives it through this interface so the
+// platform socket details never leak into the shared code.
+type dgramState interface {
+	// run starts the reader goroutine (the Engine tracks it via its wg).
+	run(e *Engine)
+	// stop interrupts the reader's blocking read so it can exit. Engine.Close
+	// calls this BEFORE wg.Wait(). Linux: no-op (the Poll loop exits on the
+	// done channel). Windows: closes the handle, which unblocks Recvfrom.
+	stop()
 }
 
-func newDgramTransport() (*dgramTransport, error) {
-	// SOCK_CLOEXEC: the fd is auto-closed if this process ever execs a child,
-	// so the raw ICMP descriptor can never leak into a subprocess's fd table.
-	// The stdlib net package sets CLOEXEC on every socket it creates; this
-	// hand-rolled syscall should match. It's defensive, not a fix for a live
-	// bug: pulsemon update does not fork/exec (installBinary renames the file in
-	// place and asks for a manual restart), and the socket binds to port 0, so
-	// there is no port to "reuse" — but any future subprocess would inherit a
-	// raw ICMP fd without this.
-	//
-	// SOCK_NONBLOCK: the reader (readDgram) drives the socket with a bounded
-	// Poll loop that must be stoppable by Close(). A blocking fd is NOT
-	// interruptible by close() (a goroutine blocked in Recvfrom stays stuck —
-	// verified empirically), so the socket is non-blocking and the reader only
-	// Recvfrom's after Poll reports readability. Sendto is unaffected: a small
-	// ICMP datagram that fits the send buffer is written immediately.
-	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC|syscall.SOCK_NONBLOCK, syscall.IPPROTO_ICMP)
-	if err != nil {
-		return nil, err
-	}
-	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: 0}); err != nil {
-		syscall.Close(fd)
-		return nil, err
-	}
-	return &dgramTransport{fd: fd}, nil
-}
-
-func (t *dgramTransport) send(dst net.IP, seq uint16) error {
-	// Full ICMP echo request: 8-byte header + payload, incl. checksum.
-	msg := make([]byte, 8+len(probePayload))
-	msg[0] = 8 // ICMPTypeEcho
-	// msg[2:4] checksum, msg[4:6] ID (kernel overwrites), msg[6:8] seq
-	binary.BigEndian.PutUint16(msg[6:], seq)
-	copy(msg[8:], probePayload)
-	binary.BigEndian.PutUint16(msg[2:], icmpChecksum(msg))
-
-	addr := &syscall.SockaddrInet4{Port: 0}
-	copy(addr.Addr[:], dst.To4())
-	return syscall.Sendto(t.fd, msg, 0, addr)
-}
-
-func (t *dgramTransport) close() error { return syscall.Close(t.fd) }
-
-// rawTransport: SOCK_RAW via x/net/icmp (root / CAP_NET_RAW).
+// rawTransport: SOCK_RAW via x/net/icmp (root / CAP_NET_RAW / elevated).
 type rawTransport struct {
 	conn *icmp.PacketConn
 }
@@ -245,8 +206,9 @@ type Engine struct {
 	isDgram bool
 	mode    string
 
-	// Concrete handles for the reader goroutine (exactly one is set).
-	dgramFd int
+	// Concrete handles for the reader goroutine (exactly one is set): dgram
+	// (the platform datagram driver, nil in raw mode) or rawConn.
+	dgram   dgramState
 	rawConn *icmp.PacketConn
 
 	// wg tracks the reply-reader goroutine so Close() can block until it has
@@ -259,23 +221,17 @@ type Engine struct {
 	wg        sync.WaitGroup
 	closeOnce sync.Once
 
-	// done is closed by Close() to unblock the reader's Poll loop. A
-	// non-blocking socket alone is not enough to make the reader stoppable:
-	// it must also be told to stop, and done is that signal. (Closing the fd
-	// does NOT wake a goroutine blocked in a blocking Recvfrom — verified —
-	// so the readers are Poll-based and select on done.)
+	// done is closed by Close() to signal the reader to exit. The Linux
+	// Poll-based reader needs this (a non-blocking socket alone is not enough
+	// to stop it); the Windows blocking reader is unblocked by the handle close
+	// in stop(). (Closing the fd alone does NOT wake a goroutine blocked in a
+	// blocking Recvfrom on Linux — verified — which is why the Linux reader is
+	// Poll-based and selects on done.)
 	done chan struct{}
 
-	// pollFn is the poll implementation readDgram drives. It is a field (not
-	// a direct unix.Poll call) so a test can inject EINTR and deterministically
-	// verify the retry path — see TestEngineReaderRetriesEINTR. Set in
-	// NewEngine; Engine literals in unit tests that only exercise deliver()
-	// never touch it.
-	pollFn func(fds []unix.PollFd, timeout int) (int, error)
-
 	// readerAlive tracks whether the reader goroutine is currently running
-	// (set in readDgram/readRaw, cleared on return). Used by tests to detect
-	// the silent-exit regression.
+	// (set in the platform readDgram, cleared on return). Used by tests to
+	// detect the silent-exit regression.
 	readerAlive int32 // atomic
 }
 
@@ -283,13 +239,13 @@ type Engine struct {
 // raw (root/CAP_NET_RAW) as fallback. Failing both means ICMP cannot work
 // on this host at all.
 func NewEngine() (*Engine, error) {
-	if t, err := newDgramTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: true, mode: "unprivileged-datagram", dgramFd: t.fd, done: make(chan struct{}), pollFn: unix.Poll}, nil
+	if d, send, closeFn, err := openDgram(); err == nil {
+		return &Engine{send: send, closeFn: closeFn, isDgram: true, mode: "unprivileged-datagram", dgram: d, done: make(chan struct{})}, nil
 	} else {
 		fmt.Fprintf(os.Stderr, "pulsemon: datagram ICMP socket unavailable (%v); falling back to raw\n", err)
 	}
 	if t, err := newRawTransport(); err == nil {
-		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{}), pollFn: unix.Poll}, nil
+		return &Engine{send: t.send, closeFn: t.close, isDgram: false, mode: "raw", rawConn: t.conn, done: make(chan struct{})}, nil
 	} else {
 		return nil, fmt.Errorf("%w (need root/CAP_NET_RAW or ping_group_range): %w", errNoIcmpTransport, err)
 	}
@@ -299,19 +255,20 @@ func NewEngine() (*Engine, error) {
 func (e *Engine) Mode() string { return e.mode }
 
 // Close stops the engine: it signals the reader to exit (done), then
-// ensures the reader's blocking read is interrupted, then blocks until the
-// reader goroutine has actually stopped. The interruption step is
-// transport-specific:
+// interrupts the reader's blocking read, then blocks until the reader
+// goroutine has actually stopped. The interruption is transport-specific:
 //
-//   - datagram: the reader is a Poll loop with a 500ms slice and a done
-//     select, so the done signal alone stops it within one slice — closing
-//     the fd after wg.Wait() is fine (and keeps the socket alive for any
-//     in-flight Sendto until the reader is confirmed stopped).
-//   - raw: ReadFrom blocks indefinitely and is NOT woken by the done
-//     channel alone — closing the conn is what makes it return
-//     net.ErrClosed. Closing AFTER wg.Wait() therefore deadlocks (wait
-//     for the reader ⇄ reader waits for the close). The conn must be
-//     closed BEFORE the wait for this transport.
+//   - datagram: stop() — a no-op on Linux (the Poll loop exits on done), but
+//     a handle-close on Windows (which unblocks the blocking Recvfrom). Both
+//     happen before wg.Wait(). The socket is then released after the wait
+//     (Linux dgram: closeFn closes the fd, keeping it alive for any in-flight
+//     Sendto until the reader is confirmed stopped; Windows dgram: no-op, the
+//     handle is already closed by stop()).
+//   - raw: ReadFrom blocks indefinitely and is NOT woken by the done channel
+//     alone — closing the conn is what makes it return net.ErrClosed. The conn
+//     must be closed BEFORE the wait for this transport (closing AFTER
+//     wg.Wait() would deadlock: wait for the reader ⇄ reader waits for the
+//     close).
 //
 // wg.Wait() guarantees no stale reader is left delivering into the
 // package-global pending map. Safe to call when run() was never called (no
@@ -319,9 +276,13 @@ func (e *Engine) Mode() string { return e.mode }
 func (e *Engine) Close() {
 	e.closeOnce.Do(func() {
 		e.closeDone()
-		if !e.isDgram && e.closeFn != nil {
-			// raw transport: closing the conn is the wake-up, so it
-			// must happen before wg.Wait(), not after.
+		if e.isDgram {
+			if e.dgram != nil {
+				e.dgram.stop()
+			}
+		} else if e.closeFn != nil {
+			// raw transport: closing the conn is the wake-up, so it must
+			// happen before wg.Wait(), not after.
 			_ = e.closeFn()
 		}
 		e.wg.Wait()
@@ -376,70 +337,18 @@ func (e *Engine) run() {
 	if e.done == nil {
 		e.done = make(chan struct{})
 	}
+	if e.isDgram {
+		// The platform datagram driver starts (and wg-tracks) its own reader.
+		if e.dgram != nil {
+			e.dgram.run(e)
+		}
+		return
+	}
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		if e.isDgram {
-			e.readDgram()
-		} else {
-			e.readRaw()
-		}
+		e.readRaw()
 	}()
-}
-
-// readDgram is the reader for the datagram socket. The kernel strips the IP
-// header and demuxes by the per-socket identifier, so replies are dispatched
-// by seq only. The socket is non-blocking (SOCK_NONBLOCK, see
-// newDgramTransport) and driven with a bounded Poll loop: a ready reply wakes
-// Poll immediately (no RTT impact), and a closed done channel exits the loop
-// at the next iteration. A blocking Recvfrom here would be un-interruptible —
-// close(fd) does not wake it (verified) — which is exactly why the socket is
-// non-blocking and the loop is Poll-based.
-func (e *Engine) readDgram() {
-	atomic.StoreInt32(&e.readerAlive, 1)
-	defer atomic.StoreInt32(&e.readerAlive, 0)
-	buf := make([]byte, 1500)
-	for {
-		// Stop signal first, every iteration — so a busy socket still exits.
-		select {
-		case <-e.done:
-			return
-		default:
-		}
-		fds := []unix.PollFd{{Fd: int32(e.dgramFd), Events: unix.POLLIN}}
-		poll := e.pollFn
-		if poll == nil {
-			poll = unix.Poll
-		}
-		if _, err := poll(fds, 100); err == unix.EINTR {
-			continue // signal (the runtime fires SIGURG to wake parked threads);
-			// x/sys's Poll returns EINTR to us — unlike syscall.Recvfrom,
-			// which retries internally — so it must NOT be fatal or the
-			// reader dies on the first interrupt and every later probe is a
-			// false loss.
-		} else if err != nil {
-			log.Printf("pulsemon: icmp reader: poll: %v (reader stopping)", err)
-			return
-		}
-		if fds[0].Revents&unix.POLLIN != 0 {
-			if rn, from, rerr := syscall.Recvfrom(e.dgramFd, buf, 0); rerr == nil {
-				if rn >= 8 && buf[0] == 0 { // ICMPTypeEchoReply
-					seq := binary.BigEndian.Uint16(buf[6:])
-					if sa, ok := from.(*syscall.SockaddrInet4); ok {
-						src := make(net.IP, 4)
-						copy(src, sa.Addr[:])
-						e.deliver(seq, src)
-					}
-				}
-			} else if rerr == syscall.EINTR {
-				continue // defensive: the syscall layer retries EINTR, but if
-				// it ever surfaces, retry rather than kill the reader
-			} else if rerr != syscall.EAGAIN && rerr != syscall.EWOULDBLOCK {
-				log.Printf("pulsemon: icmp reader: recvfrom: %v (reader stopping)", rerr)
-				return // real error (e.g. socket closed)
-			}
-		}
-	}
 }
 
 // readRaw is the reader for the raw socket: parse IP/ICMP, filter by our
@@ -514,7 +423,7 @@ func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
 	}
 	if tries == 16 {
 		// Table full: no free (seq, dst) slot in 16 tries. Take the next
-		// counter value anyway (least-bad option here).
+		// counter value anyway (least-­bad option here).
 		pendingMu.Lock()
 		pending[key] = p
 		pendingMu.Unlock()

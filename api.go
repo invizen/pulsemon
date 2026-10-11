@@ -229,7 +229,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	case EngineDead():
 		hz["status"] = "degraded"
 		hz["icmp_mode"] = "unavailable"
-		hz["icmp_hint"] = "ICMP socket unavailable: this uid is outside net.ipv4.ping_group_range and CAP_NET_RAW is not granted. Fix: sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\" (persist via /etc/sysctl.d/90-pulsemon-ping.conf) and restart pulsemon — or grant CAP_NET_RAW. See `journalctl -u pulsemon` for the exact error."
+		hz["icmp_hint"] = icmpHint()
 	}
 	if e := LastProbeError(); e != "" {
 		hz["probe_error"] = e

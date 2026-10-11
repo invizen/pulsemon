@@ -8,9 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -27,12 +25,13 @@ func listenAddr() string {
 }
 
 // dbPathFromEnv returns the database path: PULSEMON_DB if set, else the
-// Docker default.
+// platform default (the Docker /data volume on Linux, %ProgramData%\pulsemon
+// on Windows — see defaultDBPath in main_linux.go / main_windows.go).
 func dbPathFromEnv() string {
 	if p := os.Getenv("PULSEMON_DB"); p != "" {
 		return p
 	}
-	return "/data/pulsemon.db"
+	return defaultDBPath()
 }
 
 // certPaths returns the TLS certificate/key pair to serve HTTPS with, or
@@ -299,6 +298,11 @@ func runAuthUser(args []string) dispatchKind {
 }
 
 func main() {
+	// Ensure the platform data dir exists before anything opens the DB. A
+	// no-op on Linux (the Docker /data volume is pre-created and MkdirAll on
+	// an existing dir returns nil); on Windows it creates %ProgramData%\pulsemon.
+	ensureDataDir()
+
 	// Self-update, healthcheck, and version are dispatched before the server
 	// starts; unknown flags are rejected there (see dispatch).
 	switch dispatch(os.Args) {
@@ -310,6 +314,17 @@ func main() {
 		os.Exit(2)
 	}
 
+	// Platform entry point: a signal-driven loop on Linux, the Windows service
+	// control manager on Windows. Both funnel into runServer (main_linux.go /
+	// main_windows.go).
+	runMain()
+}
+
+// runServer starts the DB, probe worker, and HTTP server, then blocks until
+// stop is closed, then performs the clean shutdown sequence. It is the single
+// server body shared by every runtime: the Linux signal path and the Windows
+// service path both close `stop` to trigger the identical shutdown.
+func runServer(stop <-chan struct{}) {
 	db, err := NewDB(dbPathFromEnv())
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
@@ -344,9 +359,6 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	startListener(srv, db)
-
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	<-stop
 	log.Println("Shutting down...")
