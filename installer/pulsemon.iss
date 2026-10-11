@@ -12,7 +12,12 @@
 ; windows-release workflow).
 
 #define MyAppName "pulsemon"
-#define MyAppVersion "0.0.0"
+; Version is set at build time via `ISCC /DMyAppVersion=X.Y.Z` (see the
+; windows-release workflow). The #ifndef guard lets the /D define win; without
+; it the hard #define below would silently override the command-line version.
+#ifndef MyAppVersion
+  #define MyAppVersion "0.0.0"
+#endif
 #define MyAppPublisher "invizen"
 #define MyAppExeName "pulsemon.exe"
 #define MyServiceName "pulsemon"
@@ -40,6 +45,7 @@ OutputBaseFilename=pulsemon-setup-{#MyAppVersion}
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=pulsemon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 CloseApplications=no
 
@@ -56,10 +62,6 @@ Source: "dist\pulsemon-windows-amd64.exe"; DestDir: "{app}"; DestName: "{#MyAppE
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
-[Run]
-; Open the dashboard once after install (the service is already running).
-Filename: "http://localhost:9299"; Flags: postinstall nowait skipifsilent
-
 [Code]
 const
   ServiceName = 'pulsemon';
@@ -67,8 +69,11 @@ const
 
 // Run a command to completion, hidden. Returns True on exit code 0.
 function RunHidden(exe, params: string): Boolean;
+var
+  rc: Integer;
 begin
-  Result := Exec(exe, params, '', SW_HIDE, ewWaitUntilTerminated, nil);
+  Result := Exec(exe, params, '', SW_HIDE, ewWaitUntilTerminated, rc);
+  Result := (rc = 0);
 end;
 
 function ServiceExists(): Boolean;
@@ -120,6 +125,33 @@ begin
   RunHidden('sc.exe', 'start ' + ServiceName);
 end;
 
+// Open the dashboard port (9299) in Windows Firewall so the dashboard is
+// reachable from the LAN. Idempotent: any existing "pulsemon" rule is
+// replaced. Runs elevated (the installer requires admin).
+procedure OpenFirewallPort;
+begin
+  RunHidden('netsh.exe', 'advfirewall firewall delete rule name=pulsemon');
+  if not RunHidden('netsh.exe',
+      'advfirewall firewall add rule name=pulsemon dir=in action=allow protocol=TCP localport=9299') then
+    MsgBox('Could not open firewall port 9299. The dashboard still works on this' #13#10 +
+           'machine (http://localhost:9299); add a firewall rule for LAN access.',
+           mbInformation, MB_OK);
+end;
+
+// Remove the firewall rule on uninstall.
+procedure RemoveFirewallPort;
+begin
+  RunHidden('netsh.exe', 'advfirewall firewall delete rule name=pulsemon');
+end;
+
+// Open the dashboard in the default browser after install.
+procedure OpenDashboard;
+var
+  rc: Integer;
+begin
+  ShellExec('open', 'http://localhost:9299', '', '', SW_SHOWNORMAL, ewNoWait, rc);
+end;
+
 procedure StopAndDeleteService;
 begin
   if not ServiceExists() then
@@ -137,6 +169,8 @@ begin
   begin
     CreateService;
     StartService;
+    OpenFirewallPort;
+    OpenDashboard;
   end;
 end;
 
@@ -145,6 +179,7 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     StopAndDeleteService;
+    RemoveFirewallPort;
     // The data dir (C:\ProgramData\pulsemon) is intentionally KEPT on
     // uninstall — it holds the operator's sensors and probe history. Delete
     // it manually if you want a full wipe.

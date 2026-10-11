@@ -14,6 +14,8 @@ pulsemon
 pulsemon-bin
 pingmon
 bin/
+# go-winres generated resource object (windows icon/version) — built, not committed
+*.syso
 
 # test files are COMMITTED since v0.2.3 (security test suite is public)
 
