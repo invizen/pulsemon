@@ -65,7 +65,8 @@ jobs:
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
-          & $iscc "/DMyAppVersion=$env:VER" "installer/pulsemon.iss"
+          $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
+          & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
           Write-Host "Installer output:"
           Get-ChildItem "installer\output" | ForEach-Object { Write-Host ("  " + $_.Name) }
@@ -73,7 +74,8 @@ jobs:
       - name: Verify installer present
         shell: pwsh
         run: |
-          $setup = "installer\output\pulsemon-setup-$env:VER.exe"
+          $ver = $env:VER -replace '^v',''
+          $setup = "installer\output\pulsemon-setup-$ver.exe"
           if (-not (Test-Path $setup)) { throw "expected installer not found: $setup" }
 
       - name: Upload to GitHub release
@@ -81,18 +83,20 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
+          $ver = $env:VER -replace '^v',''
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",
-            "installer\output\pulsemon-setup-$env:VER.exe"
+            "installer\output\pulsemon-setup-$ver.exe"
           )
           # On a tag push the Linux release (cut from zenai) may not exist yet,
           # so retry the upload for a couple of minutes. On a manual run the
           # release already exists and this succeeds on the first attempt.
           $ok = $false
           for ($i = 0; $i -lt 10; $i++) {
-            if (gh release upload $env:VER @assets --clobber) { $ok = $true; break }
-            Write-Host "release $env:VER not ready (attempt $($i+1)/10); retrying in 15s"
+            $out = & gh release upload $env:VER @assets --clobber 2>&1
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "upload attempt $($i+1)/10 failed: $out"
             Start-Sleep -Seconds 15
           }
           if (-not $ok) { throw "could not upload Windows assets to release $env:VER" }
