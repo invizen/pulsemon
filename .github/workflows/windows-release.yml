@@ -59,15 +59,27 @@ jobs:
           "$hash  pulsemon-windows-amd64.exe" | Out-File -Encoding ascii "dist/pulsemon-windows-amd64.exe.sha256"
           Write-Host "Built dist/pulsemon-windows-amd64.exe  sha256=$hash"
 
+      - name: Install pinned Inno Setup 6.7.3
+        shell: pwsh
+        run: |
+          # Pin the Inno Setup version: the runner bundles an UNPINNED Inno Setup 6, and a
+          # version shift between runs has broken the build before (a "String error" on a
+          # literal that compiled on the prior runner). 6.7.3 is the version the installer was
+          # validated against on the QA boxes, so building with it is reproducible.
+          $isver = '6.7.3'
+          $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-$isver.exe"
+          Invoke-WebRequest -Uri $url -OutFile "innosetup-$isver.exe"
+          Start-Process -FilePath "innosetup-$isver.exe" -ArgumentList '/SILENT' -Wait
+          $pinned = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $pinned)) { throw "pinned ISCC 6.7.3 not found after install: $pinned" }
+          Write-Host "Pinned ISCC installed: $((Get-Item $pinned).VersionInfo.FileVersion)"
+
       - name: Build Inno Setup installer
         shell: pwsh
         run: |
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
-          # The runner bundles an UNPINNED Inno Setup 6; a version shift between runs has
-          # broken the build before (a "String error" on a literal that compiled on the
-          # prior runner). Log the version so such failures are diagnosable.
           Write-Host "ISCC: $iscc (version $((Get-Item $iscc).VersionInfo.FileVersion))"
           $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
           & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
