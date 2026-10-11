@@ -65,6 +65,10 @@ jobs:
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
+          # The runner bundles an UNPINNED Inno Setup 6; a version shift between runs has
+          # broken the build before (a "String error" on a literal that compiled on the
+          # prior runner). Log the version so such failures are diagnosable.
+          Write-Host "ISCC: $iscc (version $((Get-Item $iscc).VersionInfo.FileVersion))"
           $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
           & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
