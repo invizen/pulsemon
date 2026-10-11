@@ -80,14 +80,9 @@ jobs:
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
-          # Inno Setup 6 is 32-bit, so on 64-bit Windows its registry lives under
-          # WOW6432Node; check both the 64-bit and 32-bit views.
-          $isccVer = 'unknown'
-          foreach ($vpath in @('HKLM:\SOFTWARE\Inno Setup 6', 'HKLM:\SOFTWARE\WOW6432Node\Inno Setup 6')) {
-            $isccVer = (Get-ItemProperty $vpath -ErrorAction SilentlyContinue).Version
-            if ($isccVer) { break }
-          }
-          Write-Host "ISCC: $iscc (Inno Setup $isccVer)"
+          # The version is pinned + logged by the "Install pinned Inno Setup" step above
+          # (ISCC.exe carries no PE version, and Inno 6 writes no reliable registry Version).
+          Write-Host "ISCC: $iscc"
           $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
           & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
