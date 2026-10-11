@@ -1,7 +1,7 @@
 ; pulsemon Windows installer (Inno Setup 6)
 ;
 ; Installs the pulsemon dashboard as a native Windows service:
-;   - pulsemon.exe  ->  {autopf}\pulsemon
+;   - pulsemon.exe  ->  {autopf}\Pulsemon
 ;   - data dir      ->  C:\ProgramData\pulsemon  (survives upgrade/uninstall)
 ;   - service       ->  "pulsemon" (LocalSystem, auto-start, restart-on-failure)
 ;   - shortcuts     ->  Start Menu + optional Desktop
@@ -11,7 +11,7 @@
 ; The dist\pulsemon-windows-amd64.exe must be built first (see the
 ; windows-release workflow).
 
-#define MyAppName "pulsemon"
+#define MyAppName "Pulsemon"
 ; Version is set at build time via `ISCC /DMyAppVersion=X.Y.Z` (see the
 ; windows-release workflow). The #ifndef guard lets the /D define win; without
 ; it the hard #define below would silently override the command-line version.
@@ -106,7 +106,7 @@ begin
       'create ' + ServiceName +
       ' binPath= "' + exePath + '"' +
       ' start= auto' +
-      ' DisplayName= "pulsemon"') then
+      ' DisplayName= "Pulsemon"') then
   begin
     MsgBox('Failed to create the pulsemon service. You can create it manually:' #13#10 +
            'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto',
@@ -114,7 +114,7 @@ begin
     Exit;
   end;
   RunHidden('sc.exe', 'description ' + ServiceName +
-    ' "pulsemon network monitor (ICMP sensor dashboard)"');
+    ' "Pulsemon network monitor (ICMP sensor dashboard)");
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
   RunHidden('sc.exe', 'failure ' + ServiceName +
     ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
