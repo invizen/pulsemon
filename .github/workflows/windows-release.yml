@@ -72,7 +72,7 @@ jobs:
           Start-Process -FilePath "innosetup-$isver.exe" -ArgumentList '/SILENT' -Wait
           $pinned = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $pinned)) { throw "pinned ISCC 6.7.3 not found after install: $pinned" }
-          Write-Host "Pinned ISCC installed: $((Get-Item $pinned).VersionInfo.FileVersion)"
+          Write-Host "Pinned Inno Setup $isver installed: $pinned"
 
       - name: Build Inno Setup installer
         shell: pwsh
@@ -80,7 +80,14 @@ jobs:
           $iscc = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe'
           if (-not (Test-Path $iscc)) { $iscc = 'C:\Program Files\Inno Setup 6\ISCC.exe' }
           if (-not (Test-Path $iscc)) { throw "ISCC.exe (Inno Setup 6) not found on the runner" }
-          Write-Host "ISCC: $iscc (version $((Get-Item $iscc).VersionInfo.FileVersion))"
+          # Inno Setup 6 is 32-bit, so on 64-bit Windows its registry lives under
+          # WOW6432Node; check both the 64-bit and 32-bit views.
+          $isccVer = 'unknown'
+          foreach ($vpath in @('HKLM:\SOFTWARE\Inno Setup 6', 'HKLM:\SOFTWARE\WOW6432Node\Inno Setup 6')) {
+            $isccVer = (Get-ItemProperty $vpath -ErrorAction SilentlyContinue).Version
+            if ($isccVer) { break }
+          }
+          Write-Host "ISCC: $iscc (Inno Setup $isccVer)"
           $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
           & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
