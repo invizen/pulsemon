@@ -68,6 +68,10 @@ jobs:
           $ver = $env:VER -replace '^v',''   # AppVersion + filename use 0.3.0, not v0.3.0
           & $iscc "/DMyAppVersion=$ver" "installer/pulsemon.iss"
           if ($LASTEXITCODE -ne 0) { throw "ISCC failed" }
+          # sha256 sidecar for the installer (the exe sidecar is made in the build step)
+          $inst = "installer\output\pulsemon-setup-$ver.exe"
+          $ihash = (Get-FileHash -Algorithm SHA256 $inst).Hash.ToLower()
+          "$ihash  pulsemon-setup-$ver.exe" | Out-File -Encoding ascii "installer\output\pulsemon-setup-$ver.exe.sha256"
           Write-Host "Installer output:"
           Get-ChildItem "installer\output" | ForEach-Object { Write-Host ("  " + $_.Name) }
 
@@ -87,7 +91,8 @@ jobs:
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",
-            "installer\output\pulsemon-setup-$ver.exe"
+            "installer\output\pulsemon-setup-$ver.exe",
+            "installer\output\pulsemon-setup-$ver.exe.sha256"
           )
           # On a tag push the Linux release (cut from zenai) may not exist yet,
           # so retry the upload for a couple of minutes. On a manual run the
