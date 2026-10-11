@@ -113,7 +113,7 @@ begin
            mbError, MB_OK);
     Exit;
   end;
-  RunHidden('sc.exe', 'description ' + ServiceName + ' "Pulsemon network monitor (ICMP sensor dashboard)");
+  RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
   RunHidden('sc.exe', 'failure ' + ServiceName +
     ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
