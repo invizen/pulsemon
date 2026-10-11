@@ -100,15 +100,18 @@ var (
 	probeErrCount atomic.Int64
 )
 
-// LastProbeError returns a human-readable description of the most recent
-// shared-socket send error, or "" if none. A persistent non-empty value
-// means ICMP is not working at all (e.g. no CAP_NET_RAW and no
-// ping_group_range) rather than any sensor being down.
+// LastProbeError returns a human-readable description of the current
+// shared-socket send-error state, or "" if none. probeErrCount tracks send
+// failures SINCE the last successful send (reset on success, see Ping), so a
+// non-empty value means ICMP sends are CURRENTLY failing (e.g. no
+// CAP_NET_RAW and no ping_group_range, or the socket is unavailable) rather
+// than any sensor being down. A single transient failure (e.g. the first
+// probe at boot, before the network is up) no longer pins this forever.
 func LastProbeError() string {
 	if probeErrCount.Load() == 0 {
 		return ""
 	}
-	return fmt.Sprintf("%d pulse send errors since start (ICMP socket unavailable? check CAP_NET_RAW / ping_group_range)",
+	return fmt.Sprintf("%d pulse send failures since the last success (ICMP socket unavailable?)",
 		probeErrCount.Load())
 }
 
@@ -440,6 +443,12 @@ func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
 		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err}
 	}
+	// A successful send proves the socket is usable, so clear the error
+	// state: probeErrCount tracks failures SINCE the last success, not the
+	// total since start. Without this reset, one transient failure (e.g. the
+	// first probe at boot, before the network stack is ready) would pin the
+	// "pulsing is broken" banner forever even after ICMP recovers.
+	probeErrCount.Store(0)
 	// Explicit timer, stopped on every return path. (time.After works on
 	// Go 1.23+ — the runtime reclaims an abandoned timer's object early,
 	// verified empirically on this toolchain — but an abandoned After

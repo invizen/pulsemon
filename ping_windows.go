@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -113,10 +114,22 @@ func (t *winDgram) readDgram(e *Engine) {
 // openDgram is the Windows implementation of the shared datagram opener (see
 // ping.go). closeFn is a no-op: the handle is closed by stop() (before the
 // reader wait), so the post-wait close in Engine.Close must not run again.
+//
+// At boot a Windows service can start before the network stack is ready, and
+// the first ICMP datagram socket open then fails transiently. Retry a few
+// times before giving up (the caller falls back to raw), so a boot-timing
+// race doesn't pin the engine to the raw transport for the process lifetime.
 func openDgram() (dgramState, sendFunc, closeFunc, error) {
-	t, err := newWinDgram()
-	if err != nil {
-		return nil, nil, nil, err
+	var lastErr error
+	for attempt := 0; attempt < 5; attempt++ {
+		if attempt > 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		t, err := newWinDgram()
+		if err == nil {
+			return t, t.send, func() error { return nil }, nil
+		}
+		lastErr = err
 	}
-	return t, t.send, func() error { return nil }, nil
+	return nil, nil, nil, lastErr
 }
