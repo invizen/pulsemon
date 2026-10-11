@@ -113,8 +113,7 @@ begin
            mbError, MB_OK);
     Exit;
   end;
-  RunHidden('sc.exe', 'description ' + ServiceName +
-    ' "Pulsemon network monitor (ICMP sensor dashboard)");
+  RunHidden('sc.exe', 'description ' + ServiceName + ' "Pulsemon network monitor (ICMP sensor dashboard)");
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
   RunHidden('sc.exe', 'failure ' + ServiceName +
     ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
@@ -181,7 +180,7 @@ begin
     StopAndDeleteService;
     RemoveFirewallPort;
     // The data dir (C:\ProgramData\pulsemon) is intentionally KEPT on
-    // uninstall — it holds the operator's sensors and probe history. Delete
+    // uninstall - it holds the operator's sensors and probe history. Delete
     // it manually if you want a full wipe.
   end;
 end;
