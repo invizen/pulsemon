@@ -168,7 +168,7 @@ end;
 // PrepareToInstall is called by Inno Setup immediately before files are copied -
 // the right hook. On a fresh install the service does not exist, so this is a
 // no-op. The (now updated) service is restarted in CurStepChanged(ssPostInstall).
-procedure PrepareToInstall(var NeedsRestart: Boolean);
+procedure PrepareToInstall;
 begin
   if ServiceExists() then
   begin
