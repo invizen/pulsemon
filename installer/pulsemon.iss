@@ -162,6 +162,23 @@ begin
   RunHidden('sc.exe', 'delete ' + ServiceName);
 end;
 
+// Stop a running pulsemon service BEFORE the [Files] section overwrites
+// pulsemon.exe. On an UPGRADE the old binary is locked while the service runs,
+// so the file copy fails (file-in-use / "cannot stop the service") without this.
+// PrepareToInstall is called by Inno Setup immediately before files are copied -
+// the right hook. On a fresh install the service does not exist, so this is a
+// no-op. The (now updated) service is restarted in CurStepChanged(ssPostInstall).
+procedure PrepareToInstall(var NeedsRestart: Boolean);
+begin
+  if ServiceExists() then
+  begin
+    RunHidden('sc.exe', 'stop ' + ServiceName);
+    // Let the service finish its clean shutdown (probe/alert/HTTP drain) so the
+    // .exe handle is released before we overwrite it - same delay as uninstall.
+    Sleep(2000);
+  end;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
