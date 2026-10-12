@@ -132,7 +132,7 @@ begin
   //      the new name without a reboot. (PowerShell Set-Service -DisplayName was
   //      tried in v0.3.5 and found to update only the cache, not the registry.)
   // After a reboot the SCM re-reads the registry, so (1) alone is sufficient.
-  RegWriteStringValue(hkLMSystem, 'CurrentControlSet\Services\' + ServiceName, 'DisplayName', 'Pulsemon');
+  RegWriteStringValue(hkLM, 'SYSTEM\CurrentControlSet\Services\' + ServiceName, 'DisplayName', 'Pulsemon');
   RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= "Pulsemon"');
 end;
 
