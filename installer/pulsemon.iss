@@ -121,11 +121,19 @@ begin
   // Ensure the display name is "Pulsemon" on EVERY install. The create above
   // only runs when the service does not exist, so a service left by a pre-fix
   // installer stays "pulsemon" and an in-place upgrade would never correct it.
-  // Use PowerShell Set-Service, which reliably sets the display name - the
-  // legacy `sc.exe config ... DisplayName=` silently no-ops on some builds.
-  // No-op if the name is already "Pulsemon".
-  RunHidden('powershell.exe',
-    '-NoProfile -NonInteractive -Command "Set-Service -Name ' + ServiceName + ' -DisplayName ''Pulsemon'' -ErrorAction Stop"');
+  // Ensure the display name is "Pulsemon" on EVERY install. The create above
+  // only runs when the service does not exist, so a service left by a pre-fix
+  // installer stays "pulsemon" and an in-place upgrade would never correct it.
+  // Two mechanisms, because each alone proved flaky on real boxes:
+  //   1. RegWriteStringValue writes HKLM\SYSTEM\...\Services\pulsemon\DisplayName
+  //      directly - the source of truth, via a built-in call (no external
+  //      process, no command-line quote-mangling). Guaranteed to persist.
+  //   2. `sc.exe config` syncs the SCM's in-memory cache so services.msc shows
+  //      the new name without a reboot. (PowerShell Set-Service -DisplayName was
+  //      tried in v0.3.5 and found to update only the cache, not the registry.)
+  // After a reboot the SCM re-reads the registry, so (1) alone is sufficient.
+  RegWriteStringValue(HKLMSD, 'CurrentControlSet\Services\' + ServiceName, 'DisplayName', 'Pulsemon');
+  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= "Pulsemon"');
 end;
 
 procedure StartService;
