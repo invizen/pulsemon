@@ -2,7 +2,7 @@
 ;
 ; Installs the pulsemon dashboard as a native Windows service:
 ;   - pulsemon.exe  ->  {autopf}\Pulsemon
-;   - data dir      ->  C:\ProgramData\pulsemon  (survives upgrade/uninstall)
+;   - data dir      ->  C:\ProgramData\Pulsemon  (survives upgrade/uninstall)
 ;   - service       ->  "pulsemon" (LocalSystem, auto-start, restart-on-failure)
 ;   - shortcuts     ->  Start Menu + optional Desktop
 ;
@@ -21,7 +21,7 @@
 #define MyAppPublisher "invizen"
 #define MyAppExeName "pulsemon.exe"
 #define MyServiceName "pulsemon"
-#define MyDataDir "C:\ProgramData\pulsemon"
+#define MyDataDir "C:\ProgramData\Pulsemon"
 
 [Setup]
 ; A fixed GUID identifies the app for upgrade/uninstall bookkeeping. Do not
@@ -65,7 +65,7 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 [Code]
 const
   ServiceName = 'pulsemon';
-  DataDir     = 'C:\ProgramData\pulsemon';
+  DataDir     = 'C:\ProgramData\Pulsemon';
 
 // Run a command to completion, hidden. Returns True on exit code 0.
 function RunHidden(exe, params: string): Boolean;
@@ -204,7 +204,7 @@ begin
   begin
     StopAndDeleteService;
     RemoveFirewallPort;
-    // The data dir (C:\ProgramData\pulsemon) is intentionally KEPT on
+    // The data dir (C:\ProgramData\Pulsemon) is intentionally KEPT on
     // uninstall - it holds the operator's sensors and probe history. Delete
     // it manually if you want a full wipe.
   end;

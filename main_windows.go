@@ -12,11 +12,11 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
-// defaultDBPath is the Windows data location: %ProgramData%\pulsemon, the
+// defaultDBPath is the Windows data location: %ProgramData%\Pulsemon, the
 // machine-wide (not per-user) store a service should use. ProgramData is
 // writable by the service's LocalSystem account and survives user logoffs.
 func defaultDBPath() string {
-	return filepath.Join(os.Getenv("ProgramData"), "pulsemon", "pulsemon.db")
+	return filepath.Join(os.Getenv("ProgramData"), "Pulsemon", "pulsemon.db")
 }
 
 // ensureDataDir creates the Windows data dir if missing. The Inno installer

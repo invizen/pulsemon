@@ -25,7 +25,7 @@ func listenAddr() string {
 }
 
 // dbPathFromEnv returns the database path: PULSEMON_DB if set, else the
-// platform default (the Docker /data volume on Linux, %ProgramData%\pulsemon
+// platform default (the Docker /data volume on Linux, %ProgramData%\Pulsemon
 // on Windows — see defaultDBPath in main_linux.go / main_windows.go).
 func dbPathFromEnv() string {
 	if p := os.Getenv("PULSEMON_DB"); p != "" {
@@ -300,7 +300,7 @@ func runAuthUser(args []string) dispatchKind {
 func main() {
 	// Ensure the platform data dir exists before anything opens the DB. A
 	// no-op on Linux (the Docker /data volume is pre-created and MkdirAll on
-	// an existing dir returns nil); on Windows it creates %ProgramData%\pulsemon.
+	// an existing dir returns nil); on Windows it creates %ProgramData%\Pulsemon.
 	ensureDataDir()
 
 	// Self-update, healthcheck, and version are dispatched before the server
