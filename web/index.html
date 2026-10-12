@@ -388,14 +388,20 @@
           <span class="text-[12px] text-slate-400">HTTPS Port</span>
           <input id="f-tls-port" type="number" min="1" max="65535" value="443" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200">
         </div>
-        <div class="space-y-1.5">
-          <div class="flex items-center gap-2">
-            <input id="f-tls-cert-file" type="file" accept=".pem,.crt,.cer,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
-            <span id="tls-cert-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">no file</span>
+        <div class="space-y-2.5">
+          <div>
+            <label for="f-tls-cert-file" class="block text-[12px] text-slate-400 mb-1">Certificate (CRT/PEM)</label>
+            <div class="flex items-center gap-2">
+              <input id="f-tls-cert-file" type="file" accept=".pem,.crt,.cer,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+              <span id="tls-cert-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">No CRT file chosen</span>
+            </div>
           </div>
-          <div class="flex items-center gap-2">
-            <input id="f-tls-key-file" type="file" accept=".pem,.key,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
-            <span id="tls-key-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">no file</span>
+          <div>
+            <label for="f-tls-key-file" class="block text-[12px] text-slate-400 mb-1">Private Key (KEY/PEM)</label>
+            <div class="flex items-center gap-2">
+              <input id="f-tls-key-file" type="file" accept=".pem,.key,.txt" class="file-input text-[11px] font-mono flex-1 min-w-0 cursor-pointer file:mr-2 file:px-2.5 file:py-1 file:rounded-lg file:border-0 file:bg-ok/15 file:text-ok file:font-mono file:text-[11px] hover:file:bg-ok/25 file:cursor-pointer text-slate-500">
+              <span id="tls-key-file-name" class="text-[10px] font-mono text-slate-500 shrink-0">No KEY file chosen</span>
+            </div>
           </div>
         </div>
         <div class="flex gap-2 pt-1">
@@ -1290,7 +1296,7 @@ async function openSettings() {
     renderTLSStatus(s.tls);
     renderAuthPanel();
     $('f-tls-cert-file').value = '';$('f-tls-key-file').value = '';
-    $('tls-cert-file-name').textContent = 'no file';$('tls-key-file-name').textContent = 'no file';
+    $('tls-cert-file-name').textContent = 'No CRT file chosen';$('tls-key-file-name').textContent = 'No KEY file chosen';
   } catch (e) {
     setMsg('Failed to load settings: ' + (e.message || 'request failed'), 'bad');
   }
