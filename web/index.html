@@ -93,6 +93,11 @@
     .spark-bar { transition: height 0.2s ease, background-color 0.2s ease; }
     .modal-backdrop { animation: fadein 0.12s ease; }
     @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+    /* Thin JetBrains Mono '/' at weight 400 can fail to rasterize on high-DPI
+       displays, so "https://" reads as "https:". Heavier weight + a small letter
+       gap + antialiasing keeps both slashes visible. Named class (not inline) so a
+       future UI rewrite can't silently drop it -- restores f95386a, lost in v0.2.0. */
+    .url-mono { font-weight: 600; letter-spacing: .03em; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
   </style>
 </head>
 <body class="bg-surface-950 text-slate-200 font-sans min-h-screen antialiased select-none sm:select-auto">
@@ -292,7 +297,7 @@
           <input id="f-name" required maxlength="60" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="e.g. gateway-01">
         </label>
         <label class="text-[12px] text-slate-400 flex flex-col gap-1 font-semibold">Target <span id="f-target-hint" class="text-[10px] text-slate-500 font-normal">URL or IP</span>
-          <input id="f-target" required maxlength="253" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" class="bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="https://api.domain.internal">
+          <input id="f-target" required maxlength="253" type="text" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="url" class="url-mono bg-surface-950 border border-surface-800 rounded-lg px-3 py-1.5 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" placeholder="https://api.domain.internal">
         </label>
       </div>
 
@@ -535,7 +540,7 @@
             <h2 id="insp-name" class="text-[15px] font-bold text-white font-mono">—</h2>
             <span id="insp-tag" class="px-1.5 py-0.2 rounded text-[11px] font-mono bg-surface-800 text-slate-400 border border-surface-700"></span>
           </div>
-          <p id="insp-target" class="text-[12px] text-slate-500 font-mono mt-0.5"></p>
+          <p id="insp-target" class="url-mono text-[12px] text-slate-500 font-mono mt-0.5"></p>
         </div>
       </div>
       <button onclick="closeInspector()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
@@ -978,7 +983,7 @@ function renderTable(list) {
     return '<tr class="hover:bg-surface-850/50 transition-colors">' +
       '<td class="py-2 px-3.5"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2 h-2 rounded-full ' + m.dot + '"></span>' + m.label + '</span></td>' +
       '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
-      '<td class="py-2 px-3.5 text-slate-500 text-[12px] hidden md:table-cell max-w-[200px] truncate">' + esc(s.target) + '</td>' +
+      '<td class="url-mono py-2 px-3.5 text-slate-500 text-[12px] hidden md:table-cell max-w-[200px] truncate">' + esc(s.target) + '</td>' +
       '<td class="py-2 px-3.5">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-1.5 py-0.2 rounded text-[11px] bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-600">—</span>') + '</td>' +
       '<td class="py-2 px-3.5 text-right font-semibold ' + (st && st.rtt_last != null ? 'text-slate-100' : 'text-slate-500') + '"><span class="mr-1">' + badge + '</span>' + rtt + cert + '</td>' +
       '<td class="py-2 px-3.5 text-right text-jit">' + jit + '</td>' +
