@@ -168,8 +168,9 @@ end;
 // PrepareToInstall is called by Inno Setup immediately before files are copied -
 // the right hook. On a fresh install the service does not exist, so this is a
 // no-op. The (now updated) service is restarted in CurStepChanged(ssPostInstall).
-procedure PrepareToInstall;
+function PrepareToInstall(var NeedsRestart: Boolean): Boolean;
 begin
+  NeedsRestart := False; // the service restart is handled in ssPostInstall
   if ServiceExists() then
   begin
     RunHidden('sc.exe', 'stop ' + ServiceName);
@@ -177,6 +178,7 @@ begin
     // .exe handle is released before we overwrite it - same delay as uninstall.
     Sleep(2000);
   end;
+  Result := True; // proceed with the install
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
