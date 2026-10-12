@@ -121,8 +121,11 @@ begin
   // Ensure the display name is "Pulsemon" on EVERY install. The create above
   // only runs when the service does not exist, so a service left by a pre-fix
   // installer stays "pulsemon" and an in-place upgrade would never correct it.
-  // `sc config` updates the name in place and is a no-op if already correct.
-  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= "Pulsemon"');
+  // Use PowerShell Set-Service, which reliably sets the display name - the
+  // legacy `sc.exe config ... DisplayName=` silently no-ops on some builds.
+  // No-op if the name is already "Pulsemon".
+  RunHidden('powershell.exe',
+    '-NoProfile -NonInteractive -Command "Set-Service -Name ' + ServiceName + ' -DisplayName ''Pulsemon'' -ErrorAction Stop"');
 end;
 
 procedure StartService;
