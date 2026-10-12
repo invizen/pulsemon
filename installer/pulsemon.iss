@@ -20,7 +20,7 @@
 #endif
 #define MyAppPublisher "invizen"
 #define MyAppExeName "pulsemon.exe"
-#define MyServiceName "pulsemon"
+#define MyServiceName "Pulsemon"
 #define MyDataDir "C:\ProgramData\Pulsemon"
 
 [Setup]
@@ -64,7 +64,13 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Code]
 const
-  ServiceName = 'pulsemon';
+  // The service is NAMED "Pulsemon" (capital P), not just display-named. The
+  // SCM locks the name in at `sc create` time and its display-name cache is
+  // sticky (sc config / Set-Service return success but do not move it), so the
+  // reliable way to present the service as "Pulsemon" in services.msc is to make
+  // the name itself "Pulsemon". Service names are case-insensitive for lookup,
+  // so `sc stop/start/query Pulsemon` all work against it.
+  ServiceName = 'Pulsemon';
   DataDir     = 'C:\ProgramData\Pulsemon';
 
 // Run a command to completion, hidden. Returns True on exit code 0.
@@ -94,12 +100,49 @@ begin
   end;
 end;
 
+// Return the exact-case registry key name of the service (e.g. "Pulsemon" vs a
+// legacy lowercase "pulsemon"), or '' if no such service exists. Service names
+// are case-insensitive for lookup, so this registry enumeration is the only way
+// to read back the case the name was actually stored under.
+function GetServiceKeyExactName(): string;
+var
+  I: Integer;
+  KeyName: string;
+begin
+  Result := '';
+  I := 0;
+  while RegEnumKey(HKLM, 'SYSTEM\CurrentControlSet\Services', I, KeyName) do
+  begin
+    if CompareText(KeyName, ServiceName) = 0 then
+    begin
+      Result := KeyName;
+      Break;
+    end;
+    Inc(I);
+  end;
+end;
+
 procedure CreateService;
 var
   exePath: string;
+  exactName: string;
 begin
   exePath := ExpandConstant('{app}\{#MyAppExeName}');
   CreateDataDir;
+  // One-time migration: a service left by a pre-v0.3.7 installer is named
+  // lowercase "pulsemon". The SCM will not rename a service in place, and its
+  // display-name cache is sticky (sc config / Set-Service succeed but do not
+  // move it), so the only way to present it as "Pulsemon" is to rebuild the
+  // registration. If the stored case differs from "Pulsemon", stop + delete it;
+  // the create below then rebuilds it with the correct name.
+  exactName := GetServiceKeyExactName();
+  if (exactName <> '') and (exactName <> ServiceName) then
+  begin
+    RunHidden('sc.exe', 'stop ' + exactName);
+    // Let the service finish its clean shutdown before deleting the registration.
+    Sleep(2000);
+    RunHidden('sc.exe', 'delete ' + exactName);
+  end;
   if not ServiceExists() then
   begin
     if not RunHidden('sc.exe',
@@ -108,8 +151,8 @@ begin
         ' start= auto' +
         ' DisplayName= "Pulsemon"') then
     begin
-      MsgBox('Failed to create the pulsemon service. You can create it manually:' #13#10 +
-             'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto',
+      MsgBox('Failed to create the Pulsemon service. You can create it manually:' #13#10 +
+             'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto DisplayName= "Pulsemon"',
              mbError, MB_OK);
       Exit;
     end;
@@ -118,24 +161,6 @@ begin
     RunHidden('sc.exe', 'failure ' + ServiceName +
       ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
   end;
-  // Ensure the display name is "Pulsemon" on EVERY install. The create above
-  // only runs when the service does not exist, so a service left by a pre-fix
-  // installer stays "pulsemon" and an in-place upgrade would never correct it.
-  // Two mechanisms, because each alone proved flaky on real boxes:
-  //   1. RegWriteStringValue writes HKLM\SYSTEM\...\Services\pulsemon\DisplayName
-  //      directly - the source of truth, via a built-in call (no external
-  //      process, no command-line quote-mangling). Guaranteed to persist; a
-  //      reboot alone is enough to make services.msc show it (the SCM re-reads
-  //      the registry at boot).
-  //   2. `sc.exe config` syncs the SCM's in-memory cache so services.msc shows
-  //      the new name IMMEDIATELY (no reboot). It uses the no-quote value form
-  //      (DisplayName= Pulsemon) because Inno's Exec mangles embedded double
-  //      quotes, and a short Sleep lets the SCM settle after a fresh `sc create`
-  //      before the config is applied (a config issued in the same breath as the
-  //      create can be dropped, leaving the cache at the service name).
-  RegWriteStringValue(hkLM, 'SYSTEM\CurrentControlSet\Services\' + ServiceName, 'DisplayName', 'Pulsemon');
-  Sleep(1000);
-  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= Pulsemon');
 end;
 
 procedure StartService;
