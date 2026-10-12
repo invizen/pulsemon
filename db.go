@@ -75,7 +75,6 @@ func (db *DB) InitSchema() error {
 		name TEXT UNIQUE NOT NULL,
 		target TEXT NOT NULL,
 		type TEXT NOT NULL DEFAULT 'icmp',
-		tag TEXT,
 		interval_s INTEGER NOT NULL,
 		timeout_ms INTEGER NOT NULL,
 		loss_warn INTEGER NOT NULL,
@@ -623,7 +622,7 @@ func (db *DB) SeedSensors() error {
 	}
 
 	// Fresh-install demo sensors. Tuning matches the UI-created defaults in
-	// the API (POST /api/sensors: 15s / 1000ms / 25% / 4) so a seeded
+	// the API (POST /api/sensors: 60s / 1000ms / 25% / 2 / 3x) so a seeded
 	// sensor and a dashboard-created one behave identically. They start
 	// PAUSED — like UI-created sensors — because the targets are
 	// environment-independent placeholders (127.0.0.1: not every host runs
@@ -639,14 +638,17 @@ func (db *DB) SeedSensors() error {
 	}
 
 	for _, s := range sensors {
+		// A real UUID id (not the name) so seeded sensors carry the same id
+		// format as every API-created sensor.
+		id := newID()
 		if _, err := db.Exec(`
 			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
 			VALUES (?, ?, ?, 60, 1000, 25, 2, 3, 'paused', 'up', ?)`,
-			s.name, s.name, s.target, tsNow()); err != nil {
+			id, s.name, s.target, tsNow()); err != nil {
 			return err
 		}
 		if s.tags != "" {
-			if _, err := db.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", s.name, s.tags); err != nil {
+			if _, err := db.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, s.tags); err != nil {
 				return err
 			}
 		}

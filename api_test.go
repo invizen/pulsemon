@@ -315,3 +315,74 @@ func TestSensorNameXSSRejectedEndToEnd(t *testing.T) {
 		t.Fatalf("renamed = %q, want router2", after)
 	}
 }
+
+// TestLossWarnBounded locks the M2 fix: loss_warn is range-checked (1-100) on
+// BOTH POST and PATCH. Out-of-range values are a 400, an omitted value
+// defaults to 25, and a valid PATCH value is persisted.
+func TestLossWarnBounded(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	// POST: out-of-range → 400.
+	resp, err := http.Post(httpSrv.URL+"/api/sensors", "application/json",
+		strings.NewReader(`{"name":"a","target":"10.99.99.1","loss_warn":150}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("POST loss_warn=150: got %d, want 400", resp.StatusCode)
+	}
+
+	// POST: omitted → 201, defaults to 25.
+	resp, err = http.Post(httpSrv.URL+"/api/sensors", "application/json",
+		strings.NewReader(`{"name":"router","target":"10.99.99.1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("POST omitted loss_warn: got %d, want 201", resp.StatusCode)
+	}
+	var lw int
+	if err := db.QueryRow("SELECT loss_warn FROM sensors WHERE name='router'").Scan(&lw); err != nil {
+		t.Fatal(err)
+	}
+	if lw != 25 {
+		t.Fatalf("default loss_warn = %d, want 25", lw)
+	}
+
+	var id string
+	if err := db.QueryRow("SELECT id FROM sensors WHERE name='router'").Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	patch := func(body string) int {
+		req, _ := http.NewRequest("PATCH", httpSrv.URL+"/api/sensors/"+id, strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r, err := httpSrv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+
+	// PATCH: 0 and 150 → 400; 50 → 200 and persisted.
+	if code := patch(`{"loss_warn":0}`); code != http.StatusBadRequest {
+		t.Fatalf("PATCH loss_warn=0: got %d, want 400", code)
+	}
+	if code := patch(`{"loss_warn":150}`); code != http.StatusBadRequest {
+		t.Fatalf("PATCH loss_warn=150: got %d, want 400", code)
+	}
+	if code := patch(`{"loss_warn":50}`); code != http.StatusOK {
+		t.Fatalf("PATCH loss_warn=50: got %d, want 200", code)
+	}
+	if err := db.QueryRow("SELECT loss_warn FROM sensors WHERE id=?", id).Scan(&lw); err != nil {
+		t.Fatal(err)
+	}
+	if lw != 50 {
+		t.Fatalf("loss_warn after PATCH = %d, want 50", lw)
+	}
+}

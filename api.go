@@ -237,12 +237,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, hz)
 }
 
-// sensorStats was the pre-v0.1.18 per-sensor SQL aggregator (4 queries per
-// call: 60-probe window, 1h loss/avg, 24h uptime, 1h sparkline). It is
-// superseded by ProbeWorker.GetStats, which computes the identical
-// SensorStats from the in-memory cache with zero DB round-trips. Kept in
-// git history for reference; do not call.
-
 func (s *Server) fetchSensors() []Sensor {
 	rows, err := s.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
 	if err != nil {
@@ -369,6 +363,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.LossWarn <= 0 {
 			req.LossWarn = 25
+		}
+		if req.LossWarn < 1 || req.LossWarn > 100 {
+			respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
+			return
 		}
 		if req.DownAfter <= 0 {
 			req.DownAfter = 2
@@ -607,6 +605,10 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			add("timeout_ms", *req.TimeoutMS)
 		}
 		if req.LossWarn != nil {
+			if *req.LossWarn < 1 || *req.LossWarn > 100 {
+				respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
+				return
+			}
 			add("loss_warn", *req.LossWarn)
 		}
 		if req.DownAfter != nil {
@@ -697,6 +699,10 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			respondWithError(w, http.StatusNotFound, "sensor not found")
+			return
+		}
+		if errors.Is(err, errPulseCoolingDown) {
+			respondWithError(w, http.StatusTooManyRequests, "pulse too soon — try again in a moment")
 			return
 		}
 		respondWithError(w, http.StatusInternalServerError, err.Error())
@@ -1285,6 +1291,15 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 			}
 		}
 		if kind == "smtp" {
+			// The host is validated against the reserved-range blocklist
+			// (the same check the webhook path applies) before it is stored,
+			// so the SMTP transport can never be pointed at loopback,
+			// cloud-metadata (169.254.169.254), or other reserved space.
+			if u != "" {
+				if err := validateSMTPHost(u); err != nil {
+					return fmt.Errorf("smtp host: %s", err.Error())
+				}
+			}
 			// Persist the host under smtp_host (not smtp_url) so the SMTP
 			// transport reads it from the right key.
 			if err := s.db.SetSetting("smtp_host", u); err != nil {

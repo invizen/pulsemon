@@ -21,7 +21,7 @@ FROM scratch
 # no dynamic loader or libc is needed, and the web UI is compiled in via
 # go:embed, so there is nothing else to ship.
 COPY --from=builder /app/pulsemon /pulsemon
-COPY --from=alpine:latest /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=alpine:3.20 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 WORKDIR /
 ENV PULSEMON_DB=/data/pulsemon.db
 EXPOSE 9299

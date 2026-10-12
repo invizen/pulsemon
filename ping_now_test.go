@@ -109,3 +109,54 @@ func TestEchoNowUnknownSensorReturns404(t *testing.T) {
 		t.Fatalf("ping on unknown sensor: %d, want 404, body %s", w.Code, w.Body.String())
 	}
 }
+
+// TestEchoNowCooldownThrottles locks the m5 fix: a second manual pulse within
+// pulseNowCooldown is refused with 429 and NOT recorded, so an unthrottled
+// loop of "Pulse Now" clicks can't starve the probe queue.
+func TestEchoNowCooldownThrottles(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "echo5.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('echocd','echocd','192.0.2.1',15,8000,25,1,3,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert sensor: %v", err)
+	}
+	pw := NewProbeWorker(db)
+	srv := NewServer(db, pw)
+
+	orig := probeTarget
+	probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+		return probeOutcome{lost: true, ip: "192.0.2.1"}
+	}
+	defer func() { probeTarget = orig }()
+
+	// First pulse: 200.
+	req := httptest.NewRequest(http.MethodPost, "/api/sensors/echocd/ping", nil)
+	w := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("first pulse: %d, want 200, body %s", w.Code, w.Body.String())
+	}
+
+	// Immediate second pulse: within the 2s cooldown → 429.
+	req2 := httptest.NewRequest(http.MethodPost, "/api/sensors/echocd/ping", nil)
+	w2 := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(w2, req2)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second pulse (within cooldown): %d, want 429, body %s", w2.Code, w2.Body.String())
+	}
+
+	// Only ONE probe row recorded — the throttled pulse must not record.
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "echocd").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("probe rows = %d, want 1 (the throttled pulse must not record)", n)
+	}
+}

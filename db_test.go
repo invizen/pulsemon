@@ -337,37 +337,43 @@ func TestSeedSensorsFreshInstallTuning(t *testing.T) {
 	}
 
 	for _, want := range []struct {
-		id, target, tag string
+		name, target, tag string
 	}{
 		{"router", "127.0.0.1", "Networking"},
 		{"server", "127.0.0.1", "Servers"},
 	} {
+		var id string
 		var intervalS, timeoutMS, lossWarn, downAfter, spikeMult int
 		var target, state, status string
-		if err := db.QueryRow(`SELECT target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status
-			FROM sensors WHERE id = ?`, want.id).
-			Scan(&target, &intervalS, &timeoutMS, &lossWarn, &downAfter, &spikeMult, &state, &status); err != nil {
-			t.Fatalf("read %s: %v", want.id, err)
+		if err := db.QueryRow(`SELECT id, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status
+			FROM sensors WHERE name = ?`, want.name).
+			Scan(&id, &target, &intervalS, &timeoutMS, &lossWarn, &downAfter, &spikeMult, &state, &status); err != nil {
+			t.Fatalf("read %s: %v", want.name, err)
+		}
+		// Seed ids are UUIDs (newID()), matching API-created sensors — not
+		// the legacy name-as-id shape.
+		if len(id) != 36 {
+			t.Errorf("%s seed id = %q, want a 36-char UUID (newID())", want.name, id)
 		}
 		if target != want.target {
-			t.Errorf("%s target = %q, want %q (environment-neutral placeholder, not 192.168.1.x)", want.id, target, want.target)
+			t.Errorf("%s target = %q, want %q (environment-neutral placeholder, not 192.168.1.x)", want.name, target, want.target)
 		}
 		if intervalS != 60 || timeoutMS != 1000 || lossWarn != 25 || downAfter != 2 || spikeMult != 3 {
 			t.Errorf("%s tuning = %ds/%dms/%d%%/%d/spike%d, want 60s/1000ms/25%%/2/spike3 (must match UI-created defaults)",
-				want.id, intervalS, timeoutMS, lossWarn, downAfter, spikeMult)
+				want.name, intervalS, timeoutMS, lossWarn, downAfter, spikeMult)
 		}
 		if state != "paused" {
-			t.Errorf("%s state = %q, want paused (placeholder targets must not alert on a fresh install)", want.id, state)
+			t.Errorf("%s state = %q, want paused (placeholder targets must not alert on a fresh install)", want.name, state)
 		}
 		if status != "up" {
-			t.Errorf("%s status = %q, want up (never fake a down state at seed time)", want.id, status)
+			t.Errorf("%s status = %q, want up (never fake a down state at seed time)", want.name, status)
 		}
 		var nTags int
-		if err := db.QueryRow("SELECT COUNT(*) FROM sensor_tags WHERE sensor_id = ? AND tag = ?", want.id, want.tag).Scan(&nTags); err != nil {
-			t.Fatalf("tag %s: %v", want.id, err)
+		if err := db.QueryRow("SELECT COUNT(*) FROM sensor_tags WHERE sensor_id = ? AND tag = ?", id, want.tag).Scan(&nTags); err != nil {
+			t.Fatalf("tag %s: %v", want.name, err)
 		}
 		if nTags != 1 {
-			t.Errorf("%s tag %q missing (count=%d)", want.id, want.tag, nTags)
+			t.Errorf("%s tag %q missing (count=%d)", want.name, want.tag, nTags)
 		}
 	}
 }

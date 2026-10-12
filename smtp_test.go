@@ -137,12 +137,12 @@ func TestApplyProviderUpdateSMTP(t *testing.T) {
 		"port": "587", "from": "pulsemon@home.lan", "to": "ops@home.lan",
 		"username": "pulsemon", "tls_mode": "starttls",
 	}
-	if err := srv.applyProviderUpdate("smtp", strPtr("smtp.home.lan"), boolPtr(true), extra); err != nil {
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), boolPtr(true), extra); err != nil {
 		t.Fatalf("applyProviderUpdate smtp: %v", err)
 	}
 	// Host is stored under smtp_host (the URL field is repurposed as host).
-	if got := db.GetSetting("smtp_host"); got != "smtp.home.lan" {
-		t.Fatalf("smtp_host = %q, want smtp.home.lan", got)
+	if got := db.GetSetting("smtp_host"); got != "10.0.0.25" {
+		t.Fatalf("smtp_host = %q, want 10.0.0.25", got)
 	}
 	if got := db.GetSetting("smtp_port"); got != "587" {
 		t.Fatalf("smtp_port = %q, want 587", got)
@@ -158,7 +158,7 @@ func TestApplyProviderUpdateSMTP(t *testing.T) {
 func TestApplyProviderUpdateSMTPRejectsBadPort(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
-	if err := srv.applyProviderUpdate("smtp", strPtr("smtp.home.lan"), nil, map[string]string{"port": "notanumber"}); err == nil {
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"port": "notanumber"}); err == nil {
 		t.Fatal("expected bad port to be rejected, got nil")
 	}
 }
@@ -166,7 +166,7 @@ func TestApplyProviderUpdateSMTPRejectsBadPort(t *testing.T) {
 func TestApplyProviderUpdateSMTPRejectsBadTLSMode(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
-	if err := srv.applyProviderUpdate("smtp", strPtr("smtp.home.lan"), nil, map[string]string{"tls_mode": "weird"}); err == nil {
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"tls_mode": "weird"}); err == nil {
 		t.Fatal("expected bad tls_mode to be rejected, got nil")
 	}
 }

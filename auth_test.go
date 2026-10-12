@@ -978,3 +978,36 @@ func jsonDecode(t *testing.T, resp *http.Response, v interface{}) {
 		t.Fatalf("decode response: %v", err)
 	}
 }
+
+// TestSweepThrottleDropsStaleEntries locks the m4 fix: the opportunistic GC
+// drops throttle entries that can no longer affect a decision (no recent
+// failures AND no active lockout), while keeping entries with a recent
+// failure or an unexpired lockout. This bounds memory under a multi-IP spray.
+func TestSweepThrottleDropsStaleEntries(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+	now := time.Now()
+
+	// stale: failures older than the window, no lockout → dropped.
+	a.loginThrottle.fails["stale"] = []time.Time{now.Add(-2 * loginFailWindow)}
+	// recent: a failure within the window → kept.
+	a.loginThrottle.fails["recent"] = []time.Time{now.Add(-time.Second)}
+	// locked: stale failures but an active (unexpired) lockout → kept.
+	a.loginThrottle.fails["locked"] = []time.Time{now.Add(-2 * loginFailWindow)}
+	a.loginThrottle.lockout["locked"] = now.Add(loginLockout)
+
+	a.sweepThrottle(now)
+
+	if _, ok := a.loginThrottle.fails["stale"]; ok {
+		t.Error("stale entry not swept")
+	}
+	if _, ok := a.loginThrottle.fails["recent"]; !ok {
+		t.Error("recent entry swept (should be kept)")
+	}
+	if _, ok := a.loginThrottle.fails["locked"]; !ok {
+		t.Error("locked entry swept (should be kept while lockout is active)")
+	}
+	if _, ok := a.loginThrottle.lockout["locked"]; !ok {
+		t.Error("active lockout removed (should be kept)")
+	}
+}

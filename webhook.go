@@ -239,3 +239,64 @@ func checkWebhookIP(ip net.IP, host string) error {
 	}
 	return nil
 }
+
+// validateSMTPHost validates the SMTP mail-server host with the same
+// reserved-range rules the webhook path applies: a well-formed hostname or IP
+// literal that does not land in a reserved range (loopback, link-local —
+// including the 169.254.169.254 cloud-metadata address —, unspecified,
+// multicast, or blockedSubnets). RFC1918/ULA are allowed, because a homelab
+// mail server on the LAN is the point.
+//
+// Unlike validateWebhookURL there is no scheme gate (SMTP has no scheme) and
+// no .local/.localhost suffix rejection: an mDNS-named LAN relay (mail.local)
+// is a legitimate SMTP target, and the reserved-range check on the resolved
+// answers is what keeps loopback/metadata out. Hostnames are resolved and
+// every answer is checked, closing the save-time DNS-rebinding hole the
+// webhook path closes.
+func validateSMTPHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return fmt.Errorf("smtp host is required")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return checkWebhookIP(ip, host)
+	}
+	if !validSMTPHostname(host) {
+		return fmt.Errorf("smtp host %q is not a valid hostname", host)
+	}
+	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	if err != nil {
+		return fmt.Errorf("cannot resolve smtp host %q: %v", host, err)
+	}
+	for _, ip := range ips {
+		if err := checkWebhookIP(ip, host); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validSMTPHostname reports whether s is a syntactically valid RFC 1123
+// hostname: labels of [a-zA-Z0-9-] separated by single dots, no leading or
+// trailing hyphen, each label 1-63 chars, total 1-253. A single label (no
+// dots) is allowed — a homelab mail server is often reached by a bare name on
+// the LAN.
+func validSMTPHostname(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(s, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, r := range label {
+			if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-') {
+				return false
+			}
+		}
+	}
+	return true
+}

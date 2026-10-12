@@ -44,7 +44,7 @@ func (t *winDgram) send(dst net.IP, seq uint16) error {
 	// is set to probeID — the Windows driver uses it to demux replies to our
 	// socket (unlike Linux, the kernel does NOT overwrite the ID).
 	msg := make([]byte, 8+len(probePayload))
-	msg[0] = 8 // ICMPTypeEcho
+	msg[0] = 8                                   // ICMPTypeEcho
 	binary.BigEndian.PutUint16(msg[4:], probeID) // ID (driver demux key)
 	binary.BigEndian.PutUint16(msg[6:], seq)     // seq
 	copy(msg[8:], probePayload)

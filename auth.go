@@ -440,6 +440,11 @@ func (a *AuthState) loginFailed(ip string) {
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
+	// Opportunistic GC: see sweepThrottle. Bounded O(n) work, run only once
+	// the map is large enough that a spray is the likely cause.
+	if len(a.loginThrottle.fails) > 1024 {
+		a.sweepThrottle(now)
+	}
 	cutoff := now.Add(-loginFailWindow)
 	fails := a.loginThrottle.fails[ip]
 	kept := fails[:0]
@@ -464,6 +469,33 @@ func (a *AuthState) loginSuccess(ip string) {
 	a.ensureThrottleMaps()
 	delete(a.loginThrottle.fails, ip)
 	delete(a.loginThrottle.lockout, ip)
+}
+
+// sweepThrottle drops throttle entries that can no longer affect a decision:
+// no unexpired lockout and no failure within the rolling window. It is called
+// opportunistically from loginFailed once the maps grow past a threshold,
+// bounding memory under a multi-IP spray (one failed login per source IP,
+// where no single IP ever re-triggers its own prune). Caller must hold
+// a.loginThrottle.
+func (a *AuthState) sweepThrottle(now time.Time) {
+	cutoff := now.Add(-loginFailWindow)
+	for ip, ts := range a.loginThrottle.fails {
+		recent := false
+		for _, t := range ts {
+			if t.After(cutoff) {
+				recent = true
+				break
+			}
+		}
+		if recent {
+			continue
+		}
+		if until, ok := a.loginThrottle.lockout[ip]; ok && now.Before(until) {
+			continue // active lockout: keep
+		}
+		delete(a.loginThrottle.fails, ip)
+		delete(a.loginThrottle.lockout, ip)
+	}
 }
 
 // ValidSession validates a session token: a live hit slides its expiry

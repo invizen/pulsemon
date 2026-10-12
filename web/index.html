@@ -772,7 +772,7 @@ function severityRank(s) {
   return sev * 2 + type;
 }
 
-function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function escJs(v) { return esc(v).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
 
 function sparklineBars(hour) {

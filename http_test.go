@@ -521,7 +521,7 @@ func TestValidURL(t *testing.T) {
 		{"http://10.0.0.5:8080/x", true},
 		{"https://[::1]:9443/", true},
 		{"https://example.com", true},
-		{"http://nas:8080", true},         // single-label internal host + explicit port
+		{"http://nas:8080", true},            // single-label internal host + explicit port
 		{"https://myhost:8443/health", true}, // single-label + port
 		{"ftp://example.com", false},
 		{"example.com", false},    // no scheme

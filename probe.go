@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -169,6 +170,11 @@ type ProbeWorker struct {
 	// instead of running 4 SQLite queries per sensor per poll.
 	statsMu    sync.RWMutex
 	statsCache map[string]*probeSeries
+
+	// lastPulse records when each sensor last had a manual "Pulse Now",
+	// enforcing a per-sensor cooldown so an unthrottled stream of pulses
+	// can't starve the probe queue. Guarded by mu; cleaned up in Remove.
+	lastPulse map[string]time.Time
 }
 
 // retentionSeconds is how long of a probe history the in-memory series keeps.
@@ -183,6 +189,7 @@ func NewProbeWorker(db *DB) *ProbeWorker {
 		loops:      make(map[string]context.CancelFunc),
 		db:         db,
 		statsCache: make(map[string]*probeSeries),
+		lastPulse:  make(map[string]time.Time),
 		stopCtx:    ctx,
 		stopCancel: cancel,
 	}
@@ -368,6 +375,7 @@ func (pw *ProbeWorker) Remove(id string) {
 		delete(pw.loops, id)
 	}
 	delete(pw.sensors, id)
+	delete(pw.lastPulse, id)
 }
 
 // ActiveCount is the number of sensor loops currently tracked (healthz).
@@ -813,6 +821,14 @@ func fnvHash(b []byte) uint64 {
 // test can shorten it.
 var pingNowTimeout = time.Second
 
+// errPulseCoolingDown is returned by PingNow when a manual pulse arrives
+// before the per-sensor cooldown elapses; the handler maps it to 429.
+var errPulseCoolingDown = errors.New("pulse too soon")
+
+// pulseNowCooldown bounds how often a sensor may be manually pulsed. A
+// human's click rate is far below this; an unthrottled loop is not.
+const pulseNowCooldown = 2 * time.Second
+
 // PingNow performs one immediate "Pulse Now" probe and RECORDS it: the row
 // lands in probes (history + dashboard sparkline) and the in-memory stats
 // cache, exactly as a scheduled tick would — but it deliberately does NOT
@@ -828,6 +844,17 @@ func (pw *ProbeWorker) PingNow(id string) (probeOutcome, error) {
 	if err := pw.db.QueryRow("SELECT target, type FROM sensors WHERE id = ?", id).Scan(&target, &probeType); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
 	}
+	// Per-sensor cooldown: a manual pulse is a quick diagnostic, and an
+	// unthrottled stream of them would starve the probe queue. 2s is well
+	// above a human's click rate.
+	now := time.Now()
+	pw.mu.Lock()
+	if last, ok := pw.lastPulse[id]; ok && now.Sub(last) < pulseNowCooldown {
+		pw.mu.Unlock()
+		return probeOutcome{}, errPulseCoolingDown
+	}
+	pw.lastPulse[id] = now
+	pw.mu.Unlock()
 	if probeType == "" {
 		probeType = "icmp"
 	}
@@ -838,9 +865,9 @@ func (pw *ProbeWorker) PingNow(id string) (probeOutcome, error) {
 	if !o.lost {
 		rttVal = o.rttMs
 	}
-	now := time.Now().UTC()
+	ts := time.Now().UTC()
 	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)",
-		id, now.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
+		id, ts.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
