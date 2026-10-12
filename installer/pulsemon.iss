@@ -121,19 +121,21 @@ begin
   // Ensure the display name is "Pulsemon" on EVERY install. The create above
   // only runs when the service does not exist, so a service left by a pre-fix
   // installer stays "pulsemon" and an in-place upgrade would never correct it.
-  // Ensure the display name is "Pulsemon" on EVERY install. The create above
-  // only runs when the service does not exist, so a service left by a pre-fix
-  // installer stays "pulsemon" and an in-place upgrade would never correct it.
   // Two mechanisms, because each alone proved flaky on real boxes:
   //   1. RegWriteStringValue writes HKLM\SYSTEM\...\Services\pulsemon\DisplayName
   //      directly - the source of truth, via a built-in call (no external
-  //      process, no command-line quote-mangling). Guaranteed to persist.
+  //      process, no command-line quote-mangling). Guaranteed to persist; a
+  //      reboot alone is enough to make services.msc show it (the SCM re-reads
+  //      the registry at boot).
   //   2. `sc.exe config` syncs the SCM's in-memory cache so services.msc shows
-  //      the new name without a reboot. (PowerShell Set-Service -DisplayName was
-  //      tried in v0.3.5 and found to update only the cache, not the registry.)
-  // After a reboot the SCM re-reads the registry, so (1) alone is sufficient.
+  //      the new name IMMEDIATELY (no reboot). It uses the no-quote value form
+  //      (DisplayName= Pulsemon) because Inno's Exec mangles embedded double
+  //      quotes, and a short Sleep lets the SCM settle after a fresh `sc create`
+  //      before the config is applied (a config issued in the same breath as the
+  //      create can be dropped, leaving the cache at the service name).
   RegWriteStringValue(hkLM, 'SYSTEM\CurrentControlSet\Services\' + ServiceName, 'DisplayName', 'Pulsemon');
-  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= "Pulsemon"');
+  Sleep(1000);
+  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= Pulsemon');
 end;
 
 procedure StartService;
