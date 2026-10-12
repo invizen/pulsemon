@@ -100,23 +100,29 @@ var
 begin
   exePath := ExpandConstant('{app}\{#MyAppExeName}');
   CreateDataDir;
-  if ServiceExists() then
-    Exit; // idempotent: an upgrade keeps the existing service
-  if not RunHidden('sc.exe',
-      'create ' + ServiceName +
-      ' binPath= "' + exePath + '"' +
-      ' start= auto' +
-      ' DisplayName= "Pulsemon"') then
+  if not ServiceExists() then
   begin
-    MsgBox('Failed to create the pulsemon service. You can create it manually:' #13#10 +
-           'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto',
-           mbError, MB_OK);
-    Exit;
+    if not RunHidden('sc.exe',
+        'create ' + ServiceName +
+        ' binPath= "' + exePath + '"' +
+        ' start= auto' +
+        ' DisplayName= "Pulsemon"') then
+    begin
+      MsgBox('Failed to create the pulsemon service. You can create it manually:' #13#10 +
+             'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto',
+             mbError, MB_OK);
+      Exit;
+    end;
+    RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
+    // Restart the service automatically if it crashes (10s, 30s, 60s delays).
+    RunHidden('sc.exe', 'failure ' + ServiceName +
+      ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
   end;
-  RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
-  // Restart the service automatically if it crashes (10s, 30s, 60s delays).
-  RunHidden('sc.exe', 'failure ' + ServiceName +
-    ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
+  // Ensure the display name is "Pulsemon" on EVERY install. The create above
+  // only runs when the service does not exist, so a service left by a pre-fix
+  // installer stays "pulsemon" and an in-place upgrade would never correct it.
+  // `sc config` updates the name in place and is a no-op if already correct.
+  RunHidden('sc.exe', 'config ' + ServiceName + ' DisplayName= "Pulsemon"');
 end;
 
 procedure StartService;
