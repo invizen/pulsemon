@@ -100,67 +100,42 @@ begin
   end;
 end;
 
-// Return the exact-case registry key name of the service (e.g. "Pulsemon" vs a
-// legacy lowercase "pulsemon"), or '' if no such service exists. Service names
-// are case-insensitive for lookup, so this registry enumeration is the only way
-// to read back the case the name was actually stored under.
-function GetServiceKeyExactName(): string;
-var
-  I: Integer;
-  KeyName: string;
-begin
-  Result := '';
-  I := 0;
-  while RegEnumKey(HKLM, 'SYSTEM\CurrentControlSet\Services', I, KeyName) do
-  begin
-    if CompareText(KeyName, ServiceName) = 0 then
-    begin
-      Result := KeyName;
-      Break;
-    end;
-    Inc(I);
-  end;
-end;
-
 procedure CreateService;
 var
   exePath: string;
-  exactName: string;
 begin
   exePath := ExpandConstant('{app}\{#MyAppExeName}');
   CreateDataDir;
-  // One-time migration: a service left by a pre-v0.3.7 installer is named
-  // lowercase "pulsemon". The SCM will not rename a service in place, and its
-  // display-name cache is sticky (sc config / Set-Service succeed but do not
-  // move it), so the only way to present it as "Pulsemon" is to rebuild the
-  // registration. If the stored case differs from "Pulsemon", stop + delete it;
-  // the create below then rebuilds it with the correct name.
-  exactName := GetServiceKeyExactName();
-  if (exactName <> '') and (exactName <> ServiceName) then
+  // Rebuild the service registration on every install. A service left by a
+  // pre-v0.3.7 installer is named lowercase "pulsemon"; the SCM will not rename
+  // it in place, and its display-name cache is sticky (sc config / Set-Service
+  // succeed but do not move it, and a reboot does not reconcile it). Deleting
+  // and recreating it as "Pulsemon" is the only reliable way to present it that
+  // way. Service names are case-insensitive, so `sc delete Pulsemon` works
+  // against a legacy "pulsemon" too. PrepareToInstall already stopped a running
+  // service before the file copy; the stop below is a safety net.
+  if ServiceExists() then
   begin
-    RunHidden('sc.exe', 'stop ' + exactName);
+    RunHidden('sc.exe', 'stop ' + ServiceName);
     // Let the service finish its clean shutdown before deleting the registration.
     Sleep(2000);
-    RunHidden('sc.exe', 'delete ' + exactName);
+    RunHidden('sc.exe', 'delete ' + ServiceName);
   end;
-  if not ServiceExists() then
+  if not RunHidden('sc.exe',
+      'create ' + ServiceName +
+      ' binPath= "' + exePath + '"' +
+      ' start= auto' +
+      ' DisplayName= "Pulsemon"') then
   begin
-    if not RunHidden('sc.exe',
-        'create ' + ServiceName +
-        ' binPath= "' + exePath + '"' +
-        ' start= auto' +
-        ' DisplayName= "Pulsemon"') then
-    begin
-      MsgBox('Failed to create the Pulsemon service. You can create it manually:' #13#10 +
-             'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto DisplayName= "Pulsemon"',
-             mbError, MB_OK);
-      Exit;
-    end;
-    RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
-    // Restart the service automatically if it crashes (10s, 30s, 60s delays).
-    RunHidden('sc.exe', 'failure ' + ServiceName +
-      ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
+    MsgBox('Failed to create the Pulsemon service. You can create it manually:' #13#10 +
+           'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto DisplayName= "Pulsemon"',
+           mbError, MB_OK);
+    Exit;
   end;
+  RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
+  // Restart the service automatically if it crashes (10s, 30s, 60s delays).
+  RunHidden('sc.exe', 'failure ' + ServiceName +
+    ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
 end;
 
 procedure StartService;
