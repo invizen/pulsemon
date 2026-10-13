@@ -94,12 +94,22 @@ func fileExists(p string) bool {
 }
 
 // httpsAddrFor derives the TLS listen address from PULSEMON_ADDR (same
-// host, HTTPS port): ":80" → ":443", "127.0.0.1:8080" → "127.0.0.1:443".
+// host, HTTPS port): ":80" → ":443", "127.0.0.1:8080" → "127.0.0.1:443",
+// "[::1]:8080" → "[::1]:443".
+//
+// SplitHostPort (NOT a naive LastIndex) so an IPv6 host keeps exactly one
+// pair of brackets: JoinHostPort double-wraps a host that already carries
+// brackets, and "[[::1]]:443" is an invalid address.
 func httpsAddrFor(httpsPort int) string {
 	addr := listenAddr()
-	host := ""
-	if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
-		host = addr[:i]
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Bare port or unbracketed IPv6: fall back to the last-colon split,
+		// which is right for every form net.Listen accepts.
+		host = ""
+		if i := strings.LastIndex(addr, ":"); i >= 0 && i+1 < len(addr) {
+			host = addr[:i]
+		}
 	}
 	return net.JoinHostPort(host, strconv.Itoa(httpsPort))
 }

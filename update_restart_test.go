@@ -59,6 +59,7 @@ func TestHandleRestartHappy(t *testing.T) {
 	healthz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/healthz" {
 			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
 			return
 		}
 		http.NotFound(w, r)
@@ -210,6 +211,7 @@ func TestHealthzTarget(t *testing.T) {
 		{":8443", "localhost:8443"},
 		{"127.0.0.1:9299", "127.0.0.1:9299"},
 		{"10.99.99.5:9300", "10.99.99.5:9300"},
+		{"[::1]:9299", "[::1]:9299"},
 		{"9299", "localhost:9299"},
 	}
 	for _, c := range cases {
@@ -226,6 +228,7 @@ func TestHealthzTarget(t *testing.T) {
 func TestWaitHealthyReachesServer(t *testing.T) {
 	healthz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok"}`))
 	}))
 	defer healthz.Close()
 	setHealthzTarget(t, healthz)
@@ -234,7 +237,7 @@ func TestWaitHealthyReachesServer(t *testing.T) {
 	healthzTimeout = 3 * time.Second
 	t.Cleanup(func() { healthzTimeout = oldTimeout })
 
-	ok, detail := waitHealthy()
+	ok, detail := waitHealthy(nil)
 	if !ok {
 		t.Fatalf("waitHealthy = false, want true (server is up): %s", detail)
 	}
@@ -314,7 +317,7 @@ func TestWaitHealthyTimesOutOnDeadPort(t *testing.T) {
 	t.Cleanup(func() { healthzTimeout = oldTimeout })
 
 	start := time.Now()
-	ok, detail := waitHealthy()
+	ok, detail := waitHealthy(nil)
 	if ok {
 		t.Fatalf("waitHealthy = true on a closed port, want false: %s", detail)
 	}

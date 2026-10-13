@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -343,8 +344,16 @@ func handleRestart(exe string, restart bool) int {
 		uErr("the new binary is installed but the service did not restart — check: " + journalHint(d))
 		return 1
 	}
-	// Poll healthz to confirm the new binary actually came up.
-	if ok, detail := waitHealthy(); ok {
+	// Poll healthz to confirm the new binary actually came up. The new
+	// process's port depends on its TLS config, which lives in the DB —
+	// open it (same data volume; WAL allows a concurrent reader) so the
+	// check can find a TLS-on-custom-port install. nil on failure: the
+	// check then falls back to the default HTTPS port.
+	db := openHealthzDB()
+	if db != nil {
+		defer db.Close()
+	}
+	if ok, detail := waitHealthy(db); ok {
 		uInfo("pulsemon is up and healthy after restart (" + detail + ")")
 	} else {
 		uErr("service restarted but is not answering healthz yet (" + detail + ")")
@@ -663,25 +672,80 @@ func journalHint(bus string) string {
 	return "journalctl -u pulsemon"
 }
 
-// healthzTarget derives the host:port to healthcheck from PULSEMON_ADDR, the
-// same way install.sh does:
+// healthzHostPort splits PULSEMON_ADDR into (host, port) for the health
+// check, the same way install.sh derives its target:
 //
-//	":9299"           -> "localhost:9299"  (all-interface bind)
-//	"127.0.0.1:9299"  -> "127.0.0.1:9299"
-//	"9299" (bare)     -> "localhost:9299"
-//	"" (unset)        -> "localhost:9299"  (the binary's own default)
-func healthzTarget() string {
+//	":9299"           -> ("localhost", "9299")  (all-interface bind)
+//	"127.0.0.1:9299"  -> ("127.0.0.1", "9299")
+//	"[::1]:9299"      -> ("::1", "9299")
+//	"9299" (bare)     -> ("localhost", "9299")
+//	"" (unset)        -> ("localhost", "9299")  (the binary's own default)
+func healthzHostPort() (string, string) {
 	addr := os.Getenv("PULSEMON_ADDR")
 	switch {
 	case addr == "":
-		return "localhost:9299"
+		return "localhost", "9299"
 	case strings.HasPrefix(addr, ":"):
-		return "localhost" + addr
+		return "localhost", addr[1:]
 	case strings.ContainsRune(addr, ':'):
-		return addr
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			return "localhost", "9299"
+		}
+		if host == "" {
+			host = "localhost"
+		}
+		return host, port
 	default: // bare port
-		return "localhost:" + addr
+		return "localhost", addr
 	}
+}
+
+// healthzTarget derives the plain-HTTP host:port to healthcheck from
+// PULSEMON_ADDR (kept for callers that only need the HTTP candidate).
+func healthzTarget() string {
+	host, port := healthzHostPort()
+	return net.JoinHostPort(host, port)
+}
+
+// healthzTargets returns the ordered scheme://host:port candidates the
+// post-restart health check polls. The port the new process serves on
+// depends on its listener config: with a TLS cert in place it serves
+// HTTPS ONLY on the configured HTTPS port (listener_https_port, default
+// 443) and does NOT bind the PULSEMON_ADDR port at all — so a TLS
+// install's healthz is unreachable at the plain port (the old code polled
+// only the plain port and `pulsemon update --restart` always timed out on
+// TLS installs). Poll every (scheme, port) combination and accept the
+// first that answers pulsemon's healthz payload; that covers plain
+// installs, TLS on the default port, TLS on a custom listener_https_port,
+// and a cert added/removed across the restart.
+//
+// db may be nil (no data dir / first run): the HTTPS port falls back to
+// defaultHTTPSPort.
+func healthzTargets(db *DB) []string {
+	host, httpPort := healthzHostPort()
+	httpsPort := defaultHTTPSPort
+	if db != nil {
+		if p := db.GetSetting("listener_https_port"); p != "" {
+			if n, err := parsePort(p); err == nil {
+				httpsPort = n
+			}
+		}
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, t := range []string{
+		"https://" + net.JoinHostPort(host, strconv.Itoa(httpsPort)),
+		"http://" + net.JoinHostPort(host, httpPort),
+		"https://" + net.JoinHostPort(host, httpPort),
+		"http://" + net.JoinHostPort(host, strconv.Itoa(httpsPort)),
+	} {
+		if !seen[t] {
+			seen[t] = true
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // activeTimeout and restartTimeout bound the two systemctl calls in the
@@ -696,17 +760,39 @@ var (
 // healthzTimeout bounds the post-restart poll. A var so tests can shrink it.
 var healthzTimeout = 15 * time.Second
 
-// waitHealthy polls the pulsemon healthz endpoint until it answers a 2xx/3xx or
-// the timeout elapses. It returns ok plus a short detail for the log line.
+// healthzPayloadMarker is the substring that identifies a real pulsemon
+// healthz answer. A 2xx/3xx from ANY other service sharing a candidate port
+// (a reverse proxy on 443, a stale process on the HTTP port) must not be
+// mistaken for the monitor — the body check is what makes polling several
+// candidate ports safe.
+const healthzPayloadMarker = `"status":"ok"`
+
+// openHealthzDB opens the data DB so the post-restart health check can read
+// the listener config (the HTTPS port). A var so tests can stub it (the
+// restart tests run where no data dir exists). nil on any failure — the
+// health check then falls back to the default HTTPS port.
+var openHealthzDB = func() *DB {
+	db, err := NewDB(dbPathFromEnv())
+	if err != nil {
+		return nil
+	}
+	return db
+}
+
+// waitHealthy polls the pulsemon healthz endpoint until it answers with the
+// healthz payload or the timeout elapses. It returns ok plus a short detail
+// for the log line.
 //
-// HTTPS is tried BEFORE HTTP: once a cert is installed the plain-HTTP port
-// is deliberately not bound (listener.go serves TLS only), so an http://
-// poll would get connection-refused forever and falsely report the service
-// down after every cert change. TLS verification is skipped because the
-// question here is "did the new process come up and answer", not "is the
-// certificate trusted" — and a self-signed homelab cert must pass too.
-func waitHealthy() (bool, string) {
-	target := healthzTarget()
+// Every (scheme, port) candidate is polled (see healthzTargets): once a cert
+// is installed the plain-HTTP port is deliberately not bound, so the TLS
+// answer comes from the HTTPS port, not PULSEMON_ADDR's. A response only
+// counts when it carries the pulsemon healthz payload — a reverse proxy
+// answering on 443 must not be mistaken for the monitor. TLS verification is
+// skipped because the question here is "did the new process come up and
+// answer", not "is the certificate trusted" — and a self-signed homelab
+// cert must pass too.
+func waitHealthy(db *DB) (bool, string) {
+	targets := healthzTargets(db)
 	deadline := time.Now().Add(healthzTimeout)
 	client := &http.Client{
 		Timeout: 3 * time.Second,
@@ -716,20 +802,21 @@ func waitHealthy() (bool, string) {
 	}
 	var lastErr error
 	for {
-		for _, scheme := range []string{"https", "http"} {
-			resp, err := client.Get(scheme + "://" + target + "/api/healthz")
+		for _, target := range targets {
+			resp, err := client.Get(target + "/api/healthz")
 			if err == nil {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
-				if resp.StatusCode < 400 {
+				if resp.StatusCode < 400 && strings.Contains(string(body), healthzPayloadMarker) {
 					return true, target
 				}
-				lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+				lastErr = fmt.Errorf("HTTP %d without pulsemon healthz payload", resp.StatusCode)
 			} else {
 				lastErr = err
 			}
 		}
 		if time.Now().After(deadline) {
-			return false, target + " — " + lastErr.Error()
+			return false, strings.Join(targets, ", ") + " — " + lastErr.Error()
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
