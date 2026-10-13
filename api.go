@@ -1508,6 +1508,17 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 				return fmt.Errorf("smtp tls_mode: %q (valid: auto, starttls, tls, none)", vv)
 			}
 		}
+		if kind == "smtp" && (k == "from" || k == "to") {
+			// Single RFC 5322 address, no CR/LF (the raw message headers are
+			// built by concatenation in sendSMTP). Store the BARE address:
+			// net/smtp wraps MAIL/RCPT arguments in <...>, so a display name
+			// or a recipient list would 501 at send time.
+			addr, err := smtpAddr(vv)
+			if err != nil {
+				return fmt.Errorf("smtp %s: %s", k, err.Error())
+			}
+			vv = addr
+		}
 		if err := s.db.SetSetting(kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
 		}

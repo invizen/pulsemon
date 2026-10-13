@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"strconv"
 	"strings"
@@ -67,6 +68,33 @@ func smtpPort(v string) (int, error) {
 	return n, nil
 }
 
+// smtpAddr validates a stored smtp_from / smtp_to value: it must be a single
+// RFC 5322 address (bare a@b, or "Display" <a@b>) and must contain no CR/LF —
+// sendSMTP builds the raw message headers by string concatenation, so a
+// control character in a stored address would inject a forged header line.
+// It returns the BARE address (addr.Address), which is what MAIL FROM /
+// RCPT TO need: net/smtp wraps its argument in <...>, so a display name
+// (PulseMon <a@b>) or a comma-separated list would produce
+// MAIL FROM:<PulseMon <a@b>> — a 501 syntax error that silently kills every
+// alert.
+func smtpAddr(v string) (string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", fmt.Errorf("required")
+	}
+	if strings.ContainsAny(v, "\r\n") {
+		return "", fmt.Errorf("must not contain newline characters")
+	}
+	a, err := mail.ParseAddress(v)
+	if err != nil {
+		return "", fmt.Errorf("invalid address %q: %s", v, err.Error())
+	}
+	if a.Address == "" {
+		return "", fmt.Errorf("invalid address %q: missing @address", v)
+	}
+	return a.Address, nil
+}
+
 // smtpDial establishes sendSMTP's TCP connection. It defaults to dialChecked
 // (webhook.go): the rebind-safe, blocklist-enforcing dial the webhook
 // providers use. Tests override it to reach an in-process server on loopback.
@@ -114,6 +142,9 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	cfg := pw.smtpConfig()
 	if cfg.Host == "" {
 		return fmt.Errorf("smtp: no host configured")
+	}
+	if cfg.From == "" {
+		return fmt.Errorf("smtp: no sender configured")
 	}
 	if cfg.To == "" {
 		return fmt.Errorf("smtp: no recipient configured")
@@ -182,18 +213,32 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 			return fmt.Errorf("smtp auth: %w", err)
 		}
 	}
-	if err := c.Mail(cfg.From); err != nil {
+	// Normalize the stored addresses to bare form. Save-time validation
+	// (smtpAddr) does this for new values; this also rescues LEGACY values
+	// stored before the validator existed (e.g. a display name), so an
+	// upgrade doesn't break a working config. An unparseable value is
+	// passed through raw — it will 501 at the server, which is exactly the
+	// pre-validator behavior.
+	from := cfg.From
+	if a, err := mail.ParseAddress(cfg.From); err == nil {
+		from = a.Address
+	}
+	to := cfg.To
+	if a, err := mail.ParseAddress(cfg.To); err == nil {
+		to = a.Address
+	}
+	if err := c.Mail(from); err != nil {
 		return fmt.Errorf("smtp MAIL FROM: %w", err)
 	}
-	if err := c.Rcpt(cfg.To); err != nil {
+	if err := c.Rcpt(to); err != nil {
 		return fmt.Errorf("smtp RCPT TO: %w", err)
 	}
 	w, err := c.Data()
 	if err != nil {
 		return fmt.Errorf("smtp DATA: %w", err)
 	}
-	msg := "From: " + cfg.From + "\r\n" +
-		"To: " + cfg.To + "\r\n" +
+	msg := "From: " + from + "\r\n" +
+		"To: " + to + "\r\n" +
 		"Subject: " + subject + "\r\n" +
 		"Content-Type: text/plain; charset=utf-8\r\n" +
 		"Content-Transfer-Encoding: 8bit\r\n" +
@@ -250,9 +295,12 @@ func smtpBodyRe(state, name, target string, rttMs float64) string {
 // smtpEnabled: explicit "1" flag. No legacy default (fresh install = off).
 func smtpEnabled(db *DB) bool { return db.GetSetting("smtp_enabled") == "1" }
 
-// smtpHasURL: SMTP is "configured" when it has a host AND a recipient — the
-// mail-server equivalent of Telegram needing a URL and a chat_id. A host alone
-// can't deliver (no one to send to), a recipient alone has nowhere to go.
+// smtpHasURL: SMTP is "configured" when it has a host, a SENDER, and a
+// recipient — the mail-server equivalent of Telegram needing a URL and a
+// chat_id. A host alone can't deliver (no one to send to), a recipient
+// alone has nowhere to go, and a missing sender produces MAIL FROM:<>
+// (a null reverse path that submission servers reject with 501) — so all
+// three are required for the provider to count as ready.
 func smtpHasURL(db *DB) bool {
-	return db.GetSetting("smtp_host") != "" && db.GetSetting("smtp_to") != ""
+	return db.GetSetting("smtp_host") != "" && db.GetSetting("smtp_from") != "" && db.GetSetting("smtp_to") != ""
 }

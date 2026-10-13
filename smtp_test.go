@@ -97,10 +97,47 @@ func TestSmtpHasURL(t *testing.T) {
 	if smtpHasURL(db) {
 		t.Fatal("expected false with host but no recipient")
 	}
-	// Both → true.
+	// Host + recipient, no sender → false: a missing sender produces
+	// MAIL FROM:<> (a null reverse path submission servers reject with 501).
 	db.SetSetting("smtp_to", "ops@example.com")
+	if smtpHasURL(db) {
+		t.Fatal("expected false with host and recipient but no sender")
+	}
+	// All three → true.
+	db.SetSetting("smtp_from", "alerts@example.com")
 	if !smtpHasURL(db) {
-		t.Fatal("expected true with host and recipient")
+		t.Fatal("expected true with host, sender, and recipient")
+	}
+}
+
+func TestSmtpAddr(t *testing.T) {
+	cases := []struct {
+		in      string
+		want    string
+		wantErr bool
+	}{
+		{"alerts@home.lan", "alerts@home.lan", false},
+		{"  ops@example.com  ", "ops@example.com", false},        // trimmed
+		{`PulseMon <alerts@home.lan>`, "alerts@home.lan", false}, // display name → bare
+		{`"Invizen Ops" <ops@home.lan>`, "ops@home.lan", false},
+		{"", "", true},                         // empty
+		{"a@x.com, b@y.com", "", true},         // recipient list
+		{"a@x.com\r\nX-Injected: 1", "", true}, // CR/LF injection
+		{"a@x.com\nBcc: evil@x.com", "", true}, // LF injection
+		{"not an address", "", true},           // garbage
+		{"Display <a@b>", "a@b", false},        // unquoted display name
+	}
+	for _, c := range cases {
+		got, err := smtpAddr(c.in)
+		if c.wantErr && err == nil {
+			t.Fatalf("smtpAddr(%q): expected error, got %q", c.in, got)
+		}
+		if !c.wantErr && err != nil {
+			t.Fatalf("smtpAddr(%q): unexpected error %v", c.in, err)
+		}
+		if !c.wantErr && got != c.want {
+			t.Fatalf("smtpAddr(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }
 
@@ -169,6 +206,55 @@ func TestApplyProviderUpdateSMTPRejectsBadTLSMode(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"tls_mode": "weird"}); err == nil {
 		t.Fatal("expected bad tls_mode to be rejected, got nil")
+	}
+}
+
+// TestApplyProviderUpdateSMTPAddressValidation locks the finding-12 fix:
+// smtp_from / smtp_to are validated as single RFC 5322 addresses on save and
+// stored in BARE form (net/smtp wraps MAIL/RCPT arguments in <...>, so a
+// display name or a recipient list would 501 at send time), and CR/LF is
+// refused (the raw headers are built by concatenation). Fails on the old
+// code, which stored the raw string and blew up at send time.
+func TestApplyProviderUpdateSMTPAddressValidation(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	// Display name accepted and stored bare.
+	extra := map[string]string{
+		"from": `PulseMon <alerts@home.lan>`,
+		"to":   "ops@home.lan",
+	}
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, extra); err != nil {
+		t.Fatalf("display-name from should be accepted: %v", err)
+	}
+	if got := db.GetSetting("smtp_from"); got != "alerts@home.lan" {
+		t.Fatalf("smtp_from = %q, want bare alerts@home.lan (display name normalized on save)", got)
+	}
+	if got := db.GetSetting("smtp_to"); got != "ops@home.lan" {
+		t.Fatalf("smtp_to = %q, want ops@home.lan", got)
+	}
+
+	// Recipient list rejected.
+	db2 := newTestDB(t)
+	srv2 := NewServer(db2, NewProbeWorker(db2))
+	if err := srv2.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"from": "a@x.com", "to": "a@x.com, b@y.com"}); err == nil {
+		t.Fatal("comma-separated recipients should be rejected, got nil")
+	}
+	if got := db2.GetSetting("smtp_to"); got != "" {
+		t.Fatalf("smtp_to = %q, want empty (rejected value must not persist)", got)
+	}
+
+	// CR/LF injection rejected.
+	if err := srv2.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"from": "a@x.com", "to": "a@x.com\r\nBcc: evil@x.com"}); err == nil {
+		t.Fatal("CR/LF in to should be rejected, got nil")
+	}
+	if got := db2.GetSetting("smtp_to"); got != "" {
+		t.Fatalf("smtp_to = %q, want empty (injection attempt must not persist)", got)
+	}
+
+	// Empty from rejected (a missing sender is MAIL FROM:<> — a 501).
+	if err := srv2.applyProviderUpdate("smtp", strPtr("10.0.0.25"), nil, map[string]string{"from": "", "to": "a@x.com"}); err == nil {
+		t.Fatal("empty from should be rejected, got nil")
 	}
 }
 
@@ -321,6 +407,122 @@ func TestApplyProviderUpdateSMTPRejectsExtraHost(t *testing.T) {
 	}
 	if got := db.GetSetting("smtp_host"); got != "" {
 		t.Fatalf("smtp_host = %q, want empty (extra host must not persist)", got)
+	}
+}
+
+// TestSendSMTPEmptyFromRefused locks the sender guard: a config with a host
+// and recipient but no sender must fail BEFORE dialing (the old code dialed
+// the relay and failed at MAIL FROM:<> with a server 501).
+func TestSendSMTPEmptyFromRefused(t *testing.T) {
+	db := newTestDB(t)
+	db.SetSetting("smtp_host", "127.0.0.1")
+	db.SetSetting("smtp_port", "2525")
+	db.SetSetting("smtp_to", "ops@test.local")
+	db.SetSetting("smtp_tls_mode", "none")
+	pw := NewProbeWorker(db)
+	err := pw.sendSMTP(t.Context(), "subject", "body")
+	if err == nil {
+		t.Fatal("sendSMTP with no sender succeeded, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "no sender configured") {
+		t.Fatalf("sendSMTP error = %q, want 'no sender configured'", err.Error())
+	}
+}
+
+// TestSendSMTPLegacyDisplayNameFromE2E locks the send-time normalization: a
+// LEGACY stored value with a display name (saved before the validator
+// existed) must still deliver — the bare address is what reaches the wire,
+// so MAIL FROM carries <alerts@home.lan>, not <PulseMon <alerts@home.lan>>.
+func TestSendSMTPLegacyDisplayNameFromE2E(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	host, portStr, _ := net.SplitHostPort(addr)
+
+	var mu sync.Mutex
+	var mailLine string
+	done := make(chan struct{})
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			close(done)
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		w := func(s string) { fmt.Fprint(conn, s) }
+		w("220 test ESMTP\r\n")
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				close(done)
+				return
+			}
+			trimmed := strings.TrimRight(line, "\r\n")
+			upper := strings.ToUpper(trimmed)
+			switch {
+			case strings.HasPrefix(upper, "EHLO"), strings.HasPrefix(upper, "HELO"):
+				w("250-test\r\n250 OK\r\n")
+			case strings.HasPrefix(upper, "MAIL"):
+				mu.Lock()
+				mailLine = trimmed
+				mu.Unlock()
+				w("250 OK\r\n")
+			case strings.HasPrefix(upper, "RCPT"):
+				w("250 OK\r\n")
+			case strings.HasPrefix(upper, "DATA"):
+				w("354 go ahead\r\n")
+				for {
+					l, err := r.ReadString('\n')
+					if err != nil {
+						close(done)
+						return
+					}
+					if strings.TrimRight(l, "\r\n") == "." {
+						w("250 OK\r\n")
+						break // client will follow with QUIT
+					}
+				}
+			case strings.HasPrefix(upper, "QUIT"):
+				w("221 bye\r\n")
+				close(done)
+				return
+			default:
+				w("250 OK\r\n")
+			}
+		}
+	}()
+
+	db := newTestDB(t)
+	db.SetSetting("smtp_host", host)
+	db.SetSetting("smtp_port", portStr)
+	// Legacy raw value — exactly what a pre-validator save would have stored.
+	db.SetSetting("smtp_from", "PulseMon <alerts@home.lan>")
+	db.SetSetting("smtp_to", "ops@home.lan")
+	db.SetSetting("smtp_tls_mode", "none")
+	pw := NewProbeWorker(db)
+
+	origDial := smtpDial
+	smtpDial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	t.Cleanup(func() { smtpDial = origDial })
+
+	if err := pw.sendSMTP(t.Context(), "pulsemon: test", "body"); err != nil {
+		t.Fatalf("sendSMTP with legacy display-name from: %v", err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the SMTP server")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if mailLine != "MAIL FROM:<alerts@home.lan>" {
+		t.Fatalf("wire MAIL line = %q, want MAIL FROM:<alerts@home.lan> (bare address)", mailLine)
 	}
 }
 
