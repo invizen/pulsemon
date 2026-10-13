@@ -1,0 +1,32 @@
+# Docker build context exclusions — keeps `COPY . .` in the Dockerfile from
+# dragging ~22 MB of prebuilt binaries and local state into the build.
+# release.sh builds release artifacts fresh into dist/; the Docker image
+# builds its own binary from source, so none of these belong in the context.
+
+# VCS
+.git/
+
+# prebuilt release binaries + checksums (stale copies must never ship)
+pulsemon-linux-*
+pulsemon-linux-*.sha256
+dist/
+installer/
+
+# local build output
+bin/
+pulsemon
+pulsemon-bin
+pingmon
+
+# runtime state — the image starts with an empty /data volume
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# secrets / local-only files
+.env
+certs/
+
+# local rollback backups
+*.bak-*

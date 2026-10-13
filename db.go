@@ -151,7 +151,11 @@ func (db *DB) InitSchema() error {
 			return err
 		}
 	}
-	// One-time migration: add per-sensor latency-spike multiplier (default 5x).
+	// One-time migration: add the per-sensor latency-spike multiplier
+	// column. DEPRECATED (v0.3.11 review): spike detection was removed
+	// from deriveStatus and neither the probe engine nor the dashboard
+	// reads the column anymore — it is retained in the schema purely for
+	// compatibility with existing databases (no destructive migration).
 	var spikeCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'spike_mult'`).Scan(&spikeCol); err == nil && spikeCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN spike_mult INTEGER NOT NULL DEFAULT 5`); err != nil {
@@ -633,8 +637,8 @@ func (db *DB) SeedSensors() error {
 	// environment-independent placeholders (127.0.0.1: not every host runs
 	// a router or a server on 192.168.1.x, and a wrong active target would
 	// fire down alerts on day one). The user edits the targets and resumes.
-	// spike_mult is written explicitly so the seed row matches the UI
-	// default (3) rather than the schema column default (5).
+	// spike_mult is written explicitly so the seed row keeps a stable
+	// value in the (deprecated, unread) compatibility column.
 	sensors := []struct {
 		name, target, tags string
 	}{

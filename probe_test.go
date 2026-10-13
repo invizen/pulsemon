@@ -226,7 +226,7 @@ func TestDeriveStatus(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.id, func(t *testing.T) {
 			pw := seedSensor(t, db, tt.id, tt.lossWarn, tt.downAfter, tt.spikeMult, tt.rtt)
-			c := sensorConfig{id: tt.id, lossWarn: tt.lossWarn, downAfter: tt.downAfter, spikeMult: tt.spikeMult}
+			c := sensorConfig{id: tt.id, lossWarn: tt.lossWarn, downAfter: tt.downAfter}
 			if got := pw.deriveStatus(c, tt.last); got != tt.want {
 				t.Errorf("deriveStatus(%s, last=%q): got %q, want %q", tt.id, tt.last, got, tt.want)
 			}

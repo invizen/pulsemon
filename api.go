@@ -35,7 +35,6 @@ type Sensor struct {
 	TimeoutMS int      `json:"timeout_ms"`
 	LossWarn  int      `json:"loss_warn"`
 	DownAfter int      `json:"down_after"`
-	SpikeMult int      `json:"spike_mult"`
 	State     string   `json:"state"`  // active | paused
 	Status    string   `json:"status"` // up | warning | error
 	CreatedAt string   `json:"created_at"`
@@ -300,7 +299,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) fetchSensors() []Sensor {
-	rows, err := s.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
+	rows, err := s.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at FROM sensors ORDER BY name`)
 	if err != nil {
 		return nil
 	}
@@ -314,7 +313,7 @@ func (s *Server) fetchSensors() []Sensor {
 		// app-controlled so this shouldn't happen — but log it so a real
 		// corruption event is visible in the service log instead of "one
 		// sensor silently vanished from the fleet view".
-		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
+		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
 			log.Printf("API: skipping corrupt sensor row: %v", err)
 			continue
 		}
@@ -381,7 +380,6 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			TimeoutMS int      `json:"timeout_ms"`
 			LossWarn  int      `json:"loss_warn"`
 			DownAfter int      `json:"down_after"`
-			SpikeMult int      `json:"spike_mult"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			code, msg := requestBodyErr(err)
@@ -433,22 +431,15 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		if req.DownAfter <= 0 {
 			req.DownAfter = 2
 		}
-		if req.SpikeMult <= 0 {
-			req.SpikeMult = 3
-		}
-		if req.SpikeMult < 2 || req.SpikeMult > 10 {
-			respondWithError(w, http.StatusBadRequest, "spike_mult must be 2-10")
-			return
-		}
 
 		id := newID()
 		now := tsNow()
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
 		// mistyped, target can't fire down alerts before the user has a chance
 		// to review it. The user resumes it from the dashboard.
-		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-			id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
+		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state, created_at, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+			id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, now)
 		if err != nil {
 			if strings.Contains(err.Error(), "UNIQUE") {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
@@ -466,7 +457,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusCreated, Sensor{
 			ID: id, Name: req.Name, Target: req.Target, Type: req.Type, Tags: req.Tags,
 			IntervalS: req.IntervalS, TimeoutMS: req.TimeoutMS,
-			LossWarn: req.LossWarn, DownAfter: req.DownAfter, SpikeMult: req.SpikeMult,
+			LossWarn: req.LossWarn, DownAfter: req.DownAfter,
 			State: "paused", Status: "up", CreatedAt: now,
 		})
 
@@ -553,8 +544,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var sn Sensor
-		err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
+		err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at FROM sensors WHERE id = ?", id).
+			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.State, &sn.Status, &sn.CreatedAt)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -584,7 +575,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			TimeoutMS *int      `json:"timeout_ms"`
 			LossWarn  *int      `json:"loss_warn"`
 			DownAfter *int      `json:"down_after"`
-			SpikeMult *int      `json:"spike_mult"`
 			State     *string   `json:"state"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -698,13 +688,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			add("down_after", *req.DownAfter)
-		}
-		if req.SpikeMult != nil {
-			if *req.SpikeMult < 2 || *req.SpikeMult > 10 {
-				respondWithError(w, http.StatusBadRequest, "spike_mult must be 2-10")
-				return
-			}
-			add("spike_mult", *req.SpikeMult)
 		}
 		if req.State != nil {
 			if *req.State != "active" && *req.State != "paused" {
@@ -995,8 +978,8 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var src Sensor
-	err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
+	err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at FROM sensors WHERE id = ?", id).
+		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.State, &src.Status, &src.CreatedAt)
 	if err != nil {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
@@ -1024,9 +1007,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	newID := newID()
 	now := tsNow()
 	// Clone starts PAUSED, matching new-sensor behavior.
-	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-		newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
+	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state, created_at, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+		newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, now)
 	if err != nil {
 		respondWithError(w, http.StatusInternalServerError, "failed to clone sensor: "+err.Error())
 		return
@@ -1039,7 +1022,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusCreated, Sensor{
 		ID: newID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
 		IntervalS: src.IntervalS, TimeoutMS: src.TimeoutMS,
-		LossWarn: src.LossWarn, DownAfter: src.DownAfter, SpikeMult: src.SpikeMult,
+		LossWarn: src.LossWarn, DownAfter: src.DownAfter,
 		State: "paused", Status: "up", CreatedAt: now,
 	})
 }

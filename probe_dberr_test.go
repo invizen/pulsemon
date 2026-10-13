@@ -43,7 +43,7 @@ func TestDeriveStatusDBErrorNeverFakesUp(t *testing.T) {
 	// Mirror doProbe's first line — the broken-socket gate compares
 	// probeErrCount (a global other tests may have raised) against
 	// c.lastErrCount, so an unset lastErrCount would make that gate trip.
-	c := sensorConfig{id: "dberr-down", lossWarn: 25, downAfter: 4, spikeMult: 3}
+	c := sensorConfig{id: "dberr-down", lossWarn: 25, downAfter: 4}
 	c.lastErrCount = probeErrCount.Load()
 	if got := pw.deriveStatus(c, "up"); got != "error" {
 		t.Fatalf("deriveStatus with healthy DB = %q, want error (test precondition)", got)
@@ -81,7 +81,7 @@ func TestDeriveStatusDBErrorRetainsLastError(t *testing.T) {
 	}
 	pw := seedSensor(t, db, "dberr-last", 25, 4, 3,
 		[]*float64{f64(10), f64(10), f64(10), f64(10), nil, nil, nil, nil})
-	c := sensorConfig{id: "dberr-last", lossWarn: 25, downAfter: 4, spikeMult: 3}
+	c := sensorConfig{id: "dberr-last", lossWarn: 25, downAfter: 4}
 	c.lastErrCount = probeErrCount.Load()
 
 	// Sanity: healthy DB reads "error" for a downed sensor.

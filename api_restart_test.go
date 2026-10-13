@@ -121,10 +121,52 @@ func TestPatchNameNoRespawn(t *testing.T) {
 	patchSensorRespawned(t, `{"name": "renamed"}`, false)
 }
 
-// TestPatchSpikeMultNoRespawn pins that spike_mult stays informational-only:
-// deriveStatus does not read it, so a PATCH of it must not churn the loop.
-func TestPatchSpikeMultNoRespawn(t *testing.T) {
-	patchSensorRespawned(t, `{"spike_mult": 8}`, false)
+// TestPatchSpikeMultDeprecated pins the deprecated spike_mult field's
+// backward-compat behavior: the field is no longer accepted by PATCH, so a
+// spike_mult-only request is an empty patch — 400 "no fields to update",
+// nothing written, and the probe loop must not churn.
+func TestPatchSpikeMultDeprecated(t *testing.T) {
+	dir := t.TempDir()
+	db, err := NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lctx, lcancel := context.WithCancel(context.Background())
+	defer db.Close()
+	defer lcancel()
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 's1', '192.0.2.1', 15, 1000, 10, 10, 5, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	pw := NewProbeWorker(db)
+	srv := NewServer(db, pw)
+	pw.syncSensors(lctx)
+
+	req, _ := http.NewRequest(http.MethodPatch, "/api/sensors/s1", bytes.NewBufferString(`{"spike_mult": 8}`))
+	rr := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH {\"spike_mult\": 8} = %d, want 400 (deprecated field is not accepted): %s", rr.Code, rr.Body.String())
+	}
+
+	// The stored value is untouched and the loop did not churn.
+	var stored int
+	if err := db.QueryRow(`SELECT spike_mult FROM sensors WHERE id = 's1'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 5 {
+		t.Fatalf("spike_mult changed to %d, want 5 (deprecated field must not write)", stored)
+	}
+	pw.mu.Lock()
+	_, alive := pw.loops["s1"]
+	pw.mu.Unlock()
+	if !alive {
+		t.Fatal("probe loop churned on a deprecated-field PATCH")
+	}
 }
 
 // TestPatchTargetStillRespawns pins that the pre-existing triggers still work

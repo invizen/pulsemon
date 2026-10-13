@@ -125,7 +125,6 @@ type sensorConfig struct {
 	timeoutMS int
 	lossWarn  int
 	downAfter int
-	spikeMult int
 	// lastErrCount is the global ICMP-socket error counter as of the last
 	// probe; deriveStatus compares against it to detect "probing is broken".
 	lastErrCount int64
@@ -235,7 +234,7 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 }
 
 func (pw *ProbeWorker) syncSensors(ctx context.Context) {
-	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state
+	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
 		FROM sensors WHERE state = 'active'`)
 	if err != nil {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
@@ -249,14 +248,11 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	var configs []activeCfg
 	for rows.Next() {
 		var c activeCfg
-		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.spikeMult, &c.state); err != nil {
+		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
 			continue
 		}
 		if c.probeType == "" {
 			c.probeType = "icmp" // legacy rows pre-migration
-		}
-		if c.spikeMult < 2 {
-			c.spikeMult = 5
 		}
 		configs = append(configs, c)
 	}

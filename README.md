@@ -15,8 +15,7 @@ pulsemon
   the access model.
 - **Single container** — static Go binary, `FROM scratch` image, SQLite storage
 - **Sensors with multiple tags** — group and filter however you like
-- **Per-sensor tuning** — interval, timeout, loss threshold, error-after count,
-  latency-spike multiplier (informational)
+- **Per-sensor tuning** — interval, timeout, loss threshold, error-after count
 - **Status derivation** — `up` / `warning` / `error` from the sensor's most
   recent probes (see *Alert behavior*)
 - **1h / 24h latency graphs** with whole-ms display
@@ -132,7 +131,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | env | `PULSEMON_CERT` + `PULSEMON_KEY` — optional TLS certificate and key file paths (PEM). Set **both** together to serve HTTPS directly (`https://host:9299`); omit both for plain HTTP. If the files are missing, pulsemon warns and serves plain HTTP (so a fresh clone with no `certs/` dir doesn't crash-loop); if they exist but are corrupt or mismatched, startup fails — TLS is never silently degraded when a pair is in place. A self-signed or wildcard cert works for LAN use; use a real cert if the dashboard is reachable from outside. |
 | env | `PULSEMON_TRUSTED_PROXIES` — optional comma-separated list of CIDRs (or bare IPs) of **immediate TCP peers** whose `X-Forwarded-For` header is trusted for login rate-limiting. By default `X-Forwarded-For` is **ignored** (the throttle keys on the direct TCP peer), so a spoofed/rotated header can't dodge the per-IP lockout. When pulsemon sits behind a reverse proxy (Caddy, nginx, …) and you want attempts attributed to the real client, set this to the proxy's IP(s), e.g. `127.0.0.1` or `192.168.1.0/24`. The header is only ever read when the connection's source address is in this list. |
 | Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode, TLS certificate, **Authentication** (create the first account, add/remove accounts, change password, disable) |
-| Per sensor | Interval, timeout, loss %, error-after, spike multiplier (informational), tags |
+| Per sensor | Interval, timeout, loss %, error-after, tags |
 | CLI | `pulsemon auth-user add <user> <pass>` — create a dashboard account (the FIRST account is what turns authentication on). `pulsemon auth-user remove <user>` — delete an account (the last one is refused; use the dashboard's "Disable Authentication" for that). `pulsemon auth-user list` — list accounts. Auth is opt-in; with no accounts the dashboard is open, as before. |
 
 ### Alert behavior
@@ -149,12 +148,13 @@ its most recent probes, checked in this order:
 - **warning** — packet loss over the last 8 probes ≥ the sensor's loss
   threshold (25% at the default) — or any recent loss that is not up and
   not error. A flapping sensor (loss/up/loss/up) that was in warning stays
-  in warning — one good probe amid ongoing loss is not "recovered". The
-  spike multiplier is **informational** — shown in the dashboard, but it
-  never changes status.
+  in warning — one good probe amid ongoing loss is not "recovered".
+  (The `spike_mult` column in the database is a deprecated legacy remnant:
+  neither the probe engine nor the dashboard reads it, and it never affects
+  status.)
 
 - New sensors default to: interval 60s, timeout 1000ms, loss warn 25%,
-  error after 2, spike 3×. New and cloned sensors start **paused** so a fresh
+  error after 2. New and cloned sensors start **paused** so a fresh
   target can't fire alerts before you review it — resume it from the dashboard.
 - **Fast re-check in error:** while a sensor's status is error it is probed
   every **30s** instead of the configured interval, until a probe brings it

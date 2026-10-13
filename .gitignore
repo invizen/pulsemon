@@ -14,6 +14,9 @@ pulsemon
 pulsemon-bin
 pingmon
 bin/
+# prebuilt release binaries (release.sh builds fresh into dist/ — never commit)
+pulsemon-linux-*
+pulsemon-linux-*.sha256
 # go-winres generated resource object (windows icon/version) — built, not committed
 *.syso
 
