@@ -79,3 +79,75 @@ func TestSetupModeBootstrapOnly(t *testing.T) {
 		t.Errorf("healthz post-bootstrap: %d, want 200", c)
 	}
 }
+
+// TestMigrateAuthBootstrappedLegacyInstall: regression test for the v0.3.10
+// incident. A legacy install — probe history, zero users, no
+// auth_bootstrapped flag (it predates the setup-mode gate and ran with auth
+// off) — must be marked bootstrapped at startup so the setup-mode gate does
+// NOT lock it to the bootstrap surface. The documented "auth off = fully
+// open" behavior is preserved. A genuinely fresh install (no probe rows)
+// must stay in setup mode.
+func TestMigrateAuthBootstrappedLegacyInstall(t *testing.T) {
+	seedLegacy := func(t *testing.T) *DB {
+		t.Helper()
+		db := newTestDB(t)
+		if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+			VALUES ('s1', 'legacy', '10.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+			t.Fatalf("seed sensor: %v", err)
+		}
+		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('s1', '2026-10-13T00:00:00Z', 1.5)`); err != nil {
+			t.Fatalf("seed probe: %v", err)
+		}
+		return db
+	}
+
+	// Legacy install (probe history, zero users, no flag) -> bootstrapped.
+	db := seedLegacy(t)
+	migrateAuthBootstrapped(db)
+	if db.GetSetting("auth_bootstrapped") != "1" {
+		t.Error("legacy install (probe history) not marked bootstrapped — dashboard would be locked to setup mode")
+	}
+
+	// Fresh install (no probe rows, zero users) -> stays in setup mode.
+	fresh := newTestDB(t)
+	migrateAuthBootstrapped(fresh)
+	if fresh.GetSetting("auth_bootstrapped") == "1" {
+		t.Error("fresh install (no probe history) marked bootstrapped — setup mode would be skipped")
+	}
+
+	// Idempotent: a second run changes nothing.
+	migrateAuthBootstrapped(db)
+	if db.GetSetting("auth_bootstrapped") != "1" {
+		t.Error("migration not idempotent")
+	}
+}
+
+// TestMigrateAuthBootstrappedLegacyInstallEndToEnd: the exact zenweb
+// scenario, driven through the real gate. A legacy install (probe history,
+// zero users) that has run the startup migration must serve the dashboard
+// fully open (GET /api/sensors = 200), NOT locked to the bootstrap surface
+// (403).
+func TestMigrateAuthBootstrappedLegacyInstallEndToEnd(t *testing.T) {
+	db := newTestDB(t)
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 'legacy', '10.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensor: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('s1', '2026-10-13T00:00:00Z', 1.5)`); err != nil {
+		t.Fatalf("seed probe: %v", err)
+	}
+	migrateAuthBootstrapped(db) // what runServer does at startup
+
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	r, err := httpSrv.Client().Get(httpSrv.URL + "/api/sensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Body.Close()
+	if r.StatusCode != http.StatusOK {
+		t.Errorf("legacy install sensor list after migration: %d, want 200 (fully open)", r.StatusCode)
+	}
+}

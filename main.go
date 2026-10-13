@@ -297,6 +297,37 @@ func runAuthUser(args []string) dispatchKind {
 	}
 }
 
+// migrateAuthBootstrapped marks legacy installs as bootstrapped so the
+// setup-mode gate (authGate) only applies to genuinely fresh installs.
+//
+// v0.3.10 incident: an install that predates the setup-mode gate and ran
+// with auth off — zero users, no auth_bootstrapped flag — is indistinguishable
+// from a fresh install, and upgrading it locked the dashboard to the
+// bootstrap surface (prod zenweb). The discriminator is probe history: a
+// legacy install has rows in probes; a fresh install has none. A legacy
+// install keeps its documented "auth off = fully open" behavior; a fresh
+// install stays in setup mode until the first account exists.
+//
+// Idempotent: once a user exists or the flag is set, it is a no-op.
+func migrateAuthBootstrapped(db *DB) {
+	n, err := db.UserCount()
+	if err != nil || n > 0 {
+		return
+	}
+	if db.GetSetting("auth_bootstrapped") == "1" {
+		return
+	}
+	var probes int
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes").Scan(&probes); err != nil || probes == 0 {
+		return
+	}
+	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		log.Printf("WARNING: failed to set auth_bootstrapped flag: %v", err)
+		return
+	}
+	log.Println("Legacy install (probe history, no accounts): keeping auth off — dashboard stays fully open")
+}
+
 func main() {
 	// Ensure the platform data dir exists before anything opens the DB. A
 	// no-op on Linux (the Docker /data volume is pre-created and MkdirAll on
@@ -334,6 +365,11 @@ func runServer(stop <-chan struct{}) {
 	if err := db.InitSchema(); err != nil {
 		log.Fatalf("Failed to init schema: %v", err)
 	}
+
+	// Legacy-install migration (v0.3.10 incident): pre-setup-mode installs
+	// that ran with auth off must stay fully open — see
+	// migrateAuthBootstrapped.
+	migrateAuthBootstrapped(db)
 
 	if err := db.SeedSensors(); err != nil {
 		log.Printf("Warning: failed to seed sensors: %v", err)
