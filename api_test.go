@@ -50,6 +50,11 @@ func TestRequestBodyBounded(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the body bound, not auth — the setup-mode
+	// and disable paths are locked in TestSetupModeBootstrapOnly and
+	// TestAuthDisableViaAPI.
+	db.SetSetting("auth_bootstrapped", "1")
 
 	// Valid JSON, ~2 MiB: a 1 MiB string field of padding.
 	pad := strings.Repeat("x", 1<<20)
@@ -91,6 +96,11 @@ func TestEventsQueryCapped(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the events API, not auth — the setup-mode
+	// and disable paths are locked in TestSetupModeBootstrapOnly and
+	// TestAuthDisableViaAPI.
+	db.SetSetting("auth_bootstrapped", "1")
 
 	// One sensor + 700 events with distinct ascending timestamps.
 	resp, err := http.Post(httpSrv.URL+"/api/sensors", "application/json",
@@ -157,6 +167,11 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the settings API, not auth — the setup-mode
+	// and disable paths are locked in TestSetupModeBootstrapOnly and
+	// TestAuthDisableViaAPI.
+	db.SetSetting("auth_bootstrapped", "1")
 
 	var out struct {
 		OK     bool   `json:"ok"`
@@ -236,11 +251,11 @@ func TestSensorNameXSSRejectedEndToEnd(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-
-	// Fresh DB has no users → auth disabled → endpoints are open.
-	if srv.auth.Enabled() {
-		t.Fatal("expected auth disabled on fresh test DB")
-	}
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the sensors API, not auth — the setup-mode
+	// and disable paths are locked in TestSetupModeBootstrapOnly and
+	// TestAuthDisableViaAPI.
+	db.SetSetting("auth_bootstrapped", "1")
 
 	// 1) POST with a breakout name must be 400.
 	resp, err := http.Post(httpSrv.URL+"/api/sensors", "application/json",
@@ -324,6 +339,11 @@ func TestLossWarnBounded(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the sensors API, not auth — the setup-mode
+	// and disable paths are locked in TestSetupModeBootstrapOnly and
+	// TestAuthDisableViaAPI.
+	db.SetSetting("auth_bootstrapped", "1")
 
 	// POST: out-of-range → 400.
 	resp, err := http.Post(httpSrv.URL+"/api/sensors", "application/json",

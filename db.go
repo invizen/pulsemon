@@ -255,6 +255,11 @@ func (db *DB) InitSchema() error {
 				tsNow()); err != nil {
 				log.Println("WARNING: legacy auth_token migration to users table failed:", err)
 			} else {
+				// This install has been set up — mark it so the gate doesn't
+				// treat a later auth-off state as a fresh install.
+				if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+					log.Println("WARNING: failed to set auth_bootstrapped flag:", err)
+				}
 				log.Println("Migrated legacy auth token to the 'admin' user; set a new password in Settings")
 			}
 		}

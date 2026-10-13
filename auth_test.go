@@ -426,11 +426,19 @@ func TestAuthGateEndToEnd(t *testing.T) {
 		return resp
 	}
 
-	t.Run("open dashboard before auth", func(t *testing.T) {
+	t.Run("setup mode: bootstrap surface only", func(t *testing.T) {
+		// Fresh install (no account has ever existed): non-bootstrap
+		// endpoints are 403 — no unauthenticated sensor access before the
+		// first account. healthz stays open.
 		resp := get("/api/sensors")
 		resp.Body.Close()
+		if resp.StatusCode != 403 {
+			t.Fatalf("sensors in setup mode: got %d, want 403", resp.StatusCode)
+		}
+		resp = get("/api/healthz")
+		resp.Body.Close()
 		if resp.StatusCode != 200 {
-			t.Fatalf("sensors open: got %d", resp.StatusCode)
+			t.Fatalf("healthz in setup mode: got %d, want 200", resp.StatusCode)
 		}
 	})
 

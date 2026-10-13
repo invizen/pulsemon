@@ -254,9 +254,26 @@ func (a *AuthState) AddUser(username, password string) error {
 	if err := a.db.AddUser(username, string(hash)); err != nil {
 		return fmt.Errorf("user already exists")
 	}
+	// Record that this install has been set up. The flag is never cleared —
+	// even when the operator later disables auth (deleting all users) — so
+	// the gate can distinguish a fresh install (bootstrap surface only) from
+	// an intentional auth-off state (fully open, the documented behavior).
+	if err := a.db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		return err
+	}
 	a.refreshEnabledNow() // first user enables auth — don't wait for the TTL
 	log.Println("Dashboard user added: " + username)
 	return nil
+}
+
+// Bootstrapped reports whether this install has ever had an account created
+// (settings row auth_bootstrapped=1, set by AddUser and never cleared —
+// including when the operator later disables auth). The auth gate uses it to
+// pick between the two zero-user states: a fresh install gets the
+// bootstrap-only surface (no unauthenticated sensor create/pulse before the
+// first account exists), an intentionally-disabled install stays fully open.
+func (a *AuthState) Bootstrapped() bool {
+	return a.db.GetSetting("auth_bootstrapped") == "1"
 }
 
 // RemoveUser deletes an account and every live session it owns. The last

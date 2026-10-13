@@ -138,6 +138,12 @@ func (s *Server) Mux() *http.ServeMux {
 // `pulsemon auth-user add/remove` is honored within the TTL (≤2s), no
 // restart required.
 //
+// Setup mode (no users exist yet): only the bootstrap surface is reachable —
+// static UI assets, /api/healthz, /api/auth/status, and POST /api/auth/users
+// (the first account). Everything else is 403 until an account exists, so an
+// unauthenticated LAN host can't use the fresh-install window for SSRF or
+// internal port scanning.
+//
 // Every request body is additionally bounded to maxRequestBytes via
 // http.MaxBytesReader: a malformed or malicious client can no longer stream
 // an arbitrarily large body into the JSON decoders (sensors, users, TLS
@@ -149,8 +155,41 @@ func (s *Server) authGate() http.Handler {
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		}
-		if !s.auth.Enabled() || r.URL.Path == "/api/healthz" {
+		// healthz is the container healthcheck and the external monitoring
+		// probe — it must be reachable in every state (setup, unauthenticated,
+		// authenticated).
+		if r.URL.Path == "/api/healthz" {
 			s.mux.ServeHTTP(w, r)
+			return
+		}
+		if !s.auth.Enabled() {
+			if s.auth.Bootstrapped() {
+				// Auth was disabled by the operator (all accounts deleted):
+				// the documented "auth off = fully open" behavior applies.
+				s.mux.ServeHTTP(w, r)
+				return
+			}
+			// Fresh install: no account has ever existed. Only the bootstrap
+			// surface is reachable — static UI assets, /api/auth/status, and
+			// POST /api/auth/users (the first account). Everything else
+			// (sensor create/pulse, settings, TLS upload, user list) is 403
+			// until an account exists, so an unauthenticated LAN host can't
+			// use the fresh-install window for SSRF or internal port scanning
+			// (2026-10-13 external review — valid finding).
+			//
+			// ACCEPTED LIMITATION: the first-user bootstrap itself is open to
+			// any LAN host — whoever POSTs /api/auth/users first wins it, and
+			// a rogue host that wins leaves the operator to create an account
+			// via `pulsemon auth-user add` (CLI). Closing that fully would
+			// need a setup token or loopback-only bootstrap, both worse UX
+			// than the risk justifies on a trusted homelab LAN.
+			if r.URL.Path == "/api/auth/status" ||
+				(r.Method == http.MethodPost && r.URL.Path == "/api/auth/users") ||
+				!strings.HasPrefix(r.URL.Path, "/api/") {
+				s.mux.ServeHTTP(w, r)
+				return
+			}
+			respondWithError(w, http.StatusForbidden, "dashboard setup required: create the first account in Settings")
 			return
 		}
 		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
