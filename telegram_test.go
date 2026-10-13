@@ -55,3 +55,47 @@ func TestTelegramCardIcons(t *testing.T) {
 		}
 	}
 }
+
+// TestTelegramCardEscapesAmpersandInTarget locks the finding-9 fix: a URL
+// query string with a raw & (validURL accepts it) must reach the card as
+// &amp; — an unescaped & in Telegram HTML parse mode can make the API
+// reject the message with 400 "can't parse entities", silently dropping
+// the alert. Both card variants are checked.
+func TestTelegramCardEscapesAmpersandInTarget(t *testing.T) {
+	target := "https://host.lan/health?service=a&check=1"
+	for _, c := range []string{
+		telegramCard("up", "error", "zenkub1", target, 0),
+		telegramCardRe("error", "zenkub1", target, 0),
+	} {
+		if !strings.Contains(c, "&amp;check=1") {
+			t.Fatalf("expected escaped &amp;check=1 in:\n%s", c)
+		}
+		if strings.Contains(c, "a&check") {
+			t.Fatalf("unescaped & reached the card:\n%s", c)
+		}
+	}
+}
+
+// TestTelegramCardEscapesMarkupInTarget locks the other half: url.Parse
+// (and thus validURL) accepts raw markup in the URL path (verified on
+// Go 1.26: https://host.lan/<b>bold</b> parses fine), so an unescaped
+// target would inject live <b> markup into the Telegram card. It must be
+// escaped to &lt;b&gt; instead.
+func TestTelegramCardEscapesMarkupInTarget(t *testing.T) {
+	target := "https://host.lan/<b>bold</b>"
+	for _, c := range []string{
+		telegramCard("up", "error", "zenkub1", target, 0),
+		telegramCardRe("error", "zenkub1", target, 0),
+	} {
+		if !strings.Contains(c, "&lt;b&gt;bold&lt;/b&gt;") {
+			t.Fatalf("expected escaped markup in:\n%s", c)
+		}
+		if strings.Contains(c, "<b>bold</b>") {
+			t.Fatalf("unescaped markup injected into the card:\n%s", c)
+		}
+		// The card's own intentional tags must survive escaping.
+		if !strings.Contains(c, "<b>Sensor:</b> zenkub1") {
+			t.Fatalf("intentional card tags were damaged:\n%s", c)
+		}
+	}
+}
