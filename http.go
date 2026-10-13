@@ -158,6 +158,23 @@ var httpClient = &http.Client{
 	},
 }
 
+// variantHosts returns the target host plus its www/bare variant, so a cert
+// issued for the www form of a bare domain (or vice versa) still verifies.
+// Real CDNs and registrars commonly serve a cert for the www variant of a
+// bare domain (google.com → cert is www.google.com). This is a
+// public-internet convenience and is applied ONLY to the system-trusted
+// verification path; the self-signed path requires an exact hostname match
+// (see verifyHTTPCert branch (b)).
+func variantHosts(host string) []string {
+	tried := []string{host}
+	if !strings.HasPrefix(host, "www.") {
+		tried = append(tried, "www."+host)
+	} else {
+		tried = append(tried, strings.TrimPrefix(host, "www."))
+	}
+	return tried
+}
+
 // verifyHTTPCert validates the certificate(s) the server presented after a
 // successful (skip-verify) handshake. It accepts the cert when EITHER
 // (a) it is trusted by the system roots, or
@@ -165,6 +182,11 @@ var httpClient = &http.Client{
 // validity hold for host. Everything else — a cert from an untrusted CA, an
 // expired cert, or a cert whose names don't match host — is rejected, so
 // "allow self-signed" never becomes "allow anything".
+//
+// The www/bare variant fallback (variantHosts) applies to branch (a) only —
+// it is a public-CDN convenience. Branch (b) requires an EXACT hostname (or
+// IP) match: the operator generated a self-signed cert and controls its SANs,
+// and hostname match is the only security control on that path.
 //
 // host is the target's hostname (e.g. "10.0.0.5" or "router.local"). An IP
 // literal is normalized so x509 matches it against IP SANs, not DNS names.
@@ -196,17 +218,11 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	}
 
 	// (a) Trusted by the system roots, with the presented intermediates —
-	// accept. Roots nil → the platform/system trust store. Real CDNs and
-	// registrars often serve a cert for the www variant of a bare domain
-	// (google.com → cert is www.google.com) or the other way around, so a
-	// hostname mismatch is retried once with the other variant.
-	triedHosts := []string{host}
-	if len(host) > 0 && !strings.HasPrefix(host, "www.") {
-		triedHosts = append(triedHosts, "www."+host)
-	} else if strings.HasPrefix(host, "www.") {
-		triedHosts = append(triedHosts, strings.TrimPrefix(host, "www."))
-	}
-	for _, hn := range triedHosts {
+	// accept. Roots nil → the platform/system trust store. The www/bare
+	// variant fallback (variantHosts) applies here: real CDNs and registrars
+	// often serve a cert for the www variant of a bare domain (google.com →
+	// cert is www.google.com) or the other way around.
+	for _, hn := range variantHosts(host) {
 		optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 		optsA.DNSName = hn
 		if _, err := leaf.Verify(optsA); err == nil {
@@ -215,18 +231,21 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	}
 
 	// (b) Not system-trusted: accept only if self-signed AND its hostname +
-	// validity hold for this target. Verifying the leaf against itself as a
-	// root re-checks both without demanding a trusted issuing CA. Same
-	// www-variant fallback as branch (a).
+	// validity hold EXACTLY for this target. Verifying the leaf against
+	// itself as a root re-checks both without demanding a trusted issuing CA.
+	// NO www-variant fallback here (2026-10-13 review): the operator generated
+	// this cert and controls its SANs, so a homelab self-signed cert carries
+	// the probed hostname (or IP) itself — a www-variant SAN is a public-CDN
+	// pattern, not a homelab one. Hostname match is the only security control
+	// on the self-signed path (there is no CA chain), so it must stay exact;
+	// the www fallback would widen the accepted set for no realistic benefit.
 	if leaf.CheckSignatureFrom(leaf) == nil {
 		roots := x509.NewCertPool()
 		roots.AddCert(leaf)
-		for _, hn := range triedHosts {
-			optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
-			optsB.DNSName = hn
-			if _, err := leaf.Verify(optsB); err == nil {
-				return nil
-			}
+		optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+		optsB.DNSName = host
+		if _, err := leaf.Verify(optsB); err == nil {
+			return nil
 		}
 	}
 	return errors.New("pulsemon: TLS certificate is not trusted and is not a self-signed cert matching the target")
