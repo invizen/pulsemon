@@ -161,3 +161,66 @@ func TestEchoNowCooldownThrottles(t *testing.T) {
 		t.Fatalf("probe rows = %d, want 1 (the throttled pulse must not record)", n)
 	}
 }
+
+// TestPingNowCacheUsesPostProbeTimestamp locks the finding-10 fix: the
+// stats-cache entry for a manual pulse must carry the SAME post-probe
+// instant as the DB row (the lockstep doProbe maintains), not the pre-probe
+// cooldown timestamp. The stubbed probe sleeps >1s, so the pre- and
+// post-probe instants ALWAYS land in different Unix seconds — with the old
+// code (now.Unix(), captured before the probe) this assertion fails
+// deterministically. The stale instant broke probeSeries's oldest-first
+// ordering (a scheduled probe completing mid-pulse appended before an
+// older entry) and could put the cached entry in a different 1-minute
+// sparkline bucket than the SQLite row.
+func TestPingNowCacheUsesPostProbeTimestamp(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "echo6.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('echots','echots','http://127.0.0.1:1/',15,8000,25,1,3,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert sensor: %v", err)
+	}
+	pw := NewProbeWorker(db)
+
+	orig := probeTarget
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
+		time.Sleep(1200 * time.Millisecond) // >1s: pre/post-probe instants are always different Unix seconds
+		return probeOutcome{lost: true}
+	}
+	defer func() { probeTarget = orig }()
+
+	if _, err := pw.PingNow(context.Background(), "echots"); err != nil {
+		t.Fatalf("PingNow: %v", err)
+	}
+
+	// The DB row's ts (post-probe instant, RFC3339Nano).
+	var tsStr string
+	if err := db.QueryRow("SELECT ts FROM probes WHERE sensor_id = ?", "echots").Scan(&tsStr); err != nil {
+		t.Fatalf("read ts: %v", err)
+	}
+	dbTs, err := time.Parse(time.RFC3339Nano, tsStr)
+	if err != nil {
+		t.Fatalf("parse ts: %v", err)
+	}
+
+	// The stats-cache entry's ts — must be the SAME instant.
+	pw.statsMu.Lock()
+	s := pw.statsCache["echots"]
+	var snap []probeEntry
+	if s == nil {
+		pw.statsMu.Unlock()
+		t.Fatal("no stats-cache entry recorded for the manual pulse")
+	}
+	snap = s.snapshot()
+	pw.statsMu.Unlock()
+	last := snap[len(snap)-1]
+
+	if last.ts != dbTs.Unix() {
+		t.Errorf("cache entry ts = %d, want %d (the DB row's post-probe instant; the pre-probe timestamp breaks oldest-first ordering and 1-minute bucketing)", last.ts, dbTs.Unix())
+	}
+}

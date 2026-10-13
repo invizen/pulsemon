@@ -871,13 +871,19 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
-	// lockstep doProbe maintains), so the dashboard reflects the echo.
+	// lockstep doProbe maintains), so the dashboard reflects the echo. The
+	// entry must carry the SAME post-probe instant as the DB row (ts), not
+	// the pre-probe cooldown timestamp (now): probeSeries is oldest-first
+	// (a scheduled probe completing mid-pulse would otherwise append before
+	// an older entry), and the sparkline floors each entry to its minute —
+	// a pulse straddling a minute boundary would bucket differently in the
+	// warm cache than in the DB.
 	var rttPtr *float64
 	if !o.lost {
 		v := o.rttMs
 		rttPtr = &v
 	}
-	pw.recordProbe(id, probeEntry{ts: now.Unix(), rtt: rttPtr})
+	pw.recordProbe(id, probeEntry{ts: ts.Unix(), rtt: rttPtr})
 	return o, nil
 }
 
