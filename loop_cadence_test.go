@@ -56,7 +56,7 @@ func TestSensorLoopResetCadence(t *testing.T) {
 	var stamps []time.Time
 	var calls atomic.Int64
 	origTarget := probeTarget
-	probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
 		calls.Add(1)
 		mu.Lock()
 		stamps = append(stamps, time.Now())

@@ -40,6 +40,46 @@ func TestValidSensorName(t *testing.T) {
 	}
 }
 
+// TestCleanTagsXSSGate pins the tag half of the stored-XSS fix: tags flow
+// into JS string literals in the setTag / removeFormTag inline handlers, so
+// cleanTags applies the same string-escape gate as sensor names. Breakout
+// payloads are dropped at the API layer; ordinary operator labels (the ones
+// the 2026-10-13 review pinned as legitimate) still pass, and the existing
+// trim / dedupe / 30-char / 8-tag behavior is unchanged.
+func TestCleanTagsXSSGate(t *testing.T) {
+	got := cleanTags([]string{
+		"wifi:guest",          // legit: colon
+		"nas/01",              // legit: slash
+		"camera@front",        // legit: at-sign
+		"ÜberNAS",             // legit: non-ASCII
+		" x');alert(1);//",    // single-quote breakout — dropped (after trim)
+		`a"onfocus="alert(1)`, // double-quote attribute breakout — dropped
+		"a\\b",                // backslash — dropped
+		"a`b",                 // backtick — dropped
+		"a<b",                 // angle bracket — dropped
+		"line\nbreak",         // control char — dropped
+		"wifi:guest",          // duplicate — dropped
+	})
+	want := []string{"wifi:guest", "nas/01", "camera@front", "ÜberNAS"}
+	if len(got) != len(want) {
+		t.Fatalf("cleanTags = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("cleanTags = %v, want %v", got, want)
+		}
+	}
+	// The 30-char cap and 8-tag cap still apply.
+	long := cleanTags([]string{strings.Repeat("x", 31), strings.Repeat("x", 30)})
+	if len(long) != 1 || long[0] != strings.Repeat("x", 30) {
+		t.Fatalf("30-char cap broken: %v", long)
+	}
+	many := cleanTags([]string{"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10"})
+	if len(many) != 8 {
+		t.Fatalf("8-tag cap broken: %v", many)
+	}
+}
+
 // TestRequestBodyBounded drives the real server: a valid-but-oversized JSON
 // body (2 MiB of padding, well past the 1 MiB gate limit) must be refused at
 // the auth gate with 413 "request body too large" — not silently buffered
@@ -404,5 +444,83 @@ func TestLossWarnBounded(t *testing.T) {
 	}
 	if lw != 50 {
 		t.Fatalf("loss_warn after PATCH = %d, want 50", lw)
+	}
+}
+
+// TestMaintenanceModeFlipsInMemoryPauseImmediately pins the maintenance-mode
+// fast path: enabling maintenance must flip the probe worker's in-memory
+// pause flag IMMEDIATELY (the same SetPaused fast path the single-sensor
+// PATCH uses), not on the next 5s syncSensors tick. Pre-fix, the sensor
+// loops kept probing during the window — up to one extra probe row and a
+// possible transition event per sensor landed after maintenance was already
+// reported ON. Disabling must flip the flag back just as immediately.
+func TestMaintenanceModeFlipsInMemoryPauseImmediately(t *testing.T) {
+	db := newTestDB(t)
+	pw := NewProbeWorker(db)
+	srv := NewServer(db, pw)
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	// Auth-disabled state (bootstrapped install, zero users): endpoints are
+	// open. This test exercises the maintenance transition, not auth.
+	db.SetSetting("auth_bootstrapped", "1")
+
+	// One ACTIVE sensor, with its in-memory state as syncSensors would have
+	// built it (probing, not paused). No loop is spawned — the test asserts
+	// the flag flip, not the probe cadence.
+	id := newID()
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+		VALUES (?, 'maint-test', '10.99.99.1', 'icmp', 60, 1000, 25, 2, 3, 'active', ?, 'up')`, id, tsNow()); err != nil {
+		t.Fatal(err)
+	}
+	pw.mu.Lock()
+	pw.sensors[id] = &ProbeState{id: id, isPaused: false}
+	pw.mu.Unlock()
+
+	put := func(body string) int {
+		req, _ := http.NewRequest(http.MethodPut, httpSrv.URL+"/api/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		r, err := httpSrv.Client().Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r.Body.Close()
+		return r.StatusCode
+	}
+	paused := func() bool {
+		pw.mu.Lock()
+		defer pw.mu.Unlock()
+		return pw.sensors[id].isPaused
+	}
+	dbState := func() string {
+		var st string
+		if err := db.QueryRow("SELECT state FROM sensors WHERE id = ?", id).Scan(&st); err != nil {
+			t.Fatal(err)
+		}
+		return st
+	}
+
+	// Enable: the in-memory flag flips NOW — no sync tick in between.
+	if code := put(`{"maintenance_mode":true}`); code != http.StatusOK {
+		t.Fatalf("enable maintenance: got %d, want 200", code)
+	}
+	if !paused() {
+		t.Fatal("in-memory isPaused not flipped immediately on maintenance enable")
+	}
+	if st := dbState(); st != "paused" {
+		t.Fatalf("db state = %q, want paused", st)
+	}
+	if db.GetSetting("maintenance_mode") != "1" {
+		t.Fatal("maintenance_mode flag not set in db")
+	}
+
+	// Disable: the flag flips back NOW too (symmetric fast path).
+	if code := put(`{"maintenance_mode":false}`); code != http.StatusOK {
+		t.Fatalf("disable maintenance: got %d, want 200", code)
+	}
+	if paused() {
+		t.Fatal("in-memory isPaused not cleared immediately on maintenance disable")
+	}
+	if st := dbState(); st != "active" {
+		t.Fatalf("db state = %q, want active", st)
 	}
 }

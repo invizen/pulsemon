@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -81,7 +82,7 @@ func TestProbeHTTPCrossHostMetadataRedirectIsLoss(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	res := probeHTTP(srv.URL, 5*time.Second)
+	res := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if !res.Lost {
 		t.Fatalf("metadata redirect marked up, want loss (guard failed): %+v", res)
 	}

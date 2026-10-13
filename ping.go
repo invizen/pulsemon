@@ -397,8 +397,12 @@ func (e *Engine) readRaw() {
 	}
 }
 
-// Ping sends one ICMP echo to dst and waits for the reply.
-func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
+// Ping sends one ICMP echo to dst and waits for the reply. ctx bounds the
+// wait: a cancelled ctx (shutdown, sensor remove/restart) returns a loss
+// immediately instead of holding the caller until the timeout — this is what
+// keeps Run's wg.Wait() (and main's 10s shutdown budget) honest for sensors
+// with long timeouts (up to 30s).
+func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) PingResult {
 	// Sequence is 16-bit (the ICMP field width, RFC 792). The pending map is
 	// keyed by (seq, destination), so a reply only ever matches the probe
 	// that sent to that destination. Normally the counter's next value is
@@ -462,6 +466,10 @@ func (e *Engine) Ping(dst net.IP, timeout time.Duration) PingResult {
 		return PingResult{RTT: d, Lost: false}
 	case <-t.C:
 		return PingResult{Lost: true}
+	case <-ctx.Done():
+		// Caller is going away (shutdown / sensor removed or reconfigured):
+		// stop waiting for a reply that no one will record.
+		return PingResult{Lost: true, Error: ctx.Err()}
 	}
 }
 
@@ -532,9 +540,11 @@ func EngineDead() bool {
 var errNoIcmpTransport = errors.New("icmp: no transport available")
 
 // pingHost is the probe worker's entry point: resolve the target, then
-// ping the resolved IP through the shared engine.
-func pingHost(target string, timeout time.Duration) PingResult {
-	ip, err := resolveIPAddrWithTimeout(context.Background(), target, 5*time.Second)
+// ping the resolved IP through the shared engine. ctx bounds BOTH phases
+// (DNS + reply wait) so a cancelled probe (shutdown, remove, restart)
+// aborts immediately instead of running out its full timeout.
+func pingHost(ctx context.Context, target string, timeout time.Duration) PingResult {
+	ip, err := resolveIPAddrWithTimeout(ctx, target, 5*time.Second)
 	if err != nil {
 		return PingResult{Lost: true, Error: err}
 	}
@@ -548,7 +558,7 @@ func pingHost(target string, timeout time.Duration) PingResult {
 		probeErrCount.Add(1)
 		return PingResult{Lost: true, Error: err, ResolvedIP: dst.String()}
 	}
-	res := e.Ping(dst, timeout)
+	res := e.Ping(ctx, dst, timeout)
 	res.ResolvedIP = dst.String()
 	return res
 }

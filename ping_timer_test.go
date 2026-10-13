@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"runtime"
 	"testing"
@@ -33,7 +34,7 @@ func TestPingTimerLifecycle(t *testing.T) {
 	ePtr = e
 
 	t.Run("reply returns RTT and drains pending", func(t *testing.T) {
-		res := e.Ping(net.ParseIP("10.9.9.9").To4(), 500*time.Millisecond)
+		res := e.Ping(context.Background(), net.ParseIP("10.9.9.9").To4(), 500*time.Millisecond)
 		if res.Lost {
 			t.Fatal("expected a reply, got loss")
 		}
@@ -49,7 +50,7 @@ func TestPingTimerLifecycle(t *testing.T) {
 	})
 
 	t.Run("timeout is a clean loss, no Error, drains pending", func(t *testing.T) {
-		res := e.Ping(net.ParseIP("10.8.8.8").To4(), 120*time.Millisecond)
+		res := e.Ping(context.Background(), net.ParseIP("10.8.8.8").To4(), 120*time.Millisecond)
 		if !res.Lost {
 			t.Fatal("expected loss for blackholed target")
 		}
@@ -66,7 +67,7 @@ func TestPingTimerLifecycle(t *testing.T) {
 		for i := 0; i < 100; i++ {
 			// 20ms timeout: every probe here times out (no reply path for
 			// 10.7.7.7), so 100 abandoned timeout paths in a row.
-			if res := e.Ping(net.ParseIP("10.7.7.7").To4(), 20*time.Millisecond); !res.Lost {
+			if res := e.Ping(context.Background(), net.ParseIP("10.7.7.7").To4(), 20*time.Millisecond); !res.Lost {
 				t.Fatalf("probe %d: expected loss", i)
 			}
 		}

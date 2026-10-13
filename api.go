@@ -500,12 +500,19 @@ func validSensorName(name string) bool {
 }
 
 // cleanTags trims, dedupes and caps sensor tags.
+//
+// Tags also pass the same string-escape gate as sensor names
+// (validSensorName): they are interpolated into JS string literals in inline
+// handlers (setTag / removeFormTag, index.html), so a tag like
+// x');alert(1);// must not be storable — the output escaping (escJs) is the
+// second layer, and the input gate keeps the non-HTML consumers (alert cards,
+// logs, inspector) clean too.
 func cleanTags(in []string) []string {
 	seen := map[string]bool{}
 	out := []string{}
 	for _, t := range in {
 		t = strings.TrimSpace(t)
-		if t == "" || len(t) > 30 || seen[t] {
+		if t == "" || len(t) > 30 || !validSensorName(t) || seen[t] {
 			continue
 		}
 		seen[t] = true
@@ -746,7 +753,7 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 
-	o, err := s.probeWorker.PingNow(id)
+	o, err := s.probeWorker.PingNow(r.Context(), id)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -1310,6 +1317,18 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				respondWithError(w, http.StatusInternalServerError, "failed to enter maintenance mode: "+err.Error())
 				return
 			}
+			// Flip the in-memory pause flag immediately — the same SetPaused
+			// fast path the single-sensor PATCH uses. Without this the sensor
+			// loops keep probing until the next 5s syncSensors tick, landing
+			// up to one extra probe row (and a possible transition event) per
+			// sensor after maintenance is already ON. Alerts are already
+			// blocked in that window — alertGates re-reads the
+			// maintenance_mode flag from the DB on every decision — so this
+			// closes the probing half of the "paused = no packets, no rows,
+			// no alerts" contract (probe.go sensorLoop).
+			for _, id := range ids {
+				s.probeWorker.SetPaused(id, true)
+			}
 			// Paused sensors don't probe, so their alert state can't drift;
 			// reset it now so resume doesn't instantly re-alert on a stale
 			// bad state.
@@ -1317,10 +1336,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			log.Printf("API: maintenance mode ON (%d sensors paused)", len(ids))
 		} else {
 			// Leaving maintenance: reactivate exactly the sensors that were
-			// active when maintenance started (the snapshot). Sensors the
-			// user paused, or that got paused/added during maintenance, stay
-			// paused. Then clear the snapshot and reset alert timers so a
-			// still-bad sensor doesn't instantly re-alert on the next tick.
+			// active when maintenance started (the snapshot). Sensors paused
+			// BEFORE maintenance (not in the snapshot), or added during
+			// maintenance, stay paused. A snapshot sensor the user paused
+			// DURING maintenance is resumed with the rest — the snapshot is
+			// the restore set, and SetMaintenanceMode resumes it wholesale.
+			// Then clear the snapshot and reset alert timers so a still-bad
+			// sensor doesn't instantly re-alert on the next tick.
 			snap := s.db.GetSetting("maintenance_active_ids")
 			var ids []string
 			if snap != "" {
@@ -1333,6 +1355,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			if err := s.db.SetMaintenanceMode(false, ids, ""); err != nil {
 				respondWithError(w, http.StatusInternalServerError, "failed to leave maintenance mode: "+err.Error())
 				return
+			}
+			// Flip the in-memory unpause immediately (symmetric fast path, see
+			// the enable side above): without this the resumed sensors wait up
+			// to 5s for syncSensors before their next probe.
+			for _, id := range ids {
+				s.probeWorker.SetPaused(id, false)
 			}
 			s.probeWorker.ResetAlertStates()
 			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
@@ -1361,8 +1389,8 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 		u := strings.TrimSpace(*url)
 		if u != "" && kind != "smtp" {
 			// SMTP's url field carries the mail-server host (a hostname), not
-			// an http(s):// webhook — it is validated as host+port in the
-			// extra-fields pass below, not as a URL.
+			// an http(s):// webhook — it is validated against the reserved
+			// range blocklist just below (validateSMTPHost), not as a URL.
 			if err := validateWebhookURL(u); err != nil {
 				return fmt.Errorf("%s url: %s", kind, err.Error())
 			}
@@ -1432,9 +1460,15 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // extraFields maps a provider kind to the non-URL settings keys it accepts.
 // chat_id is free-form (a numeric user/group ID or an @channel name); no URL
 // validation applies.
+//
+// The SMTP host is deliberately NOT an extra field: it travels in the url
+// field, where validateSMTPHost enforces the reserved-range blocklist before
+// it is stored. The extra loop below persists its keys without host
+// validation, so accepting "host" here let a client write smtp_host — e.g.
+// 127.0.0.1 or 169.254.169.254 — straight to SQLite, bypassing the check.
 var extraFields = map[string]map[string]bool{
 	"telegram": {"chat_id": true},
-	"smtp": {"host": true, "port": true, "from": true, "to": true,
+	"smtp": {"port": true, "from": true, "to": true,
 		"username": true, "password": true, "tls_mode": true},
 }
 

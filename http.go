@@ -288,22 +288,24 @@ type httpProbeResult struct {
 // failure, a terminal 3xx/4xx/5xx, or a redirect loop — is a loss (the same
 // loss that drives the card's loss%, sparkline, and status state, exactly as
 // an ICMP loss does).
-func probeHTTP(target string, timeout time.Duration) httpProbeResult {
+func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpProbeResult {
 	// Resolve the host up front so the resolved_ip diagnostic is populated
 	// the same way ICMP fills it (and a hung DNS becomes a loss row, not a
 	// wedged tick). The request still runs under its own deadline below.
+	// Both phases run under ctx so a cancelled probe (shutdown, remove,
+	// restart) aborts the DNS lookup and the request immediately.
 	var host string
 	if u, err := url.Parse(target); err == nil {
 		host = u.Hostname()
 	}
 	resolved := ""
 	if host != "" {
-		if ip, err := resolveIPAddrWithTimeout(context.Background(), host, 5*time.Second); err == nil {
+		if ip, err := resolveIPAddrWithTimeout(ctx, host, 5*time.Second); err == nil {
 			resolved = ip.IP.String()
 		}
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)

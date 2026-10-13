@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"runtime"
 	"testing"
@@ -32,7 +33,7 @@ func TestEngineCloseWaitsForReader(t *testing.T) {
 	// reply. (Even if the reply is lost, the reader is running — but on
 	// loopback it should respond, confirming the reader is engaged.)
 	e.run()
-	if res := e.Ping(net.ParseIP("127.0.0.1"), 500*time.Millisecond); !res.Lost {
+	if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 500*time.Millisecond); !res.Lost {
 		// loopback up — reader delivered.
 	}
 
@@ -72,7 +73,7 @@ func TestEngineCloseWaitsForReader(t *testing.T) {
 	// reports a loss — the reader is gone, so no delivery.
 	after := make(chan struct{})
 	go func() {
-		e.Ping(net.ParseIP("127.0.0.1"), 200*time.Millisecond)
+		e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 200*time.Millisecond)
 		close(after)
 	}()
 	select {

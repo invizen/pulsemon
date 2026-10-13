@@ -143,6 +143,41 @@ func tlsKeyPairOK(cert, key string) error {
 	return err
 }
 
+// reexecBindDeadline bounds a re-exec child's bind retries. The parent's
+// shutdown is structurally bounded at 30s (the 10s probe-worker + 15s
+// alert-drain + 5s HTTP-drain backstops in runServer); 45s covers that
+// worst case with margin so a slow parent release never loses the race.
+// A var (not const) so tests can shorten it.
+var reexecBindDeadline = 45 * time.Second
+
+// bindFatal is the failure path for a bind that will not succeed; stubbed
+// in tests so log.Fatalf (which exits) does not kill the test process.
+// (Same pattern as certFatal.)
+var bindFatal = func(msg string) { log.Fatal(msg) }
+
+// bindServeWithRetry runs bind — which serves the server on a fresh
+// listener and blocks until it stops — and retries failed BINDS while a
+// re-exec parent may still hold the port. A successful serve and a clean
+// shutdown (http.ErrServerClosed) are both normal exits. Any other error:
+// fail immediately when not re-exec'ing (a port conflict or permission
+// error will not resolve on its own), or at the deadline when re-exec'ing.
+// A re-exec child that cannot bind must die loudly — a supervisor
+// restarts it — rather than return and leave the process alive as a
+// headless zombie with a probe worker but no listener.
+func bindServeWithRetry(retry bool, label string, bind func() error) {
+	deadline := time.Now().Add(reexecBindDeadline)
+	for {
+		err := bind()
+		if err == nil || err == http.ErrServerClosed {
+			return
+		}
+		if !retry || time.Now().After(deadline) {
+			bindFatal("Listen (" + label + "): " + err.Error())
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // startListener starts the HTTP (and, when a TLS pair is in place,
 // HTTPS) listener in the background and wires its fatal errors to
 // log.Fatalf (same behavior as the old inline goroutine).
@@ -153,8 +188,9 @@ func tlsKeyPairOK(cert, key string) error {
 // reachable in plaintext on the old port.
 //
 // When PULSEMON_RESTARTING is set (we are the child of a re-exec), the
-// bind may fail for up to 30s while the parent still holds the port;
-// retry with backoff instead of dying.
+// bind may fail for up to ~30s while the parent still holds the port;
+// bindServeWithRetry retries it until reexecBindDeadline instead of
+// dying (and dies loudly if the parent never releases).
 func startListener(srv *http.Server, db *DB) {
 	cfg := loadListenerCfg(db)
 	retry := os.Getenv("PULSEMON_RESTARTING") == "1"
@@ -174,31 +210,25 @@ func startListener(srv *http.Server, db *DB) {
 				srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 				addr := httpsAddrFor(cfg.httpsPort)
 				log.Println("Starting server on " + addr + " (TLS, cert " + cfg.source + ")")
-				deadline := time.Now().Add(30 * time.Second)
-				for {
-					err := listenTLS(srv, addr, cfg.certPath, cfg.keyPath)
-					if err == nil {
-						return
-					}
-					if err != http.ErrServerClosed && !retry && time.Now().After(deadline) {
-						// TLS was configured and the bind keeps failing:
-						// fail fast rather than serve plaintext.
-						log.Fatalf("Listen (TLS: %s): %v", addr, err)
-					}
-					if err == http.ErrServerClosed || time.Now().After(deadline) {
-						log.Println("listener stopped")
-						return
-					}
-					time.Sleep(500 * time.Millisecond)
-				}
+				bindServeWithRetry(retry, "TLS: "+addr, func() error {
+					return listenTLS(srv, addr, cfg.certPath, cfg.keyPath)
+				})
+				return
 			}
 		}
 		addr := listenAddr()
-		srv.Addr = addr // ListenAndServe defaults to :80 when Addr is empty
+		srv.Addr = addr // listener is created explicitly below; keep srv.Addr in sync
 		log.Println("Starting server on " + addr)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Listen: %v", err)
-		}
+		bindServeWithRetry(retry, addr, func() error {
+			ln, err := net.Listen("tcp", addr)
+			if err != nil {
+				return err
+			}
+			defer ln.Close() // no leaked socket on a retry after a failed serve
+			errCh := make(chan error, 1)
+			go func() { errCh <- srv.Serve(ln) }()
+			return <-errCh
+		})
 	}()
 }
 
@@ -406,9 +436,11 @@ func runServer(stop <-chan struct{}) {
 	case <-workerDone:
 		log.Println("Probe worker stopped")
 	case <-time.After(10 * time.Second):
-		// Each in-flight probe is bounded by its own timeout (default 1s),
-		// so this is effectively unreachable; if it ever fires, the DB close
-		// below would abort an in-flight write — log it loudly.
+		// Probes are cancellable (the loop ctx threads through doProbe into
+		// DNS + the transport), so a cancelled worker returns well within
+		// this budget even for a 30s-timeout sensor mid-probe. If it ever
+		// fires, a goroutine is stuck beyond its ctx — the DB close below
+		// would abort an in-flight write, so log it loudly.
 		log.Println("WARNING: probe worker did not stop in 10s; in-flight probes may be aborted")
 	}
 

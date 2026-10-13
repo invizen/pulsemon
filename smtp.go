@@ -67,11 +67,41 @@ func smtpPort(v string) (int, error) {
 	return n, nil
 }
 
-// sendSMTP delivers a plain-text alert email. It is context-aware: a cancelled
-// ctx (shutdown) aborts the dial at its next read, matching how the webhook
-// deliveries are bounded. net/smtp's Client has no pluggable dialer, so we dial
-// the TCP connection ourselves (net.Dialer + DialContext for ctx) and hand it to
-// smtp.NewClient.
+// smtpDial establishes sendSMTP's TCP connection. It defaults to dialChecked
+// (webhook.go): the rebind-safe, blocklist-enforcing dial the webhook
+// providers use. Tests override it to reach an in-process server on loopback.
+var smtpDial = dialChecked
+
+// smtpConnDeadline caps the WHOLE SMTP conversation (greeting → QUIT) on one
+// absolute conn deadline — the SMTP equivalent of the webhook path's
+// http.Client 10s total-request timeout. A LAN relay completes the exchange
+// in well under a second; 15s is the tarpit bound. A var so tests can
+// shorten it.
+var smtpConnDeadline = 15 * time.Second
+
+// sendSMTP delivers a plain-text alert email. Every phase is bounded,
+// matching the webhook deliveries:
+//
+//   - dial — 10s ctx timeout (dialChecked's shared dialer has none of its
+//     own) through smtpDial (default: dialChecked, webhook.go) — the same
+//     rebind-safe path the webhook providers use: resolve the host, enforce
+//     the reserved-range blocklist on every answer, and pin the dial to the
+//     checked IP. A save-time-allowed name that rebinds to loopback or
+//     cloud-metadata (169.254.169.254) at dial time is refused, and a stored
+//     reserved literal is refused too.
+//   - conversation — an absolute deadline on the conn (smtpConnDeadline)
+//     covers every read/write from the 220 greeting through QUIT, and
+//     context.AfterFunc closes the conn when ctx is cancelled. Both are
+//     needed: net/smtp's Client methods take no ctx and have no timeout of
+//     their own, so a relay that accepts TCP and then hangs (tarpit, missing
+//     220 greeting) would otherwise block this goroutine forever — leaking
+//     the alert delivery and stalling the settings Test button. Closing the
+//     conn is the ONLY way to abort a blocked net/smtp read, which is what
+//     lets StopAlerts (shutdown) and an abandoned test request cancel an
+//     in-flight delivery.
+//
+// net/smtp's Client has no pluggable dialer, so we dial the TCP connection
+// ourselves and hand it to smtp.NewClient.
 //
 // TLS mode:
 //   - "auto"     (default) — implicit TLS on port 465 (handshake on the raw
@@ -89,14 +119,26 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 		return fmt.Errorf("smtp: no recipient configured")
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
-	d := net.Dialer{Timeout: 10 * time.Second}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	// dialChecked's shared dialer has no per-dial timeout of its own; keep
+	// the 10-second dial bound the plain net.Dialer used to provide.
+	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	conn, err := smtpDial(dctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("smtp dial %s: %w", addr, err)
 	}
+	// Conversation bounds (see the sendSMTP doc): an absolute deadline caps
+	// every read/write through QUIT, and ctx cancellation closes the conn —
+	// the only way to abort a blocked net/smtp read.
+	if err := conn.SetDeadline(time.Now().Add(smtpConnDeadline)); err != nil {
+		conn.Close()
+		return fmt.Errorf("smtp deadline %s: %w", addr, err)
+	}
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 
 	// Implicit TLS ("tls" mode, or "auto" on 465): handshake on the raw conn
 	// BEFORE the SMTP conversation starts.

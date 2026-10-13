@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -84,7 +85,7 @@ func TestProbeHTTPSuccess(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if r.Lost {
 		t.Fatalf("200 response marked lost: %+v", r)
 	}
@@ -112,7 +113,7 @@ func TestProbeHTTPFollowsRedirect(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if r.Lost {
 		t.Fatalf("redirect chain ending in 200 marked loss, want up")
 	}
@@ -129,7 +130,7 @@ func TestProbeHTTPRedirectLoopIsLoss(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if !r.Lost {
 		t.Fatalf("redirect loop marked up, want loss")
 	}
@@ -144,7 +145,7 @@ func TestProbeHTTPErrorsAreLoss(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "x", code)
 		}))
-		r := probeHTTP(srv.URL, 5*time.Second)
+		r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 		srv.Close()
 		if !r.Lost {
 			t.Errorf("status %d marked up, want loss", code)
@@ -168,7 +169,7 @@ func TestProbeHTTPTimeout(t *testing.T) {
 	defer srv.Close()
 
 	start := time.Now()
-	r := probeHTTP(srv.URL, 400*time.Millisecond)
+	r := probeHTTP(context.Background(), srv.URL, 400*time.Millisecond)
 	if !r.Lost {
 		t.Fatalf("slow handler marked up, want loss")
 	}
@@ -197,7 +198,7 @@ func TestProbeHTTPUntrustedCACert(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if !r.Lost {
 		t.Fatalf("untrusted-CA cert marked up, want loss (verification failed)")
 	}
@@ -252,7 +253,7 @@ func TestProbeHTTPSelfSignedAccepted(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if r.Lost {
 		t.Fatalf("valid self-signed cert marked loss, want up: err=%v", r.Err)
 	}
@@ -281,7 +282,7 @@ func TestProbeHTTPSelfSignedExpiredRejected(t *testing.T) {
 	srv.StartTLS()
 	defer srv.Close()
 
-	r := probeHTTP(srv.URL, 5*time.Second)
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if !r.Lost {
 		t.Fatalf("expired self-signed cert marked up, want loss (expiry enforced)")
 	}
@@ -313,7 +314,7 @@ func TestProbeHTTPTLSKeepAlive(t *testing.T) {
 	defer srv.Close()
 
 	for i := 0; i < 3; i++ {
-		r := probeHTTP(srv.URL, 5*time.Second)
+		r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
 		if r.Lost {
 			t.Fatalf("probe %d lost: %v", i, r.Err)
 		}
@@ -524,7 +525,7 @@ func TestVerifyHTTPCertIPLiteral(t *testing.T) {
 // failure is a different error and just skips the test.
 func TestProbeHTTPPublicCertWithIntermediate(t *testing.T) {
 	const target = "https://pulsemon.net"
-	r := probeHTTP(target, 10*time.Second)
+	r := probeHTTP(context.Background(), target, 10*time.Second)
 	if r.Err != nil && strings.Contains(r.Err.Error(), "not trusted") {
 		t.Fatalf("%s rejected as untrusted (chain-building regression): %v", target, r.Err)
 	}
@@ -681,7 +682,7 @@ func TestProbeTargetDispatch(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	o := probeTarget("http", srv.URL, 5*time.Second)
+	o := probeTarget(context.Background(), "http", srv.URL, 5*time.Second)
 	if o.lost || o.httpCode == nil || *o.httpCode != 200 || o.certExpiry != nil {
 		t.Errorf("http dispatch = %+v, want up 200 no-cert (plain http)", o)
 	}
@@ -692,13 +693,13 @@ func TestProbeTargetDispatch(t *testing.T) {
 	// ICMP: 127.0.0.1 loopback should answer on any sane host. (If the test
 	// box has ICMP blocked, the lost flag may be true — both are valid
 	// outcomes; what matters is NO http fields leak into an icmp probe.)
-	oi := probeTarget("icmp", "127.0.0.1", 2*time.Second)
+	oi := probeTarget(context.Background(), "icmp", "127.0.0.1", 2*time.Second)
 	if oi.httpCode != nil || oi.certExpiry != nil {
 		t.Errorf("icmp dispatch leaked http fields: %+v", oi)
 	}
 
 	// Unknown type falls through to icmp (the default).
-	ou := probeTarget("nonsense", "127.0.0.1", 2*time.Second)
+	ou := probeTarget(context.Background(), "nonsense", "127.0.0.1", 2*time.Second)
 	if ou.httpCode != nil {
 		t.Errorf("unknown type leaked http fields: %+v", ou)
 	}
@@ -724,7 +725,7 @@ func TestPingNowHTTPSensor(t *testing.T) {
 
 	// down_after=1: a single lost probe WOULD error the sensor if PingNow
 	// derived status. It must not.
-	o, err := pw.PingNow("pnow")
+	o, err := pw.PingNow(context.Background(), "pnow")
 	if err != nil {
 		t.Fatalf("PingNow: %v", err)
 	}

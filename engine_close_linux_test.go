@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"net"
 	"os"
 	"runtime"
@@ -60,7 +61,7 @@ func TestEngineReaderRetriesEINTR(t *testing.T) {
 	}
 
 	// And it must still deliver real replies after the interruptions.
-	if res := e.Ping(net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
+	if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
 		t.Fatal("reader not delivering after EINTR interruptions")
 	}
 }
@@ -88,7 +89,7 @@ func TestEngineReaderSurvivesSignalInterrupt(t *testing.T) {
 	e.run()
 
 	// Warm-up: prove the reader is alive and delivering on loopback.
-	if res := e.Ping(net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
+	if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
 		t.Skip("loopback ICMP not available here — cannot prove reader delivery")
 	}
 
@@ -111,7 +112,7 @@ func TestEngineReaderSurvivesSignalInterrupt(t *testing.T) {
 	const pings = 1000
 	lost, consecLost := 0, 0
 	for i := 0; i < pings; i++ {
-		if res := e.Ping(net.ParseIP("127.0.0.1"), 100*time.Millisecond); res.Lost {
+		if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 100*time.Millisecond); res.Lost {
 			lost++
 			consecLost++
 			// 10 consecutive losses = the reader is gone (each loss costs the
@@ -128,7 +129,7 @@ func TestEngineReaderSurvivesSignalInterrupt(t *testing.T) {
 
 	// Final proof: after the storm the reader still delivers.
 	time.Sleep(50 * time.Millisecond)
-	if res := e.Ping(net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
+	if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
 		t.Fatal("reader not delivering after SIGURG storm — it exited on EINTR")
 	}
 }

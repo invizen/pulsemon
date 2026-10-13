@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"net/http"
 	"net/http/httptest"
@@ -32,7 +33,7 @@ func TestEchoNowProbeRowCount(t *testing.T) {
 
 	var captured *time.Duration
 	orig := probeTarget
-	probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
 		captured = &timeout
 		return probeOutcome{lost: true, ip: "192.0.2.1"}
 	}
@@ -130,7 +131,7 @@ func TestEchoNowCooldownThrottles(t *testing.T) {
 	srv := NewServer(db, pw)
 
 	orig := probeTarget
-	probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
 		return probeOutcome{lost: true, ip: "192.0.2.1"}
 	}
 	defer func() { probeTarget = orig }()

@@ -9,25 +9,27 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-// TestRunWaitsForInFlightProbes pins the graceful-shutdown fix: ProbeWorker.Run
-// must NOT return the moment its context is cancelled while a per-sensor loop
-// is mid-probe — it must wait for every spawned loop to exit, so the caller
-// (main's shutdown path) can close the database without aborting a probe write.
+// TestRunAbortsInFlightProbesOnCancel pins the finding-6 shutdown contract:
+// when Run's context is cancelled while per-sensor loops are mid-probe, the
+// in-flight probes ABORT (they run on the loop ctx, not
+// context.Background()) and none of them commit a row after the cancel
+// instant. Run returns promptly — well inside main's 10s worker budget — so
+// db.Close() never lands in a probe's write window.
 //
-// The old code returned immediately on ctx.Done(); the N sensor loops kept
-// running, and main's deferred db.Close() could land inside doProbe's
-// INSERT→UPDATE window, leaving an unrecorded status and lock noise across a
-// restart.
+// This replaces the older contract (let the in-flight probes run out and
+// commit, then return): aborting is strictly safer. A probe that completes
+// during shutdown writes a row for a state the operator no longer cares
+// about, and for a sensor that was just deleted it is an FK violation.
 //
 // Method: 10 sensors at a 1s interval with a 700ms ICMP timeout against
 // TEST-NET-1 (192.0.2.1 — black-holed, so every probe runs the full 700ms
 // timeout deterministically). At any instant, probes are staggered across a
-// 1s window, so a cancel() mid-run catches at least one loop inside doProbe.
-// Run() may only return after that probe has committed, which we observe two
-// ways: probe rows strictly increase across the cancel, AND at least one row
-// has a timestamp AFTER the cancel instant (the in-flight probe landed during
-// the wait, not before it).
-func TestRunWaitsForInFlightProbes(t *testing.T) {
+// 1s window, so a cancel() mid-run catches at least one loop inside
+// doProbe. Under the OLD behavior those in-flight probes committed up to
+// 700ms AFTER cancel; under the new contract they abort, so no row may carry
+// a timestamp after cancel+100ms (the 100ms absorbs a microsecond-scale
+// race where a probe passed the ctx check a hair before the cancel landed).
+func TestRunAbortsInFlightProbesOnCancel(t *testing.T) {
 	db, err := NewDB(filepath.Join(t.TempDir(), "shutdown.db"))
 	if err != nil {
 		t.Fatalf("NewDB: %v", err)
@@ -71,35 +73,33 @@ func TestRunWaitsForInFlightProbes(t *testing.T) {
 
 	// Let the staggered probes get mid-flight.
 	time.Sleep(800 * time.Millisecond)
-	countBefore := probeCount(t, db)
 	cancelInstant := time.Now().UTC().Format(time.RFC3339Nano)
+	start := time.Now()
 	cancel()
 
 	select {
 	case <-runDone:
+		if d := time.Since(start); d > 2*time.Second {
+			t.Fatalf("Run took %v after cancel, want < 2s (main's shutdown budget is 10s; in-flight 700ms probes must abort, not run out)", d)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("Run did not return within 10s of cancel")
 	}
 
-	// 1. The in-flight probes committed during the wait: the row count grew
-	// past the pre-cancel snapshot.
-	countAfter := probeCount(t, db)
-	if countAfter <= countBefore {
-		t.Fatalf("probe rows did not grow after cancel (before=%d after=%d) — Run returned before the in-flight probe committed, so db.Close() would abort it", countBefore, countAfter)
-	}
-
-	// 2. At least one row is timestamped AFTER the cancel instant: a probe
-	// started before cancel and committed during the wait (the exact window
-	// the old code's db.Close() would have hit).
+	// 1. No probe committed after the cancel instant (±100ms race margin):
+	// the in-flight probes were aborted, so nothing wrote a row for the
+	// cancelled window. Under the old behavior this count was > 0 (the
+	// in-flight probes landed up to 700ms late).
 	var after int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE ts > ?", cancelInstant).Scan(&after); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE ts > ?",
+		add100ms(cancelInstant)).Scan(&after); err != nil {
 		t.Fatalf("post-cancel count: %v", err)
 	}
-	if after == 0 {
-		t.Fatalf("no probe committed after the cancel instant (countBefore=%d) — cannot prove the wait covered an in-flight probe", countBefore)
+	if after != 0 {
+		t.Fatalf("%d probe rows committed after the cancel instant — in-flight probes must abort, not commit late (old shutdown behavior regressed)", after)
 	}
 
-	// 3. No torn writes: every probe row references an existing sensor.
+	// 2. No torn writes: every probe row references an existing sensor.
 	var orphan int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM probes p WHERE NOT EXISTS (SELECT 1 FROM sensors s WHERE s.id = p.sensor_id)`).Scan(&orphan); err != nil {
 		t.Fatalf("orphan check: %v", err)
@@ -109,12 +109,14 @@ func TestRunWaitsForInFlightProbes(t *testing.T) {
 	}
 }
 
-func probeCount(t *testing.T, db *DB) int {
-	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes").Scan(&n); err != nil {
-		t.Fatalf("count probes: %v", err)
+// add100ms shifts an RFC3339Nano timestamp forward by 100ms (the race
+// margin documented in TestRunAbortsInFlightProbesOnCancel).
+func add100ms(rfc3339 string) string {
+	ts, err := time.Parse(time.RFC3339Nano, rfc3339)
+	if err != nil {
+		return rfc3339
 	}
-	return n
+	return ts.Add(100 * time.Millisecond).UTC().Format(time.RFC3339Nano)
 }
 
 // TestRunExitsPromptlyWithNoLoops guards the other direction: with zero

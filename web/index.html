@@ -773,7 +773,14 @@ function severityRank(s) {
 }
 
 function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-function escJs(v) { return esc(v).replace(/\\/g,'\\\\').replace(/'/g,"\\'"); }
+// escJs escapes a value for a JS string literal inside an inline HTML
+// attribute (onclick="setTag('...')"). The ORDER is load-bearing:
+// JS-escape FIRST (backslash, quote, CR, LF), then HTML-encode. If
+// esc() ran first, ' becomes &#39; and the quote-escape below matches
+// nothing — and the browser's HTML parser decodes &#39; back to a literal '
+// before the JS engine ever sees it, so a stored tag like x');alert(1);//
+// breaks out of the string and executes.
+function escJs(v) { return esc((v || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n')); }
 
 function sparklineBars(hour) {
   const arr = (hour || []).slice(0, 60);
@@ -1604,11 +1611,11 @@ function renderProviderList(providers) {
     if (isTg) {
       extraRow = `
         <div class="mt-1.5 flex items-center gap-2">
-          <input id="prov-chatid-telegram" type="text" placeholder="Chat ID (123456789 or @channel)" value="${chatId}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+          <input id="prov-chatid-telegram" type="text" placeholder="Chat ID (123456789 or @channel)" value="${esc(chatId)}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
         </div>`;
     } else if (isSmtp) {
       const inp = (id, ph, val, type='text') =>
-        `<input id="${id}" type="${type}" placeholder="${ph}" value="${val||''}" class="flex-1 min-w-0 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">`;
+        `<input id="${id}" type="${type}" placeholder="${ph}" value="${esc(val || '')}" class="flex-1 min-w-0 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">`;
       const lbl = (t) => `<span class="w-14 shrink-0 text-[10px] uppercase tracking-wide text-slate-500 pt-1">${t}</span>`;
       extraRow = `
         <div class="mt-1.5 space-y-1.5">
@@ -1637,7 +1644,7 @@ function renderProviderList(providers) {
         </button>
       </div>
       <div class="flex items-center gap-2">
-        <input id="prov-url-${p.kind}" type="text" placeholder="${urlPlaceholder}" value="${urlVal}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        <input id="prov-url-${p.kind}" type="text" placeholder="${urlPlaceholder}" value="${esc(urlVal)}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
         <button type="button" onclick="testWebhook('${p.kind}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
       </div>
       ${extraRow}`;
@@ -1678,8 +1685,9 @@ async function saveAlerts() {
       pb.extra = { chat_id: ci ? ci.value.trim() : '' };
     }
     if (p.kind === 'smtp') {
+      // host is NOT sent here: it travels in pb.url, where the server
+      // validates it against the reserved-range blocklist (validateSMTPHost).
       pb.extra = {
-        host:     pb.url,
         port:     val('prov-smtp-port'),
         from:     val('prov-smtp-from'),
         to:       val('prov-smtp-to'),

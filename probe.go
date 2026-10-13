@@ -794,7 +794,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 		timer.Reset(nextDelay)
 
 		if !paused {
-			pw.doProbe(c)
+			pw.doProbe(ctx, c)
 		}
 	}
 }
@@ -839,7 +839,7 @@ const pulseNowCooldown = 2 * time.Second
 // healthy sensor to error or fire a recovery webhook). Works while paused
 // (SPEC §2). Dispatches by sensor type, so an HTTP sensor's manual pulse
 // makes an HTTP request (the card's "Pulse Now" shows its status code).
-func (pw *ProbeWorker) PingNow(id string) (probeOutcome, error) {
+func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
 	var target, probeType string
 	if err := pw.db.QueryRow("SELECT target, type FROM sensors WHERE id = ?", id).Scan(&target, &probeType); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
@@ -859,7 +859,7 @@ func (pw *ProbeWorker) PingNow(id string) (probeOutcome, error) {
 		probeType = "icmp"
 	}
 
-	o := probeTarget(probeType, target, pingNowTimeout)
+	o := probeTarget(ctx, probeType, target, pingNowTimeout)
 
 	var rttVal interface{}
 	if !o.lost {
@@ -910,9 +910,12 @@ type probeOutcome struct {
 
 // probeTarget dispatches one probe to the sensor's transport. A var so a
 // test can stub the whole probe without opening a socket or making a request.
-var probeTarget = func(probeType, target string, timeout time.Duration) probeOutcome {
+// ctx bounds the probe (DNS + transport) so a cancelled probe — shutdown,
+// sensor removed, sensor reconfigured — aborts at its next read instead of
+// running out its full (up to 30s) timeout.
+var probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
 	if probeType == "http" {
-		r := probeHTTP(target, timeout)
+		r := probeHTTP(ctx, target, timeout)
 		o := probeOutcome{lost: r.Lost, ip: r.IP, httpCode: r.Status, certExpiry: r.CertExpiry}
 		if !r.Lost {
 			o.rttMs = r.Elapsed.Seconds() * 1000
@@ -920,7 +923,7 @@ var probeTarget = func(probeType, target string, timeout time.Duration) probeOut
 		return o
 	}
 	// icmp (default)
-	res := pingHost(target, timeout)
+	res := pingHost(ctx, target, timeout)
 	o := probeOutcome{lost: res.Lost, ip: res.ResolvedIP}
 	if !res.Lost {
 		o.rttMs = res.RTT.Seconds() * 1000
@@ -928,9 +931,17 @@ var probeTarget = func(probeType, target string, timeout time.Duration) probeOut
 	return o
 }
 
-func (pw *ProbeWorker) doProbe(c sensorConfig) {
+func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	c.lastErrCount = probeErrCount.Load()
-	o := probeTarget(c.probeType, c.target, time.Duration(c.timeoutMS)*time.Millisecond)
+	o := probeTarget(ctx, c.probeType, c.target, time.Duration(c.timeoutMS)*time.Millisecond)
+	// If the probe was cancelled in flight (shutdown, sensor removed or
+	// reconfigured), drop the result: writing it would record a probe for a
+	// sensor that no longer exists (FK violation) or for a config that was
+	// already changed. The loop is exiting (or about to be replaced), so the
+	// row is simply skipped.
+	if ctx.Err() != nil {
+		return
+	}
 
 	var rttVal interface{}
 	var rttMs float64
