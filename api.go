@@ -1020,6 +1020,20 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// hot path (that one is served from the in-memory stats cache). Net: a
 	// constant write-path tax to shave 0.06 ms off an occasional read — not
 	// worth it.
+	//
+	// SECOND PROPOSAL (same review pass — rejected as UNSAFE): binding a
+	// Go-formatted RFC3339 cutoff and comparing `ts >= ?` as a string to
+	// unlock an index range seek. ts is stored as RFC3339Nano (tsNow, db.go),
+	// which STRIPS trailing zeros — the live DB contains rows with 6-9 digit
+	// fractional widths. Variable-width fractions break lexicographic ==
+	// chronological: '...T01:57:25.13Z' (25.130s) compares GREATER than
+	// '...T01:57:25.134241458Z' (25.134s) because 'Z' > '4', so the window
+	// mis-filters by up to a second in both directions. This is the exact
+	// bug class the epoch-normalization comment above was written for (plain
+	// string comparison once made the graphs show the ENTIRE history). The
+	// strftime-epoch form is the format-robust comparison. And the range
+	// seek would save no rows anyway: the 24h graph window equals the 24h
+	// retention, so every row of a sensor is inside the window.
 	rows, err := s.db.Query(`SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
