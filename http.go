@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"time"
@@ -17,9 +18,18 @@ import (
 // HTTP probe type. Unlike ICMP (a shared socket + reader goroutine that
 // dispatches out-of-band replies), an HTTP probe is a plain request ->
 // response: no socket lifecycle, no background reader, no sequence numbers.
-// So it is a thin wrapper over net/http with a per-sensor deadline, and it
-// reuses ping.go's resolveIPAddrWithTimeout for the resolved_ip diagnostic
-// (a hung DNS lookup must become a loss row, not wedge the probe tick).
+// So it is a thin wrapper over net/http with a per-sensor deadline.
+//
+// The resolved_ip diagnostic is captured from the REAL connection via
+// httptrace.GotConn — not from a separate pre-flight DNS lookup. The old
+// pre-flight (resolveIPAddrWithTimeout before the request) was redundant
+// (httpClient resolves again, or not at all on a keep-alive reuse), ran
+// OUTSIDE the probe timeout (a slow DNS added up to 5s on top of
+// timeout_ms, uncounted in Elapsed), and was IPv4-only (validURL accepts
+// IPv6 targets like https://[::1]:9443/, which recorded an empty
+// resolved_ip). With the lookup inside the request context, a hung DNS is
+// bounded by the probe timeout itself and becomes a loss row — the same
+// protection the pre-flight was added for, without the distortion.
 
 // probeHTTPTimeout is the client-level ceiling for a single HTTP probe. The
 // per-sensor timeout bounds each request via context; this is a second,
@@ -289,26 +299,34 @@ type httpProbeResult struct {
 // loss that drives the card's loss%, sparkline, and status state, exactly as
 // an ICMP loss does).
 func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpProbeResult {
-	// Resolve the host up front so the resolved_ip diagnostic is populated
-	// the same way ICMP fills it (and a hung DNS becomes a loss row, not a
-	// wedged tick). The request still runs under its own deadline below.
-	// Both phases run under ctx so a cancelled probe (shutdown, remove,
-	// restart) aborts the DNS lookup and the request immediately.
-	var host string
-	if u, err := url.Parse(target); err == nil {
-		host = u.Hostname()
-	}
-	resolved := ""
-	if host != "" {
-		if ip, err := resolveIPAddrWithTimeout(ctx, host, 5*time.Second); err == nil {
-			resolved = ip.IP.String()
-		}
-	}
-
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	host := ""
+	if u, err := url.Parse(target); err == nil {
+		host = u.Hostname()
+	}
+
+	// The resolved_ip diagnostic comes from the ACTUAL connection
+	// (httptrace.GotConn), not a separate DNS lookup: it is the IP the
+	// request really went to (round-robin DNS included), it is populated
+	// on keep-alive reuse (where no DNS happens at all), and it works for
+	// IPv6 targets (the old pre-flight resolver was IPv4-only). GotConn
+	// fires synchronously on this goroutine for every connection in the
+	// redirect chain; the last one wins, which is the final hop — the
+	// same connection that determines the terminal status and cert.
+	var resolved string
+	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil && info.Conn.RemoteAddr() != nil {
+				if h, _, err := net.SplitHostPort(info.Conn.RemoteAddr().String()); err == nil {
+					resolved = h
+				}
+			}
+		},
+	}
+
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, trace), http.MethodGet, target, nil)
 	if err != nil {
 		// Malformed URL. Validation at save time (validURL) should prevent
 		// this; a loss row with the error is the honest fallback.

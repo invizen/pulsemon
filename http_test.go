@@ -748,3 +748,68 @@ func TestPingNowHTTPSensor(t *testing.T) {
 		t.Errorf("status after pulse = %q, want up (manual probe must not flip status)", status)
 	}
 }
+
+// TestProbeHTTPIp6TargetRecordsResolvedIP locks the finding-8 fix: an IPv6
+// target (validURL explicitly allows https://[::1]:9443/) must record its
+// resolved_ip. The old pre-flight resolver was IPv4-only
+// (resolveIPAddrWithTimeout filters To4() != nil), so an IPv6-only host
+// resolved the probe fine but recorded an EMPTY resolved_ip. This test
+// fails against the old code.
+func TestProbeHTTPIp6TargetRecordsResolvedIP(t *testing.T) {
+	ln, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skip("IPv6 loopback unavailable on this host")
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.Listener = ln
+	srv.Start()
+	defer srv.Close()
+
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+	if r.Lost {
+		t.Fatalf("IPv6 loopback probe marked lost: %+v", r)
+	}
+	if r.IP != "::1" {
+		t.Errorf("resolved_ip = %q, want ::1 (IPv6 targets must record their IP)", r.IP)
+	}
+}
+
+// TestProbeHTTPDNSErrorBoundedByProbeTimeout locks the other half of the
+// finding-8 fix: a DNS failure must be bounded by the PROBE timeout (the
+// lookup now runs inside the request context), not by a separate 5s
+// pre-flight stacked on top of it. A guaranteed-NXDOMAIN host with a 500ms
+// timeout must complete near 500ms, not 500ms+5s.
+func TestProbeHTTPDNSErrorBoundedByProbeTimeout(t *testing.T) {
+	start := time.Now()
+	r := probeHTTP(context.Background(), "http://nonexistent-pulsemon.invalid/", 500*time.Millisecond)
+	elapsed := time.Since(start)
+	if !r.Lost {
+		t.Fatalf("unresolvable host marked up, want loss: %+v", r)
+	}
+	if elapsed > 2*time.Second {
+		t.Errorf("probe took %v, want ~500ms (DNS is inside the probe timeout, not a +5s pre-flight)", elapsed)
+	}
+}
+
+// TestProbeHTTPKeepAliveRecordsResolvedIP locks that the resolved_ip
+// diagnostic is captured from the real connection even when the transport
+// REUSES a keep-alive connection — the case where no DNS lookup happens at
+// all and the old pre-flight was pure overhead.
+func TestProbeHTTPKeepAliveRecordsResolvedIP(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	for i := 0; i < 2; i++ {
+		r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+		if r.Lost {
+			t.Fatalf("probe %d lost: %+v", i, r)
+		}
+		if r.IP != "127.0.0.1" {
+			t.Errorf("probe %d resolved_ip = %q, want 127.0.0.1 (captured on keep-alive reuse too)", i, r.IP)
+		}
+	}
+}
