@@ -209,6 +209,40 @@ func TestApplyProviderUpdateSMTPRejectsBadTLSMode(t *testing.T) {
 	}
 }
 
+// TestApplyProviderUpdateSMTPRejectsBlockedHost pins the M1 wiring: the
+// reserved-range blocklist runs on the SAVE PATH (the url field is
+// repurposed as the mailer host for smtp), so a reserved-range IP — the
+// cloud-metadata address being the canonical SSRF target — is refused
+// before anything persists. The original bypass slipped through because
+// validation existed in a helper the save path never called; this test
+// locks the wiring itself (unit coverage of validateSMTPHost lives in
+// smtp_host_test.go).
+func TestApplyProviderUpdateSMTPRejectsBlockedHost(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	// A working baseline first, so we can prove a rejected update leaves
+	// the previous config untouched (no partial save).
+	extra := map[string]string{"port": "587", "from": "pulsemon@home.lan", "to": "ops@home.lan"}
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), boolPtr(true), extra); err != nil {
+		t.Fatalf("baseline save: %v", err)
+	}
+
+	for _, blocked := range []string{"169.254.169.254", "127.0.0.1", "0.0.0.0", "100.64.0.1"} {
+		if err := srv.applyProviderUpdate("smtp", strPtr(blocked), nil, nil); err == nil {
+			t.Fatalf("applyProviderUpdate smtp host %s: accepted, want rejected", blocked)
+		}
+	}
+
+	// Rejected updates persisted nothing: the baseline config survives intact.
+	if got := db.GetSetting("smtp_host"); got != "10.0.0.25" {
+		t.Fatalf("smtp_host = %q after rejected updates, want 10.0.0.25 (no partial save)", got)
+	}
+	if got := db.GetSetting("smtp_enabled"); got != "1" {
+		t.Fatalf("smtp_enabled = %q after rejected updates, want 1", got)
+	}
+}
+
 // TestApplyProviderUpdateSMTPAddressValidation locks the finding-12 fix:
 // smtp_from / smtp_to are validated as single RFC 5322 addresses on save and
 // stored in BARE form (net/smtp wraps MAIL/RCPT arguments in <...>, so a
