@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -152,6 +153,28 @@ func (s *Server) Mux() *http.ServeMux {
 // instead of a generic decode error.
 func (s *Server) authGate() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Cross-port CSRF gate (RFC 6265bis): the session cookie is
+		// SameSite=Strict, but "same-site" is scheme+host — the PORT is
+		// not part of the site. In a homelab, every other web app on the
+		// same IP (192.168.1.10:8080) is same-SITE to this one
+		// (192.168.1.10:9299): a page there can fire a simple
+		// credentials-including POST (empty body, no custom headers → no
+		// CORS preflight) at /api/auth/disable — wiping all dashboard
+		// accounts — and the browser WILL attach the session cookie.
+		// Browsers send Origin on every cross-origin request; a request
+		// with no Origin (curl, server-to-server) cannot be a browser
+		// CSRF and passes. A reverse proxy must preserve the original
+		// Host header (Caddy does by default) for the comparison to
+		// match. (2026-10-13 external review — valid finding.)
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if orig := r.Header.Get("Origin"); orig != "" {
+				u, err := url.Parse(orig)
+				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+					respondWithError(w, http.StatusForbidden, "cross-origin request blocked")
+					return
+				}
+			}
+		}
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		}
