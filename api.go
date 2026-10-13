@@ -1008,6 +1008,18 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// `ts >= datetime('now', ?)` string comparison matched nearly every row
 	// and the "1h"/"24h" graphs silently showed the ENTIRE history.
 	// CAST(strftime('%s', ...)) normalizes both sides to epoch seconds.
+	//
+	// PERF NOTE (2026-10-13 external review — dismissed): a covering index
+	// probes(sensor_id, ts, rtt_ms) was proposed to avoid the base-table row
+	// fetches for COUNT/SUM/AVG/MAX. Measured at the review's own worst-case
+	// scale (72,000 rows = 50 sensors x 24h @ 60s): the query takes 0.74 ms
+	// as-is, the covering index saves ~0.06 ms (8%), and costs +48% on every
+	// probe INSERT (4.4 -> 6.5 ms per 2000 rows) plus index storage. The
+	// probes table is retention-bounded (24h, hourly purgeOld) so there is no
+	// growth trajectory, and the graph endpoint is on-demand, not the 5s poll
+	// hot path (that one is served from the in-memory stats cache). Net: a
+	// constant write-path tax to shave 0.06 ms off an occasional read — not
+	// worth it.
 	rows, err := s.db.Query(`SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
