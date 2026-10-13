@@ -59,6 +59,20 @@ const (
 	// loginFailWindow, then the IP is locked for loginLockout. In-memory only
 	// (restarts clear it) — the threat model is "don't let an attacker spray
 	// passwords", not "survive a restart mid-attack".
+	//
+	// Why in-memory and NOT persisted to the settings table (2026-10-13
+	// review, dismissed): an attacker who can force a process restart — the
+	// only way to reset the lockout — already has host/docker access, at
+	// which point brute-forcing the dashboard is moot (they can read the
+	// SQLite DB or change the password directly), OR a pre-existing remote
+	// crash bug, which is a separate finding to fix on its own. The
+	// realistic brute-forcer (LAN access to :9299, no host access) cannot
+	// restart the container, so the in-memory lockout holds for the
+	// process's uptime. Persisting the per-IP failure map to SQLite would add
+	// a write + a failure mode to the auth hot path for a vector the threat
+	// model excludes. And even a coincidental restart (deploy/OOM) only
+	// resets the attacker to a fresh loginFailMax budget at the
+	// loginSlowDown-limited ~5 guesses/s — not an unlimited free pass.
 	loginFailMax    = 7
 	loginFailWindow = 60 * time.Second
 	loginLockout    = 5 * time.Minute
