@@ -468,6 +468,18 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // inline handlers). Removing the input gate would leave those still safe,
 // but would let a malicious name through to the non-HTML consumers (alert
 // cards, logs, the inspector) where output encoding does not apply.
+//
+// Why a blacklist and NOT the suggested whitelist (2026-10-13 review,
+// dismissed): a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
+// but a REGRESSION — it rejects legitimate operator labels this gate is
+// meant to allow: non-ASCII names (ÜberNAS) and benign punctuation
+// (wifi:guest, nas/01, camera@front), all pinned VALID in
+// TestValidSensorName. A broad whitelist that re-admits those characters is
+// more complex, not less, and no safer: the ContainsAny below already blocks
+// the exact string-escape metacharacters (' " ` \ < >) plus control chars —
+// the complete set needed to prevent string-context escape in every consumer.
+// As a defense-in-depth gate behind output encoding, it needs to be precise,
+// not exhaustive.
 func validSensorName(name string) bool {
 	if name == "" || len(name) > 60 {
 		return false
