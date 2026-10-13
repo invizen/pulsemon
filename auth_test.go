@@ -1019,3 +1019,69 @@ func TestSweepThrottleDropsStaleEntries(t *testing.T) {
 		t.Error("active lockout removed (should be kept)")
 	}
 }
+
+// TestSweepExpiredSessionsEvictsAbandoned locks the opportunistic session
+// GC: when CreateSession runs past the sweep threshold, expired sessions
+// are evicted from the map while live sessions survive. Without the sweep,
+// an abandoned session (cookie discarded, never presented again) pins its
+// map entry for the process's entire uptime — ValidSession/SessionUser only
+// delete the specific token they are asked about.
+func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	if err := a.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fill the map past the sweep threshold (64).
+	const n = 70
+	toks := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		tok, ok := a.CreateSession("admin", "secretpw")
+		if !ok {
+			t.Fatal("create session")
+		}
+		toks = append(toks, tok)
+	}
+
+	// Age every session EXCEPT the last five past its expiry: the five
+	// survivors must outlive the sweep, the rest must not.
+	a.mu.Lock()
+	for i, tok := range toks {
+		if i < n-5 {
+			s := a.sessions[tok]
+			s.expiry = time.Now().Add(-time.Minute)
+			a.sessions[tok] = s
+		}
+	}
+	a.mu.Unlock()
+
+	// The next CreateSession crosses the threshold and must sweep.
+	fresh, ok := a.CreateSession("admin", "secretpw")
+	if !ok {
+		t.Fatal("create session after sweep")
+	}
+
+	a.mu.Lock()
+	got := len(a.sessions)
+	_, freshAlive := a.sessions[fresh]
+	a.mu.Unlock()
+	if !freshAlive {
+		t.Fatal("new session missing from map")
+	}
+	if want := 6; got != want { // 5 live survivors + the new session
+		t.Fatalf("map size after sweep = %d, want %d (expired entries evicted, live ones kept)", got, want)
+	}
+	// The aged tokens must be gone — not merely expired, evicted.
+	a.mu.Lock()
+	for i, tok := range toks[:n-5] {
+		if _, ok := a.sessions[tok]; ok {
+			t.Fatalf("expired token %d (age %s) still in map after sweep", i, tok[:8])
+		}
+	}
+	a.mu.Unlock()
+	for i, tok := range toks[n-5:] {
+		if !a.ValidSession(tok) {
+			t.Fatalf("live token %d rejected after sweep", i)
+		}
+	}
+}

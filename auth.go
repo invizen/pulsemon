@@ -349,9 +349,32 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 		return "", false
 	}
 	a.mu.Lock()
-	a.sessions[tok] = authSession{user: user, expiry: time.Now().Add(authSessionTTL)}
+	now := time.Now()
+	// Opportunistic GC: see sweepExpiredSessions. Bounded O(n) work, run
+	// only once the map is large enough that abandoned sessions are the
+	// likely cause (mirrors sweepThrottle for the login-throttle maps).
+	if len(a.sessions) > 64 {
+		a.sweepExpiredSessions(now)
+	}
+	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL)}
 	a.mu.Unlock()
 	return tok, true
+}
+
+// sweepExpiredSessions evicts sessions whose TTL has lapsed. Expired
+// entries are already rejected — and individually deleted — by
+// ValidSession/SessionUser when their token is presented; this sweep
+// covers the rest: abandoned sessions whose cookie was discarded and
+// will never be presented again, which would otherwise pin their map
+// entries for the process's entire uptime. It is called opportunistically
+// from CreateSession once the map grows past a threshold (no goroutine,
+// no ticker — mirrors sweepThrottle). Caller must hold a.mu.
+func (a *AuthState) sweepExpiredSessions(now time.Time) {
+	for tok, s := range a.sessions {
+		if now.After(s.expiry) {
+			delete(a.sessions, tok)
+		}
+	}
 }
 
 // peerIP extracts the client's IP from the request's direct TCP peer
