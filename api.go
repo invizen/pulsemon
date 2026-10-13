@@ -859,17 +859,48 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	}
 
 	var probes, events int64
-	if res, err := s.db.Exec("DELETE FROM probes WHERE sensor_id = ?", id); err == nil {
+	// One transaction (the SetSensorTags house pattern): probes, events,
+	// alert_state, and the status reset commit atomically, so a failure
+	// mid-clear can't leave the DB half-wiped. The old code ran four
+	// autocommit statements and ignored the last two errors.
+	tx, err := s.db.Begin()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "begin: "+err.Error())
+		return
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+
+	if res, err := tx.Exec("DELETE FROM probes WHERE sensor_id = ?", id); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear probes: "+err.Error())
+		return
+	} else {
 		probes, _ = res.RowsAffected()
 	}
-	if res, err := s.db.Exec("DELETE FROM events WHERE sensor_id = ?", id); err == nil {
+	if res, err := tx.Exec("DELETE FROM events WHERE sensor_id = ?", id); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear events: "+err.Error())
+		return
+	} else {
 		events, _ = res.RowsAffected()
 	}
-	_, _ = s.db.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id)
-	_, _ = s.db.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id)
-	// Keep the in-memory stats cache in step with the DB: the cleared sensor's
-	// series is gone, so its cache must be too (else the card would show the
-	// just-deleted history until the next probe).
+	if _, err := tx.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear alert_state: "+err.Error())
+		return
+	}
+	if _, err := tx.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "reset status: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "commit: "+err.Error())
+		return
+	}
+	// Keep the in-memory state in step with the DB: the cleared sensor's
+	// series AND its ProbeState (lastStatus/fastRetry/lastHTTPStatus/
+	// lastCertExpiry) are gone from the DB, so both must go from memory
+	// too (else the card would show the just-deleted history, and a stale
+	// "HTTP 503" badge on an "up" sensor, until the next probe). Commit
+	// first: if the DB write fails the cache is kept (its rows are still
+	// there); if the reset failed, the next tick rebuilds the cache entry.
 	s.probeWorker.ResetStatsFor(id)
 
 	log.Printf("API: cleared history for %s (%d probes, %d events)", name, probes, events)
@@ -888,15 +919,42 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var probes, events int64
-	if res, err := s.db.Exec("DELETE FROM probes"); err == nil {
+	// One transaction (the SetSensorTags house pattern): see
+	// handleSensorClearHistory for why.
+	tx, err := s.db.Begin()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "begin: "+err.Error())
+		return
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+
+	if res, err := tx.Exec("DELETE FROM probes"); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear probes: "+err.Error())
+		return
+	} else {
 		probes, _ = res.RowsAffected()
 	}
-	if res, err := s.db.Exec("DELETE FROM events"); err == nil {
+	if res, err := tx.Exec("DELETE FROM events"); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear events: "+err.Error())
+		return
+	} else {
 		events, _ = res.RowsAffected()
 	}
-	_, _ = s.db.Exec("DELETE FROM alert_state")
-	_, _ = s.db.Exec("UPDATE sensors SET status = 'up'")
-	s.probeWorker.ResetStatsAll() // wipe the whole in-memory stats cache too
+	if _, err := tx.Exec("DELETE FROM alert_state"); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "clear alert_state: "+err.Error())
+		return
+	}
+	if _, err := tx.Exec("UPDATE sensors SET status = 'up'"); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "reset status: "+err.Error())
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		respondWithError(w, http.StatusInternalServerError, "commit: "+err.Error())
+		return
+	}
+	// Wipe the whole in-memory state too: every sensor's series AND
+	// ProbeState (see ResetStatsAll for the fields and why).
+	s.probeWorker.ResetStatsAll()
 
 	log.Printf("API: cleared ALL history (%d probes, %d events)", probes, events)
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{

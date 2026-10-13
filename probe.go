@@ -547,16 +547,40 @@ func (pw *ProbeWorker) GetStats(id string) *SensorStats {
 	return pw.statsFor(id, time.Now().Unix())
 }
 
-// ResetStatsFor empties one sensor's cached series (used by the clear-history
-// endpoint so the cache doesn't outlive the DB rows it mirrors).
+// ResetStatsFor empties one sensor's cached series AND its in-memory
+// ProbeState (used by the clear-history endpoint so neither the cache nor
+// the loop state outlives the DB rows it mirrors). Without the ProbeState
+// reset, a cleared failing HTTP sensor keeps serving its stale
+// lastHTTPStatus (the card shows "up" with an "HTTP 503" badge) and its
+// fastRetry cadence until the next probe tick overwrites them. isPaused is
+// deliberately untouched — pause is operator state, not history.
+// Lock order: pw.mu (ProbeState) then pw.statsMu (cache); no other path
+// takes the two locks, so the order can't invert.
 func (pw *ProbeWorker) ResetStatsFor(id string) {
+	pw.mu.Lock()
+	if ps, ok := pw.sensors[id]; ok {
+		ps.lastStatus = ""
+		ps.fastRetry = false
+		ps.lastHTTPStatus = nil
+		ps.lastCertExpiry = nil
+	}
+	pw.mu.Unlock()
 	pw.statsMu.Lock()
 	delete(pw.statsCache, id)
 	pw.statsMu.Unlock()
 }
 
-// ResetStatsAll empties every sensor's cached series (clear-all-history).
+// ResetStatsAll empties every sensor's cached series and ProbeState
+// (clear-all-history). Same field set and lock order as ResetStatsFor.
 func (pw *ProbeWorker) ResetStatsAll() {
+	pw.mu.Lock()
+	for _, ps := range pw.sensors {
+		ps.lastStatus = ""
+		ps.fastRetry = false
+		ps.lastHTTPStatus = nil
+		ps.lastCertExpiry = nil
+	}
+	pw.mu.Unlock()
 	pw.statsMu.Lock()
 	pw.statsCache = make(map[string]*probeSeries)
 	pw.statsMu.Unlock()
