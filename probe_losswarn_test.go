@@ -26,6 +26,7 @@ func TestLossWarnIsARealGate(t *testing.T) {
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
+	t.Cleanup(func() { db.Close() })
 
 	mk := func(id string, rtt []*float64) string {
 		pw := seedSensor(t, db, id, 25, 2, 3, rtt)
@@ -80,6 +81,82 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "up"); got != "warning" {
 			t.Errorf("single loss with loss_warn=10 = %q, want warning (per-sensor threshold honored)", got)
+		}
+	}
+
+	// warning->up transition (lastStatus="warning"): a sub-threshold flap
+	// (newest success, 2nd-newest loss, 1/8 = 12.5%) now reads UP — the
+	// pre-fix code held it in warning via the unconditional fallback, and
+	// every case above runs lastStatus="up", so this path was uncovered.
+	{
+		pw := seedSensor(t, db, "lw-warn-flap-up", 25, 2, 3,
+			[]*float64{f64(10), nil, f64(10), f64(10), f64(10), f64(10), f64(10), f64(10)})
+		c := sensorConfig{id: "lw-warn-flap-up", lossWarn: 25, downAfter: 2}
+		c.lastErrCount = probeErrCount.Load()
+		if got := pw.deriveStatus(c, "warning"); got != "up" {
+			t.Errorf("sub-threshold flap from warning = %q, want up (blip below loss_warn recovers)", got)
+		}
+	}
+
+	// At-threshold flap from warning stays warning: 2/8 = 25% >= 25 with
+	// newest success + 2nd-newest loss — neither the up rule nor the
+	// sub-threshold fallthrough may rescue it.
+	{
+		pw := seedSensor(t, db, "lw-warn-flap-stay", 25, 2, 3,
+			[]*float64{nil, f64(10), nil, f64(10), f64(10), f64(10), f64(10), f64(10)})
+		c := sensorConfig{id: "lw-warn-flap-stay", lossWarn: 25, downAfter: 2}
+		c.lastErrCount = probeErrCount.Load()
+		if got := pw.deriveStatus(c, "warning"); got != "warning" {
+			t.Errorf("at-threshold flap from warning = %q, want warning (loss gate holds)", got)
+		}
+	}
+
+	// Steady state (newest two ok) with 3/8 = 37.5% loss reads warning: the
+	// up rule checks the window loss before returning up, so a flapping
+	// sensor above the threshold can't ride a 2-straight-good tick back to
+	// up. (Pre-v0.3.15 this shape read up — the short-circuit this fixes.)
+	{
+		pw := seedSensor(t, db, "lw-steady-over", 25, 2, 3,
+			[]*float64{nil, f64(10), nil, f64(10), nil, f64(10), f64(10), f64(10)})
+		c := sensorConfig{id: "lw-steady-over", lossWarn: 25, downAfter: 2}
+		c.lastErrCount = probeErrCount.Load()
+		if got := pw.deriveStatus(c, "up"); got != "warning" {
+			t.Errorf("steady state at 37.5%% loss = %q, want warning (up rule honors loss_warn)", got)
+		}
+	}
+
+	// down_after > statusWindow: loss% is over the newest 8 probes, not the
+	// 20-row read. 4 losses in the newest 8 (50%) warn even though 4/20 =
+	// 20% < 25 — the pre-fix denominator diluted the threshold.
+	{
+		rtt := make([]*float64, 0, 20)
+		for i := 0; i < 12; i++ {
+			rtt = append(rtt, f64(10))
+		}
+		rtt = append(rtt, f64(10), nil, f64(10), nil, f64(10), nil, f64(10), nil)
+		pw := seedSensor(t, db, "lw-diluted", 25, 20, 3, rtt)
+		c := sensorConfig{id: "lw-diluted", lossWarn: 25, downAfter: 20}
+		c.lastErrCount = probeErrCount.Load()
+		if got := pw.deriveStatus(c, "up"); got != "warning" {
+			t.Errorf("down_after=20, 4 losses in newest 8 = %q, want warning (loss%% over 8, not 20)", got)
+		}
+	}
+
+	// down_after > statusWindow, at-threshold: 2 losses in the newest 8
+	// (25%) with down_after=12 reads warning — 2/12 = 16.7% would have read
+	// up with the diluted denominator. The 2/8 = 25% is the same number the
+	// inspector displays, so badge and inspector agree.
+	{
+		rtt := make([]*float64, 0, 12)
+		for i := 0; i < 4; i++ {
+			rtt = append(rtt, f64(10))
+		}
+		rtt = append(rtt, f64(10), f64(10), f64(10), f64(10), nil, f64(10), nil, f64(10))
+		pw := seedSensor(t, db, "lw-window8", 25, 12, 3, rtt)
+		c := sensorConfig{id: "lw-window8", lossWarn: 25, downAfter: 12}
+		c.lastErrCount = probeErrCount.Load()
+		if got := pw.deriveStatus(c, "up"); got != "warning" {
+			t.Errorf("down_after=12, 2 losses in newest 8 = %q, want warning (2/8=25%%, not 2/12)", got)
 		}
 	}
 }

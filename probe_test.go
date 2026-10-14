@@ -106,16 +106,17 @@ func TestDeriveStatus(t *testing.T) {
 		{
 			id: "up-at-boundary", lossWarn: 25, downAfter: 4, spikeMult: 3,
 			// 12 probes, 3 lost = 25% overall (and 2/8 = 25% in the status
-			// window — exactly the threshold). But the newest 2 probes both
-			// succeeded, and up is checked FIRST, so it reads up. This is
-			// the intended up-first consequence: recovery beats the loss
-			// boundary (previously this case read warning).
+			// window — exactly the threshold). The newest 2 probes both
+			// succeeded, but the up rule checks the window loss before
+			// returning up, so at-threshold loss reads warning — the
+			// steady-state branch must not short-circuit the sole warning
+			// gate. (Pre-v0.3.15 this case read up.)
 			rtt: []*float64{
 				f64(10), f64(10), f64(10), nil,
 				f64(10), f64(10), f64(10), f64(10),
 				nil, nil, f64(10), f64(10),
 			},
-			want: "up",
+			want: "warning",
 		},
 		{
 			id: "loss-below", lossWarn: 25, downAfter: 4, spikeMult: 3,
@@ -185,12 +186,17 @@ func TestDeriveStatus(t *testing.T) {
 		},
 		{
 			id: "recovery-after-outage", lossWarn: 25, downAfter: 4, spikeMult: 3,
-			// An hour of total loss, then 2 successes: 75% window loss, but
-			// the newest 2 both succeeded, so the sensor reads up
-			// IMMEDIATELY — no waiting for the window to wash out.
+			// An hour of total loss, then 2 successes: the newest 2 both
+			// succeeded, but the window loss is 75% — far above loss_warn.
+			// The up rule honors the sole warning gate, so a sensor in
+			// WARNING stays in warning until the window loss washes back
+			// under the threshold. (A sensor confirmed in ERROR reads up on
+			// its FIRST good probe — see fast-recovery-one-success.)
+			// Pre-v0.3.15 the 2-straight-good tick short-circuited the
+			// loss gate and read up here.
 			rtt:  append(make([]*float64, 60), f64(10), f64(10)),
 			last: "warning",
-			want: "up",
+			want: "warning",
 		},
 		{
 			id: "recovery-one-success-from-warning", lossWarn: 25, downAfter: 4, spikeMult: 3,

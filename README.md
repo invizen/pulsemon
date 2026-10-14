@@ -139,18 +139,22 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 Statuses are `up`, `warning`, and `error`. A sensor's status is derived from
 its most recent probes, checked in this order:
 
-- **up** — the last 2 probes both succeeded; **or** a sensor recovering
-  from **error** whose newest probe succeeded (error → up on a single good
-  reply). A brand-new sensor with 1 successful probe reads up. Checked
-  first, so a sensor recovering from a long outage flips back quickly — it
-  does not wait for the loss window to wash out.
+- **up** — a sensor recovering from **error** whose newest probe succeeded
+  (error → up on a single good reply); a brand-new sensor with 1
+  successful probe; the last 2 probes both succeeded **and** loss over the
+  last 8 probes is below the sensor's loss threshold (25% at the default);
+  or a single recent loss amid sub-threshold stats (a blip — the LOSS
+  metric and red sparkline bar show it). Recovery is checked first, so a
+  sensor recovering from a long outage flips back quickly — it does not
+  wait for the loss window to wash out.
 - **error** — `error after` consecutive losses (2 at the default)
 - **warning** — packet loss over the last 8 probes ≥ the sensor's loss
-  threshold (25% at the default) — or any recent loss that is not up and
-  not error. A flapping sensor (loss/up/loss/up) that was in warning stays
-  in warning — one good probe amid ongoing loss is not "recovered".
-  (`spike_mult` never affects status: it only tints dashboard sparkline
-  bars — see below.)
+  threshold (25% at the default). loss_warn is the sole warning gate: a
+  flapping sensor stays in warning on every tick — including
+  2-straight-good ticks — while its 8-probe loss is at/above the threshold,
+  and reads up once the window loss falls back under it. A single loss
+  below the threshold does not warn. (`spike_mult` never affects status: it
+  only tints dashboard sparkline bars — see below.)
 
 - **Sparkline spike tint:** each sensor's 1-hour sparkline colors bars
   **amber** at/above `spike_mult ×` that sensor's own window-average RTT

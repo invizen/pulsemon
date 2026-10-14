@@ -671,8 +671,10 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 
 	// Status-window loss: the SAME window deriveStatus uses, so the inspector
 	// can show the number the badge actually came from. Fewer than
-	// statusWindow probes (a new sensor) just means a shorter window — the
-	// same rule deriveStatus applies (up on the newest 2, warning on loss%).
+	// statusWindow probes (a new sensor) just means a shorter window.
+	// deriveStatus reads warning at/above this loss%, up below it (steady
+	// state on the newest 2, or a single blip); only the fast-recovery
+	// shortcut from error bypasses the % entirely.
 	st.StatusWindowSize = statusWindow
 	sw := entries
 	if len(sw) > statusWindow {
@@ -1217,28 +1219,30 @@ const statusWindow = 8
 // Status is derived from the sensor's most recent probes with fixed
 // precedence:
 //
-//	up        — window loss% (last `statusWindow` probes) is BELOW
-//	            loss_warn AND consecutive losses < down_after. Two shapes
-//	            read up: steady state (newest + previous succeeded) and a
-//	            single recent loss amid sub-threshold stats (a blip — the
-//	            LOSS metric and red sparkline bar show it). The fast-
-//	            recovery shortcut is kept: a sensor back from ERROR reads
-//	            up on its FIRST good probe. A flapping sensor whose window
-//	            loss has crossed loss_warn reads warning, not up.
+//	up        — (a) fast recovery: a sensor back from ERROR reads up on its
+//	            FIRST good probe (it was already confirmed down, one reply
+//	            is sufficient proof of return); (b) a brand-new sensor with
+//	            a single recorded success; (c) steady state: the newest two
+//	            probes succeeded AND the window loss% (last `statusWindow`
+//	            probes) is BELOW loss_warn; (d) a single recent loss (newest
+//	            probe lost) amid sub-threshold window stats — a blip, shown
+//	            by the LOSS metric and the red sparkline bar.
 //	error     — `down_after` consecutive losses from the newest probe
 //	warning   — window loss% (last `statusWindow` probes) >= loss_warn
 //	            (and not error); loss_warn == 0 (disabled, API-unreachable)
 //	            warns on any loss in the window
 //
-// Consequence of the up-first ordering: a sensor back from a long outage
-// reads up on its FIRST good probe (fast recovery — it was already
-// confirmed down, one reply is sufficient proof of return), while a sensor
-// whose window loss crosses loss_warn reads warning until it has 2 straight
-// good probes AND the window loss falls back under the threshold.
+// loss_warn is the SOLE warning gate, and the up rule honors it: the
+// steady-state branch checks the window loss% before returning up, so a
+// flapping sensor whose window loss has crossed loss_warn reads warning —
+// not up — on every tick (including 2-straight-good ticks) until the
+// window loss falls back under the threshold.
 //
 // The window read is max(statusWindow, down_after) rows so that a sensor
-// configured with down_after > statusWindow still has enough history for the
-// consecutive-loss test. A probe-level ICMP error (broken socket) forces
+// configured with down_after > statusWindow still has enough history for
+// the consecutive-loss test; the extra rows feed ONLY that test — loss% is
+// always computed over the newest statusWindow probes, the same window the
+// inspector displays. A probe-level ICMP error (broken socket) forces
 // warning so a dead probe path never reads as "up".
 func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// Broken probe path (e.g. ICMP socket cannot be created): probes never
@@ -1288,14 +1292,43 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 		return "up" // no data yet
 	}
 
-	// UP (highest precedence): the newest probe succeeded, and the sensor is
-	// either recovering from ERROR (fast recovery — one good reply is enough
-	// once it was confirmed down) or the previous probe also succeeded (2
-	// straight = steady up; with only one probe recorded, a single success
-	// is enough — new-sensor grace). Checked before error/warning so
-	// recovery is immediate, but a flapping sensor in WARNING (newest
-	// success, 2nd-newest loss, lastStatus=warning) does NOT read up.
-	if recent[0] != nil && (lastStatus == "error" || len(recent) == 1 || recent[1] != nil) {
+	// Window loss% over the STATUS WINDOW (newest statusWindow probes) —
+	// the same 8-probe window the inspector displays, so the badge and the
+	// inspector number always agree. The read above fetches
+	// max(statusWindow, down_after) rows; the extra rows feed only the
+	// consecutive-loss test below, never this math.
+	sw := recent
+	if len(sw) > statusWindow {
+		sw = sw[:statusWindow]
+	}
+	totalLost := 0
+	for _, r := range sw {
+		if r == nil {
+			totalLost++
+		}
+	}
+	lossPct := float64(totalLost) / float64(len(sw)) * 100
+
+	// UP (highest precedence): the newest probe succeeded, and the sensor
+	// is either recovering from ERROR (fast recovery — one good reply is
+	// enough once it was confirmed down), a brand-new sensor with a single
+	// recorded success, or steady state (the previous probe also succeeded)
+	// with the window loss BELOW loss_warn. The steady-state branch is
+	// gated on the threshold so the up rule can't short-circuit the sole
+	// warning gate: a flapping sensor whose window loss has crossed
+	// loss_warn reads warning, not up, even on a 2-straight-good tick.
+	// (loss_warn == 0 keeps the pre-gate steady-state behavior — the
+	// defensive zeroed-row path, unreachable via the API.)
+	upRule := false
+	if recent[0] != nil {
+		switch {
+		case lastStatus == "error" || len(recent) == 1:
+			upRule = true
+		case recent[1] != nil && (c.lossWarn == 0 || lossPct < float64(c.lossWarn)):
+			upRule = true
+		}
+	}
+	if upRule {
 		return "up"
 	}
 
@@ -1318,20 +1351,8 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// SOLE warning gate: loss_warn is a real threshold, not a decoration.
 	// A sensor whose window loss is below it reads "up" even when the
 	// newest probe is a single loss — the LOSS metric and the red
-	// sparkline bar still show the blip. The pre-fix code ended with an
-	// unconditional `return "warning"` fallback, which made the per-sensor
-	// loss_warn setting dead code: any single loss in the 8-probe window
-	// (12.5% < the 25% default) warned, then flapped back to up on the
-	// next good probe — constant false warnings on links with ~5% hourly
-	// loss.
-	totalLost := 0
-	for _, r := range recent {
-		if r == nil {
-			totalLost++
-		}
-	}
+	// sparkline bar still show the blip.
 	if c.lossWarn > 0 {
-		lossPct := float64(totalLost) / float64(len(recent)) * 100
 		if lossPct >= float64(c.lossWarn) {
 			return "warning"
 		}
