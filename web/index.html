@@ -900,7 +900,11 @@ function layoutSparklines() {
     const gap = 2;
     const innerD = inner * dpr;
     const gapD = gap * dpr;
-    const barD = Math.max(1, Math.round((innerD - (bars.length - 1) * gapD) / bars.length));
+    // FLOOR, not round: with 60 bars, Math.round can inflate the total bar
+    // width by up to ~30px past the container (0.5px x 60), spilling the bars
+    // out of the box at certain window widths. Floor guarantees the snapped
+    // total <= inner while keeping the device-pixel snap from v0.2.7.
+    const barD = Math.max(1, Math.floor((innerD - (bars.length - 1) * gapD) / bars.length));
     const w = barD / dpr;
     bars.forEach(b => { b.style.flex = 'none'; b.style.width = w + 'px'; });
   });
@@ -960,7 +964,7 @@ function cardHtml(s) {
         '<span>past 1h</span>' +
         (!paused && st && st.total ? '<span>uptime 24h: ' + st.uptime_24h.toFixed(2) + '%' + '</span>' : '') +
       '</div>' +
-      '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end justify-center') + ' gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
+      '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end justify-center') + ' gap-[2px] p-1 overflow-hidden bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
           : (st && st.hour ? sparklineBars(st.hour, s.spike_mult) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
