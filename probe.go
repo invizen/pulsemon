@@ -1217,23 +1217,24 @@ const statusWindow = 8
 // Status is derived from the sensor's most recent probes with fixed
 // precedence:
 //
-//	up        — the newest probe succeeded AND the sensor is either
-//	            recovering from ERROR (lastStatus == "error" — one good
-//	            reply is enough to prove it's back) or the probe before it
-//	            also succeeded (steady state / brand-new sensor). A flapping
-//	            sensor in WARNING (loss, success, loss, success…) reads
-//	            warning, not up — one good probe amid ongoing loss is not
-//	            "recovered", and error+1-success would make a flapping link
-//	            oscillate up/error every cycle.
+//	up        — window loss% (last `statusWindow` probes) is BELOW
+//	            loss_warn AND consecutive losses < down_after. Two shapes
+//	            read up: steady state (newest + previous succeeded) and a
+//	            single recent loss amid sub-threshold stats (a blip — the
+//	            LOSS metric and red sparkline bar show it). The fast-
+//	            recovery shortcut is kept: a sensor back from ERROR reads
+//	            up on its FIRST good probe. A flapping sensor whose window
+//	            loss has crossed loss_warn reads warning, not up.
 //	error     — `down_after` consecutive losses from the newest probe
 //	warning   — window loss% (last `statusWindow` probes) >= loss_warn
-//	fallback  — warning (a loss is in the recent window but it's not
-//	            error and the up rule doesn't hold)
+//	            (and not error); loss_warn == 0 (disabled, API-unreachable)
+//	            warns on any loss in the window
 //
 // Consequence of the up-first ordering: a sensor back from a long outage
 // reads up on its FIRST good probe (fast recovery — it was already
 // confirmed down, one reply is sufficient proof of return), while a sensor
-// merely losing packets reads warning until it has 2 straight good probes.
+// whose window loss crosses loss_warn reads warning until it has 2 straight
+// good probes AND the window loss falls back under the threshold.
 //
 // The window read is max(statusWindow, down_after) rows so that a sensor
 // configured with down_after > statusWindow still has enough history for the
@@ -1313,7 +1314,16 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 		return "error"
 	}
 
-	// WARNING: loss% over the status window meets loss_warn.
+	// WARNING: loss% over the status window meets loss_warn. This is the
+	// SOLE warning gate: loss_warn is a real threshold, not a decoration.
+	// A sensor whose window loss is below it reads "up" even when the
+	// newest probe is a single loss — the LOSS metric and the red
+	// sparkline bar still show the blip. The pre-fix code ended with an
+	// unconditional `return "warning"` fallback, which made the per-sensor
+	// loss_warn setting dead code: any single loss in the 8-probe window
+	// (12.5% < the 25% default) warned, then flapped back to up on the
+	// next good probe — constant false warnings on links with ~5% hourly
+	// loss.
 	totalLost := 0
 	for _, r := range recent {
 		if r == nil {
@@ -1325,9 +1335,16 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 		if lossPct >= float64(c.lossWarn) {
 			return "warning"
 		}
+		// Below the threshold: the window is statistically healthy, so the
+		// sensor reads up (a single recent loss among sub-threshold stats
+		// is a blip, not degradation).
+		return "up"
 	}
 
-	// WARNING: a loss is in the recent window but it's not error and not up.
+	// loss_warn == 0 (threshold disabled): any loss in the window that
+	// isn't an error degrades the sensor. Unreachable via the API — it
+	// validates 1-100 — kept so a zeroed row degrades loudly rather than
+	// reading up while dropping packets.
 	return "warning"
 }
 
