@@ -12,10 +12,18 @@
   <script>
     if (localStorage.getItem('pulsemon_theme') === 'light') document.documentElement.classList.add('light');
   </script>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script src="https://unpkg.com/@phosphor-icons/web"></script>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <!-- Vendored third-party assets (web/vendor/) so the dashboard is fully
+       self-contained: no CDN dependency, works with the internet down.
+       Refresh procedure: re-download and replace the files (Tailwind Play
+       CDN script, Phosphor Icons 2.1.2 regular + bold weights, Google Fonts
+       JetBrains Mono + Plus Jakarta Sans latin/latin-ext woff2). The
+       Play CDN is a browser-side JIT compiler — deliberately vendored
+       rather than pre-built to a static CSS so hand-edited class names
+       in index.html keep working without a build step. -->
+  <script src="/vendor/tailwind.js"></script>
+  <link rel="stylesheet" href="/vendor/phosphor/regular.css">
+  <link rel="stylesheet" href="/vendor/phosphor/bold.css">
+  <link rel="stylesheet" href="/vendor/fonts/fonts.css">
   <script>
     tailwind.config = {
       theme: {
