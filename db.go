@@ -152,10 +152,11 @@ func (db *DB) InitSchema() error {
 		}
 	}
 	// One-time migration: add the per-sensor latency-spike multiplier
-	// column. DEPRECATED (v0.3.11 review): spike detection was removed
-	// from deriveStatus and neither the probe engine nor the dashboard
-	// reads the column anymore — it is retained in the schema purely for
-	// compatibility with existing databases (no destructive migration).
+	// column. LIVE (dashboard-only): sparkline bars at/above
+	// spike_mult × the window's average RTT render amber (absolute
+	// red >200 ms is unchanged). The probe engine never reads it —
+	// status derivation is unaffected — so it is a display tuning
+	// knob, editable per sensor in the dashboard modal.
 	var spikeCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'spike_mult'`).Scan(&spikeCol); err == nil && spikeCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN spike_mult INTEGER NOT NULL DEFAULT 5`); err != nil {

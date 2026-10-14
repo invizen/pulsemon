@@ -149,9 +149,15 @@ its most recent probes, checked in this order:
   threshold (25% at the default) — or any recent loss that is not up and
   not error. A flapping sensor (loss/up/loss/up) that was in warning stays
   in warning — one good probe amid ongoing loss is not "recovered".
-  (The `spike_mult` column in the database is a deprecated legacy remnant:
-  neither the probe engine nor the dashboard reads it, and it never affects
-  status.)
+  (`spike_mult` never affects status: it only tints dashboard sparkline
+  bars — see below.)
+
+- **Sparkline spike tint:** each sensor's 1-hour sparkline colors bars
+  **amber** at/above `spike_mult ×` that sensor's own window-average RTT
+  (per-sensor, 2–10, default 5 — "Spike ×" in the sensor modal), so a 6 ms
+  blip on a 2 ms LAN link is visible even though it's nowhere near the
+  absolute thresholds. Bars above **200 ms** stay **red** regardless.
+  Display-only: the probe engine and status derivation never read it.
 
 - New sensors default to: interval 60s, timeout 1000ms, loss warn 25%,
   error after 2. New and cloned sensors start **paused** so a fresh

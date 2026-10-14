@@ -322,7 +322,7 @@
         </div>
       </div>
 
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 pt-1">
+      <div class="grid grid-cols-2 sm:grid-cols-5 gap-2.5 pt-1">
         <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Interval (s)
           <input id="f-interval" type="number" min="1" max="3600" value="60" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
@@ -334,6 +334,9 @@
         </label>
         <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono">Down After
           <input id="f-down" type="number" min="1" max="30" value="2" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
+        </label>
+        <label class="text-[11px] text-slate-400 flex flex-col gap-1 font-mono" title="Sparkline bars at/above this multiple of the sensor's own average RTT turn amber (absolute red above 200 ms is unchanged)">Spike ×
+          <input id="f-spike" type="number" min="2" max="10" step="1" value="5" class="bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 text-[13px] font-mono text-slate-200 focus:outline-none focus:border-ok/60">
         </label>
       </div>
 
@@ -790,16 +793,22 @@ function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 // breaks out of the string and executes.
 function escJs(v) { return esc((v || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n')); }
 
-function sparklineBars(hour) {
+// Sparkline bar colors: red > 200 ms (absolute — objectively slow), amber at
+// or above spikeMult × the window's own average (relative — a spike FOR THIS
+// SENSOR, so a 6 ms bar on a 2 ms LAN link is flagged while a steady 80 ms
+// WAN link stays green). spikeMult comes from the sensor row (default 5).
+function sparklineBars(hour, spikeMult) {
   const arr = (hour || []).slice(0, 60);
   const vals = arr.filter(x => typeof x === 'number' && x >= 0);
   const maxVal = Math.max(...(vals.length ? vals : [0]), 100);
+  const avg = vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : 0;
+  const spikeAt = (spikeMult > 0 && avg > 0) ? spikeMult * avg : 0;
   return arr.map(v => {
     if (v === null) return '<div class="spark-bar flex-1 h-full bg-bad/80 rounded-sm" title="packet lost"></div>';
     if (v === -2) return '<div class="spark-bar flex-1 h-[8%] bg-surface-700/40 rounded-sm" title="no data"></div>';
     const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
     let cls = 'bg-ok/80';
-    if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
+    if (v > 200) cls = 'bg-bad'; else if (spikeAt > 0 && v >= spikeAt) cls = 'bg-warn';
     return '<div class="spark-bar flex-1 rounded-sm ' + cls + '" style="height:' + h + '%" title="' + fmtRtt(v) + '"></div>';
   }).join('');
 }
@@ -953,7 +962,7 @@ function cardHtml(s) {
       '</div>' +
       '<div class="h-9 flex ' + (paused || !(st && st.hour) ? 'items-center justify-center' : 'items-end justify-center') + ' gap-[2px] p-1 bg-surface-950/70 border border-surface-800/80 rounded">' +
         (paused ? '<span class="text-[11px] text-slate-600 font-mono">paused</span>'
-          : (st && st.hour ? sparklineBars(st.hour) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
+          : (st && st.hour ? sparklineBars(st.hour, s.spike_mult) : '<span class="text-[11px] text-slate-600 font-mono">collecting…</span>')) +
       '</div>' +
     '</div>' +
 
@@ -1220,14 +1229,14 @@ function openSensorModal(id) {
     onFormTypeChange();
     formTagsCache = (s.tags || []).slice();
     renderFormTags(formTagsCache);
-    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after;
+    $('f-interval').value = s.interval_s; $('f-timeout').value = s.timeout_ms; $('f-loss').value = s.loss_warn; $('f-down').value = s.down_after; $('f-spike').value = s.spike_mult || 5;
   } else {
     $('modal-title').textContent = 'New Sensor';
     $('f-id').value = ''; $('f-name').value = ''; $('f-target').value = '';
     $('f-type').value = 'http';
     onFormTypeChange();
     renderFormTags([]);
-    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2;
+    $('f-interval').value = 60; $('f-timeout').value = 1000; $('f-loss').value = 25; $('f-down').value = 2; $('f-spike').value = 5;
   }
   $('modal-backdrop').classList.remove('hidden');
   setTimeout(() => $('f-name').focus(), 50);
@@ -1264,7 +1273,7 @@ async function submitSensor(ev) {
   const body = {
     name: $('f-name').value.trim(), target: $('f-target').value.trim(), type:$('f-type').value, tags: selectedFormTags(),
     interval_s: +$('f-interval').value, timeout_ms: +$('f-timeout').value,
-    loss_warn: +$('f-loss').value, down_after: +$('f-down').value
+    loss_warn: +$('f-loss').value, down_after: +$('f-down').value, spike_mult: +$('f-spike').value
   };
   const ne = nameErr(body.name);
   if (ne) { $('form-err').textContent = ne; $('form-err').classList.remove('hidden'); return; }

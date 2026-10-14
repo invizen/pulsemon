@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -121,51 +123,91 @@ func TestPatchNameNoRespawn(t *testing.T) {
 	patchSensorRespawned(t, `{"name": "renamed"}`, false)
 }
 
-// TestPatchSpikeMultDeprecated pins the deprecated spike_mult field's
-// backward-compat behavior: the field is no longer accepted by PATCH, so a
-// spike_mult-only request is an empty patch — 400 "no fields to update",
-// nothing written, and the probe loop must not churn.
-func TestPatchSpikeMultDeprecated(t *testing.T) {
+// TestPatchSpikeMultNoRespawn pins the display-only contract: spike_mult
+// only tints dashboard sparkline bars — the probe engine never reads it —
+// so a spike_mult PATCH must succeed AND must not churn the probe loop
+// (unlike loss_warn/down_after, which the running loop reads from its
+// spawn-time config copy).
+func TestPatchSpikeMultNoRespawn(t *testing.T) {
+	patchSensorRespawned(t, `{"spike_mult": 8}`, false)
+}
+
+// TestSpikeMultLifecycle pins the field's full API surface: POST defaults
+// to 5, GET returns it, PATCH validates the 2-10 range and persists, and
+// clone carries the value over.
+func TestSpikeMultLifecycle(t *testing.T) {
 	dir := t.TempDir()
 	db, err := NewDB(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	lctx, lcancel := context.WithCancel(context.Background())
 	defer db.Close()
-	defer lcancel()
 	if err := db.InitSchema(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-		VALUES ('s1', 's1', '192.0.2.1', 15, 1000, 10, 10, 5, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
-		t.Fatal(err)
-	}
-
 	pw := NewProbeWorker(db)
 	srv := NewServer(db, pw)
-	pw.syncSensors(lctx)
-
-	req, _ := http.NewRequest(http.MethodPatch, "/api/sensors/s1", bytes.NewBufferString(`{"spike_mult": 8}`))
-	rr := httptest.NewRecorder()
-	srv.Mux().ServeHTTP(rr, req)
-	if rr.Code != http.StatusBadRequest {
-		t.Fatalf("PATCH {\"spike_mult\": 8} = %d, want 400 (deprecated field is not accepted): %s", rr.Code, rr.Body.String())
+	do := func(method, path, body string) (int, map[string]interface{}) {
+		req, _ := http.NewRequest(method, path, bytes.NewBufferString(body))
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		var out map[string]interface{}
+		_ = json.Unmarshal(rr.Body.Bytes(), &out)
+		return rr.Code, out
 	}
 
-	// The stored value is untouched and the loop did not churn.
+	// POST without spike_mult → default 5.
+	code, created := do(http.MethodPost, "/api/sensors", `{"name":"sm1","target":"192.0.2.1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("POST = %d, want 201: %v", code, created)
+	}
+	if got := created["spike_mult"]; got != float64(5) {
+		t.Fatalf("POST default spike_mult = %v, want 5", got)
+	}
+	id := created["id"].(string)
+
+	// GET (list) returns it too.
+	code, _ = do(http.MethodGet, "/api/sensors", "")
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/sensors = %d", code)
+	}
+	// PATCH to 8 → persisted.
+	code, _ = do(http.MethodPatch, "/api/sensors/"+id, `{"spike_mult": 8}`)
+	if code != http.StatusOK {
+		t.Fatalf("PATCH spike_mult=8 = %d, want 200", code)
+	}
 	var stored int
-	if err := db.QueryRow(`SELECT spike_mult FROM sensors WHERE id = 's1'`).Scan(&stored); err != nil {
+	if err := db.QueryRow(`SELECT spike_mult FROM sensors WHERE id = ?`, id).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
-	if stored != 5 {
-		t.Fatalf("spike_mult changed to %d, want 5 (deprecated field must not write)", stored)
+	if stored != 8 {
+		t.Fatalf("stored spike_mult = %d, want 8", stored)
 	}
-	pw.mu.Lock()
-	_, alive := pw.loops["s1"]
-	pw.mu.Unlock()
-	if !alive {
-		t.Fatal("probe loop churned on a deprecated-field PATCH")
+	// Validation: below and above the range are rejected, stored value intact.
+	for _, bad := range []int{1, 11} {
+		code, _ = do(http.MethodPatch, "/api/sensors/"+id, fmt.Sprintf(`{"spike_mult": %d}`, bad))
+		if code != http.StatusBadRequest {
+			t.Fatalf("PATCH spike_mult=%d = %d, want 400", bad, code)
+		}
+	}
+	if err := db.QueryRow(`SELECT spike_mult FROM sensors WHERE id = ?`, id).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != 8 {
+		t.Fatalf("stored spike_mult = %d after rejected patches, want 8", stored)
+	}
+	// POST validation.
+	code, _ = do(http.MethodPost, "/api/sensors", `{"name":"sm2","target":"192.0.2.2","spike_mult": 11}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST spike_mult=11 = %d, want 400", code)
+	}
+	// Clone carries the value over.
+	code, cloned := do(http.MethodPost, "/api/sensors/"+id+"/clone", "")
+	if code != http.StatusCreated {
+		t.Fatalf("clone = %d, want 201", code)
+	}
+	if got := cloned["spike_mult"]; got != float64(8) {
+		t.Fatalf("clone spike_mult = %v, want 8", got)
 	}
 }
 
