@@ -55,6 +55,19 @@ func setupUpdateHarness(t *testing.T, container bool) *updateHarness {
 	return h
 }
 
+// updateServer builds a Server with authentication ENABLED (one account):
+// the recommended production shape for the update endpoint (the endpoint
+// itself does not require it - see docs/DEFERRED.md).
+func updateServer(t *testing.T) *Server {
+	t.Helper()
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	if err := srv.auth.AddUser("admin", "update-test-password-1"); err != nil {
+		t.Fatal(err)
+	}
+	return srv
+}
+
 func postUpdate(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	var req *http.Request
@@ -82,8 +95,7 @@ func decodeUpdate(t *testing.T, rec *httptest.ResponseRecorder) updateResponse {
 // downloads or installs in a container — it answers with the operator
 // command (generic default, PULSEMON_UPDATE_CMD override).
 func TestUpdateContainerMode(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 
 	t.Run("default command", func(t *testing.T) {
 		_ = setupUpdateHarness(t, true)
@@ -110,8 +122,7 @@ func TestUpdateContainerMode(t *testing.T) {
 // TestUpdateUpToDate pins the ordering rule: a release not newer than the
 // running version is a no-op (200, nothing installed, no restart).
 func TestUpdateUpToDate(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	h := setupUpdateHarness(t, false)
 	base, _ := serveRelease(t, "v1.0.0", "")
 	oldBase, oldVer := releaseBase, Version
@@ -145,8 +156,7 @@ func TestUpdateMissingPlatformAsset(t *testing.T) {
 	releaseBase, Version = gh.URL+"/releases", "v0.0.1"
 	t.Cleanup(func() { releaseBase, Version = oldBase, oldVer })
 
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	h := setupUpdateHarness(t, false)
 
 	rec := postUpdate(t, srv, "")
@@ -163,8 +173,7 @@ func TestUpdateMissingPlatformAsset(t *testing.T) {
 // once. The 202 must be written BEFORE performRestart (the process dies
 // when systemd restarts it), so the recorder must carry the full response.
 func TestUpdateHappyPathRestart(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	h := setupUpdateHarness(t, false)
 	h.detectBus = "user"
 	base, _ := serveReleaseVerified(t, "v9.9.9")
@@ -193,8 +202,7 @@ func TestUpdateHappyPathRestart(t *testing.T) {
 // systemd service the binary is installed but the endpoint must NOT
 // auto-restart — it reports "installed" with a manual hint.
 func TestUpdateInstalledNoService(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	h := setupUpdateHarness(t, false) // detectBus = ""
 	base, _ := serveReleaseVerified(t, "v9.9.9")
 	oldBase, oldVer := releaseBase, Version
@@ -222,8 +230,7 @@ func TestUpdateInstalledNoService(t *testing.T) {
 // a download that verifies against the wrong SHA-256 is refused (502) and
 // nothing is installed or restarted.
 func TestUpdateSHARefused(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	h := setupUpdateHarness(t, false)
 	h.detectBus = "user"
 	base, _ := serveRelease(t, "v9.9.9", "sha256:0000000000000000000000000000000000000000000000000000000000000000")
@@ -246,8 +253,7 @@ func TestUpdateSHARefused(t *testing.T) {
 // TestUpdateBadVersion pins the pre-validation: a malformed version pin is a
 // 400 before any network call (no path traversal into the releases URL).
 func TestUpdateBadVersion(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	rec := postUpdate(t, srv, `{"version":"../evil"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400: %s", rec.Code, rec.Body.String())
@@ -260,8 +266,7 @@ func TestUpdateBadVersion(t *testing.T) {
 
 // TestUpdateMethodNotAllowed pins the 405 on non-POST.
 func TestUpdateMethodNotAllowed(t *testing.T) {
-	db := newTestDB(t)
-	srv := NewServer(db, NewProbeWorker(db))
+	srv := updateServer(t)
 	rec := httptest.NewRecorder()
 	srv.handleUpdate(rec, httptest.NewRequest("GET", "/api/update", nil))
 	if rec.Code != http.StatusMethodNotAllowed {

@@ -146,7 +146,7 @@ func runRestartCommand() dispatchKind {
 func restartSystemdService() error {
 	var last error
 	for _, args := range [][]string{{"--user", "restart", "pulsemon"}, {"restart", "pulsemon"}} {
-		if err := exec.Command("systemctl", args...).Run(); err == nil {
+		if err := exec.Command(systemctlPath(), args...).Run(); err == nil {
 			return nil
 		} else {
 			last = err

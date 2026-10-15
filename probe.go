@@ -6,14 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log"
 	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -125,9 +129,12 @@ type sensorConfig struct {
 	timeoutMS int
 	lossWarn  int
 	downAfter int
-	// lastErrCount is the global ICMP-socket error counter as of the last
-	// probe; deriveStatus compares against it to detect "probing is broken".
-	lastErrCount int64
+	// probeBroken is set by doProbe on its per-probe copy of the config when
+	// THIS probe could not be attempted because the ICMP engine itself is
+	// unusable (see PingResult.Broken). deriveStatus reads it so a dead probe
+	// path never reads "up". It is deliberately per-probe, not a process-wide
+	// counter: one sensor's per-target send error must not degrade the others.
+	probeBroken bool
 }
 
 type ProbeWorker struct {
@@ -246,15 +253,27 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		state string
 	}
 	var configs []activeCfg
+	// partial is true when the read could not be completed (a row failed to
+	// scan, or the cursor errored mid-iteration). The sensor set is then
+	// incomplete, so the "stop loops for vanished sensors" pass below must be
+	// skipped: otherwise a healthy sensor whose row merely failed to read this
+	// time would have its loop cancelled and its ProbeState deleted.
+	partial := false
 	for rows.Next() {
 		var c activeCfg
 		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
+			log.Printf("ProbeWorker: skipping unreadable sensor row: %v", err)
+			partial = true
 			continue
 		}
 		if c.probeType == "" {
 			c.probeType = "icmp" // legacy rows pre-migration
 		}
 		configs = append(configs, c)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("ProbeWorker: sensor query ended early: %v", err)
+		partial = true
 	}
 
 	// ONE batched tag query after the loop — never a per-sensor query inside
@@ -294,9 +313,10 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		}
 	}
 
-	// Stop loops for sensors that vanished or were deleted.
+	// Stop loops for sensors that vanished or were deleted (only when we saw
+	// the complete set - see partial above).
 	for id, cancel := range pw.loops {
-		if !seen[id] {
+		if !partial && !seen[id] {
 			cancel()
 			delete(pw.loops, id)
 			delete(pw.sensors, id)
@@ -410,6 +430,9 @@ func (pw *ProbeWorker) warmStats() {
 			idList = append(idList, id)
 		}
 	}
+	if err := ids.Err(); err != nil {
+		log.Printf("stats warm: sensor list ended early: %v", err)
+	}
 
 	// One batched fetch for all sensors (never a per-sensor query in a loop —
 	// same pool-starvation rule as SensorTagsFor), oldest-first, so each
@@ -445,7 +468,7 @@ func (pw *ProbeWorker) warmStats() {
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		args = append(args, cutoff.Format(time.RFC3339Nano))
+		args = append(args, fmtTS(cutoff))
 		rows, err := pw.db.Query(
 			`SELECT sensor_id, ts, rtt_ms FROM (
 				SELECT sensor_id, ts, rtt_ms,
@@ -475,6 +498,9 @@ func (pw *ProbeWorker) warmStats() {
 			}
 			a.series.append(probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
 			built++
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("stats warm: chunk read ended early: %v", err)
 		}
 	}
 	for i := 0; i < len(idList); i += inQueryChunk {
@@ -522,17 +548,18 @@ func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
 // it directly with a fixed now so the time-window fields (1h, 24h, sparkline)
 // compare deterministically against the DB reference.
 func (pw *ProbeWorker) statsFor(id string, nowUnix int64) *SensorStats {
+	// Compute under the read lock directly over the live slice: appends take
+	// the write lock, so the series cannot mutate mid-read, and
+	// computeSensorStats only reads (the *float64 values it keeps are
+	// immutable). This avoids copying up to 24h of entries (1.4 MB for a
+	// 1s sensor) per sensor per dashboard poll.
 	pw.statsMu.RLock()
+	defer pw.statsMu.RUnlock()
 	s, ok := pw.statsCache[id]
-	var entries []probeEntry
-	if ok {
-		entries = s.snapshot()
-	}
-	pw.statsMu.RUnlock()
-	if len(entries) == 0 {
+	if !ok || s.len() == 0 {
 		return nil
 	}
-	return computeSensorStats(entries, nowUnix)
+	return computeSensorStats(s.data[s.start:], nowUnix)
 }
 
 // GetStats computes a sensor's SensorStats from the in-memory series,
@@ -758,16 +785,16 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 
 func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 	interval := time.Duration(c.intervalS) * time.Second
+	if interval <= 0 {
+		interval = time.Minute // a zeroed row must not divide by zero or spin
+	}
 
 	// Stagger the first tick by a deterministic per-sensor phase (hash of the
 	// id, 0 .. interval). Without this, every sensor added at the same time —
 	// or every sensor sharing an interval — fires on the same wall-clock second,
 	// producing a write thundering-herd against SQLite. Spreading the phases
 	// turns N simultaneous writes into N writes spread across the interval.
-	phase := time.Duration(fnvHash([]byte(c.id))) % time.Duration(interval)
-	if phase < 250*time.Millisecond {
-		phase += 250 * time.Millisecond // never probe in the first instant
-	}
+	phase := staggerPhase(c.id, interval)
 
 	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
 	// ERROR is re-checked on the fast-retry cadence (errorRetryInterval,
@@ -816,7 +843,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 		timer.Reset(nextDelay)
 
 		if !paused {
-			pw.doProbe(ctx, c)
+			pw.safeProbe(ctx, c)
 		}
 	}
 }
@@ -824,16 +851,35 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 // fnvHash is a 64-bit FNV-1a over the byte slice — cheap, deterministic, and
 // only used to derive a stable stagger phase per sensor id.
 func fnvHash(b []byte) uint64 {
-	const (
-		offset64 = 14695981039346656037
-		prime64  = 1099511628211
-	)
-	var h uint64 = offset64
-	for _, c := range b {
-		h ^= uint64(c)
-		h *= prime64
+	h := fnv.New64a()
+	_, _ = h.Write(b)
+	return h.Sum64()
+}
+
+// staggerPhase is the deterministic first-tick delay for a sensor, in
+// [250ms, interval+250ms). The modulo MUST be done in uint64 BEFORE converting
+// to a Duration: converting the raw hash first makes ~half of all ids negative
+// (>= 2^63), which fires the timer immediately and defeats the stagger.
+func staggerPhase(id string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = time.Minute
 	}
-	return h
+	phase := time.Duration(fnvHash([]byte(id)) % uint64(interval))
+	if phase < 250*time.Millisecond {
+		phase += 250 * time.Millisecond // never probe in the first instant
+	}
+	return phase
+}
+
+// safeProbe runs one probe and contains a panic: one bad probe must not take
+// the whole monitor (every other sensor) down with it.
+func (pw *ProbeWorker) safeProbe(ctx context.Context, c sensorConfig) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("ProbeWorker: probe for sensor %s panicked: %v\n%s", c.id, r, debug.Stack())
+		}
+	}()
+	pw.doProbe(ctx, c)
 }
 
 // pingNowTimeout bounds the "Pulse Now" manual probe. It is a fixed 1s,
@@ -889,7 +935,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	}
 	ts := time.Now().UTC()
 	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)",
-		id, ts.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
+		id, fmtTS(ts), rttVal, o.ip, o.httpCode); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
@@ -934,6 +980,9 @@ type probeOutcome struct {
 	ip         string
 	httpCode   *int
 	certExpiry *time.Time
+	// broken: the probe could not be attempted because the ICMP engine is
+	// unusable (never set for HTTP probes or per-target ICMP failures).
+	broken bool
 }
 
 // probeTarget dispatches one probe to the sensor's transport. A var so a
@@ -952,7 +1001,7 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 	}
 	// icmp (default)
 	res := pingHost(ctx, target, timeout)
-	o := probeOutcome{lost: res.Lost, ip: res.ResolvedIP}
+	o := probeOutcome{lost: res.Lost, ip: res.ResolvedIP, broken: res.Broken}
 	if !res.Lost {
 		o.rttMs = res.RTT.Seconds() * 1000
 	}
@@ -960,9 +1009,8 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 }
 
 func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
-	c.lastErrCount = probeErrCount.Load()
 	o := probeTarget(ctx, c.probeType, c.target, time.Duration(c.timeoutMS)*time.Millisecond)
-	// If the probe was cancelled in flight (shutdown, sensor removed or
+	// If the probe was cancelled in flight (stop, sensor removed or
 	// reconfigured), drop the result: writing it would record a probe for a
 	// sensor that no longer exists (FK violation) or for a config that was
 	// already changed. The loop is exiting (or about to be replaced), so the
@@ -970,6 +1018,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	if ctx.Err() != nil {
 		return
 	}
+	c.probeBroken = o.broken // per-probe, on this call's own copy of the config
 
 	var rttVal interface{}
 	var rttMs float64
@@ -979,7 +1028,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 
 	now := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, now.Format(time.RFC3339Nano), rttVal, o.ip, o.httpCode); err != nil {
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, fmtTS(now), rttVal, o.ip, o.httpCode); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -992,24 +1041,22 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 	pw.recordProbe(c.id, probeEntry{ts: now.Unix(), rtt: rttPtr})
 
-	// Read the current status BEFORE deriving the new one: deriveStatus's
-	// fast-recovery rule needs to know whether the sensor was in ERROR (one
-	// good probe then flips it up) vs WARNING (it must have 2 straight good
-	// probes). The DB is the source of truth (survives restarts).
-	var oldStatus string
-	if err := pw.db.QueryRow("SELECT status FROM sensors WHERE id = ?", c.id).Scan(&oldStatus); err != nil {
+	// The previous status feeds deriveStatus's fast-recovery rule (a sensor
+	// recovering from ERROR flips to up on one good probe). Memory is
+	// authoritative once the sensor has ticked in this process; the DB (which
+	// survives restarts) is read only on the first tick or after a history clear.
+	oldStatus, err := pw.currentStatus(c.id)
+	if err != nil {
 		return
 	}
 
 	newStatus := pw.deriveStatus(c, oldStatus)
 
-	// Keep the in-memory lastStatus + fastRetry flag in lockstep so the
-	// sensorLoop can pick the next-tick cadence without a DB read. For HTTP
-	// sensors, also remember the status code + cert expiry so the card can
-	// show "HTTP 503" / "cert expires in 3d" without a DB read per poll.
+	// Keep the fast-retry flag and, for HTTP sensors, the status code + cert
+	// expiry in lockstep so sensorLoop picks the next-tick cadence and the card
+	// shows "HTTP 503" / "cert expires in 3d" without a DB read per poll.
 	pw.mu.Lock()
 	if ps, ok := pw.sensors[c.id]; ok {
-		ps.lastStatus = newStatus
 		ps.fastRetry = newStatus == "error"
 		if c.probeType == "http" {
 			ps.lastHTTPStatus = o.httpCode
@@ -1019,6 +1066,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	pw.mu.Unlock()
 
 	if newStatus == oldStatus {
+		pw.rememberStatus(c.id, newStatus)
 		// No transition: a sustained ERROR may be due for a re-alert.
 		// Warning is never re-alerted (loss flapping is dashboard noise).
 		if newStatus == "error" {
@@ -1028,9 +1076,12 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 
 	if _, err := pw.db.Exec("UPDATE sensors SET status = ? WHERE id = ?", newStatus, c.id); err != nil {
+		// lastStatus is NOT advanced, so the next tick sees the same
+		// transition and retries the write instead of believing it is done.
 		log.Printf("ProbeWorker: failed to update status for %s: %v", c.id, err)
 		return
 	}
+	pw.rememberStatus(c.id, newStatus) // only once the new status is durable
 
 	note := fmt.Sprintf("%s -> %s", oldStatus, newStatus)
 	if newStatus == "up" {
@@ -1046,8 +1097,42 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	// alerts (into error, partial recovery error -> warning, full recovery
 	// error -> up).
 	if pw.shouldAlertNow(c, oldStatus, newStatus) {
-		pw.launchAlert(func() { pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) })
+		pw.launchAlert(func() {
+			// Every provider failed after retries: for an error alert, make the
+			// re-alert path try again soon instead of waiting a full interval.
+			if !pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) && newStatus == "error" {
+				pw.scheduleAlertRetry(c.id, newStatus)
+			}
+		})
 	}
+}
+
+// currentStatus returns the sensor's last known derived status: the in-memory
+// value when the sensor has already been derived in this process, else the
+// durable one from the sensors table.
+func (pw *ProbeWorker) currentStatus(id string) (string, error) {
+	pw.mu.Lock()
+	if ps, ok := pw.sensors[id]; ok && ps.lastStatus != "" {
+		s := ps.lastStatus
+		pw.mu.Unlock()
+		return s, nil
+	}
+	pw.mu.Unlock()
+	var s string
+	if err := pw.db.QueryRow("SELECT status FROM sensors WHERE id = ?", id).Scan(&s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// rememberStatus records the durable status in memory (no-op if the sensor was
+// removed or restarted meanwhile).
+func (pw *ProbeWorker) rememberStatus(id, status string) {
+	pw.mu.Lock()
+	if ps, ok := pw.sensors[id]; ok {
+		ps.lastStatus = status
+	}
+	pw.mu.Unlock()
 }
 
 // alertsEnabled reports whether any alert may fire: maintenance mode
@@ -1163,14 +1248,40 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	// A sustained error re-alerts on its own schedule (error -> error is
 	// not a transition); only the maintenance + routing gates apply.
 	if pw.alertGates(c) {
-		pw.launchAlert(func() { pw.sendRealert(c.id, c.name, c.target, status, rttMs) })
+		pw.launchAlert(func() {
+			if !pw.sendRealert(c.id, c.name, c.target, status, rttMs) {
+				pw.scheduleAlertRetry(c.id, status) // all providers failed: try again soon, not in 30 min
+			}
+		})
 	}
 }
 
 func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
 	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES (?, ?, ?)
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		id, status, ts.Format(time.RFC3339Nano))
+		id, status, fmtTS(ts))
+}
+
+// alertRetryAfter is how soon a re-alert is retried after every provider
+// failed (instead of waiting out the full re-alert interval). A var for tests.
+var alertRetryAfter = time.Minute
+
+// scheduleAlertRetry backdates alert_state.last_ts so the sustained-error
+// re-alert path (maybeRealert) fires again in about alertRetryAfter. It is a
+// no-op for "alert once only" (realert_min = 0), and only touches the row if it
+// is still tracking the same status (a sensor that recovered meanwhile keeps
+// its newer state).
+func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
+	m := pw.realertMin()
+	if m == 0 {
+		return
+	}
+	back := time.Duration(m)*time.Minute - alertRetryAfter
+	if back < 0 {
+		back = 0
+	}
+	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ? WHERE sensor_id = ? AND status = ?`,
+		fmtTS(time.Now().UTC().Add(-back)), id, status)
 }
 
 // realertMin returns the re-alert interval in minutes. 0 means alert
@@ -1245,9 +1356,14 @@ const statusWindow = 8
 // inspector displays. A probe-level ICMP error (broken socket) forces
 // warning so a dead probe path never reads as "up".
 func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
-	// Broken probe path (e.g. ICMP socket cannot be created): probes never
-	// land, so we cannot know the real state — flag warning, never up.
-	if probeErrCount.Load() > c.lastErrCount {
+	// Broken probe path (the ICMP engine is unusable): this probe never
+	// landed, so we cannot know the real state — flag warning, never up. An
+	// already-confirmed ERROR stays ERROR: a dead probe path must not fake a
+	// "partial recovery" (error -> warning is an alertable transition).
+	if c.probeBroken {
+		if lastStatus == "error" {
+			return "error"
+		}
 		return "warning"
 	}
 
@@ -1257,34 +1373,26 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	if c.downAfter > limit {
 		limit = c.downAfter
 	}
-	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", c.id, limit)
-	if err != nil {
-		// Can't read the probe history, so we can't know the real state.
-		// Retain the last known status (lastStatus) rather than manufacturing a
-		// transition: a monitoring tool must not fake a recovery it can't confirm,
-		// AND it must not fabricate a spurious one. Returning "warning" here (the
-		// old behavior) was a BUG for a sensor in "error":
-		// alertableTransition("error", "warning") is true (a "partial recovery"),
-		// so a transient WAL/SQLite hiccup on a downed sensor fired a false
-		// recovery webhook AND corrupted the DB status to "warning". Retaining
-		// lastStatus means doProbe sees a same-state tick (no UPDATE, no event,
-		// no alert); a downed sensor stays down and its sustained-error re-alert
-		// path (maybeRealert) handles it. A brand-new sensor (lastStatus == "")
-		// has no known state, so it reads "warning" (unknown) — never "up".
-		// Self-clears next tick once the DB is healthy again.
-		if lastStatus != "" {
-			return lastStatus
-		}
-		return "warning"
-	}
-	defer rows.Close() // top-level: this function has a post-Query return ("warning"),
-	// so a bare rows.Close() below the loop would leak the pooled connection
-	// on that path — the hang under SetMaxOpenConns(10) the issue describes.
-	var recent []*float64 // index 0 = newest; nil = lost, non-nil = rtt
-	for rows.Next() {
-		var rtt *float64
-		if rows.Scan(&rtt) == nil {
-			recent = append(recent, rtt)
+	// Warm sensors answer from the in-memory series (no SQL); a cold or short
+	// series (fresh process, new sensor, test) falls back to the DB.
+	recent, ok := pw.recentFromCache(c.id, limit)
+	if !ok {
+		var err error
+		recent, err = pw.recentFromDB(c.id, limit)
+		if err != nil {
+			// Can't read the probe history, so we can't know the real state.
+			// Retain the last known status (lastStatus) rather than manufacturing a
+			// transition: a monitoring tool must not fake a recovery it can't confirm,
+			// AND it must not fabricate a spurious one. (Returning "warning" here was
+			// a BUG for a sensor in "error": error -> warning is an alertable
+			// "partial recovery", so a transient SQLite hiccup on a downed sensor fired
+			// a false recovery webhook and corrupted the DB status.) A brand-new
+			// sensor (lastStatus == "") has no known state, so it reads "warning"
+			// (unknown) - never "up". Self-clears next tick once the DB is healthy.
+			if lastStatus != "" {
+				return lastStatus
+			}
+			return "warning"
 		}
 	}
 
@@ -1369,60 +1477,52 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	return "warning"
 }
 
-// purgeOld enforces 24-hour retention on probes/events (SPEC §3).
-// 24h is the longest window the dashboard reads (24h graph / uptime 24h), so
-// nothing on screen ever needs older data. Revisit if historical reporting
-// is added later.
+// recentFromCache returns up to limit most-recent RTTs (index 0 = newest,
+// nil = lost) from the in-memory series. ok is false when the series holds
+// fewer than limit entries, in which case the DB may know more history.
+func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]*float64, bool) {
+	pw.statsMu.RLock()
+	defer pw.statsMu.RUnlock()
+	s, ok := pw.statsCache[id]
+	if !ok || s.len() < limit {
+		return nil, false
+	}
+	out := make([]*float64, 0, limit)
+	for i := len(s.data) - 1; i >= s.start && len(out) < limit; i-- {
+		out = append(out, s.data[i].rtt)
+	}
+	return out, true
+}
+
+// recentFromDB is the durable equivalent of recentFromCache.
+func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]*float64, error) {
+	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close() // top-level: closed on every return path (the pool is capped; a leak would hang)
+	var recent []*float64
+	for rows.Next() {
+		var rtt *float64
+		if err := rows.Scan(&rtt); err != nil {
+			return nil, err
+		}
+		recent = append(recent, rtt)
+	}
+	return recent, rows.Err()
+}
+
+// purgeOld enforces 24-hour retention on probes/events (SPEC §3). 24h is the
+// longest window the dashboard reads, so nothing on screen needs older data.
 //
-// The comparison is a string compare. That is safe for every instant EXCEPT
-// one bounded case: a row stamped at exactly an integer second in the boundary
-// second (no fractional part, "...SSZ") sorts AFTER a fractional row
-// ("...SS.5Z") because 'Z' (0x5A) > '.' (0x2E). The consequence is
-// over-retention only — such a row survives ~1h longer than intended, on the
-// next hourly purge it is well past the boundary and is deleted. It is NEVER
-// early-deletion: a row is deleted iff ts < cutoff, and the cutoff is built
-// from time.Now(), which is sub-second, so the cutoff is never an integer
-// second and the ordering that would delete a young row never arises. The
-// window is at most the single boundary second, so it is not user-visible.
-//
-// The v0.1.18 window bug was different: it compared RFC3339 against
-// datetime('now')'s space-separated output — two DIFFERENT formats — which is
-// what made the string compare wrong. Same-format string compares are safe
-// (with the one integer-second boundary case above); mixed-format ones are not.
-//
-// Why not a fixed-width cutoff: the divergence is on the STORED side
-// (integer-second rows), not the cutoff side. Formatting only the cutoff to
-// 9 fractional digits does not make "...SSZ" sort before "...SS.5Z" — the
-// stored row still carries a 'Z' where a '.' is needed. A fixed-width cutoff
-// would just shift where the boundary lands.
-//
-// Why not integer epoch seconds: strftime('%s') truncates the fractional part,
-// so a row at 15:13:11.900 is treated as 15:13:11 — a 1-second boundary error
-// on EVERY row, not just the rare integer-second one. The string compare is
-// strictly better.
-// purgeOld deletes probes and events older than 24 hours.
-//
-// Uses a same-format RFC3339Nano string compare (ts < cutoff) rather than
-// epoch integers. Both the stored ts (tsNow() → RFC3339Nano) and the cutoff
-// (RFC3339Nano) use the SAME variable-width format, so lexicographic order
-// matches chronological order EXACTLY for all real rows. The only divergence
-// is at the 1-in-1e9 boundary where time.Now() produces zero fractional
-// seconds ("...Z" vs "...0Z"): the "Z" row (0x5A) sorts AFTER the
-// fractional row ("." = 0x2E) in the same second, causing OVER-retention
-// of at most ~1 second, never early-deletion. An epoch compare
-// (strftime('%s')) was empirically tested and rejected: it truncates
-// fractional seconds, introducing a systematic 1-second boundary error
-// that the string compare doesn't have. The v0.1.18 window bug was a
-// MIXED-format compare (RFC3339 'T'-sep vs datetime('now') space-sep) —
-// that's been fixed; this same-format compare is the correct approach.
-//
-// Review note (2026-10-10): a code review flagged this as a "hardcoded
-// RFC3339 string format truncation hazard" and suggested unixepoch(ts).
-// DISMISSED — the epoch fix is a net regression (truncation error), the
-// string compare is exact for same-format strings, and the 1-in-1e9
-// boundary case over-retains by ≤1s (harmless for a 24h retention window).
+// ts is compared as a string. That is exact because every writer uses the
+// fixed-width fmtTS layout (lexicographic order == chronological order). Rows
+// written by older versions used a variable-width layout; for those the
+// comparison can be off by under one second right at the cutoff, which only
+// ever over- or under-retains a single boundary row once and ages out within a
+// day - harmless for a 24h window.
 func (pw *ProbeWorker) purgeOld() {
-	cutoff := time.Now().Add(-24 * time.Hour).UTC().Format(time.RFC3339Nano)
+	cutoff := fmtTS(time.Now().Add(-24 * time.Hour))
 	for _, table := range []string{"probes", "events"} {
 		res, err := pw.db.Exec("DELETE FROM "+table+" WHERE ts < ?", cutoff)
 		if err != nil {
@@ -1626,7 +1726,15 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 	return out
 }
 
-func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) {
+// sendWebhook delivers one alert to every active provider IN PARALLEL (a slow
+// endpoint must not delay the others) and reports whether it was delivered:
+// true when at least one provider accepted it, or when none is configured (there
+// is nothing to retry); false only when every configured provider failed after
+// its retries, so the caller can schedule another attempt.
+func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+	var wg sync.WaitGroup
+	var delivered atomic.Bool
+	attempted := 0
 	for _, p := range pw.activeProviders() {
 		url := pw.db.GetSetting(p.Kind + "_url")
 		if url == "" && p.EnvFallback != "" {
@@ -1635,44 +1743,66 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		if url == "" {
 			continue
 		}
-		switch p.Kind {
-		case "google_chat":
-			card := cardFor(oldState, state, name, target, rttMs)
-			if reAlert {
-				card = cardForRe(state, name, target, rttMs)
+		attempted++
+		wg.Add(1)
+		go func(p providerMeta, url string) {
+			defer wg.Done()
+			if pw.deliverOne(p, url, name, target, oldState, state, rttMs, reAlert) {
+				delivered.Store(true)
 			}
-			pw.postJSON(url, map[string]string{"text": card})
-		case "discord":
-			card := discordCard(oldState, state, name, target, rttMs)
-			if reAlert {
-				card = discordCardRe(state, name, target, rttMs)
-			}
-			pw.postJSON(url, map[string]string{"content": card})
-		case "telegram":
-			card := telegramCard(oldState, state, name, target, rttMs)
-			if reAlert {
-				card = telegramCardRe(state, name, target, rttMs)
-			}
-			pw.postJSON(url, map[string]string{
-				"chat_id":    pw.db.GetSetting("telegram_chat_id"),
-				"text":       card,
-				"parse_mode": "HTML",
-			})
-		case "smtp":
-			// SMTP is not a webhook POST — it dials the mail server. The url
-			// variable is the host here (URLField: smtp_host); delivery is a
-			// plain-text email via sendSMTP.
-			subject := smtpSubject(oldState, state)
-			body := smtpBody(oldState, state, name, target, rttMs)
-			if reAlert {
-				subject = smtpSubject(state, state) + " (re-alert)"
-				body = smtpBodyRe(state, name, target, rttMs)
-			}
-			if err := pw.sendSMTP(pw.stopCtx, subject, body); err != nil {
-				log.Printf("smtp alert to %s: %v", url, err)
-			}
-		}
+		}(p, url)
 	}
+	wg.Wait()
+	return attempted == 0 || delivered.Load()
+}
+
+// deliverOne sends one alert to one provider and reports success.
+func (pw *ProbeWorker) deliverOne(p providerMeta, url, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+	switch p.Kind {
+	case "google_chat":
+		card := cardFor(oldState, state, name, target, rttMs)
+		if reAlert {
+			card = cardForRe(state, name, target, rttMs)
+		}
+		return pw.postJSON(url, map[string]string{"text": card}) == nil
+	case "discord":
+		card := discordCard(oldState, state, name, target, rttMs)
+		if reAlert {
+			card = discordCardRe(state, name, target, rttMs)
+		}
+		return pw.postJSON(url, map[string]string{"content": card}) == nil
+	case "telegram":
+		card := telegramCard(oldState, state, name, target, rttMs)
+		if reAlert {
+			card = telegramCardRe(state, name, target, rttMs)
+		}
+		return pw.postJSON(url, map[string]string{
+			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+			"text":       card,
+			"parse_mode": "HTML",
+		}) == nil
+	case "smtp":
+		// SMTP is not a webhook POST — it dials the mail server. The url
+		// variable is the host here (URLField: smtp_host); delivery is a
+		// plain-text email via sendSMTP.
+		subject := smtpSubject(oldState, state)
+		body := smtpBody(oldState, state, name, target, rttMs)
+		if reAlert {
+			subject = smtpSubject(state, state) + " (re-alert)"
+			body = smtpBodyRe(state, name, target, rttMs)
+		}
+		err := pw.retryAlert(func() (bool, error) {
+			err := pw.sendSMTP(pw.stopCtx, subject, body)
+			// "smtp: no host/sender/recipient configured" cannot succeed on retry.
+			return err != nil && !strings.HasPrefix(err.Error(), "smtp: no "), err
+		})
+		if err != nil {
+			log.Printf("smtp alert to %s: %v", url, err)
+			return false
+		}
+		return true
+	}
+	return false
 }
 
 // TestWebhook sends a test message to ONE provider and reports whether it
@@ -1718,14 +1848,16 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	} else {
 		body = map[string]string{"text": "✅ *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
+	// Errors from net/http embed the full request URL, which carries the
+	// provider token: strip it before it reaches the browser or the log.
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
 	if err != nil {
-		return false, err.Error()
+		return false, redactErr(err).Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := webhookClient.Do(req)
 	if err != nil {
-		return false, err.Error()
+		return false, redactErr(err).Error()
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
@@ -1782,15 +1914,15 @@ func (pw *ProbeWorker) StopAlerts() {
 }
 
 // sendAlert dispatches a state-transition alert to every active provider.
-func (pw *ProbeWorker) sendAlert(id, name, target, oldState, state string, rttMs float64) {
-	pw.sendWebhook(id, name, target, oldState, state, rttMs, false)
+func (pw *ProbeWorker) sendAlert(id, name, target, oldState, state string, rttMs float64) bool {
+	return pw.sendWebhook(id, name, target, oldState, state, rttMs, false)
 }
 
 // sendRealert notifies that a sensor has stayed in the same non-up state.
 // oldState == state (the re-alert is not a transition; the card just says
 // "still <state>").
-func (pw *ProbeWorker) sendRealert(id, name, target, state string, rttMs float64) {
-	pw.sendWebhook(id, name, target, state, state, rttMs, true)
+func (pw *ProbeWorker) sendRealert(id, name, target, state string, rttMs float64) bool {
+	return pw.sendWebhook(id, name, target, state, state, rttMs, true)
 }
 
 // recoveryTitle picks the alert headline for the new status: a full
@@ -1808,9 +1940,9 @@ func recoveryTitle(oldState, state string) string {
 
 // statusIcon maps a sensor state to the alert-card emoji, matching the
 // dashboard's icon language (check-circle / warning / x-circle / pause-circle).
-func statusIcon(state string) string {
-	return map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}[state]
-}
+func statusIcon(state string) string { return statusIcons[state] }
+
+var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}
 
 func cardFor(oldState, state, name, target string, rttMs float64) string {
 	icon := statusIcon(state)
@@ -1866,31 +1998,71 @@ func discordCardRe(state, name, target string, rttMs float64) string {
 	return card
 }
 
+// alertRetryDelays are the pauses between delivery attempts: 3 attempts total
+// (now, +2s, +10s). A var so tests can shrink or clear it.
+var alertRetryDelays = []time.Duration{2 * time.Second, 10 * time.Second}
+
+// redactErr strips the request URL out of a net/http error. url.Error.Error()
+// embeds the full URL, and every webhook URL here carries its credential
+// (Telegram bot token, Discord/Chat key), so logging or returning the raw error
+// would leak the secret to journald and to the browser.
+func redactErr(err error) error {
+	var ue *neturl.Error
+	if errors.As(err, &ue) {
+		return ue.Err
+	}
+	return err
+}
+
+// retryAlert runs try until it succeeds, reports a non-retryable failure, or
+// the delays are exhausted. It stops sleeping the moment shutdown begins.
+func (pw *ProbeWorker) retryAlert(try func() (retryable bool, err error)) error {
+	for i := 0; ; i++ {
+		retryable, err := try()
+		if err == nil || !retryable || i >= len(alertRetryDelays) {
+			return err
+		}
+		select {
+		case <-time.After(alertRetryDelays[i]):
+		case <-pw.stopCtx.Done():
+			return err
+		}
+	}
+}
+
 // postJSON delivers a JSON payload to a webhook with the shared hardened
-// client (10s timeout, no redirects). The POST is bound to pw.stopCtx so
-// that on shutdown a delivery stuck in a network blip is aborted at its
-// next read instead of holding DrainAlerts for the full client timeout.
-func (pw *ProbeWorker) postJSON(url string, payload map[string]string) {
+// client (10s timeout, no redirects), retrying transient failures (network
+// errors, 429, 5xx) per alertRetryDelays. The POST is bound to pw.stopCtx so
+// that on shutdown a delivery stuck in a network blip - or sleeping between
+// retries - is aborted promptly instead of holding DrainAlerts. The returned
+// error never contains the URL (it carries the provider credential).
+func (pw *ProbeWorker) postJSON(url string, payload map[string]string) error {
 	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
+	err := pw.retryAlert(func() (bool, error) {
+		req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
+		if err != nil {
+			return false, redactErr(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := webhookClient.Do(req)
+		if err != nil {
+			return pw.stopCtx.Err() == nil, redactErr(err)
+		}
+		defer resp.Body.Close()
+		switch code := resp.StatusCode; {
+		case code >= 300 && code < 400:
+			return false, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")
+		case code == http.StatusTooManyRequests || code >= 500:
+			return true, fmt.Errorf("endpoint returned %d", code)
+		case code >= 300:
+			return false, fmt.Errorf("endpoint returned %d", code)
+		}
+		return false, nil
+	})
 	if err != nil {
 		log.Printf("webhook: send failed: %v", err)
-		return
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := webhookClient.Do(req)
-	if err != nil {
-		log.Printf("webhook: send failed: %v", err)
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		log.Printf("webhook: endpoint redirected (refused to follow — possible misconfiguration)")
-		return
-	}
-	if resp.StatusCode >= 300 {
-		log.Printf("webhook: endpoint returned %d", resp.StatusCode)
-	}
+	return err
 }
 
 // newID generates a unique sensor id.
@@ -1898,7 +2070,7 @@ func newID() string {
 	return uuid.NewString()
 }
 
-// validateTarget guards against SQL/host injection-ish junk in targets.
+// validTarget accepts only well-formed probe targets (all SQL is parameterized; this is input hygiene).
 //
 // Hostnames must be dotted labels ending in an alphabetic TLD (one or more
 // labels). Bare single-label hostnames (a plain "router", "NAS", "home")

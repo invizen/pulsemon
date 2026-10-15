@@ -24,10 +24,10 @@ func TestWebhookMasked(t *testing.T) {
 		{"empty", "", ""},
 		{"google chat query key",
 			"https://chat.googleapis.com/v1/spaces/abc/messages?key=SECRET&token=TOK",
-			"https://chat.googleapis.com/v1/spaces/abc/messages?***"},
+			"https://chat.googleapis.com/***"},
 		{"discord path token",
 			"https://discord.com/api/webhooks/12345/abcdef-ghijkl-mnopq",
-			"https://discord.com/api/webhooks/12345/***"},
+			"https://discord.com/***"},
 		{"plain no secret", "https://example.com/hook", "https://example.com/***"},
 	}
 	for _, c := range cases {

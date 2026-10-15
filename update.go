@@ -147,6 +147,8 @@ func targetAsset() string {
 //	pulsemon update check    check only, no install
 //	pulsemon update v0.1.5   install a specific version
 //	pulsemon update --restart install AND restart the running service
+//	pulsemon update rollback   restore the previous binary (<exe>.prev)
+//	pulsemon update rollback --restart   restore + restart the service
 //
 // --restart auto-restarts ONLY when a live systemd pulsemon service is
 // confidently detected (a user-bus service, or a system-bus service when
@@ -170,6 +172,7 @@ func targetAsset() string {
 func runUpdate(args []string) int {
 	checkOnly := false
 	restart := false
+	rollback := false
 	version := "latest"
 	for _, a := range args {
 		switch a {
@@ -177,8 +180,10 @@ func runUpdate(args []string) int {
 			checkOnly = true
 		case "restart", "--restart":
 			restart = true
+		case "rollback":
+			rollback = true
 		case "-h", "--help":
-			fmt.Println("usage: pulsemon update [check|<version>] [--restart]")
+			fmt.Println("usage: pulsemon update [check|rollback|<version>] [--restart]")
 			return 0
 		default:
 			version = a
@@ -192,6 +197,15 @@ func runUpdate(args []string) int {
 	}
 	uInfo("binary:  " + exe)
 	uInfo("version: " + Version)
+
+	if rollback {
+		if err := rollbackBinary(exe); err != nil {
+			uErr("rollback: " + err.Error())
+			return 1
+		}
+		uInfo("rolled back " + exe + " to the previous binary (from " + exe + ".prev)")
+		return handleRollbackRestart(exe, restart)
+	}
 
 	client := &http.Client{Timeout: 30 * time.Second}
 
@@ -311,6 +325,77 @@ func handleRestart(exe string, restart bool) int {
 	// open it (same data volume; WAL allows a concurrent reader) so the
 	// check can find a TLS-on-custom-port install. nil on failure: the
 	// check then falls back to the default HTTPS port.
+	db := openHealthzDB()
+	if db != nil {
+		defer db.Close()
+	}
+	if ok, detail := waitHealthy(db); ok {
+		uInfo("pulsemon is up and healthy after restart (" + detail + ")")
+	} else {
+		// The new binary is not answering: roll the install back to
+		// <exe>.prev, restart once more, and report exit 1 (the update
+		// did not take, even if the old binary comes back healthy).
+		uErr("service restarted but is not answering healthz yet (" + detail + ")")
+		uErr("rolling back to the previous binary (" + exe + ".prev) and restarting...")
+		if rerr := rollbackBinary(exe); rerr != nil {
+			uErr("rollback failed: " + rerr.Error())
+			uErr("check: " + journalHint(d))
+			return 1
+		}
+		if perr := performRestart(d); perr != nil {
+			uErr("restart after rollback failed: " + perr.Error())
+			uErr("check: " + journalHint(d))
+			return 1
+		}
+		if ok, detail2 := waitHealthy(db); ok {
+			uInfo("rolled back to the previous binary; pulsemon is healthy again (" + detail2 + ")")
+		} else {
+			uErr("rolled back to the previous binary, but it is not answering healthz either (" + detail2 + ")")
+			uErr("check: " + journalHint(d))
+		}
+		return 1
+	}
+	return 0
+}
+
+// handleRollbackRestart is the post-rollback restart decision for
+// `pulsemon update rollback [--restart]`: the same auto-restart rule as
+// handleRestart (only a confidently detected live systemd service), with
+// the install-and-hint fallbacks otherwise.
+func handleRollbackRestart(exe string, restart bool) int {
+	if exe == "/pulsemon" {
+		if restart {
+			uWarn("--restart ignored: container detected — the binary in the image is unchanged; rebuild with `docker compose up -d --build` to pick up the previous binary.")
+		} else {
+			uWarn("container detected — the binary inside the image is unchanged; rebuild with `docker compose up -d --build` to pick up the previous binary.")
+		}
+		return 0
+	}
+
+	if !restart {
+		if _, err := os.Stat("/run/systemd/system"); err == nil {
+			uInfo("restart with: systemctl --user restart pulsemon   (system-wide install: sudo systemctl restart pulsemon)")
+		} else {
+			uWarn("restart the pulsemon process to pick up the previous binary.")
+		}
+		return 0
+	}
+
+	d := detectRestart()
+	if d == "" {
+		if _, err := os.Stat("/run/systemd/system"); err == nil {
+			uInfo("no live pulsemon service detected; restart with: systemctl --user restart pulsemon   (system-wide install: sudo systemctl restart pulsemon)")
+		} else {
+			uWarn("no live pulsemon service detected; restart the pulsemon process to pick up the previous binary.")
+		}
+		return 0
+	}
+	uInfo("restarting pulsemon (" + d + " service)...")
+	if err := performRestart(d); err != nil {
+		uErr("restart failed: " + err.Error())
+		uErr("check: " + journalHint(d))
+		return 1
+	}
 	db := openHealthzDB()
 	if db != nil {
 		defer db.Close()
@@ -516,6 +601,9 @@ func fileSHA256(path string) (string, error) {
 // installBinary swaps the running binary. On Linux the running process keeps
 // the old inode alive, so writing a temp file in the same directory and
 // renaming it over the original is atomic and safe — no "text file busy".
+// Before the swap the current binary is kept at <dst>.prev (M4 rollback
+// artifact): the rename atomically replaces any stale .prev and preserves
+// the original's mode and ownership.
 func installBinary(src, dst string) error {
 	// Preserve the original binary's ownership (a root-installed binary
 	// must stay root-owned after a root update). The rename replaces dst's
@@ -532,6 +620,9 @@ func installBinary(src, dst string) error {
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after successful rename
 
+	// Stage the new binary into the temp file FIRST: a bad source must
+	// fail with the destination untouched (TestInstallBinaryBadSource),
+	// so dst is only moved aside once the source is fully staged.
 	// Open the source with a managed lifecycle — the previous mustOpen
 	// helper leaked this descriptor on every install and panicked (raw
 	// runtime trace, no formatted diagnostic) when the open failed.
@@ -553,13 +644,47 @@ func installBinary(src, dst string) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
+
+	// Keep the previous binary for `pulsemon update rollback`. A missing
+	// dst (no running binary to back up) is tolerated: there is simply no
+	// previous version to roll back to.
+	prev := dst + ".prev"
+	if err := os.Rename(dst, prev); err != nil {
+		if os.IsNotExist(err) {
+			uWarn("no previous binary to keep at " + prev + " (nothing to roll back to later)")
+		} else {
+			return fmt.Errorf("save previous binary as %s: %w", prev, err)
+		}
+	}
 	if err := swapBinary(tmpName, dst); err != nil {
+		// The previous binary was already moved to .prev; put it back so
+		// a failed swap never leaves the install without a current
+		// binary.
+		if _, perr := os.Stat(prev); perr == nil {
+			_ = os.Rename(prev, dst)
+		}
 		return err
 	}
 	if haveOwner {
 		if err := os.Chown(dst, int(wantUID), int(wantGID)); err != nil {
 			uWarn("could not restore original ownership on " + dst + ": " + err.Error())
 		}
+	}
+	return nil
+}
+
+// rollbackBinary restores <exe>.prev over <exe> (atomic rename) and
+// consumes the .prev. It is the undo for installBinary: after a bad update
+// the previous binary is exactly one rename away. Fails cleanly when there
+// is no .prev (nothing to roll back to — e.g. the first update from a
+// release that predates the .prev artifact).
+func rollbackBinary(exe string) error {
+	prev := exe + ".prev"
+	if _, err := os.Stat(prev); err != nil {
+		return fmt.Errorf("no previous binary at %s to roll back to", prev)
+	}
+	if err := os.Rename(prev, exe); err != nil {
+		return fmt.Errorf("restore previous binary over %s: %w", exe, err)
 	}
 	return nil
 }
@@ -653,7 +778,7 @@ func systemctlActive(bus string) bool {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), activeTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	cmd := exec.CommandContext(ctx, systemctlPath(), args...)
 	// is-active prints "active"/"inactive"/"failed"/"unknown"; we only care
 	// about the exit code, so discard output.
 	return cmd.Run() == nil
@@ -670,7 +795,11 @@ func runRestart(bus string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "systemctl", args...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, systemctlPath(), args...)
+	// If systemctl (or a wrapper) leaves a child holding the output pipe, the
+	// context kill alone would not release CombinedOutput: bound the wait too.
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -833,4 +962,24 @@ func waitHealthy(db *DB) (bool, string) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
+}
+
+// systemctlPath is the systemctl binary the updater/restart helpers execute.
+// A var so tests can inject a fake: a unit test must NEVER run the host's real
+// systemctl (it would restart a real pulsemon service on a dev/test box).
+var systemctlPath = resolveSystemctl
+
+// resolveSystemctl picks the systemctl binary. The fixed system locations win
+// over $PATH so a writable directory early in PATH cannot substitute its own
+// "systemctl"; PATH is only the fallback for unusual layouts (NixOS, containers).
+func resolveSystemctl() string {
+	for _, p := range []string{"/usr/bin/systemctl", "/bin/systemctl"} {
+		if fi, err := os.Stat(p); err == nil && fi.Mode().IsRegular() {
+			return p
+		}
+	}
+	if p, err := exec.LookPath("systemctl"); err == nil {
+		return p
+	}
+	return "systemctl"
 }

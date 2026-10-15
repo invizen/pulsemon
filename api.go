@@ -24,6 +24,13 @@ var content embed.FS
 // Anything past 1 MiB is either a bug or a DoS attempt.
 const maxRequestBytes = 1 << 20
 
+// minIntervalS is the floor on a sensor's probe interval. At 1s a sensor
+// holds ~86,400 in-memory entries per day and copies ~1.4 MB per dashboard
+// poll, so the API refuses to store intervals below 5s. Existing rows are
+// NOT migrated (a legacy 1s sensor keeps running until the operator edits
+// it); the floor is enforced only on new writes via the API.
+const minIntervalS = 5
+
 // Sensor mirrors the sensors table. JSON is snake_case per SPEC §4.
 type Sensor struct {
 	ID        string   `json:"id"`
@@ -96,6 +103,16 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 	json.NewEncoder(w).Encode(APIError{Error: message})
 }
 
+// respondInternal is the ONLY way a handler reports a 500: it logs the full
+// error for the operator (the service log is where raw SQL/driver detail
+// belongs) and returns a generic body to the dashboard, so internal error
+// text never leaks to the client. 4xx validation messages are user-facing
+// and keep their specific text via respondWithError.
+func respondInternal(w http.ResponseWriter, what string, err error) {
+	log.Printf("API: %s: %v", what, err)
+	respondWithError(w, http.StatusInternalServerError, "internal error")
+}
+
 // requestBodyErr maps the MaxBytesReader limit (authGate bounds every body
 // to maxRequestBytes) to a clean 413; any other decode error is a plain 400.
 // Every JSON handler routes its json.Decoder error through this, so an
@@ -158,6 +175,10 @@ func (s *Server) Mux() *http.ServeMux {
 // instead of a generic decode error.
 func (s *Server) authGate() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
 		// Cross-port CSRF gate (RFC 6265bis): the session cookie is
 		// SameSite=Strict, but "same-site" is scheme+host — the PORT is
 		// not part of the site. In a homelab, every other web app on the
@@ -275,7 +296,11 @@ func (s *Server) routes() {
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	var n int
 	if err := s.db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
-		respondWithError(w, http.StatusServiceUnavailable, "db unreachable: "+err.Error())
+		// 503, not 500: the API process is healthy, the DB is down. Keep
+		// the "db unreachable" wording (operators and health checks read
+		// it) and log the driver detail instead of leaking it.
+		log.Printf("API: healthz db check: %v", err)
+		respondWithError(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
 	hz := map[string]interface{}{
@@ -418,8 +443,8 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		if req.IntervalS <= 0 {
 			req.IntervalS = 60
 		}
-		if req.IntervalS < 1 || req.IntervalS > 3600 {
-			respondWithError(w, http.StatusBadRequest, "interval_s must be 1-3600")
+		if req.IntervalS < minIntervalS || req.IntervalS > 3600 {
+			respondWithError(w, http.StatusBadRequest, "interval_s must be 5-3600")
 			return
 		}
 		if req.TimeoutMS <= 0 {
@@ -427,6 +452,13 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.TimeoutMS < 100 || req.TimeoutMS > 30000 {
 			respondWithError(w, http.StatusBadRequest, "timeout_ms must be 100-30000")
+			return
+		}
+		// A probe timeout longer than the interval means two probes can
+		// never complete back-to-back — the loss window becomes
+		// meaningless. Reject it once both values are final.
+		if req.TimeoutMS > req.IntervalS*1000 {
+			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
 			return
 		}
 		if req.LossWarn <= 0 {
@@ -438,6 +470,10 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		}
 		if req.DownAfter <= 0 {
 			req.DownAfter = 2
+		}
+		if req.DownAfter < 1 || req.DownAfter > 100 {
+			respondWithError(w, http.StatusBadRequest, "down_after must be 1-100")
+			return
 		}
 		if req.SpikeMult <= 0 {
 			req.SpikeMult = 5
@@ -460,7 +496,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
 				return
 			}
-			respondWithError(w, http.StatusInternalServerError, "failed to create sensor: "+err.Error())
+			respondInternal(w, "create sensor", err)
 			return
 		}
 		if len(req.Tags) > 0 {
@@ -565,7 +601,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			if err == sql.ErrNoRows {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
 			} else {
-				respondWithError(w, http.StatusInternalServerError, err.Error())
+				respondInternal(w, "get sensor "+id, err)
 			}
 			return
 		}
@@ -604,7 +640,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// for the type the sensor will end up with (URL for http, host for
 		// icmp), whether the user changed the target, the type, or both.
 		var currentType string
-		if err := s.db.QueryRow("SELECT type FROM sensors WHERE id = ?", id).Scan(&currentType); err != nil {
+		var storedIntervalS, storedTimeoutMS int
+		if err := s.db.QueryRow("SELECT type, interval_s, timeout_ms FROM sensors WHERE id = ?", id).Scan(&currentType, &storedIntervalS, &storedTimeoutMS); err != nil {
 			respondWithError(w, http.StatusNotFound, "sensor not found")
 			return
 		}
@@ -621,6 +658,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		}
 
 		sets, args := []string{}, []interface{}{}
+		// newTags holds the cleaned tag list when req.Tags was sent; the
+		// write happens after ALL validation, in the UPDATE transaction.
+		newTags := []string{}
 		add := func(col string, val interface{}) {
 			sets = append(sets, col+" = ?")
 			args = append(args, val)
@@ -672,14 +712,16 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if req.Tags != nil {
-			if err := s.db.SetSensorTags(id, cleanTags(*req.Tags)); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to update tags: "+err.Error())
-				return
-			}
+			// Validated (cleanTags) but NOT written yet: the tag write moves
+			// to after ALL field validation, into the same transaction as
+			// the UPDATE — a 400 on a later field must not leave the tag
+			// set changed (repro: {"tags":["sneaky"],"interval_s":0} used to
+			// persist the tags and then 400).
+			newTags = cleanTags(*req.Tags)
 		}
 		if req.IntervalS != nil {
-			if *req.IntervalS < 1 || *req.IntervalS > 3600 {
-				respondWithError(w, http.StatusBadRequest, "interval_s must be 1-3600")
+			if *req.IntervalS < minIntervalS || *req.IntervalS > 3600 {
+				respondWithError(w, http.StatusBadRequest, "interval_s must be 5-3600")
 				return
 			}
 			add("interval_s", *req.IntervalS)
@@ -691,6 +733,21 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			add("timeout_ms", *req.TimeoutMS)
 		}
+		// Cross-check the EFFECTIVE (post-patch) values: when only one of
+		// the two is supplied, the stored value stands in for the other,
+		// so a PATCH can't leave a timeout longer than the interval.
+		effIntervalS := storedIntervalS
+		if req.IntervalS != nil {
+			effIntervalS = *req.IntervalS
+		}
+		effTimeoutMS := storedTimeoutMS
+		if req.TimeoutMS != nil {
+			effTimeoutMS = *req.TimeoutMS
+		}
+		if effTimeoutMS > effIntervalS*1000 {
+			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
+			return
+		}
 		if req.LossWarn != nil {
 			if *req.LossWarn < 1 || *req.LossWarn > 100 {
 				respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
@@ -699,8 +756,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			add("loss_warn", *req.LossWarn)
 		}
 		if req.DownAfter != nil {
-			if *req.DownAfter < 1 {
-				respondWithError(w, http.StatusBadRequest, "down_after must be >= 1")
+			if *req.DownAfter < 1 || *req.DownAfter > 100 {
+				respondWithError(w, http.StatusBadRequest, "down_after must be 1-100")
 				return
 			}
 			add("down_after", *req.DownAfter)
@@ -719,18 +776,48 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			add("state", *req.State)
 		}
-		if len(sets) == 0 {
+		if len(sets) == 0 && req.Tags == nil {
 			respondWithError(w, http.StatusBadRequest, "no fields to update")
 			return
 		}
-		args = append(args, id)
-		res, err := s.db.Exec("UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
+		// One transaction: the UPDATE and the tag replace commit together,
+		// so a constraint failure (rename) or a crash can't leave the tags
+		// changed while the row is not (or vice versa). setSensorTagsInTx is
+		// the tx-aware twin of db.SetSensorTags (which owns its own
+		// transaction and can't join this one).
+		tx, err := s.db.Begin()
 		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondInternal(w, "begin sensor update", err)
 			return
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			respondWithError(w, http.StatusNotFound, "sensor not found")
+		defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+
+		if len(sets) > 0 {
+			args = append(args, id)
+			res, err := tx.Exec("UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
+			if err != nil {
+				// A rename hitting the UNIQUE name constraint is a 409,
+				// exactly like POST — not a 500 with raw SQL text.
+				if strings.Contains(err.Error(), "UNIQUE") {
+					respondWithError(w, http.StatusConflict, "sensor name already exists")
+					return
+				}
+				respondInternal(w, "update sensor "+id, err)
+				return
+			}
+			if n, _ := res.RowsAffected(); n == 0 {
+				respondWithError(w, http.StatusNotFound, "sensor not found")
+				return
+			}
+		}
+		if req.Tags != nil {
+			if err := setSensorTagsInTx(tx, id, newTags); err != nil {
+				respondInternal(w, "update sensor tags "+id, err)
+				return
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			respondInternal(w, "commit sensor update", err)
 			return
 		}
 
@@ -754,7 +841,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		res, err := s.db.Exec("DELETE FROM sensors WHERE id = ?", id)
 		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -767,6 +854,23 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	default:
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
+}
+
+// setSensorTagsInTx is the transaction-aware twin of db.SetSensorTags:
+// replace the sensor's tags (DELETE + INSERTs) on the CALLER's transaction,
+// so the PATCH path can commit the tag change atomically with the sensor
+// UPDATE. db.SetSensorTags keeps its own transaction and can't join one, so
+// the twin lives here rather than in db.go.
+func setSensorTagsInTx(tx *sql.Tx, id string, tags []string) error {
+	if _, err := tx.Exec("DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if _, err := tx.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, tag); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // handleSensorPing performs one immediate probe ("Pulse Now"). Works while
@@ -792,7 +896,7 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusTooManyRequests, "pulse too soon — try again in a moment")
 			return
 		}
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondInternal(w, "pulse sensor "+id, err)
 		return
 	}
 	respondWithJSON(w, http.StatusOK, pulseResponse(o))
@@ -845,7 +949,7 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 
 	rows, err := s.db.Query("SELECT ts, rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, n)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondInternal(w, "sensor history "+id, err)
 		return
 	}
 	defer rows.Close()
@@ -894,33 +998,33 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	// autocommit statements and ignored the last two errors.
 	tx, err := s.db.Begin()
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "begin: "+err.Error())
+		respondInternal(w, "clear history begin "+id, err)
 		return
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
 	if res, err := tx.Exec("DELETE FROM probes WHERE sensor_id = ?", id); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear probes: "+err.Error())
+		respondInternal(w, "clear probes "+id, err)
 		return
 	} else {
 		probes, _ = res.RowsAffected()
 	}
 	if res, err := tx.Exec("DELETE FROM events WHERE sensor_id = ?", id); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear events: "+err.Error())
+		respondInternal(w, "clear events "+id, err)
 		return
 	} else {
 		events, _ = res.RowsAffected()
 	}
 	if _, err := tx.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear alert_state: "+err.Error())
+		respondInternal(w, "clear alert_state "+id, err)
 		return
 	}
 	if _, err := tx.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "reset status: "+err.Error())
+		respondInternal(w, "reset status "+id, err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "commit: "+err.Error())
+		respondInternal(w, "clear history commit "+id, err)
 		return
 	}
 	// Keep the in-memory state in step with the DB: the cleared sensor's
@@ -952,33 +1056,33 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	// handleSensorClearHistory for why.
 	tx, err := s.db.Begin()
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "begin: "+err.Error())
+		respondInternal(w, "clear all history begin", err)
 		return
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
 	if res, err := tx.Exec("DELETE FROM probes"); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear probes: "+err.Error())
+		respondInternal(w, "clear all probes", err)
 		return
 	} else {
 		probes, _ = res.RowsAffected()
 	}
 	if res, err := tx.Exec("DELETE FROM events"); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear events: "+err.Error())
+		respondInternal(w, "clear all events", err)
 		return
 	} else {
 		events, _ = res.RowsAffected()
 	}
 	if _, err := tx.Exec("DELETE FROM alert_state"); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "clear alert_state: "+err.Error())
+		respondInternal(w, "clear all alert_state", err)
 		return
 	}
 	if _, err := tx.Exec("UPDATE sensors SET status = 'up'"); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "reset status: "+err.Error())
+		respondInternal(w, "clear all reset status", err)
 		return
 	}
 	if err := tx.Commit(); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "commit: "+err.Error())
+		respondInternal(w, "clear all history commit", err)
 		return
 	}
 	// Wipe the whole in-memory state too: every sensor's series AND
@@ -990,6 +1094,10 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 		"cleared": map[string]int64{"probes": probes, "events": events},
 	})
 }
+
+// cloneMaxAttempts bounds the INSERT retries when concurrent clones race for
+// the same name.
+const cloneMaxAttempts = 5
 
 // handleSensorClone creates a copy of a sensor with a new unique name
 // (name-copy, name-copy2, ...). The clone starts PAUSED, like a new sensor.
@@ -1012,29 +1120,47 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	}
 	src.Tags = s.db.SensorTags(id)
 
-	// Find a free clone name.
-	name := src.Name + "-copy"
-	for i := 2; ; i++ {
-		var exists int
-		_ = s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE name = ?", name).Scan(&exists)
-		if exists == 0 {
-			break
-		}
-		name = fmt.Sprintf("%s-copy%d", src.Name, i)
-		if i > 100 {
-			respondWithError(w, http.StatusConflict, "too many clones with this name")
-			return
-		}
-	}
-
+	// Pick the first free name and insert it. Another request can take the
+	// name between the SELECT and the INSERT (the sensors.name UNIQUE index is
+	// the real arbiter), so a UNIQUE failure moves on to the next candidate:
+	// at most cloneMaxAttempts inserts, then 409.
 	newID := newID()
 	now := tsNow()
-	// Clone starts PAUSED, matching new-sensor behavior.
-	_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-		newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
-	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "failed to clone sensor: "+err.Error())
+	name := ""
+	created := false
+	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
+	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
+		for ; ; next++ {
+			if next > 100 { // same ceiling as before: the last usable name is -copy100
+				respondWithError(w, http.StatusConflict, "too many clones with this name")
+				return
+			}
+			name = src.Name + "-copy"
+			if next > 1 {
+				name = fmt.Sprintf("%s-copy%d", src.Name, next)
+			}
+			var exists int
+			_ = s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE name = ?", name).Scan(&exists)
+			if exists == 0 {
+				break
+			}
+		}
+		// Clone starts PAUSED, matching new-sensor behavior.
+		_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+			newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
+		if err == nil {
+			created = true
+			break
+		}
+		if !strings.Contains(err.Error(), "UNIQUE") {
+			respondInternal(w, "clone sensor "+id, err)
+			return
+		}
+		next++ // lost the race for this name: try the next one
+	}
+	if !created {
+		respondWithError(w, http.StatusConflict, "too many clones with this name")
 		return
 	}
 	if len(src.Tags) > 0 {
@@ -1065,7 +1191,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		}
 		n, err := s.db.DeleteTag(tag)
 		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
 		respondWithJSON(w, http.StatusOK, map[string]interface{}{"status": "deleted", "sensors_updated": n})
@@ -1149,7 +1275,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)
 		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, from)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondInternal(w, "graph query", err)
 		return
 	}
 	defer rows.Close()
@@ -1167,9 +1293,10 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var total, lostTotal int
-	_ = s.db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM probes WHERE sensor_id = ?
-			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)`, id, from).Scan(&total, &lostTotal)
+	for _, p := range points {
+		total += p.Total
+		lostTotal += p.Lost
+	}
 	uptime := 0.0
 	if total > 0 {
 		uptime = float64(total-lostTotal) / float64(total) * 100
@@ -1200,7 +1327,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		res, err := s.db.Exec("DELETE FROM events")
 		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondInternal(w, "delete events", err)
 			return
 		}
 		n, _ := res.RowsAffected()
@@ -1226,7 +1353,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		FROM events e LEFT JOIN sensors s ON s.id = e.sensor_id
 		ORDER BY e.ts DESC LIMIT ?`, n)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondInternal(w, "query events", err)
 		return
 	}
 	defer rows.Close()
@@ -1242,23 +1369,16 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, events)
 }
 
-// webhookMasked shows the URL with the secret masked so the dashboard and
-// the settings API never echo credentials. Google Chat keeps its key in a
-// query string (mask the query); Discord embeds the token in the path
-// (mask the last path segment). Without the path mask a Discord webhook
-// would be fully exposed — the token in the path is the credential.
-func webhookMasked(url string) string {
-	if url == "" {
+// webhookMasked shows only scheme://host/*** — the path and query carry the credential for every supported provider.
+func webhookMasked(raw string) string {
+	if raw == "" {
 		return ""
 	}
-	if i := strings.Index(url, "?"); i >= 0 {
-		return url[:i] + "?***"
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "***"
 	}
-	slash := strings.LastIndex(url, "/")
-	if slash >= 0 && slash < len(url)-1 {
-		return url[:slash] + "/***"
-	}
-	return url
+	return u.Scheme + "://" + u.Host + "/***" // path/query is the credential for every provider here
 }
 
 // settingsPayload is the shared GET/PUT response shape for /api/settings.
@@ -1325,58 +1445,78 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			Enabled *bool             `json:"enabled"` // nil = keep; else set
 			Extra   map[string]string `json:"extra"`   // non-URL fields (e.g. telegram chat_id)
 		} `json:"providers"`
-		AlertScope  string   `json:"alert_scope"`
-		AlertFilter []string `json:"alert_filter"`
-		RealertMin  *int     `json:"realert_min"` // nil = keep; 0 = alert once only
-		MaintMode   *bool    `json:"maintenance_mode"`
+		AlertScope  *string   `json:"alert_scope"`  // nil = keep; else all|tags|sensors
+		AlertFilter *[]string `json:"alert_filter"` // nil = keep; else set
+		RealertMin  *int      `json:"realert_min"`  // nil = keep; 0 = alert once only
+		MaintMode   *bool     `json:"maintenance_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
 		respondWithError(w, code, msg)
 		return
 	}
-	// Per-provider updates. The legacy top-level webhook_url maps to the
-	// google_chat provider so an older dashboard keeps working.
+
+	// Validate EVERYTHING before any write: the old code applied provider
+	// writes as it went and reset alert_scope/alert_filter unconditionally
+	// (a partial save like {"realert_min":10} silently wiped the tag
+	// routing), and one bad field could leave a partial save behind. Now a
+	// 400 leaves the store exactly as it was.
+	if req.AlertScope != nil && *req.AlertScope != "all" && *req.AlertScope != "tags" && *req.AlertScope != "sensors" {
+		respondWithError(w, http.StatusBadRequest, "alert_scope must be all, tags or sensors")
+		return
+	}
+	if req.RealertMin != nil && (*req.RealertMin < 0 || *req.RealertMin > 1440) {
+		respondWithError(w, http.StatusBadRequest, "realert_min must be 0-1440 (0 = alert once only)")
+		return
+	}
 	for _, prov := range req.Providers {
-		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
+		if err := validateProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
+		if err := validateProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
-	if req.AlertScope == "" {
-		req.AlertScope = "all"
+
+	// All valid: apply. Provider writes first (the dashboard saves them
+	// alongside the routing fields), then ONLY the routing fields that were
+	// sent — nil means keep, so a partial save no longer resets routing.
+	for _, prov := range req.Providers {
+		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
+			// Unreachable after the validation pass above (nothing reads
+			// the DB in between); keep a 500 for the impossible case.
+			respondInternal(w, "apply provider "+prov.Kind, err)
+			return
+		}
 	}
-	if req.AlertScope != "all" && req.AlertScope != "tags" && req.AlertScope != "sensors" {
-		respondWithError(w, http.StatusBadRequest, "alert_scope must be all, tags or sensors")
-		return
+	if req.WebhookURL != nil {
+		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
+			respondInternal(w, "apply provider google_chat", err)
+			return
+		}
 	}
 	if req.RealertMin != nil {
-		if *req.RealertMin < 0 || *req.RealertMin > 1440 {
-			respondWithError(w, http.StatusBadRequest, "realert_min must be 0-1440 (0 = alert once only)")
-			return
-		}
 		if err := s.db.SetSetting("realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
+			respondInternal(w, "save setting realert_min", err)
 			return
 		}
 	}
-	if req.AlertFilter == nil {
-		req.AlertFilter = []string{}
+	if req.AlertScope != nil {
+		if err := s.db.SetSetting("alert_scope", *req.AlertScope); err != nil {
+			respondInternal(w, "save setting alert_scope", err)
+			return
+		}
 	}
-	if err := s.db.SetSetting("alert_scope", req.AlertScope); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-		return
-	}
-	filterJSON, _ := json.Marshal(req.AlertFilter)
-	if err := s.db.SetSetting("alert_filter", string(filterJSON)); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "failed to save: "+err.Error())
-		return
+	if req.AlertFilter != nil {
+		filterJSON, _ := json.Marshal(*req.AlertFilter)
+		if err := s.db.SetSetting("alert_filter", string(filterJSON)); err != nil {
+			respondInternal(w, "save setting alert_filter", err)
+			return
+		}
 	}
 	if req.MaintMode != nil {
 		if *req.MaintMode {
@@ -1386,7 +1526,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			// so they are left alone. The snapshot is what resume restores.
 			ids, err := s.db.ActiveSensorIDs()
 			if err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to snapshot active sensors: "+err.Error())
+				respondInternal(w, "snapshot active sensors", err)
 				return
 			}
 			// Nothing active: the snapshot would be empty and resume would have
@@ -1401,7 +1541,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			// vice versa). See SetMaintenanceMode in db.go.
 			snapJSON, _ := json.Marshal(ids)
 			if err := s.db.SetMaintenanceMode(true, ids, string(snapJSON)); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to enter maintenance mode: "+err.Error())
+				respondInternal(w, "enter maintenance mode", err)
 				return
 			}
 			// Flip the in-memory pause flag immediately — the same SetPaused
@@ -1440,7 +1580,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			// Atomic: resume + clear snapshot + mode flag in ONE transaction.
 			// See SetMaintenanceMode in db.go.
 			if err := s.db.SetMaintenanceMode(false, ids, ""); err != nil {
-				respondWithError(w, http.StatusInternalServerError, "failed to leave maintenance mode: "+err.Error())
+				respondInternal(w, "leave maintenance mode", err)
 				return
 			}
 			// Flip the in-memory unpause immediately (symmetric fast path, see
@@ -1459,8 +1599,80 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			realertLog = n
 		}
 	}
-	log.Printf("API: settings updated (scope=%s filter=%d realert=%dm)", req.AlertScope, len(req.AlertFilter), realertLog)
+	// Log the EFFECTIVE stored values (the request fields are pointers now:
+	// a partial save leaves the others untouched).
+	scopeLog := s.db.GetSetting("alert_scope")
+	filterLog := 0
+	if v := s.db.GetSetting("alert_filter"); v != "" {
+		var fl []string
+		if json.Unmarshal([]byte(v), &fl) == nil {
+			filterLog = len(fl)
+		}
+	}
+	log.Printf("API: settings updated (scope=%s filter=%d realert=%dm)", scopeLog, filterLog, realertLog)
 	respondWithJSON(w, http.StatusOK, s.settingsPayload())
+}
+
+// validateProviderUpdate checks one provider update WITHOUT writing
+// anything. handleSettingsPut runs it over the whole request BEFORE any
+// write, so a 400 never leaves a partial save; applyProviderUpdate reuses
+// it so the two paths can't drift.
+func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
+	if _, ok := providerByKey(kind); !ok {
+		return fmt.Errorf("unknown alert provider: %q", kind)
+	}
+	if url != nil {
+		u := strings.TrimSpace(*url)
+		if u != "" && kind != "smtp" {
+			// SMTP's url field carries the mail-server host (a hostname),
+			// not an http(s):// webhook — it is validated against the
+			// reserved range blocklist just below (validateSMTPHost), not
+			// as a URL.
+			if err := validateWebhookURL(u); err != nil {
+				return fmt.Errorf("%s url: %s", kind, err.Error())
+			}
+		}
+		if kind == "smtp" && u != "" {
+			// The host is validated against the reserved-range blocklist
+			// (the same check the webhook path applies) before it is
+			// stored, so the SMTP transport can never be pointed at
+			// loopback, cloud-metadata (169.254.169.254), or other
+			// reserved space.
+			if err := validateSMTPHost(u); err != nil {
+				return fmt.Errorf("smtp host: %s", err.Error())
+			}
+		}
+	}
+	// Non-URL fields (e.g. telegram chat_id): only known keys are accepted,
+	// so a client can't write arbitrary settings keys.
+	for k, v := range extra {
+		if !extraFields[kind][k] {
+			return fmt.Errorf("unknown field %q for %s", k, kind)
+		}
+		vv := strings.TrimSpace(v)
+		if kind == "smtp" && k == "port" && vv != "" {
+			if _, err := smtpPort(vv); err != nil {
+				return fmt.Errorf("smtp %s: %s", k, err.Error())
+			}
+		}
+		if kind == "smtp" && k == "tls_mode" && vv != "" {
+			switch vv {
+			case "auto", "starttls", "tls", "none":
+			default:
+				return fmt.Errorf("smtp tls_mode: %q (valid: auto, starttls, tls, none)", vv)
+			}
+		}
+		if kind == "smtp" && (k == "from" || k == "to") {
+			// Single RFC 5322 address, no CR/LF (the raw message headers
+			// are built by concatenation in sendSMTP). Store the BARE
+			// address: net/smtp wraps MAIL/RCPT arguments in <...>, so a
+			// display name or a recipient list would 501 at send time.
+			if _, err := smtpAddr(vv); err != nil {
+				return fmt.Errorf("smtp %s: %s", k, err.Error())
+			}
+		}
+	}
+	return nil
 }
 
 // applyProviderUpdate persists one provider's URL / enabled flag. URL is a
@@ -1469,29 +1681,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // This is the single write path for provider config, so the validation and
 // key-naming stay consistent no matter how many providers exist.
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
-	if _, ok := providerByKey(kind); !ok {
-		return fmt.Errorf("unknown alert provider: %q", kind)
+	if err := validateProviderUpdate(kind, url, enabled, extra); err != nil {
+		return err
 	}
 	if url != nil {
 		u := strings.TrimSpace(*url)
-		if u != "" && kind != "smtp" {
-			// SMTP's url field carries the mail-server host (a hostname), not
-			// an http(s):// webhook — it is validated against the reserved
-			// range blocklist just below (validateSMTPHost), not as a URL.
-			if err := validateWebhookURL(u); err != nil {
-				return fmt.Errorf("%s url: %s", kind, err.Error())
-			}
-		}
 		if kind == "smtp" {
-			// The host is validated against the reserved-range blocklist
-			// (the same check the webhook path applies) before it is stored,
-			// so the SMTP transport can never be pointed at loopback,
-			// cloud-metadata (169.254.169.254), or other reserved space.
-			if u != "" {
-				if err := validateSMTPHost(u); err != nil {
-					return fmt.Errorf("smtp host: %s", err.Error())
-				}
-			}
 			// Persist the host under smtp_host (not smtp_url) so the SMTP
 			// transport reads it from the right key.
 			if err := s.db.SetSetting("smtp_host", u); err != nil {
@@ -1512,41 +1707,22 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
 		}
 	}
-	// Non-URL fields (e.g. telegram chat_id): only known keys persist, so a
-	// client can't write arbitrary settings keys.
+	// Non-URL fields (e.g. telegram chat_id): validated above; the loop
+	// persists the accepted keys.
 	for k, v := range extra {
-		if !extraFields[kind][k] {
-			return fmt.Errorf("unknown field %q for %s", k, kind)
-		}
 		vv := strings.TrimSpace(v)
-		// SMTP password: the mask value means "unchanged" (the UI returns the
-		// fixed mask for a stored password). Skip the write so we never clobber
-		// the real credential with the mask string.
+		// SMTP password: the mask value means "unchanged" (the UI returns
+		// the fixed mask for a stored password). Skip the write so we never
+		// clobber the real credential with the mask string.
 		if kind == "smtp" && k == "password" && vv == "••••••••" {
 			continue
 		}
-		if kind == "smtp" && k == "port" && vv != "" {
-			if _, err := smtpPort(vv); err != nil {
-				return fmt.Errorf("smtp %s: %s", k, err.Error())
-			}
-		}
-		if kind == "smtp" && k == "tls_mode" && vv != "" {
-			switch vv {
-			case "auto", "starttls", "tls", "none":
-			default:
-				return fmt.Errorf("smtp tls_mode: %q (valid: auto, starttls, tls, none)", vv)
-			}
-		}
 		if kind == "smtp" && (k == "from" || k == "to") {
-			// Single RFC 5322 address, no CR/LF (the raw message headers are
-			// built by concatenation in sendSMTP). Store the BARE address:
-			// net/smtp wraps MAIL/RCPT arguments in <...>, so a display name
-			// or a recipient list would 501 at send time.
-			addr, err := smtpAddr(vv)
-			if err != nil {
-				return fmt.Errorf("smtp %s: %s", k, err.Error())
+			// Store the BARE address (validated above): a display name or
+			// list would 501 at send time (see smtpAddr).
+			if addr, err := smtpAddr(vv); err == nil {
+				vv = addr
 			}
-			vv = addr
 		}
 		if err := s.db.SetSetting(kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
@@ -1618,15 +1794,20 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Every asset revalidates (no-cache) against a strong ETag, so an update
+	// is never served stale and an unchanged asset costs a 304 with no body.
+	tag := staticETag(path, data)
+	w.Header().Set("ETag", tag)
+	w.Header().Set("Cache-Control", "no-cache")
 	switch {
 	case strings.HasSuffix(path, ".html"):
-		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-cache, must-revalidate")
 		w.Header().Set("Pragma", "no-cache")
 	case strings.HasSuffix(path, ".js"):
-		w.Header().Set("Content-Type", "application/javascript")
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 	case strings.HasSuffix(path, ".css"):
-		w.Header().Set("Content-Type", "text/css")
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	case strings.HasSuffix(path, ".svg"):
 		w.Header().Set("Content-Type", "image/svg+xml")
 	case strings.HasSuffix(path, ".png"):
@@ -1635,6 +1816,10 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "font/woff2")
 	default:
 		w.Header().Set("Content-Type", "application/octet-stream")
+	}
+	if inm := r.Header.Get("If-None-Match"); inm != "" && etagMatches(inm, tag) {
+		w.WriteHeader(http.StatusNotModified)
+		return
 	}
 	w.Write(data)
 }

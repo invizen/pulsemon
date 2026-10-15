@@ -50,7 +50,7 @@ func TestRedirectTargetAllowed(t *testing.T) {
 		{"", "example.com", true, "empty host"},
 	}
 	for _, c := range cases {
-		err := redirectTargetAllowed(c.host, c.orig)
+		err := redirectTargetAllowed(context.Background(), c.host, c.orig)
 		if c.wantErr && err == nil {
 			t.Errorf("redirectTargetAllowed(%q, %q) = nil, want refusal (%s)", c.host, c.orig, c.why)
 		}

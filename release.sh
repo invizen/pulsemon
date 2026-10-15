@@ -27,6 +27,20 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p dist
 
+# --- 0. vulnerability gate: fail the release on reachable vulns --------------
+# govulncheck scans the module graph and flags vulnerabilities that are
+# actually REACHABLE from our code (its exit code 2), so a new CVE in a
+# dependency aborts the release before a single binary is built. Set
+# SKIP_VULNCHECK=1 to bypass (e.g. an offline run); the gate is on by
+# default.
+if [[ "${SKIP_VULNCHECK:-}" == "1" ]]; then
+  echo "pulsemon: SKIP_VULNCHECK=1 — skipping govulncheck"
+else
+  echo "pulsemon: govulncheck (release fails on reachable vulnerabilities) ..."
+  go run golang.org/x/vuln/cmd/govulncheck@latest ./... \
+    || { echo "release.sh: govulncheck reported reachable vulnerabilities (or failed) — release aborted"; exit 1; }
+fi
+
 # --- 1. build both architectures ---------------------------------------------
 for ARCH in amd64 arm64; do
   OUT="dist/pulsemon-linux-$ARCH"

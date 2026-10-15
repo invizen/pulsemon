@@ -31,7 +31,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 	mk := func(id string, rtt []*float64) string {
 		pw := seedSensor(t, db, id, 25, 2, 3, rtt)
 		c := sensorConfig{id: id, lossWarn: 25, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		return pw.deriveStatus(c, "up")
 	}
 
@@ -65,7 +64,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		pw := seedSensor(t, db, "lw-recovery", 25, 2, 3,
 			[]*float64{nil, nil, nil, nil, f64(10)})
 		c := sensorConfig{id: "lw-recovery", lossWarn: 25, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "error"); got != "up" {
 			t.Errorf("recovery from error on first good probe = %q, want up", got)
 		}
@@ -78,7 +76,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		pw := seedSensor(t, db, "lw-low-threshold", 10, 2, 3,
 			[]*float64{f64(10), f64(10), f64(10), f64(10), f64(10), f64(10), f64(10), nil})
 		c := sensorConfig{id: "lw-low-threshold", lossWarn: 10, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "up"); got != "warning" {
 			t.Errorf("single loss with loss_warn=10 = %q, want warning (per-sensor threshold honored)", got)
 		}
@@ -92,7 +89,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		pw := seedSensor(t, db, "lw-warn-flap-up", 25, 2, 3,
 			[]*float64{f64(10), nil, f64(10), f64(10), f64(10), f64(10), f64(10), f64(10)})
 		c := sensorConfig{id: "lw-warn-flap-up", lossWarn: 25, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "warning"); got != "up" {
 			t.Errorf("sub-threshold flap from warning = %q, want up (blip below loss_warn recovers)", got)
 		}
@@ -105,7 +101,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		pw := seedSensor(t, db, "lw-warn-flap-stay", 25, 2, 3,
 			[]*float64{nil, f64(10), nil, f64(10), f64(10), f64(10), f64(10), f64(10)})
 		c := sensorConfig{id: "lw-warn-flap-stay", lossWarn: 25, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "warning"); got != "warning" {
 			t.Errorf("at-threshold flap from warning = %q, want warning (loss gate holds)", got)
 		}
@@ -119,7 +114,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		pw := seedSensor(t, db, "lw-steady-over", 25, 2, 3,
 			[]*float64{nil, f64(10), nil, f64(10), nil, f64(10), f64(10), f64(10)})
 		c := sensorConfig{id: "lw-steady-over", lossWarn: 25, downAfter: 2}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "up"); got != "warning" {
 			t.Errorf("steady state at 37.5%% loss = %q, want warning (up rule honors loss_warn)", got)
 		}
@@ -136,7 +130,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		rtt = append(rtt, f64(10), nil, f64(10), nil, f64(10), nil, f64(10), nil)
 		pw := seedSensor(t, db, "lw-diluted", 25, 20, 3, rtt)
 		c := sensorConfig{id: "lw-diluted", lossWarn: 25, downAfter: 20}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "up"); got != "warning" {
 			t.Errorf("down_after=20, 4 losses in newest 8 = %q, want warning (loss%% over 8, not 20)", got)
 		}
@@ -154,7 +147,6 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		rtt = append(rtt, f64(10), f64(10), f64(10), f64(10), nil, f64(10), nil, f64(10))
 		pw := seedSensor(t, db, "lw-window8", 25, 12, 3, rtt)
 		c := sensorConfig{id: "lw-window8", lossWarn: 25, downAfter: 12}
-		c.lastErrCount = probeErrCount.Load()
 		if got := pw.deriveStatus(c, "up"); got != "warning" {
 			t.Errorf("down_after=12, 2 losses in newest 8 = %q, want warning (2/8=25%%, not 2/12)", got)
 		}

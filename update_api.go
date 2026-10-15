@@ -76,6 +76,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "use POST /api/update")
 		return
 	}
+	// NOTE: handleUpdate deliberately has no "auth must be enabled" gate. A
+	// review (M4c) proposed refusing the swap+restart on auth-off installs;
+	// the owner decided to defer that (docs/DEFERRED.md), so on an auth-off
+	// dashboard anyone who can reach the port can trigger an update.
 	if !updateMu.TryLock() {
 		respondWithError(w, http.StatusConflict, "an update is already in progress")
 		return
@@ -154,11 +158,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	exe, err := runningExecutable()
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "cannot locate running binary: "+err.Error())
+		respondInternal(w, "cannot locate running binary", err)
 		return
 	}
 	if err := installBinary(tmp, exe); err != nil {
-		respondWithError(w, http.StatusInternalServerError, "install: "+err.Error())
+		respondInternal(w, "install", err)
 		return
 	}
 

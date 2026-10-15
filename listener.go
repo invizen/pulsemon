@@ -25,12 +25,13 @@ import (
 //     Settings → TLS upload; lives in the data volume so it survives
 //     container rebuilds)
 //
-// A pair that is merely ABSENT at startup is fine: plain HTTP. A pair that
-// is present but unreadable is also tolerated (WARNING, plain HTTP until
-// the files appear — supports an install that stages certs after first
-// boot). But a pair that is in place AND unparseable/mismatched fails the
-// process at startup (log.Fatalf in startListener): silently serving
+// A pair that is merely ABSENT (not configured) is fine: plain HTTP.
+// A pair that is CONFIGURED (PULSEMON_CERT) but unreadable now FAILS the
+// process at startup (certFatal in startListener): silently serving
 // plaintext when the operator believes TLS is on is the worse failure.
+// An install that stages certs after first boot can keep the old
+// warn-and-serve-plaintext behavior with PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1.
+// A pair that is in place AND unparseable/mismatched also fails startup.
 //
 // The runtime-specific restart logic (requestRestart / runRestartCommand)
 // lives in listener_linux.go / listener_windows.go — each OS respawns the

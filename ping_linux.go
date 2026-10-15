@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -77,7 +78,18 @@ func (t *dgramTransport) run(e *Engine) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		t.readDgram(e)
+		for {
+			t.readDgram(e)
+			// readDgram only returns on done (clean) or an unexpected error.
+			// An unsupervised exit would turn every later probe into a silent
+			// false loss, so come back after a short pause unless we are closing.
+			select {
+			case <-e.done:
+				return
+			case <-time.After(readerRestartDelay):
+				log.Printf("pulsemon: icmp reader restarted after an unexpected stop")
+			}
+		}
 	}()
 }
 

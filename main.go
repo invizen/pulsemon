@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -38,8 +41,10 @@ func dbPathFromEnv() string {
 // ("", "") for plain HTTP. Both PULSEMON_CERT and PULSEMON_KEY must be set
 // together — a cert without a key (or vice versa) is a misconfiguration
 // worth failing on at startup, not a half-working listener.
-// certFatal is the failure path for a partial TLS env config; stubbed in
-// tests so log.Fatalf (which exits) does not kill the test process.
+// certFatal is the failure path for a TLS misconfiguration (partial env
+// config, a configured-but-unreadable pair, an in-place-but-unloadable
+// pair); stubbed in tests so log.Fatalf (which exits) does not kill the
+// test process.
 var certFatal = func(msg string) { log.Fatal(msg) }
 
 func certPaths() (string, string) {
@@ -104,7 +109,7 @@ func dispatch(args []string) dispatchKind {
 	// error.
 	if strings.HasPrefix(args[1], "-") {
 		fmt.Fprintf(os.Stderr, "pulsemon: unknown flag %q\n\n", args[1])
-		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|VERSION] [--restart]  self-update (check only, or pin a version); --restart also restarts the service\n  pulsemon auth-user add <user> <pass>   create a dashboard account (first account enables auth)\n  pulsemon auth-user remove <user>       delete a dashboard account\n  pulsemon auth-user list                list dashboard accounts\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|rollback|VERSION] [--restart]  self-update (check only, roll back the last update, or pin a version); --restart also restarts the service\n  pulsemon auth-user add <user> [<password>]   create a dashboard account (first account enables auth); no <password> (or --password-stdin) reads it from stdin\n  pulsemon auth-user remove <user>       delete a dashboard account\n  pulsemon auth-user list                list dashboard accounts\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
 		if os.Getenv("PULSEMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
@@ -143,6 +148,26 @@ func tlsKeyPairOK(cert, key string) error {
 	return err
 }
 
+// newHTTPServer builds the production HTTP server: the read/idle timeouts
+// and header cap that protect the listener from slowloris-style abuse.
+//
+// There is deliberately NO server-level WriteTimeout: POST /api/update
+// (self-update) runs up to ~60s (download + verify + install) and a
+// server write deadline would cut it off mid-install. See
+// docs/HANDOFF-esthero.md for the note and the middleware-shaped
+// alternative if a global write cap is ever wanted.
+//
+// Factored out of runServer so a test can pin the exact values.
+func newHTTPServer(handler http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
+}
+
 // reexecBindDeadline bounds a re-exec child's bind retries. The parent's
 // shutdown is structurally bounded at 30s (the 10s probe-worker + 15s
 // alert-drain + 5s HTTP-drain backstops in runServer); 45s covers that
@@ -168,7 +193,7 @@ func bindServeWithRetry(retry bool, label string, bind func() error) {
 	deadline := time.Now().Add(reexecBindDeadline)
 	for {
 		err := bind()
-		if err == nil || err == http.ErrServerClosed {
+		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return
 		}
 		if !retry || time.Now().After(deadline) {
@@ -197,15 +222,31 @@ func startListener(srv *http.Server, db *DB) {
 
 	go func() {
 		if cfg.certPath != "" {
+			// A CONFIGURED pair must be servable. Silently serving
+			// plaintext when the operator believes TLS is on is the
+			// worse failure, so an unreadable pair is fatal — unless the
+			// operator opts back into the old warn-and-fallback behavior
+			// (an install that stages certs after first boot) with
+			// PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1.
+			var missing string
 			if _, err := os.Stat(cfg.certPath); err != nil {
-				log.Printf("WARNING: %s is not readable (%v); serving plain HTTP until it is in place", cfg.certPath, err)
+				missing = cfg.certPath + ": " + err.Error()
 			} else if _, err := os.Stat(cfg.keyPath); err != nil {
-				log.Printf("WARNING: %s is not readable (%v); serving plain HTTP until it is in place", cfg.keyPath, err)
+				missing = cfg.keyPath + ": " + err.Error()
+			}
+			if missing != "" {
+				if os.Getenv("PULSEMON_ALLOW_PLAINTEXT_FALLBACK") == "1" {
+					log.Printf("WARNING: TLS is configured (%s) but %s is not readable; PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 — serving plain HTTP until it is in place", cfg.source, missing)
+				} else {
+					certFatal("CRITICAL: TLS is configured (" + cfg.source + ") but " + missing + " — fix the files, or set PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 to serve plain HTTP in the meantime")
+					return
+				}
 			} else if err := tlsKeyPairOK(cfg.certPath, cfg.keyPath); err != nil {
 				// A pair is in place but unusable (encrypted key,
 				// corrupt cert, mismatched pair). Fail fast with the
 				// reason instead of looping or serving plaintext.
-				log.Fatalf("TLS: %s + %s are in place but cannot be loaded: %v", cfg.certPath, cfg.keyPath, err)
+				certFatal(fmt.Sprintf("TLS: %s + %s are in place but cannot be loaded: %v", cfg.certPath, cfg.keyPath, err))
+				return
 			} else {
 				srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 				addr := httpsAddrFor(cfg.httpsPort)
@@ -247,9 +288,72 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 	return <-errCh
 }
 
+// authUserUsage is the single usage string for `pulsemon auth-user` (the
+// add forms: <user> <pass> is the legacy argv form; <user> alone or with
+// --password-stdin reads the password from stdin).
+const authUserUsage = "usage: pulsemon auth-user add <username> [<password>|--password-stdin] | remove <username> | list"
+
+// authAddArgs is the parsed `auth-user add` argument set.
+type authAddArgs struct {
+	user      string
+	pass      string
+	fromStdin bool // password comes from stdin (one line)
+	err       error
+}
+
+// parseAuthAddArgs accepts the three add forms:
+//
+//	add <user> <pass>           legacy (password in argv — insecure, warned)
+//	add <user>                  password from stdin (one line)
+//	add <user> --password-stdin  password from stdin (one line)
+//
+// Anything else is a usage error (dExit2 at the call site).
+func parseAuthAddArgs(args []string) authAddArgs {
+	usage := errors.New("usage: pulsemon auth-user add <username> [<password>|--password-stdin]")
+	stdinFlag := false
+	rest := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--password-stdin" {
+			stdinFlag = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+	switch len(rest) {
+	case 1:
+		// No password in argv: it comes from stdin. The explicit flag is
+		// accepted too (redundant, but explicit intent is good).
+		return authAddArgs{user: rest[0], fromStdin: true}
+	case 2:
+		if stdinFlag {
+			return authAddArgs{err: usage} // <user> <pass> + flag is ambiguous
+		}
+		return authAddArgs{user: rest[0], pass: rest[1]}
+	default:
+		return authAddArgs{err: usage}
+	}
+}
+
+// readPasswordLine reads one line from r, stripping the trailing newline
+// (and CR). An empty result is an error up front: it would otherwise hit
+// the weak-password gate with a confusing message.
+func readPasswordLine(r io.Reader) (string, error) {
+	line, err := bufio.NewReader(r).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	line = strings.TrimRight(line, "\r\n")
+	if line == "" {
+		return "", errors.New("empty password on stdin")
+	}
+	return line, nil
+}
+
 // runAuthUser manages dashboard accounts from the host:
 //
-//	pulsemon auth-user add <username> <password>
+//	pulsemon auth-user add <username> <password>      (legacy; password in argv)
+//	pulsemon auth-user add <username>                 (password from stdin, one line)
+//	pulsemon auth-user add <username> --password-stdin (password from stdin, one line)
 //	pulsemon auth-user remove <username>
 //	pulsemon auth-user list
 //
@@ -257,9 +361,14 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 // remove is refused for the last remaining user — `auth-user remove` on
 // the final account errors, and the "disable authentication" action in the
 // dashboard (which removes all users) is the explicit off-switch.
+//
+// The 3-arg form keeps the password in argv (visible in `ps` and shell
+// history), so it warns; the stdin forms are the recommended path. When
+// the stdin forms read from a TTY they warn that the input will be echoed
+// (x/term is not a dependency, so there is no echo suppression).
 func runAuthUser(args []string) dispatchKind {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user add <username> <password> | remove <username> | list")
+		fmt.Fprintln(os.Stderr, authUserUsage)
 		return dExit2
 	}
 	db, err := NewDB(dbPathFromEnv())
@@ -278,18 +387,35 @@ func runAuthUser(args []string) dispatchKind {
 	a := NewAuthState(db)
 	switch args[0] {
 	case "add":
-		if len(args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user add <username> <password>")
+		p := parseAuthAddArgs(args[1:])
+		if p.err != nil {
+			fmt.Fprintln(os.Stderr, p.err.Error())
 			return dExit2
 		}
-		if err := a.AddUser(args[1], args[2]); err != nil {
+		if p.fromStdin {
+			// A pipe/file stdin (the normal case) is read silently; a TTY
+			// would echo — say so, since there is no echo suppression
+			// (x/term is not a dependency).
+			if fi, serr := os.Stdin.Stat(); serr == nil && fi.Mode()&os.ModeCharDevice != 0 {
+				fmt.Fprintln(os.Stderr, "warning: reading the password from the terminal; it will be echoed")
+			}
+			line, rerr := readPasswordLine(os.Stdin)
+			if rerr != nil {
+				fmt.Fprintln(os.Stderr, "auth-user add: password from stdin:", rerr)
+				return dExit1
+			}
+			p.pass = line
+		} else {
+			fmt.Fprintln(os.Stderr, "warning: the password is visible in `ps` and shell history — prefer `pulsemon auth-user add <username>` (password from stdin) or `--password-stdin`")
+		}
+		if err := a.AddUser(p.user, p.pass); err != nil {
 			fmt.Fprintln(os.Stderr, "auth-user add:", err)
 			return dExit1
 		}
 		if n, _ := db.UserCount(); n == 1 {
-			fmt.Println("Dashboard authentication is now ENABLED —", args[1], "can log in at the dashboard URL.")
+			fmt.Println("Dashboard authentication is now ENABLED —", p.user, "can log in at the dashboard URL.")
 		} else {
-			fmt.Println("User added:", args[1])
+			fmt.Println("User added:", p.user)
 		}
 		return dExit0
 	case "remove":
@@ -322,7 +448,7 @@ func runAuthUser(args []string) dispatchKind {
 		}
 		return dExit0
 	default:
-		fmt.Fprintf(os.Stderr, "unknown auth-user action %q\nusage: pulsemon auth-user add <username> <password> | remove <username> | list\n", args[0])
+		fmt.Fprintf(os.Stderr, "unknown auth-user action %q\n%s\n", args[0], authUserUsage)
 		return dExit2
 	}
 }
@@ -417,13 +543,10 @@ func runServer(stop <-chan struct{}) {
 	}()
 
 	server := NewServer(db, pw)
-	srv := &http.Server{
-		// authGate re-checks the enabled state (user count) per request:
-		// a host `pulsemon auth-user add/remove` must take effect on the
-		// very next request without a restart.
-		Handler:           server.authGate(),
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	// authGate re-checks the enabled state (user count) per request: a
+	// host `pulsemon auth-user add/remove` must take effect on the very
+	// next request without a restart.
+	srv := newHTTPServer(server.authGate())
 	startListener(srv, db)
 
 	<-stop
@@ -462,8 +585,11 @@ func runServer(stop <-chan struct{}) {
 	// 4. Drain active HTTP connections.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
+	// log.Printf (NOT Fatalf): a shutdown error must not exit before the
+	// deferred db.Close() runs — an aborted Close can leave the WAL in a
+	// state the next boot has to recover from.
 	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Fatalf("Server shutdown error: %v", err)
+		log.Printf("Server shutdown error: %v", err)
 	}
 	log.Println("Server exited")
 }

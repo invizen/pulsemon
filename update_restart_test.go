@@ -252,11 +252,16 @@ func TestSystemctlActiveBoundedByTimeout(t *testing.T) {
 	// that never answers `is-active`.
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "systemctl")
-	script := "#!/bin/sh\nsleep 30\n"
+	script := "#!/bin/sh\nexec sleep 30\n"
 	if err := os.WriteFile(fake, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathSeparator)+os.Getenv("PATH"))
+	// Use the fake explicitly: systemctlPath prefers the real /usr/bin binary
+	// over PATH, and a unit test must never run the host's real systemctl.
+	oldSP := systemctlPath
+	systemctlPath = func() string { return fake }
+	t.Cleanup(func() { systemctlPath = oldSP })
 
 	oldActive, oldRestart := activeTimeout, restartTimeout
 	activeTimeout = 1 * time.Second
@@ -278,11 +283,16 @@ func TestSystemctlActiveBoundedByTimeout(t *testing.T) {
 func TestRunRestartBoundedByTimeout(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "systemctl")
-	script := "#!/bin/sh\nsleep 30\n"
+	script := "#!/bin/sh\nexec sleep 30\n"
 	if err := os.WriteFile(fake, []byte(script), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathSeparator)+os.Getenv("PATH"))
+	// Use the fake explicitly: systemctlPath prefers the real /usr/bin binary
+	// over PATH, and a unit test must never run the host's real systemctl.
+	oldSP := systemctlPath
+	systemctlPath = func() string { return fake }
+	t.Cleanup(func() { systemctlPath = oldSP })
 
 	oldActive, oldRestart := activeTimeout, restartTimeout
 	activeTimeout = 1 * time.Second

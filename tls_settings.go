@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/ecdsa"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
@@ -232,33 +233,83 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Port validation.
+	// Port range validation. Persistence happens AFTER the files are in
+	// place (below), so a failed pair upload can never leave a new port
+	// stored alongside the old pair.
 	if req.Port != nil {
 		if *req.Port < 1 || *req.Port > 65535 {
 			respondWithError(w, http.StatusBadRequest, "port out of range (1-65535)")
-			return
-		}
-		if err := s.db.SetSetting("listener_https_port", fmt.Sprintf("%d", *req.Port)); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "save port: "+err.Error())
 			return
 		}
 	}
 
 	if cert != "" {
 		dir := tlsDir(s.db)
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "create cert dir: "+err.Error())
+		// Owner-only: key.pem is a private key and the dir lives next to
+		// the secret-holding DB.
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			respondInternal(w, "create cert dir", err)
 			return
 		}
-		if err := os.WriteFile(filepath.Join(dir, "cert.pem"), []byte(normPEM(cert, "CERTIFICATE")), 0o644); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "write cert: "+err.Error())
+		certPath, keyPath := filepath.Join(dir, "cert.pem"), filepath.Join(dir, "key.pem")
+		// Atomic install: write BOTH files to temp files in the same dir
+		// (0600, as CreateTemp makes them), re-validate the pair as it
+		// will land on disk (tls.LoadX509KeyPair on the temps), then
+		// rename key then cert into place. A failure anywhere before the
+		// renames leaves the previously installed pair untouched — no
+		// mismatched pair, no boot crash loop.
+		tmpCert, err := os.CreateTemp(dir, ".cert.pem.tmp*")
+		if err != nil {
+			respondInternal(w, "temp cert", err)
 			return
 		}
-		if err := os.WriteFile(filepath.Join(dir, "key.pem"), []byte(normPEM(key, keyPEMType(key))), 0o600); err != nil {
-			respondWithError(w, http.StatusInternalServerError, "write key: "+err.Error())
+		certName := tmpCert.Name()
+		tmpKey, err := os.CreateTemp(dir, ".key.pem.tmp*")
+		if err != nil {
+			tmpCert.Close()
+			os.Remove(certName)
+			respondInternal(w, "temp key", err)
+			return
+		}
+		keyName := tmpKey.Name()
+		install := func() error {
+			if _, err := tmpCert.Write([]byte(normPEM(cert, "CERTIFICATE"))); err != nil {
+				return err
+			}
+			if err := tmpCert.Close(); err != nil {
+				return err
+			}
+			if _, err := tmpKey.Write([]byte(normPEM(key, keyPEMType(key)))); err != nil {
+				return err
+			}
+			if err := tmpKey.Close(); err != nil {
+				return err
+			}
+			if _, err := tls.LoadX509KeyPair(certName, keyName); err != nil {
+				return err
+			}
+			if err := os.Rename(keyName, keyPath); err != nil {
+				return err
+			}
+			return os.Rename(certName, certPath)
+		}
+		if err := install(); err != nil {
+			os.Remove(certName)
+			os.Remove(keyName)
+			respondInternal(w, "install cert", err)
 			return
 		}
 		log.Printf("TLS: certificate installed (%s, expires %s)", parsed.Subject.CommonName, parsed.NotAfter.Format("2006-01-02"))
+	}
+
+	// Persist the port ONLY after the pair is in place (or when only the
+	// port changed): the running listener must never be left with a port
+	// that belongs to a pair it does not have.
+	if req.Port != nil {
+		if err := s.db.SetSetting("listener_https_port", fmt.Sprintf("%d", *req.Port)); err != nil {
+			respondInternal(w, "save port", err)
+			return
+		}
 	}
 
 	// Response is flushed BEFORE the restart is triggered: the restart
@@ -298,11 +349,11 @@ func (s *Server) handleTLSSettingsDelete(w http.ResponseWriter, r *http.Request)
 	}
 	dir := tlsDir(s.db)
 	if err := os.Remove(filepath.Join(dir, "cert.pem")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		respondWithError(w, http.StatusInternalServerError, "remove cert: "+err.Error())
+		respondInternal(w, "remove cert", err)
 		return
 	}
 	if err := os.Remove(filepath.Join(dir, "key.pem")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		respondWithError(w, http.StatusInternalServerError, "remove key: "+err.Error())
+		respondInternal(w, "remove key", err)
 		return
 	}
 	log.Printf("TLS: certificate removed — reverting to plain HTTP on %s", listenAddr())

@@ -15,24 +15,16 @@ func binaryOwner(dst string) (uid, gid uint32, ok bool) {
 }
 
 // swapBinary replaces the running .exe with tmpName. On Windows the running
-// exe is LOCKED — you cannot rename over or delete it — but you CAN rename it
-// aside. So: (1) move the running pulsemon.exe to pulsemon.exe.old (the
-// process keeps running from the renamed inode), (2) move the new tmp file
-// into place as pulsemon.exe, (3) best-effort delete the .old. The .old is
-// still locked by the running process so the delete usually fails; it is
-// removed on the NEXT start by cleanupStaleBinary.
+// exe is LOCKED — you cannot rename over or delete it — but you CAN rename
+// it aside. installBinary has ALREADY moved the running exe aside to
+// <dst>.prev (the M4 rollback artifact) before calling this, so the only
+// step left is moving the new tmp file into place. The .prev stays put
+// (locked by the running process until it exits) so `pulsemon update
+// rollback` can restore it later.
 func swapBinary(tmpName, dst string) error {
-	old := dst + ".old"
-	_ = os.Remove(old) // clear a stale .old from a prior update, if it's unlocked
-	if err := os.Rename(dst, old); err != nil {
-		return fmt.Errorf("rename running binary aside: %w", err)
-	}
 	if err := os.Rename(tmpName, dst); err != nil {
-		// Best-effort: put the old binary back so we're not left with none.
-		_ = os.Rename(old, dst)
 		return fmt.Errorf("install new binary: %w", err)
 	}
-	_ = os.Remove(old) // usually fails (locked by the running process)
 	return nil
 }
 

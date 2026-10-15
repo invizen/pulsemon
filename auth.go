@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -206,6 +207,11 @@ func parseTrustedProxies(raw string) []*net.IPNet {
 //
 // The count source is userCountFn (defaults to db.UserCount); the seam lets
 // a test count reads and prove the cache actually stops the query.
+//
+// On a COUNT error the LAST KNOWN value is kept (a transient "database is
+// locked" must not read as "auth disabled"); if there is no last known
+// value yet (first-ever read) the gate fails CLOSED — enabled — so a DB
+// hiccup can never open the dashboard.
 func (a *AuthState) Enabled() bool {
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
@@ -217,7 +223,15 @@ func (a *AuthState) Enabled() bool {
 		fn = a.db.UserCount
 	}
 	n, err := fn()
-	a.enabled = err == nil && n > 0
+	if err != nil {
+		log.Printf("auth: user count failed (keeping previous state): %v", err)
+		if a.enabledAt.IsZero() {
+			a.enabled = true // never read: fail closed
+		}
+		a.enabledAt = time.Now()
+		return a.enabled
+	}
+	a.enabled = n > 0
 	a.enabledAt = time.Now()
 	return a.enabled
 }
@@ -227,6 +241,8 @@ func (a *AuthState) Enabled() bool {
 // Disable) so the gate reflects them on the very next request with no TTL
 // wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
 // handle and never reaches this method — which is exactly why the TTL exists.
+// Like Enabled(), an error keeps the last known value (fails closed when
+// there is none).
 func (a *AuthState) refreshEnabledNow() {
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
@@ -235,7 +251,15 @@ func (a *AuthState) refreshEnabledNow() {
 		fn = a.db.UserCount
 	}
 	n, err := fn()
-	a.enabled = err == nil && n > 0
+	if err != nil {
+		log.Printf("auth: user count failed (keeping previous state): %v", err)
+		if a.enabledAt.IsZero() {
+			a.enabled = true // never read: fail closed
+		}
+		a.enabledAt = time.Now()
+		return
+	}
+	a.enabled = n > 0
 	a.enabledAt = time.Now()
 }
 
@@ -245,6 +269,11 @@ func (a *AuthState) refreshEnabledNow() {
 var (
 	errUsernameInvalid = fmt.Errorf("username must start with a letter and contain only letters, digits, . _ - (max %d)", maxUsernameLen)
 	errPasswordWeak    = fmt.Errorf("password must be at least %d characters", minPasswordLen)
+	// errUserExists is the ONLY db error AddUser maps to a user-facing
+	// message; every other db failure propagates as a raw error so the
+	// handler can 500 it (respondInternal) instead of misreporting it as
+	// a duplicate.
+	errUserExists = fmt.Errorf("user already exists")
 )
 
 func validUsername(u string) bool {
@@ -266,7 +295,13 @@ func (a *AuthState) AddUser(username, password string) error {
 		return err
 	}
 	if err := a.db.AddUser(username, string(hash)); err != nil {
-		return fmt.Errorf("user already exists")
+		// Only a UNIQUE-constraint violation means the account exists —
+		// any other db failure must surface as a 500, not be misreported
+		// as "user already exists".
+		if strings.Contains(err.Error(), "UNIQUE") {
+			return errUserExists
+		}
+		return err
 	}
 	// Record that this install has been set up. The flag is never cleared —
 	// even when the operator later disables auth (deleting all users) — so
@@ -459,14 +494,30 @@ func (a *AuthState) ensureThrottleMaps() {
 	}
 }
 
-// loginAllowed reports whether ip may attempt a login now, and if not, how
-// long until the lockout lifts. It prunes failed-attempt timestamps older
-// than loginFailWindow so a long-ago burst can't pin an IP.
-func (a *AuthState) loginAllowed(ip string) (bool, time.Duration) {
+// beginAttempt atomically decides whether ip may run a credential check
+// NOW, and if so records the attempt in the SAME critical section — before
+// the caller runs bcrypt. Counting first is what closes the concurrency
+// bypass: the old check-then-KDF-then-record shape let N parallel requests
+// all pass loginAllowed before any of them recorded a failure, so a burst
+// ran the KDF N times (repro: 60 concurrent -> 59x 401). With the count
+// inside the lock, at most loginFailMax concurrent attempts can pass; the
+// rest get a fast 429 without touching the KDF.
+//
+// Returns (false, how-long-until-the-lockout-lifts) when the IP is locked
+// out or has exhausted its window; the caller answers 429 + Retry-After.
+// A failed attempt is NOT recorded again by the caller — it is already
+// counted here, for success OR failure alike (a success clears the counter
+// via loginSuccess).
+func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	a.loginThrottle.Lock()
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
+	// Opportunistic GC: see sweepThrottle. Bounded O(n) work, run only once
+	// the map is large enough that a multi-IP spray is the likely cause.
+	if len(a.loginThrottle.fails) > 1024 {
+		a.sweepThrottle(now)
+	}
 	if until, ok := a.loginThrottle.lockout[ip]; ok {
 		if now.Before(until) {
 			return false, until.Sub(now)
@@ -483,37 +534,14 @@ func (a *AuthState) loginAllowed(ip string) (bool, time.Duration) {
 			kept = append(kept, t)
 		}
 	}
-	a.loginThrottle.fails[ip] = kept
-	return len(kept) < loginFailMax, 0
-}
-
-// loginFailed records a failed attempt for ip; once the rolling window hits
-// loginFailMax the IP is locked out for loginLockout.
-func (a *AuthState) loginFailed(ip string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.ensureThrottleMaps()
-	now := time.Now()
-	// Opportunistic GC: see sweepThrottle. Bounded O(n) work, run only once
-	// the map is large enough that a spray is the likely cause.
-	if len(a.loginThrottle.fails) > 1024 {
-		a.sweepThrottle(now)
-	}
-	cutoff := now.Add(-loginFailWindow)
-	fails := a.loginThrottle.fails[ip]
-	kept := fails[:0]
-	for _, t := range fails {
-		if t.After(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	kept = append(kept, now)
 	if len(kept) >= loginFailMax {
 		a.loginThrottle.lockout[ip] = now.Add(loginLockout)
 		a.loginThrottle.fails[ip] = kept
-		return
+		return false, loginLockout
 	}
-	a.loginThrottle.fails[ip] = kept
+	// Counted NOW, before the KDF: this timestamp is the attempt itself.
+	a.loginThrottle.fails[ip] = append(kept, now)
+	return true, 0
 }
 
 // loginSuccess clears all failure accounting for ip.
@@ -527,7 +555,7 @@ func (a *AuthState) loginSuccess(ip string) {
 
 // sweepThrottle drops throttle entries that can no longer affect a decision:
 // no unexpired lockout and no failure within the rolling window. It is called
-// opportunistically from loginFailed once the maps grow past a threshold,
+// opportunistically from beginAttempt once the maps grow past a threshold,
 // bounding memory under a multi-IP spray (one failed login per source IP,
 // where no single IP ever re-triggers its own prune). Caller must hold
 // a.loginThrottle.
@@ -675,22 +703,23 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 // so its DoS surface is the per-IP throttle, not a global concurrency cap.
 //
 // Security-review note (deliberate, do NOT "fix" with an in-flight bcrypt
-// semaphore): the single-attacker vector is already closed — loginAllowed
-// rejects a locked-out IP at 429 BEFORE any bcrypt runs (7 fails/60s -> 5 min
-// lockout, plus a constant 200ms delay on every 401 capping ~5 guesses/s/IP),
-// and ClientIP keys the throttle to the TCP peer (a spoofed X-Forwarded-For
-// from an untrusted peer is ignored), so the counter cannot be rotated to
-// dodge the lockout. The only residual is a MULTI-source-IP botnet — the
-// classic per-IP-limit bypass — which is OUT of this tool's threat model
-// (single-operator LAN dashboard, not an anonymous internet endpoint; see the
-// file header). Bounding bcrypt concurrency in-app does not stop that vector,
-// and a non-blocking semaphore (select/default -> reject) would actively
-// REGRESS legitimate logins: under attack the 2 slots stay busy with the
-// attacker's requests and every real operator login hits the default branch
-// and fails at the exact moment they most need to get in to check the
-// degraded dashboard. If this ever becomes internet-facing, the right
-// hardening is a GLOBAL in-flight cap that QUEUES (blocking select with a
-// timeout) rather than fails, or a connection cap / fail2ban at the reverse
+// semaphore): the single-attacker vector is already closed — beginAttempt
+// counts the attempt inside the throttle lock BEFORE any bcrypt runs, so at
+// most loginFailMax concurrent attempts can reach the KDF (7 fails/60s -> 5
+// min lockout, plus a constant 200ms delay on every 401 capping ~5
+// guesses/s/IP), and ClientIP keys the throttle to the TCP peer (a spoofed
+// X-Forwarded-For from an untrusted peer is ignored), so the counter cannot
+// be rotated to dodge the lockout. The only residual is a MULTI-source-IP
+// botnet — the classic per-IP-limit bypass — which is OUT of this tool's
+// threat model (single-operator LAN dashboard, not an anonymous internet
+// endpoint; see the file header). Bounding bcrypt concurrency in-app does not
+// stop that vector, and a non-blocking semaphore (select/default -> reject)
+// would actively REGRESS legitimate logins: under attack the 2 slots stay
+// busy with the attacker's requests and every real operator login hits the
+// default branch and fails at the exact moment they most need to get in to
+// check the degraded dashboard. If this ever becomes internet-facing, the
+// right hardening is a GLOBAL in-flight cap that QUEUES (blocking select with
+// a timeout) rather than fails, or a connection cap / fail2ban at the reverse
 // proxy (which PULSEMON_TRUSTED_PROXIES already anticipates) — not an in-app
 // semaphore that locks the operator out.
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
@@ -712,9 +741,11 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	// Per-IP failure throttle: reject a locked-out client FAST, before any
 	// bcrypt work (the KDF is the expensive part, and a locked-out attacker
-	// shouldn't get to run it at all).
+	// shouldn't get to run it at all). beginAttempt counts the attempt in
+	// the SAME locked section that admits it — a failed attempt is NOT
+	// recorded again below, it is already counted here.
 	ip := s.auth.ClientIP(r)
-	if ok, wait := s.auth.loginAllowed(ip); !ok {
+	if ok, wait := s.auth.beginAttempt(ip); !ok {
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1
@@ -726,16 +757,16 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	tok, ok := s.auth.CreateSession(req.Username, req.Password)
 	if !ok {
-		s.auth.loginFailed(ip)
 		// Constant-time-ish delay on rejection: equalizes response time across
 		// the unknown-user / wrong-password paths (closes the timing oracle)
-		// and caps an online attacker at ~5 guesses/second per IP.
+		// and caps an online attacker at ~5 guesses/second per IP. The
+		// attempt was already counted by beginAttempt before the KDF.
 		time.Sleep(loginSlowDown)
 		respondWithError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
 	s.auth.loginSuccess(ip)
-	setAuthCookie(w, r, tok)
+	s.setAuthCookie(w, r, tok)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username)})
 }
 
@@ -747,7 +778,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(authSessionName); err == nil {
 		s.auth.DropSession(c.Value)
 	}
-	setAuthCookie(w, r, "")
+	s.setAuthCookie(w, r, "")
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false})
 }
 
@@ -772,7 +803,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// requireAuth wraps this route (see routes()).
 		users, err := s.db.ListUsers()
 		if err != nil {
-			respondWithError(w, http.StatusInternalServerError, err.Error())
+			respondInternal(w, "list users", err)
 			return
 		}
 		respondWithJSON(w, http.StatusOK, users)
@@ -787,7 +818,13 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.auth.AddUser(req.Username, req.Password); err != nil {
-			respondWithError(w, http.StatusBadRequest, err.Error())
+			// Only the duplicate-account case is a client error; any
+			// other failure (db, KDF) is a 500 with the detail logged.
+			if errors.Is(err, errUserExists) {
+				respondWithError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			respondInternal(w, "add user", err)
 			return
 		}
 		respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -853,10 +890,10 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.auth.Disable(); err != nil {
-		respondWithError(w, http.StatusInternalServerError, err.Error())
+		respondInternal(w, "disable auth", err)
 		return
 	}
-	setAuthCookie(w, r, "")
+	s.setAuthCookie(w, r, "")
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: false, Authed: false})
 }
 
@@ -864,8 +901,11 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 // A clear uses a past Expires so the browser drops the cookie outright
 // (the value alone is not enough — an empty-valued cookie with a future
 // expiry is retained by some browsers). Secure is applied on HTTPS
-// requests; on plain HTTP it is omitted so a LAN-only install keeps working.
-func setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
+// requests — including plain-HTTP requests arriving from a trusted
+// TLS-terminating reverse proxy (see cookieSecure) — so a proxied install
+// never hands the session token to a plaintext hop. On a direct plain-HTTP
+// LAN install it is omitted so the dashboard keeps working.
+func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
 	expires := time.Now().Add(authSessionTTL)
 	if value == "" {
 		expires = time.Unix(0, 0) // past: delete the cookie
@@ -876,8 +916,22 @@ func setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
 		Path:     "/",
 		Domain:   "",
 		Expires:  expires,
-		Secure:   r.TLS != nil,
+		Secure:   s.cookieSecure(r),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})
+}
+
+// cookieSecure reports whether the session cookie should carry the Secure
+// flag: always over TLS, and — for a TLS-terminating reverse proxy — when
+// the immediate TCP peer is in PULSEMON_TRUSTED_PROXIES and reports the
+// original scheme as https. The header is only trusted from a peer we've
+// explicitly whitelisted (the same rule ClientIP uses for X-Forwarded-For),
+// so a direct attacker cannot spoof it into a Secure cookie (or dodge one).
+func (s *Server) cookieSecure(r *http.Request) bool {
+	if r.TLS != nil {
+		return true
+	}
+	return s.auth.trustedPeer(peerIP(r)) &&
+		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }

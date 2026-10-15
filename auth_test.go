@@ -1085,3 +1085,67 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 		}
 	}
 }
+
+// TestFix_m6_SecureCookieBehindTrustedProxy pins the m6 fix: behind a
+// TLS-terminating reverse proxy (plain HTTP at the socket, trusted peer,
+// X-Forwarded-Proto: https) the session cookie must carry Secure — the old
+// code set Secure only when r.TLS != nil, so a proxied install handed the
+// session token to a plaintext hop. A spoofed X-Forwarded-Proto from a
+// peer that is NOT in the trusted list must not gain Secure.
+func TestFix_m6_SecureCookieBehindTrustedProxy(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	// Trust the loopback peer (the httptest client) so its
+	// X-Forwarded-Proto is honored — models a reverse-proxied install.
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	login := func(xfp string) *http.Cookie {
+		t.Helper()
+		req, _ := http.NewRequest("POST", httpSrv.URL+"/api/auth/login", strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+		req.Header.Set("Content-Type", "application/json")
+		if xfp != "" {
+			req.Header.Set("X-Forwarded-Proto", xfp)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("login: got %d, want 200", resp.StatusCode)
+		}
+		var c *http.Cookie
+		for _, cc := range resp.Cookies() {
+			if cc.Name == authSessionName {
+				c = cc
+				break
+			}
+		}
+		if c == nil {
+			t.Fatalf("no session cookie in response")
+		}
+		return c
+	}
+
+	t.Run("trusted proxy + XFP https => Secure", func(t *testing.T) {
+		if c := login("https"); !c.Secure {
+			t.Error("cookie not Secure behind a trusted proxy reporting https")
+		}
+	})
+	t.Run("trusted proxy + XFP http => not Secure", func(t *testing.T) {
+		if c := login("http"); c.Secure {
+			t.Error("cookie Secure behind a trusted proxy reporting http")
+		}
+	})
+	t.Run("no XFP header => not Secure", func(t *testing.T) {
+		if c := login(""); c.Secure {
+			t.Error("cookie Secure on plain HTTP without X-Forwarded-Proto")
+		}
+	})
+}

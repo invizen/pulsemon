@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -109,4 +110,81 @@ func TestBindServeWithRetryNormalExits(t *testing.T) {
 
 	bindServeWithRetry(false, ":9299", func() error { return nil })
 	bindServeWithRetry(true, ":9299", func() error { return http.ErrServerClosed })
+}
+
+// TestFix_m2_UnreadableTLSPairIsFatal pins the m2 fix: a TLS pair that is
+// CONFIGURED (env) but unreadable must go fatal (via certFatal) — the old
+// behavior (WARNING + serve plain HTTP) silently ran plaintext when the
+// operator believed TLS was on.
+func TestFix_m2_UnreadableTLSPairIsFatal(t *testing.T) {
+	t.Setenv("PULSEMON_CERT", "/nonexistent/cert.pem")
+	t.Setenv("PULSEMON_KEY", "/nonexistent/key.pem")
+	t.Setenv("PULSEMON_ALLOW_PLAINTEXT_FALLBACK", "")
+
+	fatals := make(chan string, 1)
+	oldCert, oldBind := certFatal, bindFatal
+	// The stubs must NOT return: the real log.Fatal exits the process, so a
+	// returning stub would let the listener's retry loop keep going and
+	// fire the REAL fatal (restored by cleanup) 500ms later. select {}
+	// mimics the non-returning semantics.
+	certFatal = func(msg string) { fatals <- msg; select {} }
+	bindFatal = func(msg string) { fatals <- msg; select {} } // must NOT be reached
+	t.Cleanup(func() { certFatal, bindFatal = oldCert, oldBind })
+
+	db, err := NewDB(filepath.Join(t.TempDir(), "m2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	startListener(newHTTPServer(http.NewServeMux()), db)
+
+	select {
+	case msg := <-fatals:
+		if !strings.Contains(msg, "/nonexistent/cert.pem") {
+			t.Fatalf("fatal %q must name the missing cert", msg)
+		}
+		if !strings.Contains(msg, "PULSEMON_ALLOW_PLAINTEXT_FALLBACK") {
+			t.Fatalf("fatal %q must mention the opt-out env", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("configured-but-unreadable TLS pair did not go fatal")
+	}
+}
+
+// TestFix_m2_PlaintextFallbackEnv pins the opt-out: with
+// PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 a configured-but-unreadable pair
+// warns and falls through to the plain-HTTP listener (no certFatal).
+// PULSEMON_ADDR points at an invalid port so the plain listener fails
+// fast via bindFatal and the test leaves no listener behind.
+func TestFix_m2_PlaintextFallbackEnv(t *testing.T) {
+	t.Setenv("PULSEMON_CERT", "/nonexistent/cert.pem")
+	t.Setenv("PULSEMON_KEY", "/nonexistent/key.pem")
+	t.Setenv("PULSEMON_ALLOW_PLAINTEXT_FALLBACK", "1")
+	t.Setenv("PULSEMON_ADDR", "127.0.0.1:99999") // invalid port: fails even as root
+
+	binds := make(chan string, 1)
+	oldCert, oldBind := certFatal, bindFatal
+	certFatal = func(msg string) { t.Errorf("unexpected certFatal: %s", msg) }
+	// select {} after the send: a returning stub would let the retry loop
+	// call bindFatal again (now the real one) and kill the test process.
+	bindFatal = func(msg string) { binds <- msg; select {} }
+	t.Cleanup(func() { certFatal, bindFatal = oldCert, oldBind })
+
+	db, err := NewDB(filepath.Join(t.TempDir(), "m2b.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	startListener(newHTTPServer(http.NewServeMux()), db)
+
+	select {
+	case msg := <-binds:
+		if !strings.Contains(msg, "Listen (127.0.0.1:99999)") {
+			t.Fatalf("bindFatal %q, want the plain-HTTP listen attempt", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 did not fall through to the plain-HTTP listener")
+	}
 }

@@ -58,9 +58,20 @@ func TestTimestampWritersAreUniform(t *testing.T) {
 	if err != nil {
 		t.Fatalf("tsNow() %q does not parse under RFC3339Nano: %v", s, err)
 	}
-	// Round-trip: formatting the parsed instant must give back an equal value.
-	if got := parsed.Format(time.RFC3339Nano); got != s {
+	// Round-trip: the writer layout is FIXED width (tsLayout), so formatting
+	// the parsed instant with it must give back the identical string - even
+	// when the nanoseconds end in zeros, where time.RFC3339Nano would trim
+	// them (the old, order-breaking behaviour this test used to encode).
+	if got := parsed.UTC().Format(tsLayout); got != s {
 		t.Errorf("tsNow() round-trip: %q -> %q, want unchanged", s, got)
+	}
+	if len(s) != len(tsLayout) {
+		t.Errorf("tsNow() = %q has width %d, want fixed %d", s, len(s), len(tsLayout))
+	}
+	// Deterministic trailing-zero instant (tsNow() only hits this ~1 run in 10).
+	zero := time.Date(2026, 10, 15, 19, 2, 38, 130000000, time.UTC)
+	if got := fmtTS(zero); got != "2026-10-15T19:02:38.130000000Z" {
+		t.Errorf("fmtTS(trailing zeros) = %q, want all 9 fractional digits kept", got)
 	}
 
 	// The re-alert parser must accept tsNow()'s output (the new writer format).

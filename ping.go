@@ -10,6 +10,7 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/net/icmp"
@@ -59,6 +60,21 @@ type PingResult struct {
 	Lost       bool
 	Error      error
 	ResolvedIP string
+	// Broken is true when the probe could not even be ATTEMPTED because the
+	// ICMP engine itself is unusable (socket closed/invalid, no transport).
+	// A per-target send failure (ENETUNREACH, EHOSTUNREACH, a netfilter EPERM)
+	// is NOT broken: it is simply a lost probe for that one sensor.
+	Broken bool
+}
+
+// isBrokenSendErr reports whether a send error means the shared ICMP socket
+// itself is unusable (as opposed to a problem reaching one particular target).
+// Only engine-level failures may degrade OTHER sensors' status; treating a
+// per-target error (a withdrawn VPN route, say) as engine-wide used to flag
+// every concurrently-probed sensor as "warning".
+func isBrokenSendErr(err error) bool {
+	return errors.Is(err, syscall.EBADF) || errors.Is(err, syscall.ENOTSOCK) ||
+		errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed)
 }
 
 // pendingPing is one in-flight probe; the reader delivers its RTT by key.
@@ -101,8 +117,9 @@ var (
 )
 
 // LastProbeError returns a human-readable description of the current
-// shared-socket send-error state, or "" if none. probeErrCount tracks send
-// failures SINCE the last successful send (reset on success, see Ping), so a
+// shared-socket send-error state, or "" if none. probeErrCount tracks
+// ENGINE-LEVEL send failures (see isBrokenSendErr) SINCE the last successful
+// send (reset on success, see Ping); per-target failures are not counted. A
 // non-empty value means ICMP sends are CURRENTLY failing (e.g. no
 // CAP_NET_RAW and no ping_group_range, or the socket is unavailable) rather
 // than any sensor being down. A single transient failure (e.g. the first
@@ -350,9 +367,21 @@ func (e *Engine) run() {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		e.readRaw()
+		for {
+			e.readRaw()
+			select { // readRaw returns on done (clean) or an unexpected error: supervise it
+			case <-e.done:
+				return
+			case <-time.After(readerRestartDelay):
+				log.Printf("pulsemon: icmp reader (raw) restarted after an unexpected stop")
+			}
+		}
 	}()
 }
+
+// readerRestartDelay is the pause before a stopped reader goroutine is
+// restarted (both transports). A var so tests can shrink it.
+var readerRestartDelay = time.Second
 
 // readRaw is the reader for the raw socket: parse IP/ICMP, filter by our
 // constant ID, dispatch by seq (source-IP verified in deliver).
@@ -444,8 +473,11 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 	}()
 
 	if err := e.send(dst, seq); err != nil {
-		probeErrCount.Add(1)
-		return PingResult{Lost: true, Error: err}
+		if isBrokenSendErr(err) {
+			probeErrCount.Add(1)
+			return PingResult{Lost: true, Error: err, Broken: true}
+		}
+		return PingResult{Lost: true, Error: err} // per-target failure: just a loss
 	}
 	// A successful send proves the socket is usable, so clear the error
 	// state: probeErrCount tracks failures SINCE the last success, not the
@@ -556,7 +588,7 @@ func pingHost(ctx context.Context, target string, timeout time.Duration) PingRes
 	e, err := SharedEngine()
 	if err != nil {
 		probeErrCount.Add(1)
-		return PingResult{Lost: true, Error: err, ResolvedIP: dst.String()}
+		return PingResult{Lost: true, Error: err, ResolvedIP: dst.String(), Broken: true}
 	}
 	res := e.Ping(ctx, dst, timeout)
 	res.ResolvedIP = dst.String()

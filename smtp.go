@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"fmt"
+	"mime"
 	"net"
 	"net/mail"
 	"net/smtp"
@@ -237,12 +240,23 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	if err != nil {
 		return fmt.Errorf("smtp DATA: %w", err)
 	}
-	msg := "From: " + from + "\r\n" +
-		"To: " + to + "\r\n" +
-		"Subject: " + subject + "\r\n" +
-		"Content-Type: text/plain; charset=utf-8\r\n" +
-		"Content-Transfer-Encoding: 8bit\r\n" +
-		"\r\n" + body + "\r\n"
+	fromAddr := from
+	if a, err := mail.ParseAddress(from); err == nil {
+		fromAddr = a.Address
+	}
+	domain := ""
+	if parts := strings.Split(fromAddr, "@"); len(parts) == 2 {
+		domain = parts[1]
+	}
+
+	msgIDBytes := make([]byte, 16)
+	if _, err := rand.Read(msgIDBytes); err != nil {
+		return fmt.Errorf("smtp: failed to generate random msg-id: %w", err)
+	}
+	msgID := hex.EncodeToString(msgIDBytes)
+
+	msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nDate: %s\r\nMessage-ID: <%s@%s>\r\nMIME-Version: 1.0\r\nSubject: %s\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n%s\r\n",
+		from, to, time.Now().Format(time.RFC1123Z), msgID, domain, mime.QEncoding.Encode("utf-8", subject), body)
 	if _, err := w.Write([]byte(msg)); err != nil {
 		return fmt.Errorf("smtp write: %w", err)
 	}

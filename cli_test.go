@@ -1,7 +1,10 @@
 package main
 
 import (
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -71,5 +74,122 @@ func TestDispatchHealthzRunsForReal(t *testing.T) {
 	db.Close()
 	if k := dispatch([]string{"pulsemon", "--healthz"}); k != dExit0 {
 		t.Fatalf("healthz on seeded store = %v, want dExit0", k)
+	}
+}
+
+// setTestStdin points os.Stdin at a pipe carrying s for the duration of the
+// test (restored after). A pipe is not a TTY, so the stdin password forms
+// read it silently — the same path a `read -s`-style caller would take.
+func setTestStdin(t *testing.T, s string) {
+	t.Helper()
+	old := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(w, s); err != nil {
+		t.Fatal(err)
+	}
+	w.Close()
+	os.Stdin = r
+	t.Cleanup(func() { os.Stdin = old })
+}
+
+// TestAuthUserAdd pins the m4 forms of `auth-user add`: the 2-arg form and
+// --password-stdin read the password from stdin; the legacy 3-arg form
+// still works; empty stdin and bad arg counts are refused. The store is a
+// real temp DB (PULSEMON_DB), and each added user is verified by
+// authenticating against it — so the stdin password actually landed.
+func TestAuthUserAdd(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authcli.db")
+	t.Setenv("PULSEMON_DB", path)
+
+	t.Run("2-arg form reads password from stdin", func(t *testing.T) {
+		setTestStdin(t, "stdin-secret-1\n")
+		if k := dispatch([]string{"pulsemon", "auth-user", "add", "alice"}); k != dExit0 {
+			t.Fatalf("add alice (stdin) = %v, want dExit0", k)
+		}
+	})
+	t.Run("--password-stdin form reads password from stdin", func(t *testing.T) {
+		setTestStdin(t, "stdin-secret-2\n")
+		if k := dispatch([]string{"pulsemon", "auth-user", "add", "bob", "--password-stdin"}); k != dExit0 {
+			t.Fatalf("add bob --password-stdin = %v, want dExit0", k)
+		}
+	})
+	t.Run("legacy 3-arg form still works", func(t *testing.T) {
+		if k := dispatch([]string{"pulsemon", "auth-user", "add", "carol", "argv-secret-3"}); k != dExit0 {
+			t.Fatalf("add carol <pass> = %v, want dExit0", k)
+		}
+	})
+	t.Run("empty stdin is refused", func(t *testing.T) {
+		setTestStdin(t, "")
+		if k := dispatch([]string{"pulsemon", "auth-user", "add", "dave"}); k != dExit1 {
+			t.Fatalf("add dave (empty stdin) = %v, want dExit1", k)
+		}
+	})
+	t.Run("missing username is a usage error", func(t *testing.T) {
+		if k := dispatch([]string{"pulsemon", "auth-user", "add"}); k != dExit2 {
+			t.Fatalf("add (no args) = %v, want dExit2", k)
+		}
+	})
+	t.Run("password plus flag is a usage error", func(t *testing.T) {
+		if k := dispatch([]string{"pulsemon", "auth-user", "add", "erin", "x", "--password-stdin"}); k != dExit2 {
+			t.Fatalf("add erin <pass> --password-stdin = %v, want dExit2", k)
+		}
+	})
+
+	// Verify the three users exist and their passwords are exactly the
+	// ones supplied (stdin forms included).
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	users, err := db.ListUsers()
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := map[string]bool{}
+	for _, u := range users {
+		names[u.Username] = true
+	}
+	for _, want := range []string{"alice", "bob", "carol"} {
+		if !names[want] {
+			t.Errorf("user %s missing after add (users: %v)", want, names)
+		}
+	}
+	if names["dave"] || names["erin"] {
+		t.Errorf("refused adds created users: %v", names)
+	}
+	a := NewAuthState(db)
+	for user, pass := range map[string]string{
+		"alice": "stdin-secret-1",
+		"bob":   "stdin-secret-2",
+		"carol": "argv-secret-3",
+	} {
+		if _, ok := a.CreateSession(user, pass); !ok {
+			t.Errorf("login %s with its added password failed — the stored password is wrong", user)
+		}
+	}
+}
+
+// TestReadPasswordLine pins the stdin reader: strips the trailing newline
+// (and CR), and rejects empty input with a clear error.
+func TestReadPasswordLine(t *testing.T) {
+	if got, err := readPasswordLine(strings.NewReader("hunter2\n")); err != nil || got != "hunter2" {
+		t.Errorf("readPasswordLine = %q, %v; want hunter2, nil", got, err)
+	}
+	if got, err := readPasswordLine(strings.NewReader("win-pass\r\n")); err != nil || got != "win-pass" {
+		t.Errorf("CRLF input = %q, %v; want win-pass, nil", got, err)
+	}
+	// No trailing newline (piped printf without \n) is still fine.
+	if got, err := readPasswordLine(strings.NewReader("no-newline")); err != nil || got != "no-newline" {
+		t.Errorf("no-newline input = %q, %v; want no-newline, nil", got, err)
+	}
+	if _, err := readPasswordLine(strings.NewReader("")); err == nil {
+		t.Error("empty stdin: expected an error")
+	}
+	if _, err := readPasswordLine(strings.NewReader("\n")); err == nil {
+		t.Error("newline-only stdin: expected an error")
 	}
 }

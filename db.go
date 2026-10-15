@@ -25,6 +25,10 @@ func NewDB(dsn string) (*DB, error) {
 	//   busy_timeout(15000) — a blocked writer waits up to 15s instead of
 	//                         failing immediately (critical under write bursts)
 	//   foreign_keys(ON)    — enforce ON DELETE CASCADE on probes/events/tags
+	//   synchronous(NORMAL) — with WAL, commits no longer fsync each time. The
+	//                         DB stays consistent across an app crash; only the
+	//                         last few commits can be lost on a power cut, which
+	//                         is acceptable for probe samples.
 	//
 	// NOTE: the '?' is load-bearing. modernc.org/sqlite treats everything after
 	// it as query params; omit it and the whole string becomes a filename and
@@ -34,9 +38,9 @@ func NewDB(dsn string) (*DB, error) {
 	// the '?' return sensors=22, busy_timeout=15000, journal_mode=wal.
 	fullDSN := dsn
 	if strings.Contains(dsn, "?") {
-		fullDSN += "&_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)"
+		fullDSN += "&_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	} else {
-		fullDSN += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)"
+		fullDSN += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	}
 
 	db, err := sql.Open("sqlite", fullDSN)
@@ -475,16 +479,19 @@ func (db *DB) GetSetting(key string) string {
 	return v
 }
 
-// tsNow is the single writer-side timestamp format for every column this app
-// writes: RFC3339Nano UTC. The two string-sorted columns (probes.ts,
-// events.ts) are already 100% RFC3339Nano in every live DB, so standardizing
-// on that (rather than integer-second RFC3339) keeps them uniform — and keeps
-// their sub-second precision. Columns that are only parsed (alert_state
-// .last_ts) or never read (settings.updated_at, sensors.created_at) now
-// match too, so a future ORDER BY on any of them is well-defined.
-func tsNow() string {
-	return time.Now().UTC().Format(time.RFC3339Nano)
-}
+// tsLayout is the single writer-side timestamp format: UTC, ALWAYS 9
+// fractional digits. Fixed width is what makes string order equal
+// chronological order (time.RFC3339Nano trims trailing zeros, so "…25.13Z"
+// sorted AFTER "…25.134Z"), which the string-compared retention purge and
+// ORDER BY ts rely on. It still parses under time.RFC3339Nano, and rows
+// written by older versions (variable width) remain readable.
+const tsLayout = "2006-01-02T15:04:05.000000000Z"
+
+// fmtTS formats t for storage in any ts column.
+func fmtTS(t time.Time) string { return t.UTC().Format(tsLayout) }
+
+// tsNow is fmtTS(now).
+func tsNow() string { return fmtTS(time.Now()) }
 
 func (db *DB) SetSetting(key, value string) error {
 	_, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)

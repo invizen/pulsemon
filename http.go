@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -104,7 +105,7 @@ const maxHTTPRedirects = 5
 // initial-target path stays open by design. This is a single-operator LAN
 // tool: the person who can create a sensor owns the whole LAN's monitoring
 // surface. See TestRedirectTargetAllowed ("LAN redirect stays allowed").
-func redirectTargetAllowed(host, origHost string) error {
+func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 	if host == "" {
 		return errors.New("redirect with empty host")
 	}
@@ -129,12 +130,14 @@ func redirectTargetAllowed(host, origHost string) error {
 	if ip := net.ParseIP(host); ip != nil {
 		return judge(ip)
 	}
-	ips, err := net.LookupIP(host)
+	// Resolve under the probe's context (g5): a slow DNS lookup must not
+	// be able to outlive the probe timeout.
+	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
 		return fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
 	}
-	for _, ip := range ips {
-		if err := judge(ip); err != nil {
+	for _, addr := range addrs {
+		if err := judge(addr.IP); err != nil {
 			return err
 		}
 	}
@@ -153,7 +156,7 @@ var httpClient = &http.Client{
 		if len(via) > 0 {
 			origHost = via[0].URL.Hostname()
 		}
-		if err := redirectTargetAllowed(req.URL.Hostname(), origHost); err != nil {
+		if err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost); err != nil {
 			return err
 		}
 		return nil
@@ -241,15 +244,25 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	}
 
 	// (b) Not system-trusted: accept only if self-signed AND its hostname +
-	// validity hold EXACTLY for this target. Verifying the leaf against
-	// itself as a root re-checks both without demanding a trusted issuing CA.
+	// validity hold EXACTLY for this target. Self-signed here means issuer ==
+	// subject AND the signature verifies with the leaf's OWN key — the check
+	// that matters (a cert with the same names signed by a different key is a
+	// forgery, not self-signed). The old gate (CheckSignatureFrom(leaf))
+	// additionally demanded CA:TRUE plus a certSign key usage, which real
+	// self-signed SERVER certs usually don't have (CA:FALSE, digSig+keyEnc) —
+	// they got a false down. Once self-signed is established, verifying the
+	// leaf against itself as a root re-checks hostname + validity without
+	// demanding a trusted issuing CA (Go accepts a self-signed leaf in the
+	// roots pool without CA/key-usage demands on it).
 	// NO www-variant fallback here (2026-10-13 review): the operator generated
 	// this cert and controls its SANs, so a homelab self-signed cert carries
 	// the probed hostname (or IP) itself — a www-variant SAN is a public-CDN
 	// pattern, not a homelab one. Hostname match is the only security control
 	// on the self-signed path (there is no CA chain), so it must stay exact;
 	// the www fallback would widen the accepted set for no realistic benefit.
-	if leaf.CheckSignatureFrom(leaf) == nil {
+	selfSigned := bytes.Equal(leaf.RawIssuer, leaf.RawSubject) &&
+		leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil
+	if selfSigned {
 		roots := x509.NewCertPool()
 		roots.AddCert(leaf)
 		optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
@@ -365,7 +378,16 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// them ourselves. This is where "allow self-signed" lives: a cert
 	// trusted by the system roots OR a genuine self-signed cert matching the
 	// target's host is accepted; anything else is a loss.
-	if vErr := verifyHTTPCert(presented, host); vErr != nil {
+	//
+	// After a redirect, resp.TLS belongs to the FINAL hop, so the cert must
+	// be verified against the FINAL request's host — not the original
+	// target (a 302 to the LAN UI with a valid self-signed cert for that
+	// host was a false down when checked against the original host).
+	verifyHost := host
+	if resp.Request != nil && resp.Request.URL != nil {
+		verifyHost = resp.Request.URL.Hostname()
+	}
+	if vErr := verifyHTTPCert(presented, verifyHost); vErr != nil {
 		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
 	}
 

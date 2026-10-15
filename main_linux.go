@@ -3,6 +3,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -15,12 +16,43 @@ func defaultDBPath() string {
 	return "/data/pulsemon.db"
 }
 
-// ensureDataDir is a no-op on Linux in the normal Docker case (the /data
-// volume already exists; MkdirAll on an existing dir returns nil). It also
-// makes a bare-metal Linux run that lacks /data fail with a clear MkdirAll
-// error rather than a cryptic SQLite open error.
+// ensureDataDir prepares the data dir and hardens its permissions. The dir
+// holds the SQLite DB (bcrypt hashes) and the settings table with plaintext
+// webhook/Telegram/SMTP secrets, so it must be owner-only: umask 0o077 for
+// everything this process creates from here on (the DB, -wal/-shm, the
+// dashboard TLS files), 0o700 for the dir itself, and an in-place upgrade
+// pass for pre-existing world-readable installs.
+//
+// It acts on the directory of the DB ACTUALLY in use (dbPathFromEnv, i.e.
+// PULSEMON_DB when set): an operator who points PULSEMON_DB elsewhere keeps
+// that dir hardened, and the platform default dir is only created/touched
+// when the default is in effect.
 func ensureDataDir() {
-	_ = os.MkdirAll(filepath.Dir(defaultDBPath()), 0o755)
+	_ = syscall.Umask(0o077)
+	dbPath := dbPathFromEnv()
+	_ = os.MkdirAll(filepath.Dir(dbPath), 0o700)
+	hardenDataDir(dbPath)
+}
+
+// hardenDataDir tightens the directory of the given DB path in place: 0700
+// on the dir, 0600 on the DB and its WAL sidecars (derived from the actual
+// path, so a non-default base name is covered too). A missing -wal/-shm is
+// normal (WAL not active); a chmod failure (e.g. the dir is owned by
+// another user) is logged, never fatal — the server must still start.
+func hardenDataDir(dbPath string) {
+	dir := filepath.Dir(dbPath)
+	if err := os.Chmod(dir, 0o700); err != nil {
+		log.Printf("data dir: chmod %s: %v (continuing)", dir, err)
+		return
+	}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			log.Printf("data dir: chmod %s: %v (continuing)", p, err)
+		}
+	}
 }
 
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.
