@@ -1360,6 +1360,7 @@ async function checkUpdate(force) {
   }
 }
 function renderUpdateUI(r) {
+  UPDATE_LATEST = r.latest || UPDATE_LATEST;
   // Header pill: show only when an update is available and not dismissed.
   const pill = $('update-pill');
   const dismissed = localStorage.getItem('pulsemon_update_dismissed') === r.latest;
@@ -1374,6 +1375,7 @@ function renderUpdateUI(r) {
     body.innerHTML =
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
       '<span class="flex items-center gap-2">' +
+        '<button id="update-btn" onclick="startUpdate()" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' +
         '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
         (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
           : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + escJs(r.latest) + '\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
@@ -1383,6 +1385,96 @@ function renderUpdateUI(r) {
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · up to date</span>' +
       '<span class="text-ok"><i class="ph ph-check-circle"></i> latest</span>';
   }
+}
+
+// ---------- Update (one-click on native installs, copy-command on Docker) ----------
+// Last release tag reported by /api/update-check; the update button targets it.
+let UPDATE_LATEST = null;
+
+async function startUpdate() {
+  const target = UPDATE_LATEST;
+  if (!target) { setMsg('no update target known — re-check for updates first', 'bad'); return; }
+  const btn = $('update-btn');
+  if (btn) { btn.disabled = true; btn.classList.add('opacity-50'); }
+  if (!confirm('Update pulsemon to ' + target + ' now?\nThe dashboard will be briefly unavailable while the service restarts.')) {
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+    return;
+  }
+  try {
+    const res = await api('/api/update', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    if (res.status === 'restarting') {
+      await waitForUpdateRestart(target); // ends in location.reload() on success
+    } else if (res.status === 'installed') {
+      setMsg(res.hint || 'New binary installed — restart the pulsemon service to pick it up.', 'ok');
+      checkUpdate(true);
+    } else if (res.status === 'container') {
+      renderContainerUpdate(res);
+    } else if (res.status === 'up-to-date') {
+      checkUpdate(true);
+    }
+  } catch (e) {
+    setMsg('update failed: ' + (e.message || e), 'bad');
+    if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
+  }
+}
+
+// Full-screen status shown while the service restarts (or when the wait times
+// out). kind: 'work' (spinner) | 'error'.
+function updateOverlay(kind, title, sub) {
+  let ov = $('update-overlay');
+  if (!ov) {
+    ov = document.createElement('div');
+    ov.id = 'update-overlay';
+    ov.className = 'fixed inset-0 z-[100] flex items-center justify-center bg-black/70 backdrop-blur-sm';
+    document.body.appendChild(ov);
+  }
+  const color = kind === 'error' ? 'text-bad' : 'text-warn';
+  const icon = kind === 'error' ? 'ph-bold ph-warning-circle' : 'ph ph-spinner animate-spin';
+  ov.innerHTML =
+    '<div class="flex flex-col items-center gap-3 text-center px-6">' +
+      '<i class="' + icon + ' text-4xl ' + color + '"></i>' +
+      '<div class="text-[15px] font-semibold text-slate-100">' + esc(title) + '</div>' +
+      (sub ? '<div class="text-[12px] font-mono text-slate-400 max-w-[460px] leading-relaxed">' + sub + '</div>' : '') +
+    '</div>';
+}
+function hideUpdateOverlay() { const ov = $('update-overlay'); if (ov) ov.remove(); }
+
+// The restart 202 is fire-and-forget: the server process dies when systemd
+// restarts it, so the only confirmation is healthz answering with the new
+// version. Poll it for up to 60s, then reload.
+async function waitForUpdateRestart(target) {
+  updateOverlay('work', 'Updating to ' + target + '…', 'the service is restarting — this usually takes a few seconds');
+  const deadline = Date.now() + 60000;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 2000));
+    let hz = null;
+    try { const r = await fetch('/api/healthz'); if (r.ok) hz = await r.json(); } catch (e) { /* still down */ }
+    if (hz && hz.version === target) {
+      hideUpdateOverlay();
+      location.reload();
+      return;
+    }
+    if (Date.now() > deadline) {
+      updateOverlay('error', 'Timed out waiting for ' + target,
+        'The new binary is installed, but healthz has not confirmed it yet. On the host: <b>journalctl --user -u pulsemon</b> (system-wide: <b>journalctl -u pulsemon</b>). If it failed to start, restore the previous binary and restart the service.');
+      return;
+    }
+  }
+}
+
+// Docker install: the app cannot update itself (no docker socket by design).
+// Show the operator command (default generic, PULSEMON_UPDATE_CMD override
+// server-side) with a copy button in place of the version row.
+function renderContainerUpdate(res) {
+  const body = $('ver-body');
+  if (!body) return;
+  const cmd = res.command || 'docker compose up -d --build';
+  body.innerHTML =
+    '<span class="text-warn"><i class="ph-bold ph-info"></i> Docker install — the app cannot update itself</span>' +
+    '<span class="flex items-center gap-2">' +
+      '<code class="text-[11px] bg-surface-800 border border-surface-700 rounded px-2 py-0.5">' + esc(cmd) + '</code>' +
+      '<button onclick="navigator.clipboard.writeText(\'' + escJs(cmd) + '\').then(() => setMsg(\'command copied\', \'ok\')).catch(() => setMsg(\'copy failed\', \'bad\'))" class="text-slate-400 hover:text-white">copy</button>' +
+    '</span>';
 }
 
 $('f-tls-cert-file').addEventListener('change', async e => {

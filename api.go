@@ -244,6 +244,7 @@ func (s *Server) authGate() http.Handler {
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/update-check", s.handleUpdateCheck)
+	s.mux.HandleFunc("POST /api/update", s.handleUpdate)
 	s.mux.HandleFunc("/api/sensors", s.handleSensors)
 	s.mux.HandleFunc("/api/sensors/{id}", s.handleSensorByID)
 	s.mux.HandleFunc("POST /api/sensors/{id}/ping", s.handleSensorPing)

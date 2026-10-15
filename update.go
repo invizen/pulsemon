@@ -185,21 +185,10 @@ func runUpdate(args []string) int {
 		}
 	}
 
-	exe, err := os.Executable()
+	exe, err := runningExecutable()
 	if err != nil {
 		uErr("cannot locate running binary: " + err.Error())
 		return 1
-	}
-	// Best-effort symlink resolution (on Linux os.Executable already returns
-	// the resolved path via /proc/self/exe, so this mostly matters on other
-	// platforms). Never ignore the error: a failed resolution that empties
-	// exe would make installBinary's filepath.Dir(dst) fall back to the CWD
-	// and swap the binary into the working directory instead of the install
-	// location.
-	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-		exe = resolved
-	} else {
-		uWarn("could not evaluate symlink for " + exe + ": " + err.Error())
 	}
 	uInfo("binary:  " + exe)
 	uInfo("version: " + Version)
@@ -218,7 +207,7 @@ func runUpdate(args []string) int {
 		uErr("release has no " + targetAsset() + " asset")
 		return 1
 	}
-	assetURL, sha := sel.assetURL, sel.sha
+	assetURL := sel.assetURL
 
 	// Version ordering matters for BOTH "latest" and explicit pins: a check
 	// against an older pin must not claim "new version available" (exit 2),
@@ -249,41 +238,14 @@ func runUpdate(args []string) int {
 	}
 	defer os.Remove(tmp)
 
-	// Mandatory verification (security): the update must never install an
-	// unverified binary. Primary source is the GitHub-computed asset digest
-	// from the release API; if that is absent (pre-2025 uploads) we fall
-	// back to the published sidecar asset (targetAsset()+".sha256", resolved
-	// by name in selectAssets — never by string-munging the binary URL,
-	// which 404'd when the URL was the API endpoint ".../assets/N"). If
-	// NEITHER exists we refuse the update — an unverifiable binary is worse
-	// than no update (guards against DNS poisoning, MITM, or a compromised
-	// release pipeline).
-	verifySHA := strings.TrimPrefix(sha, "sha256:")
-	if verifySHA == "" {
-		if sel.sidecarURL == "" {
-			uErr("refusing to update: no trusted SHA-256 sidecar asset found in " + rel.TagName)
-			return 1
-		}
-		sidecar, err := fetchChecksumSidecar(client, sel.sidecarURL)
-		if err != nil {
-			uErr("refusing to update: no trusted SHA-256 available for " + rel.TagName)
-			uErr("  (sidecar fetch failed: " + err.Error() + ")")
-			return 1
-		}
-		verifySHA = sidecar
-		uInfo("sha256 source: release sidecar asset (API digest unavailable)")
-	}
-	got, err := fileSHA256(tmp)
+	// Mandatory verification (security) — see verifyDownloadedAsset: the
+	// update must never install an unverified binary.
+	digest, err := verifyDownloadedAsset(client, sel, tmp)
 	if err != nil {
-		uErr("verify: " + err.Error())
+		uErr("refusing to update: " + err.Error())
 		return 1
 	}
-	if got != verifySHA {
-		uErr("SHA-256 MISMATCH — expected " + verifySHA + ", got " + got)
-		uErr("refusing to install.")
-		return 1
-	}
-	uInfo("sha256:  " + got + " ✓")
+	uInfo("sha256:  " + digest + " ✓")
 
 	if err := installBinary(tmp, exe); err != nil {
 		uErr("install: " + err.Error())
@@ -600,6 +562,57 @@ func installBinary(src, dst string) error {
 		}
 	}
 	return nil
+}
+
+// runningExecutable locates the running binary (os.Executable) and resolves
+// symlinks best-effort: on Linux os.Executable already returns the resolved
+// path via /proc/self/exe, so this mostly matters on other platforms. A
+// failed resolution keeps the unresolved path — the update must still work
+// (and os.Executable never returns an empty string, so installBinary's
+// filepath.Dir(dst) can't silently fall back to the CWD). Var so tests can
+// stub it: a unit test must never let the install path touch the real test
+// binary (/tmp/go-build.../pulsemon.test).
+var runningExecutable = func() (string, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
+		exe = resolved
+	}
+	return exe, nil
+}
+
+// verifyDownloadedAsset enforces the mandatory SHA-256 check on a downloaded
+// release asset. Primary source is the GitHub-computed asset digest from the
+// release API; when that is absent (pre-2025 uploads) it falls back to the
+// published sidecar asset (targetAsset()+".sha256", resolved by name in
+// selectAssets — never by string-munging the binary URL, which 404'd when
+// the URL was the API endpoint ".../assets/N"). When NEITHER exists it
+// refuses — an unverifiable binary is worse than no update (guards against
+// DNS poisoning, MITM, or a compromised release pipeline). Returns the
+// verified digest. Shared by the CLI (runUpdate) and the dashboard endpoint
+// (handleUpdate) so the verification contract lives in one place.
+func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string) (string, error) {
+	verifySHA := strings.TrimPrefix(sel.sha, "sha256:")
+	if verifySHA == "" {
+		if sel.sidecarURL == "" {
+			return "", fmt.Errorf("no trusted SHA-256 sidecar asset found in release")
+		}
+		sidecar, err := fetchChecksumSidecar(client, sel.sidecarURL)
+		if err != nil {
+			return "", fmt.Errorf("no trusted SHA-256 available (sidecar fetch failed: %v)", err)
+		}
+		verifySHA = sidecar
+	}
+	got, err := fileSHA256(tmp)
+	if err != nil {
+		return "", fmt.Errorf("verify: %v", err)
+	}
+	if got != verifySHA {
+		return "", fmt.Errorf("SHA-256 MISMATCH — expected %s, got %s", verifySHA, got)
+	}
+	return got, nil
 }
 
 // detectRestart and performRestart are vars (not plain funcs) so tests can

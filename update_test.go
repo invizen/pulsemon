@@ -75,6 +75,18 @@ func serveRelease(t *testing.T, tag, digest string) (string, string) {
 	return srv.URL + "/releases", realHex
 }
 
+// serveReleaseVerified is serveRelease with the advertised digest set to the
+// payload's REAL sha256, so verification passes and the install path is
+// exercised. Returns the releases base URL and the real digest.
+func serveReleaseVerified(t *testing.T, tag string) (string, string) {
+	t.Helper()
+	bin := []byte("fake pulsemon binary payload\n")
+	real := sha256.Sum256(bin)
+	realHex := hex.EncodeToString(real[:])
+	base, _ := serveRelease(t, tag, "sha256:"+realHex)
+	return base, realHex
+}
+
 // TestRunUpdateCheckOnlyNoLeak pins the check-only contract: `pulsemon update
 // check` reports a newer release with exit code 2 WITHOUT downloading or
 // installing anything, so no temp file may be left behind.
