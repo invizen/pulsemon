@@ -128,15 +128,29 @@ type ghRelease struct {
 
 // targetAsset is the release asset name for the platform this binary runs
 // on — "pulsemon-<GOOS>-<GOARCH>" (e.g. pulsemon-linux-amd64, pulsemon-linux-arm64
-// on a Pi 4/5 or RK3588). It honors $GOARCH so a host can deliberately fetch
-// a different architecture's release asset. The sidecar checksum asset is
-// targetAsset() + ".sha256" (see the fallback below).
+// on a Pi 4/5 or RK3588); Windows assets carry the .exe extension (the
+// release workflow uploads pulsemon-windows-amd64.exe), so the name is
+// platform-shaped, not a bare os/arch join. It honors $GOARCH so a host can
+// deliberately fetch a different architecture's release asset. The sidecar
+// checksum asset is targetAsset() + ".sha256" (see the fallback below).
 func targetAsset() string {
 	goarch := os.Getenv("GOARCH")
 	if goarch == "" {
 		goarch = runtime.GOARCH
 	}
-	return fmt.Sprintf("pulsemon-%s-%s", runtime.GOOS, goarch)
+	return targetAssetName(runtime.GOOS, goarch)
+}
+
+// targetAssetName is the pure (testable) form of targetAsset: the release
+// asset name for a given platform (2026-10-19: the bare os/arch join made
+// the first real Windows self-update on zendev fail — the asset is
+// pulsemon-windows-amd64.exe, not pulsemon-windows-amd64).
+func targetAssetName(goos, goarch string) string {
+	name := fmt.Sprintf("pulsemon-%s-%s", goos, goarch)
+	if goos == "windows" {
+		name += ".exe"
+	}
+	return name
 }
 
 // runUpdate implements `pulsemon update`. Works from any directory: it

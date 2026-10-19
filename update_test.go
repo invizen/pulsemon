@@ -477,12 +477,27 @@ func TestRunUpdateNewerPinCheck(t *testing.T) {
 // different architecture's asset.
 func TestTargetAssetFollowsRuntime(t *testing.T) {
 	t.Setenv("GOARCH", "")
-	if got, want := targetAsset(), "pulsemon-"+runtime.GOOS+"-"+runtime.GOARCH; got != want {
+	if got, want := targetAsset(), targetAssetName(runtime.GOOS, runtime.GOARCH); got != want {
 		t.Fatalf("targetAsset() = %q, want %q", got, want)
 	}
 	t.Setenv("GOARCH", "arm64")
-	if got, want := targetAsset(), "pulsemon-"+runtime.GOOS+"-arm64"; got != want {
+	if got, want := targetAsset(), targetAssetName(runtime.GOOS, "arm64"); got != want {
 		t.Fatalf("targetAsset() with GOARCH=arm64 = %q, want %q", got, want)
+	}
+}
+
+// TestTargetAssetNameWindowsExe pins the 2026-10-19 fix: Windows release
+// assets carry the .exe extension (the workflow uploads
+// pulsemon-windows-amd64.exe + .exe.sha256), so the updater must request
+// that exact name. The old bare os/arch join made the first real Windows
+// self-update (zendev) fail with "release has no pulsemon-windows-amd64
+// asset" even though the asset was on the release.
+func TestTargetAssetNameWindowsExe(t *testing.T) {
+	if got := targetAssetName("windows", "amd64"); got != "pulsemon-windows-amd64.exe" {
+		t.Errorf("windows/amd64 = %q, want pulsemon-windows-amd64.exe", got)
+	}
+	if got := targetAssetName("linux", "arm64"); got != "pulsemon-linux-arm64" {
+		t.Errorf("linux/arm64 = %q, want pulsemon-linux-arm64", got)
 	}
 }
 
