@@ -402,7 +402,9 @@ func (e *Engine) readRaw() {
 		}
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
-			if err != net.ErrClosed {
+			// errors.Is, not ==: ReadFrom wraps it in a *net.OpError, so the
+			// bare sentinel compare never matched (2026-10-19 review m4).
+			if !errors.Is(err, net.ErrClosed) {
 				log.Printf("pulsemon: icmp reader (raw): read: %v (reader stopping)", err)
 			}
 			return

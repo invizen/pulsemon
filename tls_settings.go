@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
@@ -151,6 +152,13 @@ func pubKeyEquals(priv, certPub any) bool {
 	case *ecdsa.PublicKey:
 		b, ok := certPub.(*ecdsa.PublicKey)
 		return ok && a.Equal(b)
+	case ed25519.PublicKey:
+		// x509 yields ed25519.PublicKey by value (2026-10-19 review m3).
+		b, ok := certPub.(ed25519.PublicKey)
+		return ok && a.Equal(b)
+	case *ed25519.PublicKey:
+		b, ok := certPub.(ed25519.PublicKey)
+		return ok && a.Equal(b)
 	default:
 		return false
 	}
@@ -189,6 +197,13 @@ func pubKeyFromAny(key interface{}) interface{} {
 		return &k.PublicKey
 	case *ecdsa.PrivateKey:
 		return &k.PublicKey
+	// PKCS8 Ed25519 keys parse to ed25519.PrivateKey; the default case
+	// passed the PRIVATE key through, so pubKeyEquals never matched and a
+	// valid Ed25519 pair was rejected (2026-10-19 review m3).
+	case ed25519.PrivateKey:
+		return k.Public()
+	case *ed25519.PrivateKey:
+		return k.Public()
 	default:
 		return key
 	}

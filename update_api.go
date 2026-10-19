@@ -78,10 +78,8 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	// NOTE: handleUpdate deliberately has no "auth must be enabled" gate. A
 	// review (M4c) proposed refusing the swap+restart on auth-off installs;
-	// the owner decided (2026-10-15) to leave it open: updates usually carry
-	// fixes/hardening, and installs that run unauthenticated do so behind
-	// compensating security. SHA-256 verification of the downloaded binary
-	// is the only gate — do not re-add the auth gate without an owner call.
+	// the owner decided to defer that (docs/DEFERRED.md), so on an auth-off
+	// dashboard anyone who can reach the port can trigger an update.
 	if !updateMu.TryLock() {
 		respondWithError(w, http.StatusConflict, "an update is already in progress")
 		return

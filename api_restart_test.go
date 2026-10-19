@@ -116,11 +116,13 @@ func TestPatchDownAfterRespawns(t *testing.T) {
 	patchSensorRespawned(t, `{"down_after": 10}`, true)
 }
 
-// TestPatchNameNoRespawn pins the boundary: a pure metadata PATCH must NOT
-// respawn the loop (no config the running probe reads changed) — avoids
-// needless probe-loop churn on cosmetic edits.
-func TestPatchNameNoRespawn(t *testing.T) {
-	patchSensorRespawned(t, `{"name": "renamed"}`, false)
+// TestPatchNameRespawns pins that a name PATCH respawns the loop (2026-10-19
+// review M1). The old "no respawn for cosmetic edits" contract was the bug:
+// name and tags are not cosmetic — the alert path reads c.name (alert text)
+// and c.tags (alertGates routing) from the spawn-time config copy, so they
+// must respawn or alerts keep the stale values until process restart.
+func TestPatchNameRespawns(t *testing.T) {
+	patchSensorRespawned(t, `{"name": "renamed"}`, true)
 }
 
 // TestPatchSpikeMultNoRespawn pins the display-only contract: spike_mult

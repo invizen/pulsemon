@@ -135,6 +135,7 @@ Environment=PULSEMON_DB=$PREFIX/data/pulsemon.db
 Environment=PULSEMON_ADDR=$PULSEMON_ADDR
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target

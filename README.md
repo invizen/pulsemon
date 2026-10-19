@@ -134,6 +134,30 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | Per sensor | Interval, timeout, loss %, error-after, tags |
 | CLI | `pulsemon auth-user add <user> <pass>` — create a dashboard account (the FIRST account is what turns authentication on). `pulsemon auth-user remove <user>` — delete an account (the last one is refused; use the dashboard's "Disable Authentication" for that). `pulsemon auth-user list` — list accounts. Auth is opt-in; with no accounts the dashboard is open, as before. |
 
+### Behind a reverse proxy
+
+When pulsemon sits behind Caddy, Traefik, nginx, or similar:
+
+- **`PULSEMON_TRUSTED_PROXIES`** — comma-separated CIDRs (or bare IPs) of the
+  **immediate proxy peer**, e.g. `127.0.0.1` or `172.18.0.0/16` for a proxy
+  container on a Docker network. **Required behind a proxy** so login
+  throttling keys on the real client: pulsemon then reads `X-Forwarded-For`
+  right to left and uses the rightmost address that is not itself a trusted
+  proxy (entries further left are client-supplied and ignored). If it is
+  **unset** behind a proxy, every client shares the proxy's IP — and its
+  throttle budget — so **7 bad logins from anyone lock everyone out for 5
+  minutes**. Throttling is per /24 (IPv4) or /64 (IPv6).
+- **`PULSEMON_ALLOWED_HOSTS`** — optional setup-mode hardening. A
+  comma-separated list of `host` or `host:port` names the dashboard is reached
+  by (case-insensitive; an entry without a port matches any port). When set,
+  creating the **first** account (fresh install, no users yet) is refused with
+  `421` unless the request's `Host` header is listed — which closes the
+  DNS-rebinding route by which a malicious web page could claim the first
+  account through a LAN browser. Unset = any Host (the LAN-trust default).
+  Has no effect once an account exists.
+- The proxy must preserve the original `Host` header (Caddy and Traefik do by
+  default) — the cross-origin check compares it with the browser's `Origin`.
+
 ### Alert behavior
 
 Statuses are `up`, `warning`, and `error`. A sensor's status is derived from

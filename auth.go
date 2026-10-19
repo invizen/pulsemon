@@ -269,6 +269,11 @@ func (a *AuthState) refreshEnabledNow() {
 var (
 	errUsernameInvalid = fmt.Errorf("username must start with a letter and contain only letters, digits, . _ - (max %d)", maxUsernameLen)
 	errPasswordWeak    = fmt.Errorf("password must be at least %d characters", minPasswordLen)
+	// errPasswordTooLong: bcrypt rejects inputs over 72 bytes
+	// (ErrPasswordTooLong) — pre-check it so create maps to a 400 instead of
+	// a 500 and change-password returns our text, not the library's
+	// (2026-10-19 review m2).
+	errPasswordTooLong = fmt.Errorf("password exceeds 72 bytes")
 	// errUserExists is the ONLY db error AddUser maps to a user-facing
 	// message; every other db failure propagates as a raw error so the
 	// handler can 500 it (respondInternal) instead of misreporting it as
@@ -290,6 +295,9 @@ func (a *AuthState) AddUser(username, password string) error {
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
 	}
+	if len(password) > 72 { // bcrypt input limit (2026-10-19 review m2)
+		return errPasswordTooLong
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return err
@@ -297,8 +305,9 @@ func (a *AuthState) AddUser(username, password string) error {
 	if err := a.db.AddUser(username, string(hash)); err != nil {
 		// Only a UNIQUE-constraint violation means the account exists —
 		// any other db failure must surface as a 500, not be misreported
-		// as "user already exists".
-		if strings.Contains(err.Error(), "UNIQUE") {
+		// as "user already exists". Match the exact constraint text, not a
+		// bare "UNIQUE" substring (2026-10-19 review m7).
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
 			return errUserExists
 		}
 		return err
@@ -326,7 +335,9 @@ func (a *AuthState) Bootstrapped() bool {
 }
 
 // RemoveUser deletes an account and every live session it owns. The last
-// remaining user is protected — use Disable (auth-off) for that.
+// remaining user is protected — use Disable (auth-off) for that. The count
+// below is only a fast path; the authoritative guard is the atomic
+// conditional DELETE in db.RemoveUser (2026-10-19 review M4).
 func (a *AuthState) RemoveUser(username string) error {
 	username = strings.ToLower(username)
 	n, err := a.db.UserCount()
@@ -352,6 +363,9 @@ func (a *AuthState) SetUserPassword(username, password, keepSession string) erro
 	username = strings.ToLower(username)
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
+	}
+	if len(password) > 72 { // bcrypt input limit (2026-10-19 review m2)
+		return errPasswordTooLong
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
@@ -445,8 +459,13 @@ func peerIP(r *http.Request) string {
 // counter and brute-force past loginFailMax.
 //
 // When PULSEMON_TRUSTED_PROXIES lists the CIDR(s) of the immediate TCP peer
-// (a reverse proxy in front of pulsemon), the first X-Forwarded-For entry is
-// used instead — attributing attempts to the real client, not the proxy.
+// (a reverse proxy in front of pulsemon), X-Forwarded-For is walked RIGHT to
+// LEFT and the first entry that parses and is NOT itself a trusted proxy is
+// used — attributing attempts to the real client, not the proxy. Rightmost-
+// untrusted, not leftmost: proxies APPEND, so everything left of the hop our
+// proxy added is client-supplied and rotatable per request (2026-10-19
+// review M3a). If every entry is trusted (nested trusted proxies only), the
+// leftmost parseable entry is used.
 // Trusting the header is gated on the PEER being in a trusted CIDR, so the
 // header is only ever read from a connection we know is our proxy; a direct
 // attacker (peer not in the list) gets the peer address and their rotation
@@ -458,8 +477,20 @@ func (a *AuthState) ClientIP(r *http.Request) string {
 	peer := peerIP(r)
 	if a.trustedPeer(peer) {
 		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
-			if ip := net.ParseIP(strings.TrimSpace(strings.Split(xf, ",")[0])); ip != nil {
-				return ip.String()
+			parts := strings.Split(xf, ",")
+			var leftmost net.IP
+			for i := len(parts) - 1; i >= 0; i-- {
+				ip := net.ParseIP(strings.TrimSpace(parts[i]))
+				if ip == nil {
+					continue
+				}
+				if !a.trustedIP(ip) {
+					return ip.String()
+				}
+				leftmost = ip
+			}
+			if leftmost != nil {
+				return leftmost.String()
 			}
 		}
 	}
@@ -469,19 +500,35 @@ func (a *AuthState) ClientIP(r *http.Request) string {
 // trustedPeer reports whether the IP string (host, no port) is inside any of
 // the trusted-proxy CIDRs. An unparseable IP is never trusted.
 func (a *AuthState) trustedPeer(ip string) bool {
-	if len(a.trustedProxies) == 0 {
-		return false
-	}
 	p := net.ParseIP(ip)
 	if p == nil {
 		return false
 	}
+	return a.trustedIP(p)
+}
+
+// trustedIP reports whether p is inside any of the trusted-proxy CIDRs.
+func (a *AuthState) trustedIP(p net.IP) bool {
 	for _, n := range a.trustedProxies {
 		if n.Contains(p) {
 			return true
 		}
 	}
 	return false
+}
+
+// throttleKey maps a client IP to its login-throttle bucket (2026-10-19
+// review M3b): IPv4 → the /24 ("a.b.c.0"), IPv6 → the /64. An unparseable
+// string is returned as-is.
+func throttleKey(ip string) string {
+	p := net.ParseIP(ip)
+	if p == nil {
+		return ip
+	}
+	if v4 := p.To4(); v4 != nil {
+		return fmt.Sprintf("%d.%d.%d.0", v4[0], v4[1], v4[2])
+	}
+	return p.Mask(net.CIDRMask(64, 128)).String()
 }
 
 // ensureThrottleMaps lazily initializes the throttle maps (cheap, idempotent).
@@ -744,8 +791,13 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// shouldn't get to run it at all). beginAttempt counts the attempt in
 	// the SAME locked section that admits it — a failed attempt is NOT
 	// recorded again below, it is already counted here.
+	// The throttle is keyed on the client's /24 (IPv4) or /64 (IPv6), not
+	// the full address: one IPv6 host owns a whole /64, so per-address
+	// keying handed it 2^64 separate 7-attempt budgets (2026-10-19 review
+	// M3b). ip stays the full address for log lines.
 	ip := s.auth.ClientIP(r)
-	if ok, wait := s.auth.beginAttempt(ip); !ok {
+	key := throttleKey(ip)
+	if ok, wait := s.auth.beginAttempt(key); !ok {
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1
@@ -765,7 +817,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
-	s.auth.loginSuccess(ip)
+	s.auth.loginSuccess(key)
 	s.setAuthCookie(w, r, tok)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username)})
 }
@@ -818,9 +870,12 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.auth.AddUser(req.Username, req.Password); err != nil {
-			// Only the duplicate-account case is a client error; any
-			// other failure (db, KDF) is a 500 with the detail logged.
-			if errors.Is(err, errUserExists) {
+			// Only the duplicate-account and validation cases are client
+			// errors; any other failure (db, KDF) is a 500 with the detail
+			// logged. Validation sentinels (incl. the 72-byte bcrypt limit)
+			// are 400, not 500 (2026-10-19 review m2).
+			if errors.Is(err, errUserExists) || errors.Is(err, errUsernameInvalid) ||
+				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
 				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}

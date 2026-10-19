@@ -152,8 +152,12 @@ func validateWebhookURL(raw string) error {
 	// Resolve ONCE and reuse the answers for both the private-check (http
 	// relaxation) and the blocklist pass — the old code resolved twice
 	// (httpAllowsPrivate + LookupIP), doubling DNS and letting the two
-	// answers disagree across a round-robin/rebind boundary.
-	ips, err := net.LookupIP(host)
+	// answers disagree across a round-robin/rebind boundary. Bounded at 5s:
+	// a bare net.LookupIP has no deadline and a hung resolver stalled the
+	// caller indefinitely (2026-10-19 review m9).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		if u.Scheme == "http" {
 			// Match the old failure shape: an http host whose privacy
@@ -264,7 +268,11 @@ func validateSMTPHost(host string) error {
 	if !validSMTPHostname(host) {
 		return fmt.Errorf("smtp host %q is not a valid hostname", host)
 	}
-	ips, err := net.DefaultResolver.LookupIP(context.Background(), "ip", host)
+	// 5s deadline — context.Background() alone never times out (2026-10-19
+	// review m9).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve smtp host %q: %v", host, err)
 	}

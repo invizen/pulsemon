@@ -2,6 +2,7 @@ package main
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -479,6 +480,23 @@ func (db *DB) GetSetting(key string) string {
 	return v
 }
 
+// GetSettingErr is GetSetting that surfaces real DB errors: an absent key is
+// ("", nil), any other failure ("", err). GetSetting's 83 call sites keep
+// their swallow-to-"" contract; this exists for paths where "unset" and
+// "read failed" must not look the same — alert delivery (2026-10-19 review
+// m5).
+func (db *DB) GetSettingErr(key string) (string, error) {
+	var v string
+	err := db.QueryRow("SELECT value FROM settings WHERE setting_key = ?", key).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return v, nil
+}
+
 // tsLayout is the single writer-side timestamp format: UTC, ALWAYS 9
 // fractional digits. Fixed width is what makes string order equal
 // chronological order (time.RFC3339Nano trims trailing zeros, so "…25.13Z"
@@ -495,6 +513,15 @@ func tsNow() string { return fmtTS(time.Now()) }
 
 func (db *DB) SetSetting(key, value string) error {
 	_, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		key, value, tsNow())
+	return err
+}
+
+// setSettingInTx is SetSetting through a caller's transaction (2026-10-19
+// review m8 — lets handleSettingsPut apply a multi-key save atomically).
+func setSettingInTx(tx *sql.Tx, key, value string) error {
+	_, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, value, tsNow())
 	return err
@@ -541,10 +568,28 @@ func (db *DB) SetUserPassword(username, passwordHash string) error {
 	return nil
 }
 
-// RemoveUser deletes one account.
+// RemoveUser deletes one account, refusing to delete the last one. The
+// count guard lives INSIDE the DELETE so check-and-delete is one atomic
+// statement: the old COUNT-then-DELETE let two concurrent removals both pass
+// the count and delete the last two users, silently turning auth off
+// (2026-10-19 review M4). 0 rows affected = the last user, or no such user —
+// the latter stays the pre-existing silent no-op.
 func (db *DB) RemoveUser(username string) error {
-	_, err := db.Exec("DELETE FROM users WHERE username = ?", username)
-	return err
+	res, err := db.Exec("DELETE FROM users WHERE username = ? AND (SELECT COUNT(*) FROM users) > 1", username)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var exists int
+		if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", username).Scan(&exists); err != nil {
+			return err
+		}
+		if exists == 0 {
+			return nil
+		}
+		return fmt.Errorf("cannot remove the last user — disable authentication instead")
+	}
+	return nil
 }
 
 // RemoveAllUsers clears every account (the "disable authentication" path).

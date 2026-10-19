@@ -291,13 +291,50 @@ func TestProbeHTTPSelfSignedExpiredRejected(t *testing.T) {
 	}
 }
 
-// TestProbeHTTPTLSKeepAlive: three HTTPS probes to the same host must reuse
-// one TCP+TLS connection. The server counts the DISTINCT client addresses
-// it sees: a reused connection keeps the same source port (1 distinct),
-// while a fresh connection per probe uses a new ephemeral port (3 distinct).
-// This pins the bounded body-drain — without it, net/http discards the
-// connection after an unread body and every probe re-handshakes.
-func TestProbeHTTPTLSKeepAlive(t *testing.T) {
+// probeConnCount runs three probes against srv and returns how many
+// DISTINCT client connections the server saw (by source address: a reused
+// connection keeps its source port, a fresh one gets a new ephemeral port).
+func probeConnCount(t *testing.T, url string, seen map[string]bool, mu *sync.Mutex) int {
+	t.Helper()
+	for i := 0; i < 3; i++ {
+		r := probeHTTP(context.Background(), url, 5*time.Second)
+		if r.Lost {
+			t.Fatalf("probe %d lost: %v", i, r.Err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	return len(seen)
+}
+
+// TestProbeHTTPKeepAlive: three plain-HTTP probes to the same host must reuse
+// one TCP connection. This pins the bounded body-drain — without it,
+// net/http discards the connection after an unread body and every probe
+// reconnects. (HTTPS deliberately does NOT reuse — see
+// TestProbeHTTPTLSFreshHandshake.)
+func TestProbeHTTPKeepAlive(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.RemoteAddr] = true
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+	if n := probeConnCount(t, srv.URL, seen, &mu); n != 1 {
+		t.Fatalf("server saw %d distinct client connections over 3 same-host probes, want 1 (keep-alive reuse)", n)
+	}
+}
+
+// TestProbeHTTPTLSFreshHandshake: every HTTPS probe must use a FRESH
+// connection (2026-10-19 review M5). A reused keep-alive conn reports the
+// cert from its original handshake, so a server cert renewal stayed
+// invisible in the displayed expiry for up to IdleConnTimeout (10 min).
+// This replaces the old TestProbeHTTPTLSKeepAlive, which pinned the reuse.
+func TestProbeHTTPTLSFreshHandshake(t *testing.T) {
 	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
 
 	var mu sync.Mutex
@@ -312,19 +349,8 @@ func TestProbeHTTPTLSKeepAlive(t *testing.T) {
 	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	srv.StartTLS()
 	defer srv.Close()
-
-	for i := 0; i < 3; i++ {
-		r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
-		if r.Lost {
-			t.Fatalf("probe %d lost: %v", i, r.Err)
-		}
-	}
-	time.Sleep(100 * time.Millisecond)
-	mu.Lock()
-	n := len(seen)
-	mu.Unlock()
-	if n != 1 {
-		t.Fatalf("server saw %d distinct client connections over 3 same-host probes, want 1 (keep-alive reuse)", n)
+	if n := probeConnCount(t, srv.URL, seen, &mu); n != 3 {
+		t.Fatalf("server saw %d distinct client connections over 3 HTTPS probes, want 3 (fresh handshake per probe)", n)
 	}
 }
 

@@ -462,6 +462,12 @@ func TestFix_M10a_StatusStaysConsistentWhenUpdateFails(t *testing.T) {
 	if st != "error" {
 		t.Fatalf("after the DB recovered the transition was not retried: status=%q", st)
 	}
+	// Drain the alert goroutines BEFORE the DB closes (t.Cleanup): the
+	// up->warning->error transitions above launched alert deliveries, and an
+	// in-flight delivery holds a pool connection open past db.Close(), which
+	// leaves the SQLite -wal/-shm files behind and fails the TempDir cleanup
+	// (same shutdown order as main: StopAlerts -> DrainAlerts -> db.Close).
+	pw.DrainAlerts(5 * time.Second)
 }
 
 func TestFix_M10a_StatsForDoesNotCopyAndMatches(t *testing.T) {

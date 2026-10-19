@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -137,17 +138,61 @@ type Server struct {
 	probeWorker *ProbeWorker
 	mux         *http.ServeMux
 	auth        *AuthState
+	// allowedHosts is the parsed PULSEMON_ALLOWED_HOSTS list (lower-cased
+	// host or host:port entries). Empty = no Host check (LAN-trust default).
+	// Enforced only on the setup-mode bootstrap POST — see authGate.
+	allowedHosts []string
 }
 
 func NewServer(db *DB, pw *ProbeWorker) *Server {
 	s := &Server{
-		db:          db,
-		probeWorker: pw,
-		mux:         http.NewServeMux(),
-		auth:        NewAuthState(db),
+		db:           db,
+		probeWorker:  pw,
+		mux:          http.NewServeMux(),
+		auth:         NewAuthState(db),
+		allowedHosts: parseAllowedHosts(os.Getenv("PULSEMON_ALLOWED_HOSTS")),
 	}
 	s.routes()
 	return s
+}
+
+// parseAllowedHosts splits PULSEMON_ALLOWED_HOSTS (comma-separated host or
+// host:port entries) into a lower-cased list, dropping blanks
+// (2026-10-19 review M2).
+func parseAllowedHosts(v string) []string {
+	var out []string
+	for _, h := range strings.Split(v, ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// hostAllowed reports whether r.Host matches the allowlist (2026-10-19 review
+// M2). An entry with a port must equal r.Host exactly; an entry without a
+// port matches r.Host or r.Host's host portion (port stripped). Matching is
+// case-insensitive. r.Host is client-controlled, so this is the only Host
+// check that a DNS-rebinding page can't satisfy — the Origin==Host CSRF gate
+// compares two values the attacker's page both controls.
+func (s *Server) hostAllowed(host string) bool {
+	host = strings.ToLower(host)
+	bare := host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		bare = h
+	}
+	for _, a := range s.allowedHosts {
+		if _, _, err := net.SplitHostPort(a); err == nil {
+			if a == host {
+				return true
+			}
+			continue
+		}
+		if a == host || a == bare || "["+a+"]" == bare {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) Mux() *http.ServeMux {
@@ -231,7 +276,17 @@ func (s *Server) authGate() http.Handler {
 			// a rogue host that wins leaves the operator to create an account
 			// via `pulsemon auth-user add` (CLI). Closing that fully would
 			// need a setup token or loopback-only bootstrap, both worse UX
-			// than the risk justifies on a trusted homelab LAN.
+			// than the risk justifies on a trusted homelab LAN. DNS
+			// rebinding also passes the Origin==Host gate above (both are
+			// attacker-controlled), so a remote page could win the bootstrap;
+			// operators who set PULSEMON_ALLOWED_HOSTS close that hole — the
+			// bootstrap POST is then refused unless r.Host is allowlisted
+			// (2026-10-19 review M2). Unset = the LAN-trust default above.
+			if r.Method == http.MethodPost && r.URL.Path == "/api/auth/users" &&
+				len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
+				respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
+				return
+			}
 			if r.URL.Path == "/api/auth/status" ||
 				(r.Method == http.MethodPost && r.URL.Path == "/api/auth/users") ||
 				!strings.HasPrefix(r.URL.Path, "/api/") {
@@ -492,7 +547,9 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
 			id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
 		if err != nil {
-			if strings.Contains(err.Error(), "UNIQUE") {
+			// Exact constraint text, not a bare "UNIQUE" substring
+			// (2026-10-19 review m7).
+			if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
 				return
 			}
@@ -797,8 +854,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			res, err := tx.Exec("UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
 			if err != nil {
 				// A rename hitting the UNIQUE name constraint is a 409,
-				// exactly like POST — not a 500 with raw SQL text.
-				if strings.Contains(err.Error(), "UNIQUE") {
+				// exactly like POST — not a 500 with raw SQL text. Exact
+				// constraint text (2026-10-19 review m7).
+				if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 					respondWithError(w, http.StatusConflict, "sensor name already exists")
 					return
 				}
@@ -830,9 +888,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// picks up the new values: target/interval/timeout are read by the
 		// loop itself, type by probeTarget, and loss_warn/down_after by
 		// deriveStatus — all from the spawn-time config copy, none are
-		// hot-reloaded.
+		// hot-reloaded. name and tags respawn too (2026-10-19 review M1): the
+		// alert path reads c.name (alert text) and c.tags (alertGates routing)
+		// from the same spawn-time copy, so a name/tags PATCH without a respawn
+		// left stale alert behavior until process restart.
 		if req.Target != nil || req.Type != nil || req.IntervalS != nil || req.TimeoutMS != nil ||
-			req.LossWarn != nil || req.DownAfter != nil {
+			req.LossWarn != nil || req.DownAfter != nil || req.Name != nil || req.Tags != nil {
 			s.probeWorker.Restart(id)
 		}
 
@@ -1153,7 +1214,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 			created = true
 			break
 		}
-		if !strings.Contains(err.Error(), "UNIQUE") {
+		// Only a name collision is retryable — exact constraint text
+		// (2026-10-19 review m7).
+		if !strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 			respondInternal(w, "clone sensor "+id, err)
 			return
 		}
@@ -1485,38 +1548,53 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// All valid: apply. Provider writes first (the dashboard saves them
 	// alongside the routing fields), then ONLY the routing fields that were
 	// sent — nil means keep, so a partial save no longer resets routing.
+	// The whole apply phase is ONE transaction: validation can't rule out a
+	// mid-sequence write failure (disk full, SQLITE_BUSY), and the old
+	// autocommit writes left a partial save behind a 500 (2026-10-19 review
+	// m8). Maintenance mode below stays outside — it has its own atomic
+	// snapshot transaction (SetMaintenanceMode).
+	tx, err := s.db.Begin()
+	if err != nil {
+		respondInternal(w, "begin settings update", err)
+		return
+	}
+	defer tx.Rollback() // no-op after Commit
 	for _, prov := range req.Providers {
-		if err := s.applyProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
-			// Unreachable after the validation pass above (nothing reads
-			// the DB in between); keep a 500 for the impossible case.
+		if err := applyProviderUpdateInTx(tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
+			// Validation errors are unreachable after the pass above
+			// (nothing reads the DB in between); a 500 covers write failures.
 			respondInternal(w, "apply provider "+prov.Kind, err)
 			return
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := s.applyProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
+		if err := applyProviderUpdateInTx(tx, "google_chat", req.WebhookURL, nil, nil); err != nil {
 			respondInternal(w, "apply provider google_chat", err)
 			return
 		}
 	}
 	if req.RealertMin != nil {
-		if err := s.db.SetSetting("realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
+		if err := setSettingInTx(tx, "realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
 			respondInternal(w, "save setting realert_min", err)
 			return
 		}
 	}
 	if req.AlertScope != nil {
-		if err := s.db.SetSetting("alert_scope", *req.AlertScope); err != nil {
+		if err := setSettingInTx(tx, "alert_scope", *req.AlertScope); err != nil {
 			respondInternal(w, "save setting alert_scope", err)
 			return
 		}
 	}
 	if req.AlertFilter != nil {
 		filterJSON, _ := json.Marshal(*req.AlertFilter)
-		if err := s.db.SetSetting("alert_filter", string(filterJSON)); err != nil {
+		if err := setSettingInTx(tx, "alert_filter", string(filterJSON)); err != nil {
 			respondInternal(w, "save setting alert_filter", err)
 			return
 		}
+	}
+	if err := tx.Commit(); err != nil {
+		respondInternal(w, "commit settings update", err)
+		return
 	}
 	if req.MaintMode != nil {
 		if *req.MaintMode {
@@ -1681,6 +1759,21 @@ func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[s
 // This is the single write path for provider config, so the validation and
 // key-naming stay consistent no matter how many providers exist.
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := applyProviderUpdateInTx(tx, kind, url, enabled, extra); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
+// caller's transaction so handleSettingsPut can apply every provider and
+// routing field atomically (2026-10-19 review m8; mirrors setSensorTagsInTx).
+func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra map[string]string) error {
 	if err := validateProviderUpdate(kind, url, enabled, extra); err != nil {
 		return err
 	}
@@ -1689,11 +1782,11 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 		if kind == "smtp" {
 			// Persist the host under smtp_host (not smtp_url) so the SMTP
 			// transport reads it from the right key.
-			if err := s.db.SetSetting("smtp_host", u); err != nil {
+			if err := setSettingInTx(tx, "smtp_host", u); err != nil {
 				return fmt.Errorf("failed to save smtp host: %s", err.Error())
 			}
 		} else {
-			if err := s.db.SetSetting(kind+"_url", u); err != nil {
+			if err := setSettingInTx(tx, kind+"_url", u); err != nil {
 				return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
 			}
 		}
@@ -1703,7 +1796,7 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 		if *enabled {
 			val = "1"
 		}
-		if err := s.db.SetSetting(kind+"_enabled", val); err != nil {
+		if err := setSettingInTx(tx, kind+"_enabled", val); err != nil {
 			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
 		}
 	}
@@ -1724,7 +1817,7 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 				vv = addr
 			}
 		}
-		if err := s.db.SetSetting(kind+"_"+k, vv); err != nil {
+		if err := setSettingInTx(tx, kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
 		}
 	}

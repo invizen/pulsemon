@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
@@ -109,5 +110,51 @@ func TestParsePort(t *testing.T) {
 		if !tc.err && (err != nil || got != tc.want) {
 			t.Errorf("parsePort(%q) = %d, %v; want %d", tc.in, got, err, tc.want)
 		}
+	}
+}
+
+// TestTLSValidatePairEd25519 is the 2026-10-19 review m3 regression: a valid
+// Ed25519 cert+key (PKCS8 "PRIVATE KEY") must be accepted. pubKeyFromAny
+// used to pass the ed25519.PrivateKey through unchanged, so pubKeyEquals
+// never matched and the pair was rejected as mismatched. A different
+// Ed25519 key must still be refused.
+func TestTLSValidatePairEd25519(t *testing.T) {
+	gen := func() (ed25519.PublicKey, string) {
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return pub, string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	}
+	pub, keyPEM := gen()
+	_, otherKeyPEM := gen()
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "pulsemon.lan"},
+		DNSNames:     []string{"pulsemon.lan"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+	}
+	// Self-signed needs the private key; re-derive it from the PEM.
+	blk, _ := pem.Decode([]byte(keyPEM))
+	priv, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, pub, priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+
+	if _, err := tlsValidatePair(certPEM, keyPEM); err != nil {
+		t.Fatalf("valid Ed25519 pair rejected: %v", err)
+	}
+	if _, err := tlsValidatePair(certPEM, otherKeyPEM); err == nil {
+		t.Fatal("mismatched Ed25519 key accepted, want error")
 	}
 }

@@ -151,3 +151,62 @@ func TestMigrateAuthBootstrappedLegacyInstallEndToEnd(t *testing.T) {
 		t.Errorf("legacy install sensor list after migration: %d, want 200 (fully open)", r.StatusCode)
 	}
 }
+
+// setupBootstrapPost POSTs the first-account bootstrap through the auth gate
+// with Host and Origin both set to host — the shape a DNS-rebinding page
+// produces (Origin==Host passes the CSRF gate) — and returns the status.
+func setupBootstrapPost(t *testing.T, srv *Server, host string) int {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/users",
+		strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Host = host
+	req.Header.Set("Origin", "http://"+host)
+	rr := httptest.NewRecorder()
+	srv.authGate().ServeHTTP(rr, req)
+	return rr.Code
+}
+
+// TestSetupModeAllowedHostsRejectsRebind: with PULSEMON_ALLOWED_HOSTS set, a
+// bootstrap POST whose Host is not allowlisted (a rebinding page, where
+// Origin==Host==rebind.example) is 421 and no account is created
+// (2026-10-19 review M2).
+func TestSetupModeAllowedHostsRejectsRebind(t *testing.T) {
+	t.Setenv("PULSEMON_ALLOWED_HOSTS", "pulsemon.lan, 10.99.99.5:9299")
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	if c := setupBootstrapPost(t, srv, "rebind.example:9299"); c != http.StatusMisdirectedRequest {
+		t.Fatalf("rebind bootstrap: %d, want 421", c)
+	}
+	if n, err := db.UserCount(); err != nil || n != 0 {
+		t.Fatalf("user count after rejected bootstrap = %d (err %v), want 0", n, err)
+	}
+	// Port-qualified entry must match the port exactly.
+	if c := setupBootstrapPost(t, srv, "10.99.99.5:8080"); c != http.StatusMisdirectedRequest {
+		t.Fatalf("wrong-port bootstrap: %d, want 421", c)
+	}
+}
+
+// TestSetupModeAllowedHostsAccepts: an allowlisted Host (case-insensitive;
+// a port-less entry matches any port) bootstraps normally.
+func TestSetupModeAllowedHostsAccepts(t *testing.T) {
+	t.Setenv("PULSEMON_ALLOWED_HOSTS", "pulsemon.lan, 10.99.99.5:9299")
+	for _, host := range []string{"PulseMon.LAN:9299", "10.99.99.5:9299"} {
+		db := newTestDB(t)
+		srv := NewServer(db, NewProbeWorker(db))
+		if c := setupBootstrapPost(t, srv, host); c != http.StatusOK {
+			t.Fatalf("allowlisted bootstrap (Host %s): %d, want 200", host, c)
+		}
+	}
+}
+
+// TestSetupModeAllowedHostsUnset: no allowlist = the documented LAN-trust
+// default — any Host bootstraps.
+func TestSetupModeAllowedHostsUnset(t *testing.T) {
+	t.Setenv("PULSEMON_ALLOWED_HOSTS", "")
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	if c := setupBootstrapPost(t, srv, "rebind.example:9299"); c != http.StatusOK {
+		t.Fatalf("bootstrap with no allowlist: %d, want 200", c)
+	}
+}

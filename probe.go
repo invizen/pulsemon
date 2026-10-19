@@ -212,7 +212,6 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	retention := time.NewTicker(1 * time.Hour)
 	defer retention.Stop()
 
-	pw.syncSensors(ctx) // immediate first pass
 	// Warm the shared ICMP socket now so a socket-level failure is visible
 	// in healthz immediately instead of after the first probe tick.
 	if _, err := getSharedConn(); err != nil {
@@ -220,8 +219,12 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	}
 	// Populate the stats cache from the DB so the first dashboard poll after a
 	// restart serves populated cards (RTT, sparkline, 24h uptime) instead of
-	// blanking them for up to an interval while probes re-accumulate.
+	// blanking them for up to an interval while probes re-accumulate. It MUST
+	// run before syncSensors spawns the loops: warmStats replaces each
+	// sensor's cached series wholesale, so running it after probing started
+	// wiped any probe recorded during the warm window (2026-10-19 review m6).
 	pw.warmStats()
+	pw.syncSensors(ctx) // immediate first pass
 	for {
 		select {
 		case <-ctx.Done():
@@ -302,6 +305,10 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			ps.isPaused = c.state == "paused" // keep pause in sync with DB
 		}
 		if _, ok := pw.loops[c.id]; !ok {
+			// Known TOCTOU (2026-10-19 review M1b, fix deferred): configs was read
+			// from the DB above, before pw.mu — a PATCH+Restart landing in that gap
+			// re-spawns here with the pre-read cfg, and the next sync won't
+			// re-spawn (loop exists). Fix: re-read this sensor's cfg under the lock.
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
 			cfg := c.sensorConfig
@@ -392,6 +399,12 @@ func (pw *ProbeWorker) Remove(id string) {
 	}
 	delete(pw.sensors, id)
 	delete(pw.lastPulse, id)
+	// Drop the cached stats series too, or a deleted sensor's 24h history
+	// stays pinned in memory for the process lifetime (2026-10-19 review
+	// m1). Lock order: pw.mu (held) then pw.statsMu — see ResetStatsFor.
+	pw.statsMu.Lock()
+	delete(pw.statsCache, id)
+	pw.statsMu.Unlock()
 }
 
 // ActiveCount is the number of sensor loops currently tracked (healthz).
@@ -415,7 +428,8 @@ func (pw *ProbeWorker) ActiveCount() int {
 // warmStats loads every active sensor's 24h probe history into the cache so a
 // fresh process (deploy/restart) serves populated cards immediately instead of
 // blanking them until each sensor re-accumulates a window. Runs once, before
-// probing starts.
+// probing starts (Run calls it before the first syncSensors — 2026-10-19
+// review m6).
 func (pw *ProbeWorker) warmStats() {
 	ids, err := pw.db.Query("SELECT id FROM sensors WHERE state = 'active'")
 	if err != nil {
@@ -577,8 +591,8 @@ func (pw *ProbeWorker) GetStats(id string) *SensorStats {
 // lastHTTPStatus (the card shows "up" with an "HTTP 503" badge) and its
 // fastRetry cadence until the next probe tick overwrites them. isPaused is
 // deliberately untouched — pause is operator state, not history.
-// Lock order: pw.mu (ProbeState) then pw.statsMu (cache); no other path
-// takes the two locks, so the order can't invert.
+// Lock order: pw.mu (ProbeState) then pw.statsMu (cache); the only other
+// path taking both (Remove) uses the same order, so it can't invert.
 func (pw *ProbeWorker) ResetStatsFor(id string) {
 	pw.mu.Lock()
 	if ps, ok := pw.sensors[id]; ok {
@@ -1732,28 +1746,44 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 // is nothing to retry); false only when every configured provider failed after
 // its retries, so the caller can schedule another attempt.
 func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
-	var wg sync.WaitGroup
-	var delivered atomic.Bool
-	attempted := 0
+	// Resolve every provider URL BEFORE delivering anything. GetSetting
+	// maps a DB error to "" — indistinguishable from "not configured" — so
+	// a transient read failure made every provider look unset and the alert
+	// was reported delivered (attempted == 0) and silently dropped. A real
+	// DB error now fails the send (2026-10-19 review m5); resolving up front
+	// means no provider has fired yet when we bail.
+	type dest struct {
+		p   providerMeta
+		url string
+	}
+	var dests []dest
 	for _, p := range pw.activeProviders() {
-		url := pw.db.GetSetting(p.Kind + "_url")
+		url, err := pw.db.GetSettingErr(p.Kind + "_url")
+		if err != nil {
+			log.Printf("alert: settings read failed, alert not delivered: %v", err)
+			return false
+		}
 		if url == "" && p.EnvFallback != "" {
 			url = os.Getenv(p.EnvFallback)
 		}
 		if url == "" {
 			continue
 		}
-		attempted++
+		dests = append(dests, dest{p, url})
+	}
+	var wg sync.WaitGroup
+	var delivered atomic.Bool
+	for _, d := range dests {
 		wg.Add(1)
 		go func(p providerMeta, url string) {
 			defer wg.Done()
 			if pw.deliverOne(p, url, name, target, oldState, state, rttMs, reAlert) {
 				delivered.Store(true)
 			}
-		}(p, url)
+		}(d.p, d.url)
 	}
 	wg.Wait()
-	return attempted == 0 || delivered.Load()
+	return len(dests) == 0 || delivered.Load()
 }
 
 // deliverOne sends one alert to one provider and reports success.
@@ -1791,10 +1821,11 @@ func (pw *ProbeWorker) deliverOne(p providerMeta, url, name, target, oldState, s
 			subject = smtpSubject(state, state) + " (re-alert)"
 			body = smtpBodyRe(state, name, target, rttMs)
 		}
-		err := pw.retryAlert(func() (bool, error) {
+		err := pw.retryAlert(func() (bool, time.Duration, error) {
 			err := pw.sendSMTP(pw.stopCtx, subject, body)
 			// "smtp: no host/sender/recipient configured" cannot succeed on retry.
-			return err != nil && !strings.HasPrefix(err.Error(), "smtp: no "), err
+			// SMTP has no Retry-After: 0 keeps the fixed alertRetryDelays.
+			return err != nil && !strings.HasPrefix(err.Error(), "smtp: no "), 0, err
 		})
 		if err != nil {
 			log.Printf("smtp alert to %s: %v", url, err)
@@ -2014,16 +2045,31 @@ func redactErr(err error) error {
 	return err
 }
 
+// maxAlertRetryAfter caps a provider's Retry-After so one hostile or buggy
+// header can't park a delivery goroutine (and DrainAlerts) for hours.
+const maxAlertRetryAfter = 60 * time.Second
+
 // retryAlert runs try until it succeeds, reports a non-retryable failure, or
 // the delays are exhausted. It stops sleeping the moment shutdown begins.
-func (pw *ProbeWorker) retryAlert(try func() (retryable bool, err error)) error {
+// try may return a server-requested retryAfter (a 429's Retry-After): the
+// pause is then max(alertRetryDelays[i], retryAfter) — a rate-limited
+// provider was otherwise re-hit on our fixed 2s/10s schedule regardless of
+// what it asked for (2026-10-19 review M8).
+func (pw *ProbeWorker) retryAlert(try func() (retryable bool, retryAfter time.Duration, err error)) error {
 	for i := 0; ; i++ {
-		retryable, err := try()
+		retryable, retryAfter, err := try()
 		if err == nil || !retryable || i >= len(alertRetryDelays) {
 			return err
 		}
+		delay := alertRetryDelays[i]
+		if retryAfter > maxAlertRetryAfter {
+			retryAfter = maxAlertRetryAfter
+		}
+		if retryAfter > delay {
+			delay = retryAfter
+		}
 		select {
-		case <-time.After(alertRetryDelays[i]):
+		case <-time.After(delay):
 		case <-pw.stopCtx.Done():
 			return err
 		}
@@ -2038,31 +2084,60 @@ func (pw *ProbeWorker) retryAlert(try func() (retryable bool, err error)) error 
 // error never contains the URL (it carries the provider credential).
 func (pw *ProbeWorker) postJSON(url string, payload map[string]string) error {
 	body, _ := json.Marshal(payload)
-	err := pw.retryAlert(func() (bool, error) {
+	err := pw.retryAlert(func() (bool, time.Duration, error) {
 		req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
 		if err != nil {
-			return false, redactErr(err)
+			return false, 0, redactErr(err)
 		}
 		req.Header.Set("Content-Type", "application/json")
 		resp, err := webhookClient.Do(req)
 		if err != nil {
-			return pw.stopCtx.Err() == nil, redactErr(err)
+			return pw.stopCtx.Err() == nil, 0, redactErr(err)
 		}
 		defer resp.Body.Close()
 		switch code := resp.StatusCode; {
 		case code >= 300 && code < 400:
-			return false, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")
-		case code == http.StatusTooManyRequests || code >= 500:
-			return true, fmt.Errorf("endpoint returned %d", code)
+			return false, 0, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")
+		case code == http.StatusTooManyRequests:
+			// Honor the provider's Retry-After (2026-10-19 review M8).
+			return true, parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), fmt.Errorf("endpoint returned %d", code)
+		case code >= 500:
+			return true, 0, fmt.Errorf("endpoint returned %d", code)
 		case code >= 300:
-			return false, fmt.Errorf("endpoint returned %d", code)
+			return false, 0, fmt.Errorf("endpoint returned %d", code)
 		}
-		return false, nil
+		return false, 0, nil
 	})
 	if err != nil {
 		log.Printf("webhook: send failed: %v", err)
 	}
 	return err
+}
+
+// parseRetryAfter parses a Retry-After header value — integer seconds or an
+// HTTP-date (relative to now) — into a duration. Unparseable, empty, or
+// past values yield 0 (fall back to the fixed schedule). retryAlert applies
+// the maxAlertRetryAfter cap (2026-10-19 review M8).
+func parseRetryAfter(v string, now time.Time) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if secs, err := strconv.Atoi(v); err == nil {
+		if secs < 0 {
+			return 0
+		}
+		if secs > int(maxAlertRetryAfter/time.Second) {
+			return maxAlertRetryAfter
+		}
+		return time.Duration(secs) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		if d := t.Sub(now); d > 0 {
+			return d
+		}
+	}
+	return 0
 }
 
 // newID generates a unique sensor id.

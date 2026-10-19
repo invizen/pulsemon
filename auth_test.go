@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -872,9 +874,10 @@ func TestRejectedLoginIsSlowed(t *testing.T) {
 // TestClientIP pins the IP-extraction rules the throttle keys on:
 //   - default: the direct TCP peer; X-Forwarded-For from an untrusted peer is
 //     IGNORED (so it cannot be rotated to dodge the lockout).
-//   - trusted peer (in PULSEMON_TRUSTED_PROXIES): the first X-Forwarded-For
-//     entry wins, attributing the attempt to the real client.
-//   - malformed XFF always falls back to the peer.
+//   - trusted peer (in PULSEMON_TRUSTED_PROXIES): the rightmost XFF entry
+//     that is not itself a trusted proxy wins (2026-10-19 review M3a —
+//     entries left of it are client-supplied and rotatable).
+//   - unparseable XFF entries are skipped; if none parse, the peer is used.
 func TestClientIP(t *testing.T) {
 	newReq := func(remote, xff string) *http.Request {
 		r := httptest.NewRequest("POST", "/api/auth/login", nil)
@@ -897,17 +900,22 @@ func TestClientIP(t *testing.T) {
 	if got := def.ClientIP(newReq("10.0.0.5:1234", "203.0.113.7, 10.0.0.1")); got != "10.0.0.5" {
 		t.Errorf("untrusted-peer XFF = %q, want peer 10.0.0.5 (XFF must be ignored)", got)
 	}
-	// Trusted peer: first XFF entry is used.
-	if got := proxied.ClientIP(newReq("127.0.0.1:999", "203.0.113.7, 10.0.0.1")); got != "203.0.113.7" {
-		t.Errorf("trusted-peer XFF = %q, want 203.0.113.7", got)
+	// Trusted peer: the rightmost untrusted XFF entry is used — 10.0.0.1 is
+	// the hop our proxy appended; 203.0.113.7 is client-supplied.
+	if got := proxied.ClientIP(newReq("127.0.0.1:999", "203.0.113.7, 10.0.0.1")); got != "10.0.0.1" {
+		t.Errorf("trusted-peer XFF = %q, want 10.0.0.1 (rightmost untrusted)", got)
 	}
 	// Trusted peer but no XFF: falls back to the peer.
 	if got := proxied.ClientIP(newReq("127.0.0.1:999", "")); got != "127.0.0.1" {
 		t.Errorf("trusted peer, no XFF = %q, want 127.0.0.1", got)
 	}
-	// Malformed XFF (even from a trusted peer): fall back to the peer.
-	if got := proxied.ClientIP(newReq("127.0.0.1:999", "garbage, 10.0.0.1")); got != "127.0.0.1" {
-		t.Errorf("malformed trusted XFF = %q, want peer 127.0.0.1", got)
+	// Malformed XFF entries are skipped (even from a trusted peer).
+	if got := proxied.ClientIP(newReq("127.0.0.1:999", "10.0.0.1, garbage")); got != "10.0.0.1" {
+		t.Errorf("malformed trusted XFF = %q, want 10.0.0.1", got)
+	}
+	// Entirely unparseable XFF: fall back to the peer.
+	if got := proxied.ClientIP(newReq("127.0.0.1:999", "garbage, nonsense")); got != "127.0.0.1" {
+		t.Errorf("unparseable trusted XFF = %q, want peer 127.0.0.1", got)
 	}
 	// Bare-IP trust entry (no /32) still matches.
 	bare := NewAuthState(nil)
@@ -1148,4 +1156,147 @@ func TestFix_m6_SecureCookieBehindTrustedProxy(t *testing.T) {
 			t.Error("cookie Secure on plain HTTP without X-Forwarded-Proto")
 		}
 	})
+}
+
+// TestClientIPRightmostUntrusted pins the 2026-10-19 review M3a fix: behind
+// a trusted proxy, the client controls everything LEFT of the hop the proxy
+// appended, so rotating the leftmost XFF entry must not change the throttle
+// key. Nested trusted proxies are skipped right-to-left; if every entry is
+// trusted, the leftmost is used.
+func TestClientIPRightmostUntrusted(t *testing.T) {
+	a := NewAuthState(nil)
+	a.trustedProxies = parseTrustedProxies("127.0.0.0/8, 10.99.99.0/24")
+	req := func(xff string) *http.Request {
+		r := httptest.NewRequest("POST", "/api/auth/login", nil)
+		r.RemoteAddr = "127.0.0.1:443"
+		r.Header.Set("X-Forwarded-For", xff)
+		return r
+	}
+	saw := map[string]bool{}
+	for i := 0; i < 20; i++ {
+		saw[a.ClientIP(req(fmt.Sprintf("1.1.1.%d, 203.0.113.7", i)))] = true
+	}
+	if len(saw) != 1 || !saw["203.0.113.7"] {
+		t.Fatalf("rotating leftmost XFF produced keys %v; want only 203.0.113.7", saw)
+	}
+	// Nested trusted hop (10.99.99.2) on the right is skipped.
+	if got := a.ClientIP(req("1.1.1.1, 203.0.113.7, 10.99.99.2")); got != "203.0.113.7" {
+		t.Errorf("nested trusted hop: got %q, want 203.0.113.7", got)
+	}
+	// Every entry trusted: leftmost wins.
+	if got := a.ClientIP(req("10.99.99.3, 10.99.99.2")); got != "10.99.99.3" {
+		t.Errorf("all-trusted XFF: got %q, want leftmost 10.99.99.3", got)
+	}
+}
+
+// TestThrottleKey pins the 2026-10-19 review M3b bucketing: IPv4 shares a
+// /24 budget, IPv6 a /64, unparseable strings pass through.
+func TestThrottleKey(t *testing.T) {
+	cases := map[string]string{
+		"10.99.99.7":           "10.99.99.0",
+		"10.99.99.250":         "10.99.99.0",
+		"::ffff:10.99.99.7":    "10.99.99.0",
+		"2001:db8:1:2:3:4:5:6": "2001:db8:1:2::",
+		"2001:db8:1:2:ffff::9": "2001:db8:1:2::",
+		"2001:db8:1:3::1":      "2001:db8:1:3::",
+		"not-an-ip":            "not-an-ip",
+	}
+	for in, want := range cases {
+		if got := throttleKey(in); got != want {
+			t.Errorf("throttleKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// TestLoginThrottleIPv6Slash64 drives the real server: failures spread
+// across addresses in ONE /64 share a single budget, so the lockout trips
+// for the whole /64 (2026-10-19 review M3b).
+func TestLoginThrottleIPv6Slash64(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < loginFailMax; i++ {
+		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, fmt.Sprintf("2001:db8:1:2::%x", i+1))
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("attempt %d: got %d, want 401", i, resp.StatusCode)
+		}
+	}
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "2001:db8:1:2::ffff")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("fresh address in locked /64: got %d, want 429", resp.StatusCode)
+	}
+	// A different /64 is unaffected.
+	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "2001:db8:1:3::1")
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("other /64: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestRemoveUserConcurrentNeverZero is the 2026-10-19 review M4 regression:
+// two concurrent RemoveUser calls on the last two accounts must never both
+// succeed (the old COUNT-then-DELETE did, leaving zero users = auth off).
+func TestRemoveUserConcurrentNeverZero(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	for round := 0; round < 100; round++ {
+		if err := db.RemoveAllUsers(); err != nil {
+			t.Fatal(err)
+		}
+		// Bypass bcrypt (cost is irrelevant here) — insert rows directly.
+		for _, u := range []string{"alice", "bob"} {
+			if err := db.AddUser(u, "x"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var wg sync.WaitGroup
+		for _, u := range []string{"alice", "bob"} {
+			wg.Add(1)
+			go func(u string) {
+				defer wg.Done()
+				_ = a.RemoveUser(u)
+			}(u)
+		}
+		wg.Wait()
+		if n, err := db.UserCount(); err != nil || n == 0 {
+			t.Fatalf("round %d: user count = %d (err %v), want >= 1", round, n, err)
+		}
+	}
+	// Direct DB call on the last user is refused too.
+	if n, _ := db.UserCount(); n == 1 {
+		users, _ := db.ListUsers()
+		if err := db.RemoveUser(users[0].Username); err == nil {
+			t.Fatal("db.RemoveUser of the last user succeeded, want error")
+		}
+	}
+}
+
+// TestPasswordOver72Bytes pins the 2026-10-19 review m2 fix: a >72-byte
+// password is a 400 with our message on create (was a 500) and a clean
+// errPasswordTooLong on change (was raw bcrypt text).
+func TestPasswordOver72Bytes(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	long := strings.Repeat("a", 73)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/users",
+		strings.NewReader(`{"username":"admin","password":"`+long+`"}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	srv.authGate().ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "exceeds 72 bytes") {
+		t.Fatalf("create with 73-byte password: %d %s, want 400 'exceeds 72 bytes'", rr.Code, rr.Body.String())
+	}
+	if err := srv.auth.AddUser("admin", strings.Repeat("a", 72)); err != nil {
+		t.Fatalf("72-byte password must be accepted: %v", err)
+	}
+	if err := srv.auth.SetUserPassword("admin", long, ""); !errors.Is(err, errPasswordTooLong) {
+		t.Fatalf("SetUserPassword 73 bytes: err %v, want errPasswordTooLong", err)
+	}
 }

@@ -1,92 +1,71 @@
-# v0.3.17 — security, reliability and scalability hardening
+# v0.3.18 — review hardening batch
 
-A code-review release. It fixes three critical, eleven major and a set of minor
-issues found in an end-to-end review, plus the toolchain/CVE bump. Probing,
-status derivation and the dashboard layout are otherwise unchanged.
+Fixes the confirmed findings from the v0.3.17 code review (8 major, 10 minor;
+see the review workspace for the full finding/verification records). All fixes
+ship with regression tests; the full `-race` suite is the release gate.
 
 ## Security
 
-- **Webhook secrets are no longer exposed.** `GET /api/settings` shows only
-  `scheme://host/***` for provider URLs (the Telegram bot token used to be shown
-  in full). Errors from failed webhook deliveries no longer carry the URL either.
-- **Login throttle can no longer be bypassed by concurrent requests.** Attempts
-  are counted before the password hash is checked; 60 parallel guesses used to
-  get ~59 evaluations, now at most 7 per IP per minute, then a lockout.
-- **Dashboard auth fails closed.** A transient database error no longer turns
-  authentication off for a couple of seconds.
-- **Data directory and database are owner-only** (0700 / 0600), including when
-  `PULSEMON_DB` points somewhere other than `/data`; the TLS directory too.
-- **Self-signed certificate handling is correct.** Common OpenSSL certificates
-  (CA:FALSE, or CA:TRUE with digitalSignature) are accepted, forged
-  "self-signed" certificates are rejected, and after a redirect the certificate
-  is verified against the final host.
-- **A configured TLS certificate that cannot be read is now fatal** instead of
-  silently serving plain HTTP. Set `PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1` to keep
-  the old behaviour.
-- **TLS certificate upload is atomic** (both files validated and installed
-  together; the port is saved last), so a failed upload cannot leave a
-  mismatched pair that crash-loops the next boot.
-- Security headers on every response (`X-Content-Type-Options`, `X-Frame-Options`,
-  `Referrer-Policy`, `frame-ancestors 'none'`).
-- Internal error text (SQL, file paths) is no longer returned in 500 responses.
-- The session cookie is `Secure` behind a trusted TLS-terminating proxy
-  (`PULSEMON_TRUSTED_PROXIES` + `X-Forwarded-Proto: https`).
-- Go toolchain 1.26.9 and `golang.org/x/net` 0.60.0: govulncheck reports 0
-  reachable vulnerabilities (29 in v0.3.16). Releases now run a govulncheck gate.
-- `pulsemon auth-user add <user>` reads the password from stdin
-  (`--password-stdin` also accepted); the old `<user> <password>` form still
-  works but warns that the password is visible in `ps`.
+- **Login throttle is un-rotatable behind trusted proxies.** `X-Forwarded-For`
+  is now walked right-to-left and the first entry that is NOT itself a trusted
+  proxy is used (previously the leftmost entry — client-supplied and
+  rotatable per request). Throttle buckets are per /24 (IPv4) or /64 (IPv6):
+  one IPv6 host no longer owns 2^64 separate 7-attempt budgets.
+- **`PULSEMON_ALLOWED_HOSTS`** (new, optional): when set, creating the first
+  account on a fresh install is refused with `421` unless the request's `Host`
+  is allowlisted. This closes the DNS-rebinding route by which a malicious web
+  page could claim the first account through a LAN browser. Unset = the
+  documented LAN-trust default.
+- **Container/unit hardening:** compose now runs with `cap_drop: [ALL]`,
+  `no-new-privileges`, a read-only root filesystem (the DB and all app writes
+  live on the `/data` volume) and a `tmpfs` on `/tmp`; the systemd unit gains
+  `NoNewPrivileges=yes`.
+- Webhook/SMTP DNS lookups are bounded at 5s (a hung resolver could stall the
+  caller indefinitely).
 
-## Reliability
+## Correctness
 
-- **A sensor whose own sends fail now reaches `error` and alerts.** Status no
-  longer depends on a process-wide error counter that other sensors could bump.
-- **Probe scheduling spread is fixed for ~half of all sensors** (an integer
-  overflow made them fire immediately and in lockstep); an interval of 0 no longer
-  panics; a panicking probe is contained.
-- **Alert delivery retries** transient failures (3 attempts, 2 s / 10 s backoff),
-  sends to all providers in parallel, and a failed delivery no longer burns the
-  re-alert interval.
-- **Settings and sensor updates are atomic and validated first.** Changing one
-  setting no longer resets alert routing; an invalid PATCH no longer half-applies;
-  renaming to an existing name returns 409.
-- The ICMP reader goroutines restart after an unexpected stop.
-- Rows with query errors are no longer treated as "no sensors"; a partial read
-  can no longer cancel healthy probe loops.
-- HTTP server read/idle timeouts and a header size limit (no write timeout on
-  purpose: self-update streams for up to a minute).
-- A graceful-shutdown error no longer skips closing the database.
+- **The last dashboard account can no longer be deleted by a race.** The count
+  guard now lives inside the DELETE statement (`... AND (SELECT COUNT(*) FROM
+  users) > 1`); two concurrent removals can no longer both pass the count and
+  silently switch auth off.
+- **Name/tags edits take effect without a process restart.** The alert path
+  reads the sensor name (alert text) and tags (routing) from the spawn-time
+  config copy, so a name/tags PATCH now respawns the probe loop like the other
+  config fields.
+- **Alerts are no longer silently dropped on a transient DB read failure.**
+  Alert delivery resolves provider URLs via a new `GetSettingErr` path and
+  fails loudly (logged, retried) instead of looking "unset" and reporting
+  delivered. URLs resolve before any provider fires — a failed read can't
+  leave a partial alert behind.
+- **HTTPS probes handshake fresh each tick**, so the displayed certificate
+  expiry can't be up to 10 minutes stale from a reused keep-alive connection.
+- **Rate-limited alert providers are respected:** 429 responses honor
+  `Retry-After` (integer seconds or HTTP-date, capped at 60s) instead of being
+  re-hit on the fixed 2s/10s schedule.
+- The settings save (providers + routing fields) is one transaction — a
+  mid-save failure can no longer leave a partial save behind a 500.
+- `tlsValidatePair` accepts Ed25519 cert/key pairs (previously rejected).
+- Passwords over bcrypt's 72-byte input limit are rejected with a 400 and a
+  clear message (create previously returned 500).
+- Deleted sensors release their cached 24h stats series from memory.
+- Startup stats warm-up runs before probing starts, so it can no longer wipe
+  probes recorded during the warm window.
+- The ICMP reader's closed-socket check now uses `errors.Is` (the wrapped
+  `OpError` never matched the bare sentinel).
+- UNIQUE-constraint detection matches the exact constraint text at all four
+  sites (a bare "UNIQUE" substring could misattribute other constraint
+  failures to name collisions).
 
-## Performance and scale
+## Docs
 
-- Status and history for each probe come from memory instead of two extra
-  queries; the stats series is no longer copied per call.
-- SQLite `synchronous=NORMAL` in WAL mode (measured on ext4: 0.55 ms to 0.02 ms
-  per probe insert).
-- Timestamps are fixed-width, so string ordering equals time ordering (retention
-  purge and `ORDER BY ts` are now exact). Older rows remain readable.
-- Graph totals come from the bucket rows (one query fewer); static assets get a
-  strong ETag and `304 Not Modified`.
+- New "Behind a reverse proxy" README section: `PULSEMON_TRUSTED_PROXIES`
+  (required behind a proxy — without it, all clients share the proxy's
+  throttle budget) and `PULSEMON_ALLOWED_HOSTS`.
 
-## Upgrade notes — behaviour changes
+## Notes
 
-- **Sensor limits are now enforced on create and update:** `interval_s` 5–3600,
-  `down_after` 1–100, `timeout_ms` no greater than the interval. Existing sensors
-  are not migrated; scripts that create sensors faster than 5 s will get a 400.
-- Clone (`POST /api/sensors/{id}/clone`) retries on a name collision and returns
-  409 when it gives up.
-- Self-update keeps the previous binary at `<exe>.prev`; new
-  `pulsemon update rollback [--restart]`, and `pulsemon update --restart` rolls
-  back automatically if the new version fails its health check. (The `.prev` copy
-  is made by the updater that is *running*, so it appears on updates made **from**
-  v0.3.17 onward.)
-
-## Known limitations (deferred, not fixed here)
-
-- **The dashboard's update button works on installs with authentication
-  disabled.** Anyone who can reach an auth-off dashboard can trigger an update,
-  including pinning an older release. Binaries are still SHA-256 verified.
-  Enable authentication (`pulsemon auth-user add <name>`) on any install reachable
-  beyond a trusted LAN.
-- Release signing for self-update, a read-only/viewer role, and HEAD/Range support
-  for HTTP probes are not part of this release.
+- The update endpoint's auth state is unchanged (owner decision, 2026-10-15).
+- Test: `TestFix_M10a_StatusStaysConsistentWhenUpdateFails` now drains alert
+  goroutines before the DB closes, matching the production shutdown order
+  (StopAlerts → DrainAlerts → db.Close).

@@ -345,6 +345,14 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		// this; a loss row with the error is the honest fallback.
 		return httpProbeResult{Lost: true, IP: resolved, Err: err}
 	}
+	if req.URL.Scheme == "https" {
+		// Force a fresh TLS handshake per probe (2026-10-19 review M5): the
+		// shared httpClient keeps idle conns for up to 10 min, and a reused
+		// conn reports the cert from its ORIGINAL handshake — a server cert
+		// renewal stayed invisible in the displayed expiry until the conn
+		// recycled. Cost is one handshake per probe (probes run every 5-60s).
+		req.Close = true
+	}
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	el := time.Since(start)
