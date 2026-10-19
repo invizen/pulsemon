@@ -4,7 +4,9 @@ package main
 
 import (
 	"errors"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -15,12 +17,10 @@ import (
 // report restarted=false with an actionable hint and leave killSelf
 // untouched.
 func TestRequestRestartBareNoKillOnReexecFailure(t *testing.T) {
-	origReexec, origKill := reexecFn, killSelf
-	defer func() { reexecFn, killSelf = origReexec, origKill }()
+	defer setRestartFnsForTest(reexec, func() { syscall.Kill(os.Getpid(), syscall.SIGTERM) })
 
 	killed := false
-	killSelf = func() { killed = true }
-	reexecFn = func() error { return errors.New("fork: resource temporarily unavailable") }
+	setRestartFnsForTest(func() error { return errors.New("fork: resource temporarily unavailable") }, func() { killed = true })
 
 	// Force the bare-process default branch: not systemd-managed, not a
 	// container.
@@ -41,12 +41,10 @@ func TestRequestRestartBareNoKillOnReexecFailure(t *testing.T) {
 // TestRequestRestartBareKillsOnReexecSuccess is the happy-path twin: a
 // successful re-exec MUST still self-SIGTERM so the child can bind.
 func TestRequestRestartBareKillsOnReexecSuccess(t *testing.T) {
-	origReexec, origKill := reexecFn, killSelf
-	defer func() { reexecFn, killSelf = origReexec, origKill }()
+	defer setRestartFnsForTest(reexec, func() { syscall.Kill(os.Getpid(), syscall.SIGTERM) })
 
 	killed := false
-	killSelf = func() { killed = true }
-	reexecFn = func() error { return nil }
+	setRestartFnsForTest(func() error { return nil }, func() { killed = true })
 
 	t.Setenv("SYSTEMD_EXEC_PID", "")
 

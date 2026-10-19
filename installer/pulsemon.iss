@@ -98,6 +98,14 @@ begin
     if not CreateDir(DataDir) then
       MsgBox('Could not create the data directory:' #13#10 + DataDir, mbError, MB_OK);
   end;
+  // M1 (F30, 2026-10-19 review): C:\ProgramData\Pulsemon inherits
+  // ProgramData's ACL, which grants BUILTIN\Users (RX) read on EVERYTHING
+  // inside it — including the SQLite DB (SMTP passwords, webhook tokens).
+  // Strip inheritance and grant full control to SYSTEM (the service runs
+  // as LocalSystem) and Administrators only. Runs on EVERY install, so an
+  // upgrade also repairs a directory an earlier installer created with the
+  // inherited ACL.
+  RunHidden('icacls.exe', '"' + DataDir + '" /inheritance:r /grant "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" /grant "BUILTIN\Administrators:(OI)(CI)(F)"');
 end;
 
 procedure CreateService;
@@ -146,11 +154,14 @@ end;
 // Open the dashboard port (9299) in Windows Firewall so the dashboard is
 // reachable from the LAN. Idempotent: any existing "pulsemon" rule is
 // replaced. Runs elevated (the installer requires admin).
+// M2 (F31, 2026-10-19 review): profile=private,domain — WITHOUT it, netsh
+// defaults to ALL profiles, so a laptop on a Public network (cafe, airport)
+// would expose the dashboard to that network. The homelab LAN is private.
 procedure OpenFirewallPort;
 begin
   RunHidden('netsh.exe', 'advfirewall firewall delete rule name=pulsemon');
   if not RunHidden('netsh.exe',
-      'advfirewall firewall add rule name=pulsemon dir=in action=allow protocol=TCP localport=9299') then
+      'advfirewall firewall add rule name=pulsemon dir=in action=allow protocol=TCP localport=9299 profile=private,domain') then
     MsgBox('Could not open firewall port 9299. The dashboard still works on this' #13#10 +
            'machine (http://localhost:9299); add a firewall rule for LAN access.',
            mbInformation, MB_OK);

@@ -111,34 +111,53 @@ var webhookClient = &http.Client{
 // Host forms: u.Hostname() already strips brackets and the port, so a
 // bracketed IPv6 host ([::1], [fe80::1], [::ffff:127.0.0.1]) lands here as a
 // bare address that net.ParseIP understands directly — no separate bracket
-// handling is needed. Zone identifiers ([::1%eth0]) are rejected at URL-parse
-// ("not a valid URL"), which is the safe direction.
-func validateWebhookURL(raw string) error {
+// handling is needed. Zone identifiers ([fe80::1%eth0], percent-encoded as
+// %25eth0 in the URL) SURVIVE url.Parse and net.ParseIP rejects them, so
+// they are refused explicitly (a webhook dial has no link scope; a zone'd
+// literal is never a valid alert destination) — the old "rejected at
+// URL-parse" claim was stale.
+// validateWebhookURLNoDNS runs validateWebhookURL's checks WITHOUT the DNS
+// resolution pass (2026-10-19 review N6): URL shape, scheme, IP-literal
+// blocklist, mDNS-suffix rejection. It returns the host and scheme so the
+// DNS variant can reuse them without re-parsing. The IN-TRANSACTION save
+// path uses this: a 5-second DNS lookup must never run while holding the
+// SQLite write lock (it stalls every concurrent probe INSERT). The
+// pre-transaction validation pass runs the full with-DNS variant, so an
+// unresolvable URL is still rejected before any write begins.
+func validateWebhookURLNoDNS(raw string) (string, string, error) {
 	u, err := url.ParseRequestURI(raw)
 	if err != nil {
-		return errors.New("not a valid URL")
+		return "", "", errors.New("not a valid URL")
 	}
 	host := u.Hostname()
 	if host == "" {
-		return errors.New("must include a host")
+		return "", "", errors.New("must include a host")
+	}
+	// Zone identifiers (P1): a '%' in the host is a percent-encoded IPv6
+	// zone id ([fe80::1%eth0] → host "fe80::1%eth0"). It is never a valid
+	// webhook target (no link scope in a webhook dial), and letting it fall
+	// through to DNS would die with a misleading "cannot resolve" — refuse
+	// it here with the accurate reason. No legitimate hostname contains '%'.
+	if strings.Contains(host, "%") {
+		return "", "", fmt.Errorf("host %q contains a zone identifier; not a valid webhook target", host)
 	}
 	if u.Scheme != "https" && u.Scheme != "http" {
-		return errors.New("must be an http:// or https:// URL")
+		return "", "", errors.New("must be an http:// or https:// URL")
 	}
 	// A literal IP is judged against the blocklist FIRST, for every scheme.
 	// This is where loopback / link-local / unspecified / multicast are
 	// rejected with an accurate "blocked address" reason — up front, so a
 	// blocked literal over http is never misreported as "not RFC1918".
-	// RFC1918 / ULA literals pass the blocklist and are then gated by scheme:
-	// https anywhere, http only when private.
+	// RFC1918 / ULA literals pass the blocklist and are then gated by
+	// scheme: https anywhere, http only when private.
 	if ip := net.ParseIP(host); ip != nil {
 		if err := checkWebhookIP(ip, host); err != nil {
-			return err
+			return "", "", err
 		}
 		if u.Scheme == "http" && !ip.IsPrivate() {
-			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+			return "", "", fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 		}
-		return nil
+		return host, u.Scheme, nil
 	}
 	// Hostname path. Reject mDNS / dev domains that commonly resolve to
 	// loopback or LAN addresses. This is NOT redundant with the blocklist:
@@ -147,7 +166,18 @@ func validateWebhookURL(raw string) error {
 	// thing that keeps those out of the http-relay path.
 	lower := strings.ToLower(host)
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
-		return fmt.Errorf("host %q cannot be used for alerts", host)
+		return "", "", fmt.Errorf("host %q cannot be used for alerts", host)
+	}
+	return host, u.Scheme, nil
+}
+
+func validateWebhookURL(raw string) error {
+	host, scheme, err := validateWebhookURLNoDNS(raw)
+	if err != nil {
+		return err
+	}
+	if net.ParseIP(host) != nil {
+		return nil // IP literal: fully judged by the NoDNS pass.
 	}
 	// Resolve ONCE and reuse the answers for both the private-check (http
 	// relaxation) and the blocklist pass — the old code resolved twice
@@ -159,14 +189,14 @@ func validateWebhookURL(raw string) error {
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
-		if u.Scheme == "http" {
+		if scheme == "http" {
 			// Match the old failure shape: an http host whose privacy
 			// cannot be established is refused the same as a public one.
 			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 		}
 		return fmt.Errorf("cannot resolve host %q: %v", host, err)
 	}
-	if u.Scheme == "http" {
+	if scheme == "http" {
 		private := false
 		for _, ip := range ips {
 			if ip.IsPrivate() {
@@ -206,6 +236,13 @@ func validateWebhookURL(raw string) error {
 //     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth
 //     without breaking the documented use case. A webhook pointed at a CGNAT
 //     address can never be a working relay.
+//   - 64:ff9b::/96 (RFC 6052) — NAT64 well-known prefix: an IPv6 literal
+//     that TUNNELS an IPv4 destination (e.g. 64:ff9b::7f00:1 == 127.0.0.1).
+//     Without this, an attacker writes the loopback address in IPv6 dress.
+//   - 2002::/16 (RFC 4380) — Teredo: the same tunneling trick with an
+//     embedded IPv4 address in bits 32-63.
+//   - 240.0.0.0/4 — Class E (reserved) through 255.255.255.255 (limited
+//     broadcast, which lands in this block). Never a valid destination.
 //
 // RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are deliberately
 // NOT here: the design allows them so a LAN relay works.
@@ -213,6 +250,9 @@ var blockedSubnets = []*net.IPNet{
 	mustCIDR("0.0.0.0/8"),
 	mustCIDR("198.18.0.0/15"),
 	mustCIDR("100.64.0.0/10"),
+	mustCIDR("64:ff9b::/96"),
+	mustCIDR("2002::/16"),
+	mustCIDR("240.0.0.0/4"),
 }
 
 func mustCIDR(s string) *net.IPNet {
@@ -234,12 +274,58 @@ func checkWebhookIP(ip net.IP, host string) error {
 		ip.IsUnspecified() || ip.IsMulticast() {
 		return fmt.Errorf("host %q resolves to a blocked address (%s)", host, ip)
 	}
-	// Reserved-for-testing (198.18/15) and carrier-NAT (100.64/10) ranges:
-	// never a valid destination (see blockedSubnets).
+	// Reserved-for-testing (198.18/15), carrier-NAT (100.64/10), NAT64
+	// (64:ff9b::/96), Teredo (2002::/16) and Class E/broadcast (240/4)
+	// ranges: never a valid destination (see blockedSubnets).
 	for _, n := range blockedSubnets {
 		if n.Contains(ip) {
 			return fmt.Errorf("host %q resolves to a reserved or carrier-NAT address (%s)", host, ip)
 		}
+	}
+	// P1 (2026-10-19 review): IPv4-embedded IPv6 forms. net.ParseIP
+	// normalizes the dotted-quad notation (::a.b.c.d, ::ffff:0:a.b.c.d)
+	// into 16-byte addresses whose IPv6 range checks (above) see only the
+	// zero/ffff prefix and never the real IPv4 destination in the trailing
+	// 32 bits — so ::127.0.0.1 passed every check. Judge that trailing
+	// IPv4 with the full IPv4 rules (recursive call; a 4-byte IP has no
+	// embedded view, so it terminates).
+	if v4 := embeddedIPv4(ip); v4 != nil {
+		if err := checkWebhookIP(v4, host); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// embeddedIPv4 returns the trailing 32 bits as an IPv4 address when the
+// 16-byte address is one of the IPv4-embedded forms the dotted-quad
+// notation produces, and nil for a genuine IPv6 address. The two recognized
+// layouts (P1):
+//
+//   - ::a.b.c.d            — leading 12 bytes zero (deprecated
+//     IPv4-compatible form).
+//   - ::ffff:0:a.b.c.d     — bytes 8-11 are ff ff 00 00 (an IPv4-mapped
+//     form with an extra zero group; not recognized by net.IP.To4).
+//
+// A genuine IPv6 address (ULA, GUA, …) has non-zero leading bytes in other
+// positions and is left alone — only these two layouts carry an IPv4
+// destination that must be judged as IPv4.
+func embeddedIPv4(ip net.IP) net.IP {
+	if len(ip) != 16 {
+		return nil
+	}
+	zero := true
+	for i := 0; i < 12; i++ {
+		if ip[i] != 0 {
+			zero = false
+			break
+		}
+	}
+	if zero {
+		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
+	}
+	if ip[8] == 0xff && ip[9] == 0xff && ip[10] == 0x00 && ip[11] == 0x00 {
+		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
 	}
 	return nil
 }
@@ -257,7 +343,10 @@ func checkWebhookIP(ip net.IP, host string) error {
 // answers is what keeps loopback/metadata out. Hostnames are resolved and
 // every answer is checked, closing the save-time DNS-rebinding hole the
 // webhook path closes.
-func validateSMTPHost(host string) error {
+// validateSMTPHostNoDNS is validateSMTPHost without the resolution pass
+// (2026-10-19 review N6) — see validateWebhookURLNoDNS for why the
+// in-transaction save path must not run DNS under the write lock.
+func validateSMTPHostNoDNS(host string) error {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return fmt.Errorf("smtp host is required")
@@ -267,6 +356,16 @@ func validateSMTPHost(host string) error {
 	}
 	if !validSMTPHostname(host) {
 		return fmt.Errorf("smtp host %q is not a valid hostname", host)
+	}
+	return nil
+}
+
+func validateSMTPHost(host string) error {
+	if err := validateSMTPHostNoDNS(host); err != nil {
+		return err
+	}
+	if net.ParseIP(strings.TrimSpace(host)) != nil {
+		return nil // IP literal: fully judged by the NoDNS pass.
 	}
 	// 5s deadline — context.Background() alone never times out (2026-10-19
 	// review m9).

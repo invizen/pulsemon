@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -85,6 +86,24 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer updateMu.Unlock()
+
+	// Cross-process lock (2026-10-19 review F19): updateMu only serializes
+	// requests WITHIN this process — a concurrent `pulsemon update` CLI run
+	// (or a second server instance) would race this install on the .prev
+	// rename. The file lock covers the whole download→install→restart span.
+	// It anchors to the executable's directory (see updateLockPath), the
+	// same location the CLI's `pulsemon update` locks, so the two processes
+	// serialize on the same file (review F19).
+	lockFile, err := acquireUpdateLock()
+	if err != nil {
+		if errors.Is(err, errUpdateLockHeld) {
+			respondWithError(w, http.StatusConflict, "update already in progress")
+			return
+		}
+		respondInternal(w, "update lock", err)
+		return
+	}
+	defer lockFile.Close()
 
 	version := "latest"
 	if r.ContentLength > 0 {
@@ -191,6 +210,14 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 	fmt.Fprintf(os.Stderr, "pulsemon: updated to %s (sha256 %s); restarting %s service\n", rel.TagName, digest, d)
+	// I2 (2026-10-19 review): this process dies with the restart, so a
+	// broken new binary would stay broken with no one to roll it back.
+	// Spawn a detached watchdog that polls healthz after the restart and
+	// restores <exe>.prev if the new binary never comes up. If the spawn
+	// fails, proceed with the restart and log it (per spec).
+	if werr := spawnUpdateWatchdog(exe); werr != nil {
+		fmt.Fprintf(os.Stderr, "pulsemon: watchdog spawn failed (proceeding without it): %v\n", werr)
+	}
 	if err := performRestart(d); err != nil {
 		// The response is already sent; the only audience left is the log.
 		fmt.Fprintf(os.Stderr, "pulsemon: update restart failed after install: %v (check: %s)\n", err, journalHint(d))

@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -43,31 +44,130 @@ func uInfo(msg string) { fmt.Printf("%s%s[+]%s %s\n", uBold, uGreen, uReset, msg
 func uWarn(msg string) { fmt.Printf("%s%s[!]%s %s\n", uBold, uYellow, uReset, msg) }
 func uErr(msg string)  { fmt.Fprintf(os.Stderr, "%s%s[x]%s %s\n", uBold, uRed, uReset, msg) }
 
+// semVer is a parsed semver-ish version with its pre-release label KEPT
+// (2026-10-19 review F17): the old parseVer dropped the label, so a final
+// release compared EQUAL to its own pre-release and v0.4.0 never "upgraded"
+// a v0.4.0-rc1 install.
+type semVer struct {
+	maj, min, pat int
+	pre           string // "" = final release
+	ok            bool
+}
+
 // parseVer parses a semver-ish version ("v1.2.3", "1.2.3-beta"). ok=false
 // means the string is not a version at all (e.g. the "dev" build default),
-// which callers treat as "older than any release".
-func parseVer(s string) (maj, min, pat int, ok bool) {
+// which callers treat as "older than any release". Build metadata (+build)
+// is ignored for precedence, per semver.
+func parseVer(s string) semVer {
 	s = strings.TrimPrefix(strings.TrimSpace(s), "v")
-	if i := strings.IndexAny(s, "-+"); i >= 0 {
+	var pre string
+	if i := strings.IndexByte(s, '+'); i >= 0 {
+		s = s[:i]
+	}
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		pre = s[i+1:]
 		s = s[:i]
 	}
 	parts := strings.Split(s, ".")
 	if len(parts) < 2 {
-		return 0, 0, 0, false
+		return semVer{}
 	}
 	maj, e1 := strconv.Atoi(parts[0])
 	min, e2 := strconv.Atoi(parts[1])
 	if e1 != nil || e2 != nil || maj < 0 || min < 0 {
-		return 0, 0, 0, false
+		return semVer{}
 	}
+	pat := 0
 	if len(parts) > 2 {
-		var e3 error
-		pat, e3 = strconv.Atoi(parts[2])
+		p, e3 := strconv.Atoi(parts[2])
 		if e3 != nil {
-			return 0, 0, 0, false
+			return semVer{}
+		}
+		pat = p
+	}
+	return semVer{maj: maj, min: min, pat: pat, pre: pre, ok: true}
+}
+
+// comparePreRelease orders two pre-release labels per semver 11:
+// dot-separated identifiers compared left to right; numeric identifiers
+// compare as integers and sort BELOW alphanumeric ones; a shorter list is
+// smaller when all its identifiers equal the longer list's prefix.
+func comparePreRelease(a, b string) int {
+	as := strings.Split(a, ".")
+	bs := strings.Split(b, ".")
+	for i := 0; i < len(as) && i < len(bs); i++ {
+		ai, aNum := strconv.Atoi(as[i])
+		bi, bNum := strconv.Atoi(bs[i])
+		switch {
+		case aNum == nil && bNum == nil:
+			if ai != bi {
+				if ai < bi {
+					return -1
+				}
+				return 1
+			}
+		case aNum == nil:
+			return -1 // numeric sorts below alphanumeric
+		case bNum == nil:
+			return 1
+		default:
+			if as[i] != bs[i] {
+				if as[i] < bs[i] {
+					return -1
+				}
+				return 1
+			}
 		}
 	}
-	return maj, min, pat, true
+	switch {
+	case len(as) < len(bs):
+		return -1
+	case len(as) > len(bs):
+		return 1
+	}
+	return 0
+}
+
+// lessThan reports whether a < b in semver precedence.
+func (a semVer) lessThan(b semVer) bool {
+	if a.maj != b.maj {
+		return a.maj < b.maj
+	}
+	if a.min != b.min {
+		return a.min < b.min
+	}
+	if a.pat != b.pat {
+		return a.pat < b.pat
+	}
+	// Equal core: a pre-release sorts BELOW the final release (semver
+	// 11.4) — v0.4.0-rc1 < v0.4.0.
+	if a.pre == b.pre {
+		return false
+	}
+	if a.pre == "" {
+		return false // a is the final release: a > b
+	}
+	if b.pre == "" {
+		return true // b is the final release: a < b
+	}
+	return comparePreRelease(a.pre, b.pre) < 0
+}
+
+// newerRelease reports whether the release tag is strictly newer than the
+// running version. An unstamped ("dev") binary is always treated as older.
+// Pre-releases order per semver, so a FINAL release is newer than its own
+// pre-release (v0.4.0 > v0.4.0-rc1) — the old label-stripping compare made
+// them equal and pinned rc installs forever (2026-10-19 review F17).
+func newerRelease(releaseTag, running string) bool {
+	r := parseVer(releaseTag)
+	if !r.ok {
+		return false
+	}
+	m := parseVer(running)
+	if !m.ok {
+		return true
+	}
+	return m.lessThan(r)
 }
 
 // validVersionToken reports whether v is safe to interpolate into the
@@ -91,26 +191,6 @@ func validVersionToken(v string) bool {
 		}
 	}
 	return true
-}
-
-// newerRelease reports whether the release tag is strictly newer than the
-// running version. An unstamped ("dev") binary is always treated as older.
-func newerRelease(releaseTag, running string) bool {
-	rmaj, rmin, rpat, rok := parseVer(releaseTag)
-	if !rok {
-		return false
-	}
-	maj, min, pat, ok := parseVer(running)
-	if !ok {
-		return true
-	}
-	switch {
-	case rmaj != maj:
-		return rmaj > maj
-	case rmin != min:
-		return rmin > min
-	}
-	return rpat > pat
 }
 
 // releaseAsset is one asset of a GitHub release.
@@ -187,8 +267,12 @@ func runUpdate(args []string) int {
 	checkOnly := false
 	restart := false
 	rollback := false
+	watchdog := false
+	wdPrev, wdDst := "", ""
+	wdTimeout := 30 * time.Second
 	version := "latest"
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		switch a {
 		case "check", "--check":
 			checkOnly = true
@@ -196,12 +280,39 @@ func runUpdate(args []string) int {
 			restart = true
 		case "rollback":
 			rollback = true
+		case "watchdog", "--watchdog":
+			// The detached post-restart guardian (I2) — see runWatchdog.
+			watchdog = true
+		case "--prev", "--dst", "--timeout":
+			if i+1 >= len(args) {
+				uErr(a + " requires a value")
+				return 1
+			}
+			i++
+			switch a {
+			case "--prev":
+				wdPrev = args[i]
+			case "--dst":
+				wdDst = args[i]
+			case "--timeout":
+				d, perr := time.ParseDuration(args[i])
+				if perr != nil || d <= 0 {
+					uErr("invalid --timeout: " + args[i])
+					return 1
+				}
+				wdTimeout = d
+			}
 		case "-h", "--help":
-			fmt.Println("usage: pulsemon update [check|rollback|<version>] [--restart]")
+			fmt.Println("usage: pulsemon update [check|rollback|watchdog|<version>] [--restart]")
+			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--timeout 30s]")
 			return 0
 		default:
 			version = a
 		}
+	}
+
+	if watchdog {
+		return runWatchdog(wdPrev, wdDst, wdTimeout)
 	}
 
 	exe, err := runningExecutable()
@@ -213,6 +324,19 @@ func runUpdate(args []string) int {
 	uInfo("version: " + Version)
 
 	if rollback {
+		// Cross-process lock (F19): the rollback rename touches the same
+		// .prev the install path moves — serialize against a concurrent
+		// update in another process.
+		lockFile, lerr := acquireUpdateLock()
+		if lerr != nil {
+			if errors.Is(lerr, errUpdateLockHeld) {
+				uErr("rollback: " + lerr.Error())
+				return 1
+			}
+			uErr("rollback: update lock: " + lerr.Error())
+			return 1
+		}
+		defer lockFile.Close()
 		if err := rollbackBinary(exe); err != nil {
 			uErr("rollback: " + err.Error())
 			return 1
@@ -258,6 +382,22 @@ func runUpdate(args []string) int {
 		return 2
 	}
 
+	// Cross-process install lock (2026-10-19 review F19): everything from
+	// here on mutates the on-disk binary. The lock is held (via the open
+	// file) until this process exits, covering the whole
+	// download→install→restart span; a concurrent update in another
+	// process (the dashboard endpoint vs. this CLI) gets a clean refusal.
+	lockFile, err := acquireUpdateLock()
+	if err != nil {
+		if errors.Is(err, errUpdateLockHeld) {
+			uErr(err.Error())
+			return 1
+		}
+		uErr("update lock: " + err.Error())
+		return 1
+	}
+	defer lockFile.Close()
+
 	uInfo("downloading " + rel.TagName + "...")
 	tmp, err := downloadAsset(client, assetURL)
 	if err != nil {
@@ -282,6 +422,66 @@ func runUpdate(args []string) int {
 	uInfo("installed " + rel.TagName + " to " + exe)
 
 	return handleRestart(exe, restart)
+}
+
+// runWatchdog is the detached post-restart guardian for the API's
+// auto-restart path (2026-10-19 review, I2): the server process dies WITH
+// the service restart it triggers, so without a watchdog a broken new
+// binary stays broken with no one to roll it back. The watchdog polls the
+// same healthz targets the CLI uses (accepting ok OR degraded — see
+// healthzPayloadOK), and on failure restores <prev> over <dst> and restarts
+// the service.
+//
+// Exit codes: 0 = the new binary is healthy, or a rollback was performed
+// successfully; 1 = the rollback itself failed (the box needs a human).
+func runWatchdog(prev, dst string, timeout time.Duration) int {
+	if prev == "" || dst == "" {
+		uErr("watchdog: --prev and --dst are required")
+		return 1
+	}
+	// Take the cross-process update lock: the rollback rename must not
+	// race a concurrent update's install (the spawn-side lock was released
+	// by the server's death, so this is the watchdog's own acquisition).
+	lockFile, err := acquireUpdateLock()
+	if err != nil {
+		uErr("watchdog: update lock: " + err.Error())
+		return 1
+	}
+	defer lockFile.Close()
+
+	db := openHealthzDB()
+	if db != nil {
+		defer db.Close()
+	}
+	ok, detail := waitHealthyWithTimeout(db, timeout)
+	if ok {
+		uInfo("watchdog: service is healthy after restart (" + detail + ")")
+		return 0
+	}
+	uErr("watchdog: service not healthy after restart (" + detail + "); restoring " + prev)
+	if err := os.Rename(prev, dst); err != nil {
+		uErr("watchdog: rollback failed: " + err.Error())
+		return 1
+	}
+	uInfo("watchdog: previous binary restored to " + dst)
+	if d := detectRestart(); d != "" {
+		if err := performRestart(d); err != nil {
+			uErr("watchdog: restart after rollback failed: " + err.Error())
+			return 1
+		}
+		uInfo("watchdog: service restarted with the previous binary")
+	}
+	return 0
+}
+
+// spawnUpdateWatchdog detaches `pulsemon update --watchdog ...` (I2) so the
+// API's auto-restart path keeps a guardian after this process dies. The
+// watchdog polls healthz and rolls back to <exe>.prev if the new binary
+// never comes up.
+func spawnUpdateWatchdog(exe string) error {
+	cmd := exec.Command(exe, "update", "watchdog",
+		"--prev", exe+".prev", "--dst", exe, "--timeout", "30s")
+	return detachSpawn(cmd)
 }
 
 // handleRestart is the post-install restart decision, factored out of
@@ -655,6 +855,13 @@ func installBinary(src, dst string) error {
 		tmp.Close()
 		return err
 	}
+	// F18b (2026-10-19): make the staged binary durable BEFORE the rename.
+	// Without this, a crash between the copy and the rename can leave a
+	// truncated file that the rename then promotes over the good binary.
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return fmt.Errorf("fsync staged binary: %w", err)
+	}
 	if err := tmp.Close(); err != nil {
 		return err
 	}
@@ -678,6 +885,15 @@ func installBinary(src, dst string) error {
 			_ = os.Rename(prev, dst)
 		}
 		return err
+	}
+	// F18b (2026-10-19): fsync the destination directory so the rename
+	// itself is durable (best effort — some filesystems, e.g. Windows,
+	// cannot open a directory for sync; the rename is already atomic).
+	if d, err := os.Open(dir); err == nil {
+		if serr := d.Sync(); serr != nil {
+			uWarn("directory fsync after swap failed: " + serr.Error())
+		}
+		d.Close()
 	}
 	if haveOwner {
 		if err := os.Chown(dst, int(wantUID), int(wantGID)); err != nil {
@@ -828,6 +1044,48 @@ func journalHint(bus string) string {
 	return "journalctl -u pulsemon"
 }
 
+// unitFileCandidates are the pulsemon systemd unit files the CLI consults
+// for unit-level environment (2026-10-19 review F16): the user unit first
+// (install.sh's default), then the system unit.
+func unitFileCandidates() []string {
+	var out []string
+	if home, err := os.UserHomeDir(); err == nil {
+		out = append(out, filepath.Join(home, ".config/systemd/user/pulsemon.service"))
+	}
+	out = append(out, "/etc/systemd/system/pulsemon.service")
+	return out
+}
+
+// unitEnvVar returns name's value from the pulsemon unit's Environment=
+// lines (2026-10-19 review F16): `pulsemon update --restart` runs from the
+// operator's shell, which does NOT carry the unit's PULSEMON_ADDR /
+// PULSEMON_DB — the post-restart healthz poll and the DB lookup then fell
+// back to defaults, so a non-default-port install could never verify its
+// own update. Shell env wins (callers check it first); this is the
+// fallback. Understands systemd's Environment= shapes: K=V, quoted K=V,
+// and space-separated lists.
+func unitEnvVar(name string) string {
+	for _, path := range unitFileCandidates() {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "Environment=") {
+				continue
+			}
+			for _, kv := range strings.Fields(strings.TrimPrefix(line, "Environment=")) {
+				kv = strings.Trim(kv, `"'`)
+				if k, v, ok := strings.Cut(kv, "="); ok && k == name {
+					return strings.Trim(v, `"'`)
+				}
+			}
+		}
+	}
+	return ""
+}
+
 // healthzHostPort splits PULSEMON_ADDR into (host, port) for the health
 // check, the same way install.sh derives its target:
 //
@@ -838,6 +1096,9 @@ func journalHint(bus string) string {
 //	"" (unset)        -> ("localhost", "9299")  (the binary's own default)
 func healthzHostPort() (string, string) {
 	addr := os.Getenv("PULSEMON_ADDR")
+	if addr == "" {
+		addr = unitEnvVar("PULSEMON_ADDR") // F16: unit env fallback
+	}
 	switch {
 	case addr == "":
 		return "localhost", "9299"
@@ -916,19 +1177,40 @@ var (
 // healthzTimeout bounds the post-restart poll. A var so tests can shrink it.
 var healthzTimeout = 15 * time.Second
 
-// healthzPayloadMarker is the substring that identifies a real pulsemon
-// healthz answer. A 2xx/3xx from ANY other service sharing a candidate port
-// (a reverse proxy on 443, a stale process on the HTTP port) must not be
-// mistaken for the monitor — the body check is what makes polling several
-// candidate ports safe.
-const healthzPayloadMarker = `"status":"ok"`
+// healthzPayloadOK reports whether body is a real pulsemon healthz answer.
+// It accepts "ok" (healthy) AND "degraded" (up and serving, but ICMP
+// unavailable — e.g. a host without CAP_NET_RAW/ping_group_range): a
+// degraded service IS a successful update. The old "ok"-only marker rolled
+// back a perfectly working new binary on no-ICMP hosts (2026-10-19 review
+// F8). A 2xx/3xx from ANY other service sharing a candidate port (a reverse
+// proxy on 443, a stale process on the HTTP port) must not be mistaken for
+// the monitor — the body check is what makes polling several candidate
+// ports safe.
+func healthzPayloadOK(body string) bool {
+	return strings.Contains(body, `"status":"ok"`) ||
+		strings.Contains(body, `"status":"degraded"`)
+}
+
+// healthzDBPath is the DB path the post-restart health check opens: the
+// shell's PULSEMON_DB, else the unit's (F16), else the default. Deliberately
+// NOT dbPathFromEnv: the server's own startup must not be redirected by a
+// unit file it is not running under.
+func healthzDBPath() string {
+	if p := os.Getenv("PULSEMON_DB"); p != "" {
+		return p
+	}
+	if p := unitEnvVar("PULSEMON_DB"); p != "" {
+		return p
+	}
+	return defaultDBPath()
+}
 
 // openHealthzDB opens the data DB so the post-restart health check can read
 // the listener config (the HTTPS port). A var so tests can stub it (the
 // restart tests run where no data dir exists). nil on any failure — the
 // health check then falls back to the default HTTPS port.
 var openHealthzDB = func() *DB {
-	db, err := NewDB(dbPathFromEnv())
+	db, err := NewDB(healthzDBPath())
 	if err != nil {
 		return nil
 	}
@@ -936,8 +1218,8 @@ var openHealthzDB = func() *DB {
 }
 
 // waitHealthy polls the pulsemon healthz endpoint until it answers with the
-// healthz payload or the timeout elapses. It returns ok plus a short detail
-// for the log line.
+// healthz payload or the default timeout elapses. It returns ok plus a short
+// detail for the log line.
 //
 // Every (scheme, port) candidate is polled (see healthzTargets): once a cert
 // is installed the plain-HTTP port is deliberately not bound, so the TLS
@@ -948,8 +1230,14 @@ var openHealthzDB = func() *DB {
 // answer", not "is the certificate trusted" — and a self-signed homelab
 // cert must pass too.
 func waitHealthy(db *DB) (bool, string) {
+	return waitHealthyWithTimeout(db, healthzTimeout)
+}
+
+// waitHealthyWithTimeout is the timeout-parameterized form of waitHealthy
+// (the watchdog passes its own budget — see runWatchdog).
+func waitHealthyWithTimeout(db *DB, timeout time.Duration) (bool, string) {
 	targets := healthzTargets(db)
-	deadline := time.Now().Add(healthzTimeout)
+	deadline := time.Now().Add(timeout)
 	client := &http.Client{
 		Timeout: 3 * time.Second,
 		Transport: &http.Transport{
@@ -963,7 +1251,7 @@ func waitHealthy(db *DB) (bool, string) {
 			if err == nil {
 				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 				resp.Body.Close()
-				if resp.StatusCode < 400 && strings.Contains(string(body), healthzPayloadMarker) {
+				if resp.StatusCode < 400 && healthzPayloadOK(string(body)) {
 					return true, target
 				}
 				lastErr = fmt.Errorf("HTTP %d without pulsemon healthz payload", resp.StatusCode)

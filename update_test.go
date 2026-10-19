@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // tempLeakBefore snapshots the set of pulsemon-update-* files in the temp dir so
@@ -747,5 +749,169 @@ func TestRunUpdateUppercaseSidecarAccepted(t *testing.T) {
 	}
 	if leaked := tempLeakAfter(before); len(leaked) != 0 {
 		t.Fatalf("orphaned temp files: %v", leaked)
+	}
+}
+
+// TestUnitEnvVarFakeUnit pins the F16 fallback (2026-10-19 review): with an
+// empty shell env, the CLI reads PULSEMON_ADDR / PULSEMON_DB from the
+// pulsemon unit's Environment= lines (user unit first), and shell env still
+// wins when set.
+func TestUnitEnvVarFakeUnit(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("PULSEMON_ADDR", "")
+	t.Setenv("PULSEMON_DB", "")
+
+	u := filepath.Join(home, ".config/systemd/user")
+	if err := os.MkdirAll(u, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	unit := "[Unit]\nDescription=pulsemon\n[Service]\nEnvironment=\"PULSEMON_ADDR=:9333\"\nEnvironment=PULSEMON_DB=/tmp/pm/fake.db OTHER=1\nExecStart=/usr/bin/pulsemon\n"
+	if err := os.WriteFile(filepath.Join(u, "pulsemon.service"), []byte(unit), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := unitEnvVar("PULSEMON_ADDR"); got != ":9333" {
+		t.Errorf("unitEnvVar(PULSEMON_ADDR) = %q, want %q (quoted form)", got, ":9333")
+	}
+	if got := unitEnvVar("PULSEMON_DB"); got != "/tmp/pm/fake.db" {
+		t.Errorf("unitEnvVar(PULSEMON_DB) = %q, want %q (space-separated list)", got, "/tmp/pm/fake.db")
+	}
+	if got := unitEnvVar("OTHER"); got != "1" {
+		t.Errorf("unitEnvVar(OTHER) = %q, want %q", got, "1")
+	}
+
+	// healthzHostPort must reflect the unit's port when the shell env is empty.
+	if h, p := healthzHostPort(); h != "localhost" || p != "9333" {
+		t.Errorf("healthzHostPort = (%q, %q), want (localhost, 9333)", h, p)
+	}
+
+	// Shell env wins over the unit.
+	t.Setenv("PULSEMON_ADDR", "127.0.0.1:9444")
+	if h, p := healthzHostPort(); h != "127.0.0.1" || p != "9444" {
+		t.Errorf("shell-env precedence broken: (%q, %q)", h, p)
+	}
+
+	// healthzDBPath: unit fallback when the shell env is empty.
+	if got := healthzDBPath(); got != "/tmp/pm/fake.db" {
+		t.Errorf("healthzDBPath = %q, want the unit's path", got)
+	}
+}
+
+// TestNewerReleasePreReleaseOrdering pins the F17 semver ordering: a final
+// release is newer than its own pre-release, pre-releases order among
+// themselves, and plain version ordering is unchanged.
+func TestNewerReleasePreReleaseOrdering(t *testing.T) {
+	cases := []struct {
+		release, running string
+		want             bool
+	}{
+		{"v0.4.0", "v0.4.0-rc1", true},  // final beats its own rc (the F17 bug)
+		{"v0.4.0-rc1", "v0.3.19", true}, // rc is still newer than the prior release
+		{"v0.4.0-rc1", "v0.4.0", false}, // never a "newer" downgrade
+		{"v0.4.0-rc2", "v0.4.0-rc1", true},
+		{"v0.4.0-rc1", "v0.4.0-rc2", false},
+		{"v0.4.0-beta.2", "v0.4.0-beta.10", false}, // numeric ids compare as integers
+		{"v0.4.0-alpha", "v0.4.0-1", true},         // numeric sorts below alphanumeric
+		{"v0.4.1", "v0.4.0-rc9", true},
+		{"v0.4.0", "v0.4.0", false},
+		{"v0.4.0", "dev", true},
+		{"v0.4.0", "not-a-version", true},
+	}
+	for _, c := range cases {
+		if got := newerRelease(c.release, c.running); got != c.want {
+			t.Errorf("newerRelease(%q, %q) = %v, want %v", c.release, c.running, got, c.want)
+		}
+	}
+}
+
+// TestUpdateLockSecondAcquireRejected pins F19: the cross-process update
+// lock is exclusive — a second acquire (another process, or a second
+// in-process handle) gets errUpdateLockHeld, and releasing the first
+// allows the next acquire.
+func TestUpdateLockSecondAcquireRejected(t *testing.T) {
+	t.Setenv("PULSEMON_DB", filepath.Join(t.TempDir(), "pulsemon.db"))
+
+	f1, err := acquireUpdateLock()
+	if err != nil {
+		t.Fatalf("first acquire: %v", err)
+	}
+	_, err = acquireUpdateLock()
+	if !errors.Is(err, errUpdateLockHeld) {
+		t.Fatalf("second acquire = %v, want errUpdateLockHeld", err)
+	}
+	f1.Close()
+
+	f2, err := acquireUpdateLock()
+	if err != nil {
+		t.Fatalf("acquire after release: %v", err)
+	}
+	f2.Close()
+}
+
+// TestWatchdogRestoresPrevOnUnhealthy pins I2: with no healthy service
+// answering, the watchdog restores <prev> over <dst>.
+func TestWatchdogRestoresPrevOnUnhealthy(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PULSEMON_DB", filepath.Join(tmp, "x.db"))
+	// Port 1 is closed: every healthz candidate fails fast.
+	t.Setenv("PULSEMON_ADDR", "127.0.0.1:1")
+
+	prev := filepath.Join(tmp, "pulsemon.prev")
+	dst := filepath.Join(tmp, "pulsemon")
+	if err := os.WriteFile(prev, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oD, oP := detectRestart, performRestart
+	detectRestart = func() string { return "" } // no live service in the test
+	performRestart = func(string) error { return nil }
+	defer func() { detectRestart, performRestart = oD, oP }()
+
+	code := runWatchdog(prev, dst, 2*time.Second)
+	if code != 0 {
+		t.Fatalf("runWatchdog exit = %d, want 0 (rollback succeeded)", code)
+	}
+	b, _ := os.ReadFile(dst)
+	if string(b) != "OLD" {
+		t.Errorf("dst = %q, want the previous binary (OLD) restored", b)
+	}
+}
+
+// TestWatchdogNoopWhenHealthy pins I2's success path: a healthy service
+// means the watchdog leaves the new binary in place.
+func TestWatchdogNoopWhenHealthy(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("PULSEMON_DB", filepath.Join(tmp, "x.db"))
+
+	hz := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"status":"ok","version":"v9.9.9"}`))
+	}))
+	defer hz.Close()
+	t.Setenv("PULSEMON_ADDR", strings.TrimPrefix(hz.URL, "http://"))
+
+	prev := filepath.Join(tmp, "pulsemon.prev")
+	dst := filepath.Join(tmp, "pulsemon")
+	if err := os.WriteFile(prev, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dst, []byte("NEW"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oD := detectRestart
+	detectRestart = func() string { return "" }
+	defer func() { detectRestart = oD }()
+
+	code := runWatchdog(prev, dst, 3*time.Second)
+	if code != 0 {
+		t.Fatalf("runWatchdog exit = %d, want 0 (healthy)", code)
+	}
+	b, _ := os.ReadFile(dst)
+	if string(b) != "NEW" {
+		t.Errorf("dst = %q, want the new binary untouched (NEW)", b)
 	}
 }

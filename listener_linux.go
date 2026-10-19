@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -75,10 +76,10 @@ func requestRestart() restartOutcome {
 		// fire-and-forget killed the monitor on any fork/exec failure —
 		// fd exhaustion, deleted binary — turning a TLS settings change
 		// into a permanent outage).
-		if err := reexecFn(); err != nil {
+		if err := callReexec(); err != nil {
 			return restartOutcome{hint: "re-exec failed: " + err.Error() + " — restart pulsemon manually to apply the change"}
 		}
-		killSelf()
+		callKillSelf()
 		return restartOutcome{restarted: true}
 	}
 }
@@ -86,11 +87,40 @@ func requestRestart() restartOutcome {
 // reexecFn and killSelf are the two side effects of the bare-process
 // restart path. They are vars (like update.go's detectRestart /
 // performRestart) so tests can inject outcomes WITHOUT spawning a real
-// child or SIGTERMing the test process.
+// child or SIGTERMing the test process. restartMu guards the pair: a test
+// stub swaps them while the server's TLS-settings goroutine can still be
+// mid-requestRestart, and the unsynchronized swap is a data race the
+// detector flags (read via callReexec/callKillSelf, write via
+// setRestartFnsForTest).
 var (
-	reexecFn = reexec
-	killSelf = func() { syscall.Kill(os.Getpid(), syscall.SIGTERM) }
+	restartMu sync.RWMutex
+	reexecFn  = reexec
+	killSelf  = func() { syscall.Kill(os.Getpid(), syscall.SIGTERM) }
 )
+
+// callReexec invokes the (possibly test-injected) re-exec under the read
+// lock so a concurrent stub swap cannot race the read.
+func callReexec() error {
+	restartMu.RLock()
+	fn := reexecFn
+	restartMu.RUnlock()
+	return fn()
+}
+
+// callKillSelf is the killSelf counterpart of callReexec.
+func callKillSelf() {
+	restartMu.RLock()
+	fn := killSelf
+	restartMu.RUnlock()
+	fn()
+}
+
+// setRestartFnsForTest atomically swaps both injection points (tests only).
+func setRestartFnsForTest(reexec func() error, kill func()) {
+	restartMu.Lock()
+	reexecFn, killSelf = reexec, kill
+	restartMu.Unlock()
+}
 
 // reexec forks a fresh copy of this process. The child sets
 // PULSEMON_RESTARTING=1 so its listen loop retries the bind for 30s

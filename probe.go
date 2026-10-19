@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -26,6 +27,12 @@ import (
 type ProbeState struct {
 	id       string
 	isPaused bool
+	// kick wakes the sensor's probe loop early (2026-10-19 review F28):
+	// SetPaused(false) sends on it so a resume probes on the loop's next
+	// wake instead of waiting out the timer it was holding while paused
+	// (up to a full interval, e.g. 60s). Buffered-1 so the send never
+	// blocks; a nil channel (test-constructed states) simply never fires.
+	kick chan struct{}
 	// lastStatus is the most recently derived status for this sensor
 	// (maintained by doProbe). It drives the fast-recovery rule: a sensor
 	// recovering from ERROR flips back to up on a single good probe, even
@@ -181,6 +188,28 @@ type ProbeWorker struct {
 	// enforcing a per-sensor cooldown so an unthrottled stream of pulses
 	// can't starve the probe queue. Guarded by mu; cleaned up in Remove.
 	lastPulse map[string]time.Time
+
+	// alertOrderGates serializes each sensor's alert deliveries in LAUNCH ORDER
+	// (2026-10-19 review F4): an "error" alert whose webhook attempt fails
+	// and retries must not be delivered AFTER the sensor's later
+	// "recovered" alert — a chat whose last word is "error" on a recovered
+	// sensor is worse than a late alert. One lazily-started consumer
+	// goroutine per sensor drains a small FIFO; jobs run strictly in queue
+	// order. Guarded by alertMu. Remove drops a deleted sensor's map entry;
+	// its idle consumer (blocked on the unclosed channel) is left behind —
+	// one per deleted sensor, negligible at homelab sensor counts, and
+	// closing the channel would panic a sender still queued on it.
+	alertMu         sync.Mutex
+	alertOrderGates map[string]chan func()
+
+	// lastProviders: the last successfully loaded active-provider list
+	// (2026-10-19 review N3). GetSetting maps a DB read error to "", so a
+	// failing DB looks exactly like "no providers configured" — and
+	// sendWebhook's len(dests)==0 branch then reports a DROPPED alert as
+	// delivered. activeProviders pings the DB first; on a read failure it
+	// serves this cache. Guarded by provMu.
+	provMu        sync.Mutex
+	lastProviders []providerMeta
 }
 
 // retentionSeconds is how long of a probe history the in-memory series keeps.
@@ -191,14 +220,37 @@ const retentionSeconds int64 = 24 * 3600
 func NewProbeWorker(db *DB) *ProbeWorker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ProbeWorker{
-		sensors:    make(map[string]*ProbeState),
-		loops:      make(map[string]context.CancelFunc),
-		db:         db,
-		statsCache: make(map[string]*probeSeries),
-		lastPulse:  make(map[string]time.Time),
-		stopCtx:    ctx,
-		stopCancel: cancel,
+		sensors:         make(map[string]*ProbeState),
+		loops:           make(map[string]context.CancelFunc),
+		db:              db,
+		statsCache:      make(map[string]*probeSeries),
+		lastPulse:       make(map[string]time.Time),
+		alertOrderGates: make(map[string]chan func()),
+		stopCtx:         ctx,
+		stopCancel:      cancel,
 	}
+}
+
+// alertGate returns the FIFO job channel that serializes one sensor's
+// alert deliveries, starting its consumer goroutine on first use
+// (2026-10-19 review F4 — see the alertOrderGates field comment). The queue is
+// small on purpose: alert cadence is bounded by the probe interval and
+// realert_min, so a deep queue would only mean a wedged provider is
+// stacking undeliverable alerts.
+func (pw *ProbeWorker) alertGate(id string) chan func() {
+	pw.alertMu.Lock()
+	defer pw.alertMu.Unlock()
+	ch, ok := pw.alertOrderGates[id]
+	if !ok {
+		ch = make(chan func(), 8)
+		pw.alertOrderGates[id] = ch
+		go func() {
+			for job := range ch {
+				job()
+			}
+		}()
+	}
+	return ch
 }
 
 // Run reconciles the probe set from the DB every 5s, plus hourly retention.
@@ -294,15 +346,29 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
 
+	// Fresh state read UNDER the lock (2026-10-19 review F28): the config
+	// read above ran before pw.mu and can be arbitrarily stale by apply
+	// time — an operator pause landing in that gap would be clobbered by
+	// the stale 'active' row (the loop would keep probing a DB-paused
+	// sensor). Re-read the state column for exactly this id set, batched,
+	// so the pause sync applies the freshest state the DB has. A missing
+	// id (row deleted in the gap) stays on the pre-lock value; the
+	// vanished-sensor pass below handles it on the next pass.
+	freshState := pw.freshStates(ids)
+
 	seen := make(map[string]bool, len(configs))
 	for _, c := range configs {
 		seen[c.id] = true
+		state := c.state
+		if s, ok := freshState[c.id]; ok {
+			state = s
+		}
 		ps, ok := pw.sensors[c.id]
 		if !ok {
-			ps = &ProbeState{id: c.id, isPaused: c.state == "paused"}
+			ps = &ProbeState{id: c.id, isPaused: state == "paused", kick: make(chan struct{}, 1)}
 			pw.sensors[c.id] = ps
 		} else {
-			ps.isPaused = c.state == "paused" // keep pause in sync with DB
+			ps.isPaused = state == "paused" // keep pause in sync with DB (fresh read, F28)
 		}
 		if _, ok := pw.loops[c.id]; !ok {
 			// Known TOCTOU (2026-10-19 review M1b, fix deferred): configs was read
@@ -331,12 +397,64 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 }
 
+// freshStates re-reads the state column for exactly the given sensor ids,
+// batched in inQueryChunk (2026-10-19 review F28). syncSensors calls it
+// under pw.mu: the pre-lock config read can be arbitrarily stale by apply
+// time (an operator pause landing in the read→apply gap would otherwise be
+// clobbered by the stale row), so the pause sync uses this fresh read. A
+// missing id (row deleted in the gap) is simply absent from the map.
+func (pw *ProbeWorker) freshStates(ids []string) map[string]string {
+	out := make(map[string]string, len(ids))
+	for i := 0; i < len(ids); i += inQueryChunk {
+		end := i + inQueryChunk
+		if end > len(ids) {
+			end = len(ids)
+		}
+		chunk := ids[i:end]
+		q := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for j, id := range chunk {
+			q[j] = "?"
+			args[j] = id
+		}
+		rows, err := pw.db.Query(`SELECT id, state FROM sensors WHERE id IN (`+strings.Join(q, ",")+`)`, args...)
+		if err != nil {
+			log.Printf("ProbeWorker: fresh state read failed: %v", err)
+			continue
+		}
+		for rows.Next() {
+			var id, state string
+			if rows.Scan(&id, &state) == nil {
+				out[id] = state
+			}
+		}
+		rows.Close()
+	}
+	return out
+}
+
 // SetPaused flips the in-memory pause flag immediately (API PATCH fast path).
+// A resume (paused=false) also KICKS the sensor's loop (2026-10-19 review
+// F28): the loop's timer was holding a full interval while the sensor was
+// paused, so without the kick the first probe after a resume would be up to
+// a whole interval late (60s on a 60s sensor). The kick makes the loop
+// re-evaluate and probe on its next wake.
 func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
-	if ps, ok := pw.sensors[id]; ok {
-		ps.isPaused = paused
+	ps, ok := pw.sensors[id]
+	if !ok {
+		return
+	}
+	ps.isPaused = paused
+	if !paused && ps.kick != nil {
+		// Non-blocking: the buffer absorbs one pending kick; a second
+		// resume while the first is still queued is a no-op (the loop is
+		// already woken).
+		select {
+		case ps.kick <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -405,6 +523,13 @@ func (pw *ProbeWorker) Remove(id string) {
 	pw.statsMu.Lock()
 	delete(pw.statsCache, id)
 	pw.statsMu.Unlock()
+	// Same for the per-sensor alert gate (2026-10-19 review F4): drop the
+	// map entry so the channel isn't pinned by the map. The idle consumer
+	// goroutine (blocked on the unclosed channel) is left behind — see the
+	// alertOrderGates field comment for why the channel is not closed.
+	pw.alertMu.Lock()
+	delete(pw.alertOrderGates, id)
+	pw.alertMu.Unlock()
 }
 
 // ActiveCount is the number of sensor loops currently tracked (healthz).
@@ -455,6 +580,18 @@ func (pw *ProbeWorker) warmStats() {
 	// sensor's window can span >24h) plus the full 24h retention — matching
 	// exactly what the live series will hold, so a fresh process serves the
 	// same window the DB path would have.
+	//
+	// Branch 1 (last 60 per sensor, ROW_NUMBER) must be UNRESTRICTED by the
+	// 24h cutoff: the "last 60" window is the 60 most recent probes
+	// OVERALL, and for a sensor whose recent probes are fewer than 60 it
+	// reaches back past the cutoff. The 24h branch then overlaps it, so the
+	// two branches are combined with a deduping UNION — a UNION ALL would
+	// emit the overlapping recent rows twice and grow the series past 60
+	// (warmstats_union_test.go pins this). The dedupe cost is a one-time
+	// startup expense; the alternative (a disjoint split) is inexpressible,
+	// because how far back the last-60 window reaches depends on each
+	// sensor's own row counts (2026-10-19 review F29 — the UNION ALL "fix"
+	// was reverted for breaking this contract).
 	// The query has two IN-clauses (last-60 part + 24h part), so the id list
 	// appears twice, followed by the 24h cutoff. It runs in inQueryChunk
 	// batches (see db.go): 2*inQueryChunk+1 params per chunk stays far under
@@ -824,10 +961,25 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 	var nextDelay time.Duration
 
 	for {
+		// Grab the kick channel under the lock so a state swap (Restart/
+		// Remove replacing pw.sensors[id]) can't leave us selecting on a
+		// stale channel. A nil kick (test-constructed state) is a case
+		// that never fires.
+		pw.mu.Lock()
+		kick := struct{ ch chan struct{} }{}
+		if ps, ok := pw.sensors[c.id]; ok {
+			kick.ch = ps.kick
+		}
+		pw.mu.Unlock()
+
 		select {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
+		case <-kick.ch:
+			// Resume fast path (2026-10-19 review F28): SetPaused(false)
+			// woke us — fall through and probe on this wake instead of
+			// waiting out the timer we were holding while paused.
 		}
 		pw.mu.Lock()
 		ps, ok := pw.sensors[c.id]
@@ -1652,14 +1804,34 @@ func telegramHasURL(db *DB) bool {
 }
 
 // activeProviders returns every provider currently receiving alerts.
-func (pw *ProbeWorker) activeProviders() []providerMeta {
+// activeProviders returns the enabled, URL-configured providers. The
+// second return value reports whether the DB read itself succeeded
+// (2026-10-19 review N3): GetSetting maps a read error to "", so a
+// failing DB is indistinguishable from "no providers configured" without
+// the liveness ping. On a read failure the LAST KNOWN-GOOD list is served
+// from the cache; if nothing was ever loaded, it returns (nil, false) and
+// the caller must report the alert NOT delivered — never "delivered" when
+// nothing was sent.
+func (pw *ProbeWorker) activeProviders() ([]providerMeta, bool) {
+	if err := pw.db.Ping(); err != nil {
+		pw.provMu.Lock()
+		cached := pw.lastProviders
+		pw.provMu.Unlock()
+		if cached != nil {
+			return cached, true
+		}
+		return nil, false
+	}
 	var out []providerMeta
 	for _, p := range providerList {
 		if p.Enabled(pw.db) && p.HasURL(pw.db) {
 			out = append(out, p)
 		}
 	}
-	return out
+	pw.provMu.Lock()
+	pw.lastProviders = out
+	pw.provMu.Unlock()
+	return out, true
 }
 
 // providerStatus is the per-provider read the settings API returns to the
@@ -1740,12 +1912,29 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 	return out
 }
 
-// sendWebhook delivers one alert to every active provider IN PARALLEL (a slow
-// endpoint must not delay the others) and reports whether it was delivered:
-// true when at least one provider accepted it, or when none is configured (there
-// is nothing to retry); false only when every configured provider failed after
-// its retries, so the caller can schedule another attempt.
+// sendWebhook delivers one alert to every active provider and reports
+// whether it was delivered. The delivery is QUEUED on the sensor's
+// alertGate FIFO first (2026-10-19 review F4): alerts for one sensor run
+// strictly in launch order, so an "error" alert whose first attempt fails
+// and retries cannot be delivered AFTER the sensor's later "recovered"
+// alert — the chat's last word must match the sensor's current state.
+// The caller blocks until the delivery finishes (the launchAlert goroutine
+// is tracked in alertWG, so DrainAlerts still sees true completion).
 func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+	done := make(chan bool, 1)
+	pw.alertGate(id) <- func() {
+		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
+	}
+	return <-done
+}
+
+// sendWebhookDeliver delivers one alert to every active provider IN
+// PARALLEL (a slow endpoint must not delay the others) and reports whether
+// it was delivered: true when at least one provider accepted it, or when
+// none is configured (there is nothing to retry); false only when every
+// configured provider failed after its retries, so the caller can schedule
+// another attempt.
+func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
 	// Resolve every provider URL BEFORE delivering anything. GetSetting
 	// maps a DB error to "" — indistinguishable from "not configured" — so
 	// a transient read failure made every provider look unset and the alert
@@ -1757,7 +1946,16 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		url string
 	}
 	var dests []dest
-	for _, p := range pw.activeProviders() {
+	providers, readOK := pw.activeProviders()
+	if !readOK {
+		// DB unreadable and no last-known-good list: the alert CANNOT be
+		// delivered, and it must be reported as such so the caller can
+		// retry — never "delivered" on an empty (error-induced) provider
+		// list (2026-10-19 review N3).
+		log.Printf("alert: provider list unreadable (no cache) — alert not delivered")
+		return false
+	}
+	for _, p := range providers {
 		url, err := pw.db.GetSettingErr(p.Kind + "_url")
 		if err != nil {
 			log.Printf("alert: settings read failed, alert not delivered: %v", err)
@@ -1794,19 +1992,26 @@ func (pw *ProbeWorker) deliverOne(p providerMeta, url, name, target, oldState, s
 		if reAlert {
 			card = cardForRe(state, name, target, rttMs)
 		}
-		return pw.postJSON(url, map[string]string{"text": card}) == nil
+		return pw.postJSON(url, map[string]interface{}{"text": card}) == nil
 	case "discord":
 		card := discordCard(oldState, state, name, target, rttMs)
 		if reAlert {
 			card = discordCardRe(state, name, target, rttMs)
 		}
-		return pw.postJSON(url, map[string]string{"content": card}) == nil
+		// allowed_mentions.parse = [] (2026-10-19 review F23): never let
+		// card text trigger role/user mentions — a sensor named
+		// "@everyone" would otherwise mass-ping the channel. Pairs with
+		// discordMentionSafe, which covers clients that ignore the field.
+		return pw.postJSON(url, map[string]interface{}{
+			"content":          card,
+			"allowed_mentions": map[string]interface{}{"parse": []string{}},
+		}) == nil
 	case "telegram":
 		card := telegramCard(oldState, state, name, target, rttMs)
 		if reAlert {
 			card = telegramCardRe(state, name, target, rttMs)
 		}
-		return pw.postJSON(url, map[string]string{
+		return pw.postJSON(url, map[string]interface{}{
 			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
 			"text":       card,
 			"parse_mode": "HTML",
@@ -1908,7 +2113,9 @@ func mustJSON(v interface{}) []byte {
 // launchAlert runs an alert delivery in a tracked goroutine. It is NOT
 // counted in wg (probe loops): a hung webhook must not stall Run's return,
 // which main bounds to 10s and treats as a failure. alertWG + DrainAlerts
-// give the delivery a bounded second chance after Run returns.
+// give the delivery a bounded second chance after Run returns. Per-sensor
+// delivery ORDERING lives in sendWebhook (which knows the sensor id) —
+// see alertGate.
 func (pw *ProbeWorker) launchAlert(fn func()) {
 	pw.alertWG.Add(1)
 	go func() {
@@ -1975,7 +2182,52 @@ func statusIcon(state string) string { return statusIcons[state] }
 
 var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}
 
+// alertTarget renders a sensor's target for third-party alert payloads,
+// stripping any userinfo (2026-10-19 review F22): an HTTP target like
+// https://admin:hunter2@nas.lan/health used to go VERBATIM into the
+// Discord/Telegram/Chat/SMTP card — the password readable by everyone who
+// can see the channel. u.User = nil drops the credentials. A string that
+// doesn't parse as a URL (an IP, a hostname) is returned unchanged —
+// there is nothing to strip.
+func alertTarget(target string) string {
+	u, err := neturl.Parse(target)
+	if err != nil || u.Scheme == "" || u.User == nil {
+		return target
+	}
+	// Strip ONLY the userinfo, from the RAW string. u.String() would
+	// percent-encode the path/query — a target like /<b>bold</b> would come
+	// back as /%3Cb%3Ebold%3C/b%3E, and the card's HTML escaping would then
+	// show literal %3C… to the reader instead of the escaped markup the
+	// target really is (telegram_test.go pins both halves: & -> &amp; and
+	// <b> -> &lt;b&gt;, with the card's own tags intact).
+	// userinfo is the run between "scheme://" and the first '@' that
+	// precedes any path/query/fragment separator.
+	if i := strings.Index(target, "://"); i >= 0 {
+		rest := target[i+3:]
+		at := strings.IndexByte(rest, '@')
+		firstSep := strings.IndexAny(rest, "/?#")
+		if at >= 0 && (firstSep < 0 || at < firstSep) {
+			return target[:i+3] + rest[at+1:]
+		}
+	}
+	return target
+}
+
+// discordMentionSafe neutralizes Discord mention tokens in free text
+// (2026-10-19 review F23): a sensor named "@everyone" (or a target path
+// containing the token) would fire a mass mention to the whole channel
+// when the card posts. A zero-width space after the @ breaks the token
+// for Discord's mention parser while staying invisible in the rendered
+// card. Belt-and-braces with the payload's allowed_mentions.parse = []:
+// this covers clients/imports that ignore allowed_mentions.
+func discordMentionSafe(s string) string {
+	s = strings.ReplaceAll(s, "@everyone", "\u200beveryone")
+	s = strings.ReplaceAll(s, "@here", "\u200bhere")
+	return s
+}
+
 func cardFor(oldState, state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1990,6 +2242,7 @@ func cardFor(oldState, state, name, target string, rttMs float64) string {
 }
 
 func cardForRe(state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -2003,8 +2256,10 @@ func cardForRe(state, name, target string, rttMs float64) string {
 }
 
 // Discord uses Markdown (**bold**, no *italic* emphasis); the card is plain
-// content. Same information, Discord-flavored.
+// content. Same information, Discord-flavored. name/target are sanitized
+// first: credentials stripped (F22) and mention tokens neutralized (F23).
 func discordCard(oldState, state, name, target string, rttMs float64) string {
+	name, target = discordMentionSafe(name), discordMentionSafe(alertTarget(target))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -2018,6 +2273,7 @@ func discordCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func discordCardRe(state, name, target string, rttMs float64) string {
+	name, target = discordMentionSafe(name), discordMentionSafe(alertTarget(target))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -2081,8 +2337,11 @@ func (pw *ProbeWorker) retryAlert(try func() (retryable bool, retryAfter time.Du
 // errors, 429, 5xx) per alertRetryDelays. The POST is bound to pw.stopCtx so
 // that on shutdown a delivery stuck in a network blip - or sleeping between
 // retries - is aborted promptly instead of holding DrainAlerts. The returned
-// error never contains the URL (it carries the provider credential).
-func (pw *ProbeWorker) postJSON(url string, payload map[string]string) error {
+// error never contains the URL (it carries the provider credential). The
+// payload is map[string]interface{} (not map[string]string) because the
+// Discord provider needs a nested object — allowed_mentions
+// (2026-10-19 review F23) — which a string-valued map can't express.
+func (pw *ProbeWorker) postJSON(url string, payload map[string]interface{}) error {
 	body, _ := json.Marshal(payload)
 	err := pw.retryAlert(func() (bool, time.Duration, error) {
 		req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
@@ -2095,6 +2354,11 @@ func (pw *ProbeWorker) postJSON(url string, payload map[string]string) error {
 			return pw.stopCtx.Err() == nil, 0, redactErr(err)
 		}
 		defer resp.Body.Close()
+		// Drain (capped) before close so the transport can reuse the
+		// TLS connection for the next alert (2026-10-19 review F25):
+		// closing an unread body marks the conn non-reusable, so every
+		// alert paid a fresh handshake even to the same endpoint.
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 		switch code := resp.StatusCode; {
 		case code >= 300 && code < 400:
 			return false, 0, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")

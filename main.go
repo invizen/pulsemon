@@ -93,6 +93,10 @@ func dispatch(args []string) dispatchKind {
 		}
 	case "-healthz", "--healthz":
 		return runHealthcheck()
+	case "-healthz-http", "--healthz-http":
+		// The HTTP form of the healthcheck (K2): verifies the RUNNING
+		// server answers /api/healthz, not just that the store opens.
+		return runHealthcheckHTTP()
 	case "restart":
 		// Apply a config that needs a fresh process (listener/TLS).
 		return runRestartCommand()
@@ -109,7 +113,7 @@ func dispatch(args []string) dispatchKind {
 	// error.
 	if strings.HasPrefix(args[1], "-") {
 		fmt.Fprintf(os.Stderr, "pulsemon: unknown flag %q\n\n", args[1])
-		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|rollback|VERSION] [--restart]  self-update (check only, roll back the last update, or pin a version); --restart also restarts the service\n  pulsemon auth-user add <user> [<password>]   create a dashboard account (first account enables auth); no <password> (or --password-stdin) reads it from stdin\n  pulsemon auth-user remove <user>       delete a dashboard account\n  pulsemon auth-user list                list dashboard accounts\n  pulsemon -healthz     verify the store is usable (container healthcheck)\n  pulsemon -version     print the build version and exit\n")
+		fmt.Fprint(os.Stderr, "Usage:\n  pulsemon            start the monitor + dashboard\n  pulsemon update [check|rollback|watchdog|VERSION] [--restart]  self-update (check only, roll back the last update, or pin a version); --restart also restarts the service\n  pulsemon auth-user add <user> [<password>]   create a dashboard account (first account enables auth); no <password> (or --password-stdin) reads it from stdin\n  pulsemon auth-user remove <user>       delete a dashboard account\n  pulsemon auth-user list                list dashboard accounts\n  pulsemon -healthz        verify the store is usable\n  pulsemon -healthz-http   verify the RUNNING server answers /api/healthz (container healthcheck)\n  pulsemon -version        print the build version and exit\n")
 		if os.Getenv("PULSEMON_TEST_NOFATAL") == "" {
 			os.Exit(1)
 		}
@@ -136,6 +140,49 @@ func runHealthcheck() dispatchKind {
 		return dExit1
 	}
 	return dExit0
+}
+
+// runHealthcheckHTTP is the HTTP form of the container healthcheck (K2,
+// 2026-10-19 review): the plain -healthz flag only opens the store, so a
+// wedged HTTP server (listener dead, handler panic-loop) still reports
+// "healthy" to the container runtime. This flag does a real GET against the
+// running server's /api/healthz and exits 0 ONLY when the pulsemon healthz
+// payload comes back, polling every configured (scheme, port) candidate the
+// same way the updater does (once a cert is installed the plain port is
+// deliberately not bound). TLS verification is skipped for the same reason
+// the updater skips it: the question is "is the server answering", not "is
+// the certificate trusted" — a self-signed homelab cert must pass.
+func runHealthcheckHTTP() dispatchKind {
+	db, err := NewDB(dbPathFromEnv())
+	if err != nil {
+		log.Printf("healthz-http: open: %v", err)
+		return dExit1
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
+		log.Printf("healthz-http: query: %v", err)
+		return dExit1
+	}
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	for _, t := range healthzTargets(db) {
+		resp, gerr := client.Get(t + "/api/healthz")
+		if gerr != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && healthzPayloadOK(string(body)) {
+			return dExit0
+		}
+	}
+	log.Printf("healthz-http: no configured endpoint answered /api/healthz with the pulsemon payload")
+	return dExit1
 }
 
 // tlsKeyPairOK pre-validates the cert+key pair the listener is about to
@@ -485,13 +532,13 @@ func migrateAuthBootstrapped(db *DB) {
 }
 
 func main() {
-	// Ensure the platform data dir exists before anything opens the DB. A
-	// no-op on Linux (the Docker /data volume is pre-created and MkdirAll on
-	// an existing dir returns nil); on Windows it creates %ProgramData%\Pulsemon.
-	ensureDataDir()
-
 	// Self-update, healthcheck, and version are dispatched before the server
-	// starts; unknown flags are rejected there (see dispatch).
+	// starts; unknown flags are rejected there (see dispatch). The data dir
+	// is ensured in runServer (the only path that opens the DB), NOT here —
+	// a `-version`/`update`/`healthz` invocation must work on a host where
+	// the default data dir can't be created (non-root, /data absent);
+	// fatalling at process start broke the whole CLI surface (2026-10-19
+	// v0.3.20 verification catch).
 	switch dispatch(os.Args) {
 	case dExit0:
 		return
@@ -512,6 +559,16 @@ func main() {
 // server body shared by every runtime: the Linux signal path and the Windows
 // service path both close `stop` to trigger the identical shutdown.
 func runServer(stop <-chan struct{}) {
+	// Ensure the platform data dir exists before the DB opens. On Linux this
+	// also refuses a RELATIVE PULSEMON_DB (F15) — a hard startup error,
+	// because a relative path would put the DB (and its secrets) in the
+	// process's working directory. This lives here (not in main) so the
+	// -version/update/healthz CLI dispatch works on hosts where the default
+	// data dir can't be created.
+	if err := ensureDataDir(); err != nil {
+		log.Fatalf("pulsemon: %v", err)
+	}
+
 	db, err := NewDB(dbPathFromEnv())
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)

@@ -259,6 +259,13 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if cert != "" {
+		// What lands on disk: the FULL chain (leaf + every intermediate),
+		// canonical PEM (2026-10-19 review F5).
+		certFile, err := fullchainPEM(cert)
+		if err != nil {
+			respondWithError(w, http.StatusBadRequest, "invalid certificate: "+err.Error())
+			return
+		}
 		dir := tlsDir(s.db)
 		// Owner-only: key.pem is a private key and the dir lives next to
 		// the secret-holding DB.
@@ -273,6 +280,15 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		// rename key then cert into place. A failure anywhere before the
 		// renames leaves the previously installed pair untouched — no
 		// mismatched pair, no boot crash loop.
+		//
+		// Crash safety (2026-10-19 review F18, minimum-acceptable variant
+		// of the spec's F2): both temps are fsynced BEFORE close and the
+		// directory is fsynced after the renames, so a crash loses at most
+		// the window between the two renames (microseconds) — the old
+		// pair stays loadable on either side of it. The spec's preferred
+		// generation-dir+symlink design was not used because the existing
+		// install test pins the flat-file rename contract (a directory at
+		// the key target must fail the install and leave the old pair).
 		tmpCert, err := os.CreateTemp(dir, ".cert.pem.tmp*")
 		if err != nil {
 			respondInternal(w, "temp cert", err)
@@ -288,13 +304,19 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		keyName := tmpKey.Name()
 		install := func() error {
-			if _, err := tmpCert.Write([]byte(normPEM(cert, "CERTIFICATE"))); err != nil {
+			if _, err := tmpCert.Write([]byte(certFile)); err != nil {
+				return err
+			}
+			if err := tmpCert.Sync(); err != nil { // F18: durable before rename
 				return err
 			}
 			if err := tmpCert.Close(); err != nil {
 				return err
 			}
 			if _, err := tmpKey.Write([]byte(normPEM(key, keyPEMType(key)))); err != nil {
+				return err
+			}
+			if err := tmpKey.Sync(); err != nil { // F18: durable before rename
 				return err
 			}
 			if err := tmpKey.Close(); err != nil {
@@ -306,7 +328,18 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			if err := os.Rename(keyName, keyPath); err != nil {
 				return err
 			}
-			return os.Rename(certName, certPath)
+			if err := os.Rename(certName, certPath); err != nil {
+				return err
+			}
+			// F18: make the two renames durable (best effort — some
+			// filesystems do not support directory fsync).
+			if d, derr := os.Open(dir); derr == nil {
+				if serr := d.Sync(); serr != nil {
+					log.Printf("TLS: directory fsync after install failed: %v", serr)
+				}
+				d.Close()
+			}
+			return nil
 		}
 		if err := install(); err != nil {
 			os.Remove(certName)
@@ -314,7 +347,8 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "install cert", err)
 			return
 		}
-		log.Printf("TLS: certificate installed (%s, expires %s)", parsed.Subject.CommonName, parsed.NotAfter.Format("2006-01-02"))
+		log.Printf("TLS: certificate installed (%s, expires %s, %d PEM block(s))",
+			parsed.Subject.CommonName, parsed.NotAfter.Format("2006-01-02"), countPEMBlocks(certFile))
 	}
 
 	// Persist the port ONLY after the pair is in place (or when only the
@@ -395,6 +429,70 @@ func normPEM(in, wantType string) string {
 		return string(pem.EncodeToMemory(block))
 	}
 	return in
+}
+
+// fullchainPEM returns canonical PEM text containing ALL CERTIFICATE blocks
+// in the upload, in order (2026-10-19 review F5). The old normPEM path kept
+// only the FIRST block, so a fullchain upload (leaf + intermediates, the
+// normal "cat leaf.pem intermediate.pem" form) stored a leaf-only file and
+// clients failed with "unknown authority". Accepts the same input forms as
+// pemBlockFromUpload: direct PEM text (multiple blocks), base64 of PEM
+// text, or raw base64 DER (a single certificate — no chain possible).
+// Validation (tlsValidatePair) still checks the FIRST block (the leaf)
+// against the key, as before; this only changes what gets stored.
+func fullchainPEM(in string) (string, error) {
+	var raw []byte
+	if b, _ := pem.Decode([]byte(in)); b != nil {
+		raw = []byte(in)
+	} else if dec, err := base64.StdEncoding.DecodeString(in); err == nil {
+		if b, _ := pem.Decode(dec); b != nil {
+			raw = dec
+		}
+	}
+	if raw != nil {
+		var blocks []*pem.Block
+		rest := raw
+		for {
+			var b *pem.Block
+			b, rest = pem.Decode(rest)
+			if b == nil {
+				break
+			}
+			if b.Type != "CERTIFICATE" {
+				return "", fmt.Errorf("unexpected PEM type %q in certificate", b.Type)
+			}
+			blocks = append(blocks, b)
+		}
+		if len(blocks) == 0 {
+			return "", errors.New("no PEM CERTIFICATE block found")
+		}
+		var out []byte
+		for _, b := range blocks {
+			out = append(out, pem.EncodeToMemory(b)...)
+		}
+		return string(out), nil
+	}
+	// Raw base64 DER (no headers at all — the common "export" format):
+	// exactly one certificate.
+	if der, err := base64.StdEncoding.DecodeString(in); err == nil && len(der) > 100 {
+		return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})), nil
+	}
+	return "", errors.New("no PEM CERTIFICATE block found")
+}
+
+// countPEMBlocks counts the PEM blocks in text (log line: lets an operator
+// see at a glance whether the stored cert kept its intermediates, F5).
+func countPEMBlocks(text string) int {
+	n := 0
+	rest := []byte(text)
+	for {
+		var b *pem.Block
+		b, rest = pem.Decode(rest)
+		if b == nil {
+			return n
+		}
+		n++
+	}
 }
 
 // keyPEMType returns the PEM type the uploaded key block had, so the

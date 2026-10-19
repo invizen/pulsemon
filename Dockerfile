@@ -4,6 +4,12 @@
 # on a Jetson/Pi it builds an arm64 image — no cross-tooling needed because
 # pulsemon is pure Go (CGO_ENABLED=0).
 FROM golang:1.26-alpine AS builder
+# F10 (2026-10-19 review): WITHOUT this ARG declaration, BuildKit leaves
+# ${TARGETARCH} EMPTY even for `docker buildx build --platform linux/arm64`,
+# so the `:-amd64` fallback silently shipped an AMD64 binary in an arm64
+# image (verified empirically). Declaring the ARG makes BuildKit populate it
+# from the requested platform.
+ARG TARGETARCH
 WORKDIR /app
 RUN apk add --no-cache git
 COPY go.mod go.sum ./
@@ -30,5 +36,8 @@ EXPOSE 9299
 # /data volume must be writable by uid 1000 (the SQLite WAL needs write
 # access to the directory, not just the file):  chown -R 1000:1000 <data dir>.
 USER 1000:1000
-HEALTHCHECK --interval=30s --timeout=5s --retries=3 --start-period=10s CMD ["/pulsemon", "-healthz"]
+# K2 (2026-10-19 review): -healthz-http verifies the RUNNING server answers
+# /api/healthz, not just that the store opens (a wedged listener would
+# otherwise read "healthy" to the container runtime).
+HEALTHCHECK --interval=30s --timeout=8s --retries=3 --start-period=10s CMD ["/pulsemon", "-healthz-http"]
 ENTRYPOINT ["/pulsemon"]

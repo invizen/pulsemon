@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"embed"
 	"encoding/json"
@@ -195,6 +196,21 @@ func (s *Server) hostAllowed(host string) bool {
 	return false
 }
 
+// unauthMutateAllowed reports whether a state-changing request arriving
+// WITHOUT a session from r.Host is permitted (2026-10-19 review N2). With
+// PULSEMON_ALLOWED_HOSTS unset the LAN-trust default stands (allowed); with
+// it set, "auth off = fully open" becomes "open to allowlisted hosts" — a
+// DNS-rebinding page fires simple credentials-including requests and, with
+// no session cookie protecting the endpoints, every mutating route is
+// reachable by it. /api/auth/login is deliberately NOT gated (the auth entry
+// point must keep working; it has its own per-IP rate limiting).
+func (s *Server) unauthMutateAllowed(r *http.Request) bool {
+	if len(s.allowedHosts) == 0 {
+		return true
+	}
+	return s.hostAllowed(r.Host)
+}
+
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
 }
@@ -260,6 +276,16 @@ func (s *Server) authGate() http.Handler {
 			if s.auth.Bootstrapped() {
 				// Auth was disabled by the operator (all accounts deleted):
 				// the documented "auth off = fully open" behavior applies.
+				// With PULSEMON_ALLOWED_HOSTS set, mutating requests from a
+				// non-allowlisted Host are 403 (2026-10-19 review N2 — see
+				// unauthMutateAllowed); reads stay open.
+				switch r.Method {
+				case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
+					if !s.unauthMutateAllowed(r) {
+						respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
+						return
+					}
+				}
 				s.mux.ServeHTTP(w, r)
 				return
 			}
@@ -303,9 +329,28 @@ func (s *Server) authGate() http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// The login/status endpoints must be reachable WITHOUT a
 			// session — the UI's gate calls them to decide whether to
-			// show the login form.
-			if r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/status" || r.URL.Path == "/api/auth/logout" {
+			// show the login form. Login is exempt from the Host gate
+			// (2026-10-19 review N2) — it is the auth entry point and has
+			// its own per-IP rate limiting; logout (a POST) is gated like
+			// any other sessionless mutating endpoint.
+			if r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/status" {
 				s.mux.ServeHTTP(w, r)
+				return
+			}
+			// Logout is reachable without a session (the UI clears its
+			// cookie on the way out and curl-based ops rely on it), so it
+			// gets the same treatment as the other sessionless mutating
+			// endpoints: allowed by default on the trusted LAN, 421 when
+			// PULSEMON_ALLOWED_HOSTS is set and the Host isn't listed
+			// (2026-10-19 review N2). An allowed logout must be FORWARDED
+			// to the handler — falling through to the 401 below would
+			// break every sessionless logout (csrf_test.go pins this).
+			if r.URL.Path == "/api/auth/logout" {
+				if s.unauthMutateAllowed(r) {
+					s.mux.ServeHTTP(w, r)
+					return
+				}
+				respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
 				return
 			}
 			respondWithError(w, http.StatusUnauthorized, "authentication required")
@@ -837,45 +882,93 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "no fields to update")
 			return
 		}
-		// One transaction: the UPDATE and the tag replace commit together,
-		// so a constraint failure (rename) or a crash can't leave the tags
-		// changed while the row is not (or vice versa). setSensorTagsInTx is
-		// the tx-aware twin of db.SetSensorTags (which owns its own
-		// transaction and can't join this one).
-		tx, err := s.db.Begin()
-		if err != nil {
-			respondInternal(w, "begin sensor update", err)
-			return
-		}
-		defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
-
-		if len(sets) > 0 {
-			args = append(args, id)
-			res, err := tx.Exec("UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
-			if err != nil {
-				// A rename hitting the UNIQUE name constraint is a 409,
-				// exactly like POST — not a 500 with raw SQL text. Exact
-				// constraint text (2026-10-19 review m7).
-				if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
-					respondWithError(w, http.StatusConflict, "sensor name already exists")
-					return
+		// One BEGIN IMMEDIATE transaction (2026-10-19 review F14): the row is
+		// re-read INSIDE it and the type/target pair (plus the effective
+		// interval/timeout cross-check) re-validated against the FRESH values
+		// before the UPDATE. The pre-tx reads above only feed the per-field
+		// validation and the 404 check; a concurrent PATCH that changed the
+		// target/type between that read and the write used to slip through
+		// validated against the stale pair. BEGIN IMMEDIATE holds the write
+		// lock from the start, so no concurrent writer can change the row
+		// between the re-read and the UPDATE. The UPDATE and the tag replace
+		// commit together, so a constraint failure (rename) or a crash can't
+		// leave the tags changed while the row is not (or vice versa).
+		var patchErr error
+		patchErr = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
+			ctx := r.Context()
+			var txType, txTarget string
+			var txIntervalS, txTimeoutMS int
+			if err := c.QueryRowContext(ctx,
+				"SELECT type, target, interval_s, timeout_ms FROM sensors WHERE id = ?", id).
+				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS); err != nil {
+				return errPatchSensorGone
+			}
+			if txType == "" {
+				txType = "icmp"
+			}
+			freshType := txType
+			if req.Type != nil {
+				freshType = normalizeProbeType(*req.Type)
+			}
+			freshTarget := txTarget
+			if req.Target != nil {
+				freshTarget = strings.TrimSpace(*req.Target)
+			}
+			if freshType == "http" {
+				if !validURL(freshTarget) {
+					return errPatchTargetNotURL
 				}
-				respondInternal(w, "update sensor "+id, err)
-				return
+			} else if !validTarget(freshTarget) {
+				return errPatchTargetInvalid
 			}
-			if n, _ := res.RowsAffected(); n == 0 {
-				respondWithError(w, http.StatusNotFound, "sensor not found")
-				return
+			feffIntervalS := txIntervalS
+			if req.IntervalS != nil {
+				feffIntervalS = *req.IntervalS
 			}
+			feffTimeoutMS := txTimeoutMS
+			if req.TimeoutMS != nil {
+				feffTimeoutMS = *req.TimeoutMS
+			}
+			if feffTimeoutMS > feffIntervalS*1000 {
+				return errPatchTimeoutExceedsInterval
+			}
+
+			if len(sets) > 0 {
+				args = append(args, id)
+				res, err := c.ExecContext(ctx, "UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
+				if err != nil {
+					// A rename hitting the UNIQUE name constraint is a 409,
+					// exactly like POST — not a 500 with raw SQL text. Exact
+					// constraint text (2026-10-19 review m7).
+					if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
+						return errPatchNameConflict
+					}
+					return err
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					return errPatchSensorGone
+				}
+			}
+			if req.Tags != nil {
+				return setSensorTagsInConn(c, id, newTags)
+			}
+			return nil
+		})
+		switch {
+		case errors.Is(patchErr, errPatchSensorGone):
+			respondWithError(w, http.StatusNotFound, "sensor not found")
+		case errors.Is(patchErr, errPatchTargetNotURL):
+			respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
+		case errors.Is(patchErr, errPatchTargetInvalid):
+			respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
+		case errors.Is(patchErr, errPatchTimeoutExceedsInterval):
+			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
+		case errors.Is(patchErr, errPatchNameConflict):
+			respondWithError(w, http.StatusConflict, "sensor name already exists")
+		case patchErr != nil:
+			respondInternal(w, "update sensor "+id, patchErr)
 		}
-		if req.Tags != nil {
-			if err := setSensorTagsInTx(tx, id, newTags); err != nil {
-				respondInternal(w, "update sensor tags "+id, err)
-				return
-			}
-		}
-		if err := tx.Commit(); err != nil {
-			respondInternal(w, "commit sensor update", err)
+		if patchErr != nil {
 			return
 		}
 
@@ -928,6 +1021,23 @@ func setSensorTagsInTx(tx *sql.Tx, id string, tags []string) error {
 	}
 	for _, tag := range tags {
 		if _, err := tx.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, tag); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setSensorTagsInConn is the *sql.Conn twin of setSensorTagsInTx, for the
+// PATCH sensor write path that runs inside a BEGIN IMMEDIATE ImmediateTx
+// (2026-10-19 review F14) — a *sql.Tx from db.Begin can't join it because
+// the transaction lives on the pinned connection.
+func setSensorTagsInConn(c *sql.Conn, id string, tags []string) error {
+	ctx := context.Background()
+	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
+		return err
+	}
+	for _, tag := range tags {
+		if _, err := c.ExecContext(ctx, "INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, tag); err != nil {
 			return err
 		}
 	}
@@ -1160,6 +1270,19 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 // the same name.
 const cloneMaxAttempts = 5
 
+// Sentinel errors from the PATCH sensor write transaction (2026-10-19 review
+// F14): the re-validation runs inside the BEGIN IMMEDIATE tx, so its
+// failures are returned as sentinels and mapped to HTTP codes by the
+// handler (the response can't be written from inside the closure without
+// tangling the commit/rollback path).
+var (
+	errPatchSensorGone             = errors.New("sensor not found")
+	errPatchTargetNotURL           = errors.New("target must be a URL")
+	errPatchTargetInvalid          = errors.New("target is invalid for the probe type")
+	errPatchTimeoutExceedsInterval = errors.New("timeout exceeds interval")
+	errPatchNameConflict           = errors.New("sensor name already exists")
+)
+
 // handleSensorClone creates a copy of a sensor with a new unique name
 // (name-copy, name-copy2, ...). The clone starts PAUSED, like a new sensor.
 func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
@@ -1190,15 +1313,30 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	name := ""
 	created := false
 	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
+	// The clone name must itself satisfy validSensorName (≤60 bytes) —
+	// otherwise the API would reject a later PATCH that renames the clone
+	// (2026-10-19 review F13). Reserve room for the LONGEST suffix
+	// ("-copy100", 8 bytes) by truncating the source name first; the
+	// shorter suffixes ("-copy", "-copy2") then always fit.
+	cloneBase := src.Name
+	const cloneSuffixCeil = 8 // len("-copy100")
+	if len(cloneBase) > 60-cloneSuffixCeil {
+		cloneBase = cloneBase[:60-cloneSuffixCeil]
+		// Never split a multi-byte UTF-8 rune: roll back continuation
+		// bytes (top bits 10) to the last rune boundary.
+		for len(cloneBase) > 0 && (cloneBase[len(cloneBase)-1]&0xC0) == 0x80 {
+			cloneBase = cloneBase[:len(cloneBase)-1]
+		}
+	}
 	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
 		for ; ; next++ {
 			if next > 100 { // same ceiling as before: the last usable name is -copy100
 				respondWithError(w, http.StatusConflict, "too many clones with this name")
 				return
 			}
-			name = src.Name + "-copy"
+			name = cloneBase + "-copy"
 			if next > 1 {
-				name = fmt.Sprintf("%s-copy%d", src.Name, next)
+				name = fmt.Sprintf("%s-copy%d", cloneBase, next)
 			}
 			var exists int
 			_ = s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE name = ?", name).Scan(&exists)
@@ -1252,10 +1390,33 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "tag query parameter is required")
 			return
 		}
+		// Collect the tagged sensors BEFORE the delete: each probe loop
+		// holds a spawn-time copy of its tag set (alert routing reads
+		// c.tags from that copy), so every affected loop must be respawned
+		// to pick up the new set (2026-10-19 review N5) — without this, a
+		// sensor that just left the alert_filter's tag scope keeps the
+		// stale routing (alerts it shouldn't send, or silence it should
+		// have) until the next process restart.
+		var tagged []string
+		rows, err := s.db.Query("SELECT sensor_id FROM sensor_tags WHERE tag = ?", tag)
+		if err != nil {
+			respondInternal(w, "delete tag "+tag, err)
+			return
+		}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err == nil {
+				tagged = append(tagged, id)
+			}
+		}
+		rows.Close()
 		n, err := s.db.DeleteTag(tag)
 		if err != nil {
 			respondInternal(w, "delete tag "+tag, err)
 			return
+		}
+		for _, id := range tagged {
+			s.probeWorker.Restart(id)
 		}
 		respondWithJSON(w, http.StatusOK, map[string]interface{}{"status": "deleted", "sensors_updated": n})
 	default:
@@ -1545,6 +1706,34 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Maintenance-mode entry validation runs BEFORE the settings tx opens
+	// (2026-10-19 review F12): "no active sensors to pause" is a derived
+	// check, and a 400 must leave the store exactly as it was — the old
+	// order committed the other settings first, then 400'd on the empty
+	// snapshot. The snapshot ids computed here are reused by the apply
+	// phase (nothing mutates the sensors table in between).
+	//
+	// Re-enable (mode already ON) takes NO new snapshot (2026-10-19 review
+	// F9): the snapshot belongs to the original off→on transition. A fresh
+	// snapshot would capture the currently-ACTIVE set, which excludes any
+	// sensor the operator resumed during maintenance — and those sensors
+	// would be left paused forever, because resume restores only the
+	// snapshot.
+	maintAlreadyOn := s.db.GetSetting("maintenance_mode") == "1"
+	var maintIDs []string
+	if req.MaintMode != nil && *req.MaintMode && !maintAlreadyOn {
+		ids, err := s.db.ActiveSensorIDs()
+		if err != nil {
+			respondInternal(w, "snapshot active sensors", err)
+			return
+		}
+		if len(ids) == 0 {
+			respondWithError(w, http.StatusBadRequest, "no active sensors to pause")
+			return
+		}
+		maintIDs = ids
+	}
+
 	// All valid: apply. Provider writes first (the dashboard saves them
 	// alongside the routing fields), then ONLY the routing fields that were
 	// sent — nil means keep, so a partial save no longer resets routing.
@@ -1598,47 +1787,44 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.MaintMode != nil {
 		if *req.MaintMode {
-			// Entering maintenance: remember which sensors are ACTIVE right
-			// now, then pause all of them so they stop probing (not just
-			// alerting). Sensors already paused by the user are not active,
-			// so they are left alone. The snapshot is what resume restores.
-			ids, err := s.db.ActiveSensorIDs()
-			if err != nil {
-				respondInternal(w, "snapshot active sensors", err)
-				return
+			if maintAlreadyOn {
+				// Already in maintenance: keep the ORIGINAL snapshot and
+				// the existing pause set — re-snapshotting would drop
+				// sensors resumed during maintenance from the restore set
+				// (2026-10-19 review F9). Nothing to write.
+				log.Printf("API: maintenance mode already ON (snapshot preserved)")
+			} else {
+				// Entering maintenance (off→on): the snapshot ids were
+				// computed and validated above, before the settings tx
+				// committed (2026-10-19 review F12).
+				//
+				// Atomic: pause + snapshot + mode flag in ONE transaction
+				// so a crash can't leave sensors paused without the mode
+				// flag (or vice versa). See SetMaintenanceMode in db.go.
+				snapJSON, _ := json.Marshal(maintIDs)
+				if err := s.db.SetMaintenanceMode(true, maintIDs, string(snapJSON)); err != nil {
+					respondInternal(w, "enter maintenance mode", err)
+					return
+				}
+				// Flip the in-memory pause flag immediately — the same
+				// SetPaused fast path the single-sensor PATCH uses. Without
+				// this the sensor loops keep probing until the next 5s
+				// syncSensors tick, landing up to one extra probe row (and
+				// a possible transition event) per sensor after maintenance
+				// is already ON. Alerts are already blocked in that window
+				// — alertGates re-reads the maintenance_mode flag from the
+				// DB on every decision — so this closes the probing half of
+				// the "paused = no packets, no rows, no alerts" contract
+				// (probe.go sensorLoop).
+				for _, id := range maintIDs {
+					s.probeWorker.SetPaused(id, true)
+				}
+				// Paused sensors don't probe, so their alert state can't
+				// drift; reset it now so resume doesn't instantly re-alert
+				// on a stale bad state.
+				s.probeWorker.ResetAlertStates()
+				log.Printf("API: maintenance mode ON (%d sensors paused)", len(maintIDs))
 			}
-			// Nothing active: the snapshot would be empty and resume would have
-			// nothing to restore. Refuse instead of silently entering a
-			// maintenance state that can't be cleanly undone.
-			if len(ids) == 0 {
-				respondWithError(w, http.StatusBadRequest, "no active sensors to pause")
-				return
-			}
-			// Atomic: pause + snapshot + mode flag in ONE transaction so a
-			// crash can't leave sensors paused without the mode flag (or
-			// vice versa). See SetMaintenanceMode in db.go.
-			snapJSON, _ := json.Marshal(ids)
-			if err := s.db.SetMaintenanceMode(true, ids, string(snapJSON)); err != nil {
-				respondInternal(w, "enter maintenance mode", err)
-				return
-			}
-			// Flip the in-memory pause flag immediately — the same SetPaused
-			// fast path the single-sensor PATCH uses. Without this the sensor
-			// loops keep probing until the next 5s syncSensors tick, landing
-			// up to one extra probe row (and a possible transition event) per
-			// sensor after maintenance is already ON. Alerts are already
-			// blocked in that window — alertGates re-reads the
-			// maintenance_mode flag from the DB on every decision — so this
-			// closes the probing half of the "paused = no packets, no rows,
-			// no alerts" contract (probe.go sensorLoop).
-			for _, id := range ids {
-				s.probeWorker.SetPaused(id, true)
-			}
-			// Paused sensors don't probe, so their alert state can't drift;
-			// reset it now so resume doesn't instantly re-alert on a stale
-			// bad state.
-			s.probeWorker.ResetAlertStates()
-			log.Printf("API: maintenance mode ON (%d sensors paused)", len(ids))
 		} else {
 			// Leaving maintenance: reactivate exactly the sensors that were
 			// active when maintenance started (the snapshot). Sensors paused
@@ -1694,8 +1880,22 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // validateProviderUpdate checks one provider update WITHOUT writing
 // anything. handleSettingsPut runs it over the whole request BEFORE any
 // write, so a 400 never leaves a partial save; applyProviderUpdate reuses
-// it so the two paths can't drift.
+// it so the two paths can't drift. The withDNS variants split the URL
+// checks: the in-transaction save path must not run the 5s DNS lookup
+// under the SQLite write lock (2026-10-19 review N6).
 func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
+	return validateProviderUpdateInternal(kind, url, enabled, extra, true)
+}
+
+// validateProviderUpdateNoDNS is the format-only twin for the
+// in-transaction save path (see N6 above). DNS reachability is already
+// enforced by the pre-transaction pass in handleSettingsPut, so a URL that
+// cannot be resolved is rejected before the write begins.
+func validateProviderUpdateNoDNS(kind string, url *string, enabled *bool, extra map[string]string) error {
+	return validateProviderUpdateInternal(kind, url, enabled, extra, false)
+}
+
+func validateProviderUpdateInternal(kind string, url *string, enabled *bool, extra map[string]string, withDNS bool) error {
 	if _, ok := providerByKey(kind); !ok {
 		return fmt.Errorf("unknown alert provider: %q", kind)
 	}
@@ -1706,7 +1906,13 @@ func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[s
 			// not an http(s):// webhook — it is validated against the
 			// reserved range blocklist just below (validateSMTPHost), not
 			// as a URL.
-			if err := validateWebhookURL(u); err != nil {
+			var err error
+			if withDNS {
+				err = validateWebhookURL(u)
+			} else {
+				_, _, err = validateWebhookURLNoDNS(u)
+			}
+			if err != nil {
 				return fmt.Errorf("%s url: %s", kind, err.Error())
 			}
 		}
@@ -1716,7 +1922,13 @@ func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[s
 			// stored, so the SMTP transport can never be pointed at
 			// loopback, cloud-metadata (169.254.169.254), or other
 			// reserved space.
-			if err := validateSMTPHost(u); err != nil {
+			var err error
+			if withDNS {
+				err = validateSMTPHost(u)
+			} else {
+				err = validateSMTPHostNoDNS(u)
+			}
+			if err != nil {
 				return fmt.Errorf("smtp host: %s", err.Error())
 			}
 		}
@@ -1750,6 +1962,18 @@ func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[s
 			}
 		}
 	}
+	// tls_mode=none cannot carry credentials (2026-10-19 review F27): with
+	// no TLS the AUTH exchange would ride the wire in plaintext — the
+	// transport fails clearly at send time, so the SAVE must fail clearly
+	// too, not store a config that can only ever fail per-alert. (The UI's
+	// "••••••••" mask counts as a present password: clearing the field is
+	// the deliberate act that makes tls_mode=none valid.)
+	if kind == "smtp" {
+		mode := strings.TrimSpace(extra["tls_mode"])
+		if mode == "none" && (strings.TrimSpace(extra["username"]) != "" || strings.TrimSpace(extra["password"]) != "") {
+			return fmt.Errorf("smtp tls_mode=none cannot use credentials (clear username/password)")
+		}
+	}
 	return nil
 }
 
@@ -1774,7 +1998,10 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // caller's transaction so handleSettingsPut can apply every provider and
 // routing field atomically (2026-10-19 review m8; mirrors setSensorTagsInTx).
 func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra map[string]string) error {
-	if err := validateProviderUpdate(kind, url, enabled, extra); err != nil {
+	// Format-only validation (2026-10-19 review N6): the DNS reachability
+	// check runs in the PRE-transaction pass (handleSettingsPut →
+	// validateProviderUpdate with DNS), never under the write lock.
+	if err := validateProviderUpdateNoDNS(kind, url, enabled, extra); err != nil {
 		return err
 	}
 	if url != nil {

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -127,6 +129,16 @@ type AuthState struct {
 	mu       sync.Mutex
 	sessions map[string]authSession // session token → owner + expiry
 
+	// userOKCache: username → last time we confirmed the account exists
+	// in the users table (see userOKTTL). Guarded by mu. Sessions are
+	// in-memory, so an out-of-band `pulsemon auth-user remove` (a separate
+	// process with its own AuthState) cannot touch this map — session
+	// validation therefore re-checks the users table at most once per
+	// userOKTTL per user (2026-10-19 review F1). Populated only by
+	// validation, never by CreateSession: a freshly minted session gets a
+	// LIVE existence check on first use (the login/remove race, F2).
+	userOKCache map[string]time.Time
+
 	// enabledCache: whether auth is enabled (user count > 0), memoized for
 	// enabledTTL so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on
 	// every request. enabledAt is zero until the first read; in-app user
@@ -157,11 +169,49 @@ type AuthState struct {
 
 func NewAuthState(db *DB) *AuthState {
 	a := &AuthState{
-		db:       db,
-		sessions: map[string]authSession{},
+		db:          db,
+		sessions:    map[string]authSession{},
+		userOKCache: map[string]time.Time{},
 	}
 	a.trustedProxies = parseTrustedProxies(os.Getenv("PULSEMON_TRUSTED_PROXIES"))
 	return a
+}
+
+// userOKTTL bounds how long a confirmed "account exists" answer is reused
+// by session validation (see SessionUser/ValidSession). It matches
+// enabledTTL: an out-of-band `pulsemon auth-user remove` is a separate
+// process that cannot touch this process's in-memory session map, so a
+// removed user's sessions die within this window instead of living out
+// their 30-day TTL (2026-10-19 review F1).
+const userOKTTL = 2 * time.Second
+
+// userExists reports whether the account exists in the users table — the
+// cross-process source of truth for session validity. A read error is
+// treated as "exists" (fail open for the session): a transient DB hiccup
+// must not log the operator out, the same tradeoff Enabled() makes.
+func (a *AuthState) userExists(username string) bool {
+	var n int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", username).Scan(&n); err != nil {
+		log.Printf("auth: user existence check failed for %q (keeping session): %v", username, err)
+		return true
+	}
+	return n > 0
+}
+
+// userExistsCached is the TTL-cached wrapper session validation uses,
+// capping the users-table lookups at one per user per userOKTTL. Caller
+// must hold a.mu.
+func (a *AuthState) userExistsCached(username string) bool {
+	if t, ok := a.userOKCache[username]; ok && time.Since(t) < userOKTTL {
+		return true
+	}
+	exists := a.userExists(username)
+	if exists {
+		a.userOKCache[username] = time.Now()
+	} else {
+		delete(a.userOKCache, username)
+	}
+	return exists
 }
 
 // parseTrustedProxies turns a comma-separated list of CIDRs (or bare IPs,
@@ -279,6 +329,11 @@ var (
 	// handler can 500 it (respondInternal) instead of misreporting it as
 	// a duplicate.
 	errUserExists = fmt.Errorf("user already exists")
+	// errBootstrapped: a concurrent unauthenticated first-user creation
+	// won the setup-mode bootstrap (2026-10-19 review F11). The handler
+	// maps it to 409 — the install is no longer fresh, the account
+	// already exists.
+	errBootstrapped = fmt.Errorf("an account already exists — this install is set up")
 )
 
 func validUsername(u string) bool {
@@ -287,7 +342,35 @@ func validUsername(u string) bool {
 
 // AddUser validates and creates an account. The first AddUser is what
 // enables authentication.
+//
+// The check-and-create runs in ONE BEGIN IMMEDIATE transaction
+// (2026-10-19 review F11): on a fresh install the unauthenticated
+// bootstrap POST is open to the whole LAN, and with a DEFERRED begin
+// every concurrent first-user POST reads user_count=0 before any of them
+// writes — N racers, N "first" accounts. BEGIN IMMEDIATE serializes the
+// writers: the winner commits the account (and the auth_bootstrapped flag
+// in the SAME transaction, so there is no window where the gate sees a
+// user without the flag), the losers see user_count > 0 and get
+// errBootstrapped (409). In-app adds (user_count > 0) keep their normal
+// path: a duplicate username is errUserExists (400).
 func (a *AuthState) AddUser(username, password string) error {
+	// In-app / CLI add: the user table may already be populated; a
+	// duplicate username is the expected client error (400).
+	return a.AddUserMode(username, password, false)
+}
+
+// AddUserMode is AddUser with the setup-mode flag made explicit.
+// setupMode=true means the caller reached this through the fresh-install
+// gate (no account existed when the gate checked, modulo its TTL): in that
+// world ONLY the first account may be created. The check must happen INSIDE
+// the ImmediateTx, on the serialized connection — the gate's Enabled()
+// result is TTL-cached, so N concurrent setup POSTs all pass the gate and
+// only the in-tx user_count (n > 0) distinguishes the winner from the
+// losers. Without it, four clients with four DIFFERENT usernames all see
+// an empty table at the gate, all pass the UNIQUE check (their names don't
+// collide), and four "first" accounts are created (2026-10-19 review F11 —
+// the ImmediateTx alone does not close the race; this check does).
+func (a *AuthState) AddUserMode(username, password string, setupMode bool) error {
 	username = strings.ToLower(username)
 	if !validUsername(username) {
 		return errUsernameInvalid
@@ -302,21 +385,48 @@ func (a *AuthState) AddUser(username, password string) error {
 	if err != nil {
 		return err
 	}
-	if err := a.db.AddUser(username, string(hash)); err != nil {
-		// Only a UNIQUE-constraint violation means the account exists —
-		// any other db failure must surface as a 500, not be misreported
-		// as "user already exists". Match the exact constraint text, not a
-		// bare "UNIQUE" substring (2026-10-19 review m7).
-		if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
-			return errUserExists
+	ctx := context.Background()
+	err = a.db.ImmediateTx(ctx, func(c *sql.Conn) error {
+		var n int
+		if err := c.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+			return err
 		}
-		return err
-	}
-	// Record that this install has been set up. The flag is never cleared —
-	// even when the operator later disables auth (deleting all users) — so
-	// the gate can distinguish a fresh install (bootstrap surface only) from
-	// an intentional auth-off state (fully open, the documented behavior).
-	if err := a.db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		if n > 0 && setupMode {
+			// Setup mode is single-shot: an account already exists (the
+			// winner of this race committed before our serialized BEGIN
+			// took its snapshot). 409, not 400 — the client's own
+			// username was fine, the install just isn't fresh anymore.
+			return errBootstrapped
+		}
+		if _, err := c.ExecContext(ctx,
+			"INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+			username, string(hash), tsNow()); err != nil {
+			// Only the exact UNIQUE-constraint text means "account
+			// exists" — any other db failure must surface as a 500, not
+			// be misreported as a duplicate (2026-10-19 review m7).
+			if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
+				if n == 0 {
+					// Lost the bootstrap race to a concurrent first user
+					// that committed between our BEGIN and our INSERT.
+					return errBootstrapped
+				}
+				return errUserExists
+			}
+			return err
+		}
+		if n == 0 {
+			// First account: mark the install bootstrapped atomically
+			// (see the function comment for why the flag must commit with
+			// the user row).
+			if _, err := c.ExecContext(ctx,
+				"INSERT OR REPLACE INTO settings (setting_key, value, updated_at) VALUES ('auth_bootstrapped', '1', ?)",
+				tsNow()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 	a.refreshEnabledNow() // first user enables auth — don't wait for the TTL
@@ -413,6 +523,17 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	}
 	a.mu.Lock()
 	now := time.Now()
+	// Re-verify the account STILL exists, under the session-map lock,
+	// BEFORE minting (2026-10-19 review F2): VerifyUser's bcrypt check ran
+	// against the hash as of a moment ago; a concurrent RemoveUser in that
+	// gap used to mint a live 30-day session for an already-deleted user.
+	// This is a live check (no cache): the mint path is cold (login rate),
+	// and the first validation of the new token is live too (CreateSession
+	// never populates userOKCache), so the race window is zero.
+	if !a.userExists(user) {
+		a.mu.Unlock()
+		return "", false
+	}
 	// Opportunistic GC: see sweepExpiredSessions. Bounded O(n) work, run
 	// only once the map is large enough that abandoned sessions are the
 	// likely cause (mirrors sweepThrottle for the login-throttle maps).
@@ -436,6 +557,11 @@ func (a *AuthState) sweepExpiredSessions(now time.Time) {
 	for tok, s := range a.sessions {
 		if now.After(s.expiry) {
 			delete(a.sessions, tok)
+		}
+	}
+	for u, t := range a.userOKCache {
+		if now.After(t.Add(userOKTTL)) {
+			delete(a.userOKCache, u)
 		}
 	}
 }
@@ -476,7 +602,16 @@ func peerIP(r *http.Request) string {
 func (a *AuthState) ClientIP(r *http.Request) string {
 	peer := peerIP(r)
 	if a.trustedPeer(peer) {
-		if xf := r.Header.Get("X-Forwarded-For"); xf != "" {
+		// Combine ALL X-Forwarded-For lines before parsing (2026-10-19
+		// review N7): HAProxy-style proxies APPEND a new header line
+		// instead of extending the first, and r.Header.Get returns only
+		// the first — the CLIENT-CONTROLLED one. Reading it alone
+		// attributed every attempt to the attacker's chosen address.
+		// Joining with "," and running the existing rightmost-untrusted
+		// parse over the combined list keeps the original semantics for
+		// single-line XFF.
+		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
+			xf := strings.Join(vals, ",")
 			parts := strings.Split(xf, ",")
 			var leftmost net.IP
 			for i := len(parts) - 1; i >= 0; i-- {
@@ -629,14 +764,18 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 
 // ValidSession validates a session token: a live hit slides its expiry
 // forward; an unknown OR expired token is rejected AND deleted — the
-// returned value is the expiry test, never just a map hit.
+// returned value is the expiry test, never just a map hit. The owner's
+// account is re-checked against the users table (TTL-cached, see
+// userOKTTL) so a user deleted out-of-band (CLI `auth-user remove`) is
+// rejected within the window even though the in-memory map can't know
+// about it (2026-10-19 review F1).
 func (a *AuthState) ValidSession(tok string) bool {
 	if tok == "" {
 		return false
 	}
 	a.mu.Lock()
 	s, ok := a.sessions[tok]
-	if ok && time.Now().Before(s.expiry) {
+	if ok && time.Now().Before(s.expiry) && a.userExistsCached(s.user) {
 		s.expiry = time.Now().Add(authSessionTTL)
 		a.sessions[tok] = s
 	} else {
@@ -649,12 +788,19 @@ func (a *AuthState) ValidSession(tok string) bool {
 
 // SessionUser returns the username a live session belongs to, validating
 // the expiry (and deleting the entry if it has lapsed) so the result is
-// safe to use as an authorization check on its own.
+// safe to use as an authorization check on its own. Like ValidSession it
+// re-checks the owner against the users table (TTL-cached): the in-memory
+// session map alone cannot see an out-of-band account deletion
+// (2026-10-19 review F1).
 func (a *AuthState) SessionUser(tok string) (string, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]
 	if !ok || !time.Now().Before(s.expiry) {
+		delete(a.sessions, tok)
+		return "", false
+	}
+	if !a.userExistsCached(s.user) {
 		delete(a.sessions, tok)
 		return "", false
 	}
@@ -869,14 +1015,26 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, code, msg)
 			return
 		}
-		if err := s.auth.AddUser(req.Username, req.Password); err != nil {
+		// setupMode mirrors the fresh-install gate: unauthenticated
+		// POSTs only reach here while Enabled() is false (TTL-cached),
+		// so the in-tx user_count is the real arbiter (review F11).
+		// An authenticated admin add is never setup mode.
+		_, sessErr := r.Cookie(authSessionName)
+		setup := sessErr != nil && !s.auth.Enabled()
+		if err := s.auth.AddUserMode(req.Username, req.Password, setup); err != nil {
 			// Only the duplicate-account and validation cases are client
 			// errors; any other failure (db, KDF) is a 500 with the detail
 			// logged. Validation sentinels (incl. the 72-byte bcrypt limit)
-			// are 400, not 500 (2026-10-19 review m2).
+			// are 400, not 500 (2026-10-19 review m2). A lost setup-mode
+			// bootstrap race is a 409: the winner's account already
+			// exists (2026-10-19 review F11).
 			if errors.Is(err, errUserExists) || errors.Is(err, errUsernameInvalid) ||
 				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
 				respondWithError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			if errors.Is(err, errBootstrapped) {
+				respondWithError(w, http.StatusConflict, err.Error())
 				return
 			}
 			respondInternal(w, "add user", err)

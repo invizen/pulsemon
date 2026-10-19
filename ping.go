@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -40,6 +41,23 @@ const (
 	probeID     = 0x5a11
 	payloadSize = 32 // max probe payload in bytes (probePayload must fit within this)
 )
+
+// rawEchoID is the ICMP echo ID used ONLY by the raw transport (2026-10-19
+// review F32): a per-process random value so two raw instances in the same
+// netns can't cross-accept each other's replies (the old fixed 0x5a11 was
+// a shared, guessable filter key). The DATAGRAM transports keep the fixed
+// probeID on purpose: the kernel (Linux) and the IP driver (Windows) demux
+// datagram replies to the socket by that ID, so it is a socket-binding key
+// there, not an application-level filter.
+var rawEchoID = newRawEchoID()
+
+func newRawEchoID() uint16 {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return probeID // crypto/rand unavailable: fall back to the constant
+	}
+	return binary.BigEndian.Uint16(b[:])
+}
 
 // probePayload is the ICMP echo payload: a fixed human-readable identifier.
 // Its size is bounded by payloadSize (enforced in init) so the on-wire
@@ -172,7 +190,9 @@ func (t *rawTransport) send(dst net.IP, seq uint16) error {
 	msg := icmp.Message{
 		Type: ipv4.ICMPTypeEcho,
 		Code: 0,
-		Body: &icmp.Echo{ID: probeID, Seq: int(seq), Data: probePayload},
+		// Per-process random ID (F32) — the raw reader matches this exact
+		// value, so a second raw instance in the netns is filtered out.
+		Body: &icmp.Echo{ID: int(rawEchoID), Seq: int(seq), Data: probePayload},
 	}
 	wb, err := msg.Marshal(nil)
 	if err != nil {
@@ -414,7 +434,9 @@ func (e *Engine) readRaw() {
 			continue
 		}
 		em, isEcho := rm.Body.(*icmp.Echo)
-		if !isEcho || em.ID != probeID {
+		// rawEchoID, not probeID (F32): the raw reader must match the ID
+		// the raw transport SENTS, which is the per-process random value.
+		if !isEcho || em.ID != int(rawEchoID) {
 			continue // not ours
 		}
 		if src == nil {
@@ -573,19 +595,78 @@ func EngineDead() bool {
 // healthz / tests a stable thing to match against (errors.Is).
 var errNoIcmpTransport = errors.New("icmp: no transport available")
 
+// dnsCacheTTL is how long a resolved ICMP target is reused before
+// re-resolving (2026-10-19 review F24). A fresh A+AAAA lookup per probe
+// added full DNS latency on top of the probe timeout (a 700ms-slow
+// resolver made every probe "time out" before the first packet went
+// out) and doubled the query load on the local resolver. With a 30s TTL a
+// cache hit costs ~0 DNS; a target that changes address picks up the new
+// answer within one TTL.
+var dnsCacheTTL = 30 * time.Second
+
+type dnsCacheEntry struct {
+	ip      net.IP
+	expires time.Time
+}
+
+var (
+	dnsCacheMu sync.Mutex
+	dnsCache   = map[string]dnsCacheEntry{}
+)
+
+// resolveICMPTarget resolves target to an IPv4 address through the
+// short-TTL cache (F24). Literal IPs short-circuit (no cache, no DNS).
+// Only successful IPv4 resolutions are cached: an IPv6-only answer is
+// re-resolved next probe (it is a loss path for the IPv4-only engine
+// anyway, and caching a nil would pin the loss for the whole TTL).
+// ctx bounds the lookup phase; the caller bounds the reply wait.
+func resolveICMPTarget(ctx context.Context, target string) (net.IP, error) {
+	if ip := net.ParseIP(target); ip != nil {
+		return ip.To4(), nil
+	}
+	dnsCacheMu.Lock()
+	if e, ok := dnsCache[target]; ok && time.Now().Before(e.expires) {
+		dnsCacheMu.Unlock()
+		return e.ip, nil
+	}
+	dnsCacheMu.Unlock()
+
+	ip, err := resolveIPAddrWithTimeout(ctx, target, 5*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	v4 := ip.IP.To4()
+	if v4 == nil {
+		return nil, fmt.Errorf("no IPv4 address found for %s", target)
+	}
+	dnsCacheMu.Lock()
+	dnsCache[target] = dnsCacheEntry{ip: v4, expires: time.Now().Add(dnsCacheTTL)}
+	// Opportunistic sweep so the map cannot grow unbounded as sensor
+	// targets churn: drop everything past its TTL.
+	if len(dnsCache) > 128 {
+		now := time.Now()
+		for k, e := range dnsCache {
+			if now.After(e.expires) {
+				delete(dnsCache, k)
+			}
+		}
+	}
+	dnsCacheMu.Unlock()
+	return v4, nil
+}
+
 // pingHost is the probe worker's entry point: resolve the target, then
 // ping the resolved IP through the shared engine. ctx bounds BOTH phases
 // (DNS + reply wait) so a cancelled probe (shutdown, remove, restart)
 // aborts immediately instead of running out its full timeout.
 func pingHost(ctx context.Context, target string, timeout time.Duration) PingResult {
-	ip, err := resolveIPAddrWithTimeout(ctx, target, 5*time.Second)
+	dst, err := resolveICMPTarget(ctx, target)
 	if err != nil {
 		return PingResult{Lost: true, Error: err}
 	}
-	dst := ip.IP.To4()
 	if dst == nil {
 		// IPv6-only result — ICMP is IPv4-only by design; count as loss.
-		return PingResult{Lost: true, ResolvedIP: ip.IP.String()}
+		return PingResult{Lost: true}
 	}
 	e, err := SharedEngine()
 	if err != nil {

@@ -20,9 +20,13 @@ func defaultDBPath() string {
 }
 
 // ensureDataDir creates the Windows data dir if missing. The Inno installer
-// also creates it; this makes a manual/console run work without it.
-func ensureDataDir() {
+// also creates it (and locks its ACL down — see M1 in installer/pulsemon.iss);
+// this makes a manual/console run work without it. The Windows data path is
+// always absolute (%ProgramData% is absolute), so the relative-path refusal
+// in the Linux variant cannot trigger here.
+func ensureDataDir() error {
 	_ = os.MkdirAll(filepath.Dir(defaultDBPath()), 0o755)
+	return nil
 }
 
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.

@@ -21,13 +21,30 @@ VERSION="$(tr -d '[:space:]' < VERSION)"
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "release.sh: VERSION file is not vN.N.N: '$VERSION'"; exit 1; }
 PUBLISH=0
 [[ "${1:-}" == "--publish" ]] && PUBLISH=1
+# L2 (2026-10-19 review F21): pin the vuln scanner. @latest silently changes
+# the tool (and its database) between runs, so two "identical" release runs
+# can disagree; a pinned version makes the gate reproducible. Bump this
+# deliberately, not as a drive-by.
+GOVULNCHECK="${GOVULNCHECK:-v1.1.0}"
 
 echo "pulsemon: releasing $VERSION (publish=$PUBLISH)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p dist
 
-# --- 0. vulnerability gate: fail the release on reachable vulns --------------
+# --- 0. pre-build gates: clean tree + passing tests --------------------------
+# L1 (2026-10-19 review F21): never ship from a dirty tree (uncommitted work
+# would land in the binary but not the tag) and never ship a build whose
+# tests fail. -count=1 defeats the test cache so the suite actually runs.
+if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
+  echo "release.sh: working tree is not clean — commit or stash first:"
+  git status --porcelain
+  exit 1
+fi
+echo "pulsemon: go test -count=1 . (release fails on any failure) ..."
+go test -count=1 . || { echo "release.sh: tests failed — release aborted"; exit 1; }
+
+# --- 0b. vulnerability gate: fail the release on reachable vulns --------------
 # govulncheck scans the module graph and flags vulnerabilities that are
 # actually REACHABLE from our code (its exit code 2), so a new CVE in a
 # dependency aborts the release before a single binary is built. Set
@@ -36,8 +53,8 @@ mkdir -p dist
 if [[ "${SKIP_VULNCHECK:-}" == "1" ]]; then
   echo "pulsemon: SKIP_VULNCHECK=1 — skipping govulncheck"
 else
-  echo "pulsemon: govulncheck (release fails on reachable vulnerabilities) ..."
-  go run golang.org/x/vuln/cmd/govulncheck@latest ./... \
+  echo "pulsemon: govulncheck $GOVULNCHECK (release fails on reachable vulnerabilities) ..."
+  go run "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK" ./... \
     || { echo "release.sh: govulncheck reported reachable vulnerabilities (or failed) — release aborted"; exit 1; }
 fi
 
@@ -58,13 +75,17 @@ for ARCH in amd64 arm64; do
     || { echo "release.sh: sidecar verification failed for $ARCH"; exit 1; }
 done
 # And the version stamp actually landed.
-for ARCH in amd64 arm64; do
-  # The binary cannot run on the wrong arch; check the stamp in the binary
-  # itself (main.Version is a string constant baked into the binary).
-  grep -q "pulsemon: $VERSION" "dist/pulsemon-linux-$ARCH" \
-    || grep -q "$VERSION" "dist/pulsemon-linux-$ARCH" \
-    || { echo "release.sh: version stamp $VERSION not found in linux/$ARCH binary"; exit 1; }
-done
+# L3 (2026-10-19 review F21): run the NATIVE binary's -version and check the
+# exact stamp. (`go version -m` was the original approach, but Go does NOT
+# record -X ldflag values in the embedded build info — it only shows module
+# and compiler settings — so it can never see main.Version. Running the
+# binary is the only reliable check.) The release is built on an amd64 host,
+# so the amd64 binary is executable here; the arm64 build uses the identical
+# -ldflags line, so a correct amd64 stamp implies a correct arm64 stamp.
+# -version works without a data dir (ensureDataDir runs in the server path,
+# not at process start), so this check is safe on any build host.
+dist/pulsemon-linux-amd64 -version 2>&1 | grep -qF "pulsemon $VERSION" \
+  || { echo "release.sh: version stamp $VERSION not found in linux/amd64 binary (-version)"; exit 1; }
 
 echo
 echo "=== assets ready ==="
@@ -82,9 +103,10 @@ EOF
   exit 0
 fi
 
-# --- 3. tag + push -------------------------------------------------------------
+# --- 3. tag (LOCAL only) --------------------------------------------------------
+# L4 (2026-10-19 review F21): the tag is created locally but NOT pushed yet —
+# the push is the very last step, after the release exists.
 git tag -a "$VERSION" -m "pulsemon $VERSION"
-git push origin "$VERSION"
 
 # --- 4. publish the release ----------------------------------------------------
 gh release create "$VERSION" \
@@ -95,6 +117,13 @@ gh release create "$VERSION" \
   dist/pulsemon-linux-arm64 \
   dist/pulsemon-linux-arm64.sha256 \
   install.sh
+
+# --- 5. push the tag LAST -------------------------------------------------------
+# The tag push triggers the Windows release workflow. It must run AFTER the
+# GitHub release exists: if the tag went out first, the workflow would build
+# the Windows assets against a release that has no assets yet, and a
+# self-updating client polling in that window finds nothing.
+git push origin "$VERSION"
 
 echo
 echo "pulsemon: $VERSION published with both arches + installer."

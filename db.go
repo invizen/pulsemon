@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -238,7 +239,15 @@ func (db *DB) InitSchema() error {
 	// it to google_chat_url (idempotent — skipped if a google_chat_url is
 	// already set). Without this, existing installs would silently lose their
 	// configured alert webhook on upgrade.
-	if _, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at)
+	//
+	// INSERT OR IGNORE (2026-10-19 review F6): the NOT EXISTS guard only
+	// checks for a NON-EMPTY google_chat_url, so an install whose operator
+	// later CLEARED the Google Chat URL (row exists, value = '') re-ran this
+	// INSERT on the next boot and hit the settings.setting_key PRIMARY KEY
+	// constraint — InitSchema failed and runServer log.Fatalf'd, crash-
+	// looping the service. OR IGNORE makes the re-insert a no-op: a cleared
+	// provider stays cleared.
+	if _, err := db.Exec(`INSERT OR IGNORE INTO settings (setting_key, value, updated_at)
 		SELECT 'google_chat_url', value, COALESCE(updated_at, datetime('now'))
 		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
 		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_url' AND TRIM(value) <> '')`); err != nil {
@@ -460,6 +469,33 @@ func (db *DB) AllTags() map[string]int {
 		}
 	}
 	return out
+}
+
+// ImmediateTx runs fn inside a BEGIN IMMEDIATE transaction on a pinned
+// connection: the write lock is acquired at BEGIN, not on the first write
+// (db.Begin issues a DEFERRED begin), so two concurrent
+// check-then-insert flows cannot both observe the pre-insert state — the
+// setup-mode bootstrap race where N unauthenticated first-user POSTs each
+// read user_count=0 and all committed (2026-10-19 review F11). fn receives
+// the pinned *sql.Conn and must run its statements through it (the
+// transaction lives on that connection); ImmediateTx commits on a nil
+// return and rolls back on error. The connection goes back to the pool
+// when the function returns.
+func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error {
+	conn, err := db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close() // returns the conn to the pool
+	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
+		return err
+	}
+	if err := fn(conn); err != nil {
+		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		return err
+	}
+	_, err = conn.ExecContext(ctx, "COMMIT")
+	return err
 }
 
 // DeleteTag removes a tag from every sensor; returns how many sensors lost it.

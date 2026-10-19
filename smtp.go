@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"mime"
 	"net"
 	"net/mail"
@@ -194,20 +195,41 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	defer c.Close()
 
 	// STARTTLS upgrade for the non-implicit modes.
+	tlsOn := implicitTLS
 	switch cfg.TLS {
 	case "starttls":
 		if err := c.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
 			return fmt.Errorf("smtp starttls: %w", err)
 		}
+		tlsOn = true
 	case "auto":
 		// Opportunistic: only if the server advertises STARTTLS in EHLO.
 		if ok, _ := c.Extension("STARTTLS"); ok {
 			if err := c.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
 				return fmt.Errorf("smtp starttls: %w", err)
 			}
+			tlsOn = true
 		}
 	case "none":
 		// no TLS
+	}
+
+	// Q1 (2026-10-19 review F26): what TLS state did we ACTUALLY end up in?
+	// A relay without STARTTLS is legitimate in "auto" mode (a 25-port LAN
+	// relay) — but only credential-free: with NO username configured the
+	// plaintext send is allowed and gets a one-line warning per send (pre-fix
+	// it was completely silent, so an operator who believed auth was in
+	// effect had no idea the mail — and the session it rode in — was
+	// cleartext). WITH credentials configured, a plaintext wire is a
+	// credential leak, not a relay preference: fail clearly (the operator
+	// must set tls_mode=starttls or remove the credentials). "none" is the
+	// explicit plaintext choice; new saves of none+credentials are refused at
+	// save time (F27), so this guard only fires for legacy stored configs.
+	if !tlsOn && cfg.User != "" {
+		return fmt.Errorf("smtp: credentials are configured but the connection to %s is plaintext (no STARTTLS); set tls_mode=starttls or remove the username/password", cfg.Host)
+	}
+	if !tlsOn && cfg.TLS == "auto" && cfg.User == "" {
+		log.Printf("smtp: %s does not offer STARTTLS; sending in plaintext (no credentials configured)", cfg.Host)
 	}
 
 	if cfg.User != "" {
@@ -282,6 +304,7 @@ func smtpSubject(oldState, state string) string {
 // SMTP alert body. Plain text (no markup) so it renders identically in every
 // mail client — the same information as the Discord/Google Chat/Telegram cards.
 func smtpBody(oldState, state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -295,6 +318,7 @@ func smtpBody(oldState, state, name, target string, rttMs float64) string {
 }
 
 func smtpBodyRe(state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"

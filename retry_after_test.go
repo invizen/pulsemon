@@ -59,7 +59,7 @@ func TestPostJSONHonorsRetryAfter(t *testing.T) {
 			w.WriteHeader(http.StatusOK)
 		}))
 		defer srv.Close()
-		if err := pw.postJSON(srv.URL, map[string]string{"text": "x"}); err != nil {
+		if err := pw.postJSON(srv.URL, map[string]interface{}{"text": "x"}); err != nil {
 			t.Fatalf("429 then 200 should succeed: %v", err)
 		}
 		mu.Lock()

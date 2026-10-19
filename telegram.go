@@ -25,6 +25,7 @@ import (
 // and unescaped < > injects live markup into the card. &amp; / &lt; render
 // identically to & / < in Telegram HTML mode, so escaping is zero-cost.
 func telegramCard(oldState, state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -39,6 +40,7 @@ func telegramCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func telegramCardRe(state, name, target string, rttMs float64) string {
+	target = alertTarget(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"

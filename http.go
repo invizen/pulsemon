@@ -159,6 +159,20 @@ var httpClient = &http.Client{
 		if err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost); err != nil {
 			return err
 		}
+		// Force a fresh connection on every hop that changes host:port or
+		// scheme (2026-10-19 review N4): the transport pools idle conns per
+		// host, and a redirect landing on a DIFFERENT server — or a scheme
+		// flip — must not inherit a pooled conn. The critical case is
+		// http→https: a reused pooled conn would report the cert from its
+		// ORIGINAL handshake, so a renewed cert stays invisible in the
+		// displayed expiry until the conn recycles (the same staleness the
+		// first-request req.Close in probeHTTP closes for the initial hop).
+		if len(via) > 0 {
+			prev := via[len(via)-1].URL
+			if prev.Host != req.URL.Host || !strings.EqualFold(prev.Scheme, req.URL.Scheme) {
+				req.Close = true
+			}
+		}
 		return nil
 	},
 	Transport: &http.Transport{
@@ -316,8 +330,10 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	defer cancel()
 
 	host := ""
+	origScheme := ""
 	if u, err := url.Parse(target); err == nil {
 		host = u.Hostname()
+		origScheme = strings.ToLower(u.Scheme)
 	}
 
 	// The resolved_ip diagnostic comes from the ACTUAL connection
@@ -397,6 +413,27 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	}
 	if vErr := verifyHTTPCert(presented, verifyHost); vErr != nil {
 		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
+	}
+
+	// A redirect chain that ENDS on plain HTTP after the configured target
+	// was HTTPS is a loss (2026-10-19 review F3): the TLS endpoint is what
+	// we configured to watch, and a 301 to the http URL is exactly what
+	// many servers emit when their cert is broken ("use the http version").
+	// Following it and reading the http hop's 2xx used to report UP while
+	// the configured HTTPS endpoint was dead — the cert problem was
+	// masked. The 2xx belongs to the redirect target, not to the endpoint
+	// under watch.
+	if origScheme == "https" && resp.Request != nil &&
+		strings.EqualFold(resp.Request.URL.Scheme, "http") {
+		code := resp.StatusCode
+		return httpProbeResult{
+			Elapsed:    el,
+			Lost:       true,
+			Status:     &code,
+			IP:         resolved,
+			CertExpiry: certExp,
+			Err:        errors.New("https target redirected to plain http (TLS endpoint not healthy)"),
+		}
 	}
 
 	code := resp.StatusCode

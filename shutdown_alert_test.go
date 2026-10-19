@@ -115,7 +115,7 @@ func TestStopAlertsAbortsInFlightPOST(t *testing.T) {
 		start := time.Now()
 		go func() {
 			defer close(done)
-			pw.postJSON(url, map[string]string{"text": "slow"})
+			pw.postJSON(url, map[string]interface{}{"text": "slow"})
 		}()
 
 		// Wait until the POST is actually in flight (reached the server).
@@ -153,7 +153,7 @@ func TestPostJSONContextCancelledBeforeStart(t *testing.T) {
 	pw := NewProbeWorker(nil)
 	pw.StopAlerts() // cancel before the POST starts
 	start := time.Now()
-	pw.postJSON(url, map[string]string{"text": "never"})
+	pw.postJSON(url, map[string]interface{}{"text": "never"})
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 		t.Errorf("postJSON with pre-cancelled stopCtx took %v, want immediate failure", elapsed)
 	}
