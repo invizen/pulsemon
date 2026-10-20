@@ -139,7 +139,8 @@ func (db *DB) InitSchema() error {
 	CREATE TABLE IF NOT EXISTS users (
 		username TEXT PRIMARY KEY,
 		password_hash TEXT NOT NULL,
-		created_at TEXT
+		created_at TEXT,
+		is_admin INTEGER NOT NULL DEFAULT 0
 	);
 	`
 	_, err := db.Exec(schema)
@@ -285,6 +286,43 @@ func (db *DB) InitSchema() error {
 		if err := db.SetSetting("auth_token", ""); err != nil {
 			return err
 		}
+	}
+	// One-time migration: the users table gained is_admin (the account
+	// panel — add/remove user, disable auth — is admin-gated; the first
+	// bootstrapped user is the admin). Old DBs get the column added, and
+	// the OLDEST user is promoted when no admin exists yet, so an existing
+	// install never boots with zero admins (that would lock every
+	// account-management endpoint). Idempotent: on a fresh DB the column
+	// exists and first accounts are created with the flag, so both
+	// statements no-op. Runs AFTER the legacy token migration above so the
+	// migrated 'admin' account (inserted without the flag) gets promoted.
+	if err := db.migrateUserAdminColumn(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// migrateUserAdminColumn adds users.is_admin to pre-admin-flag DBs and
+// promotes the oldest user when the table has no admin. Called from
+// InitSchema on every boot; both statements are idempotent.
+func (db *DB) migrateUserAdminColumn() error {
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'is_admin'").Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		if _, err := db.Exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"); err != nil {
+			return err
+		}
+	}
+	res, err := db.Exec(`UPDATE users SET is_admin = 1
+		WHERE rowid = (SELECT rowid FROM users ORDER BY created_at ASC, username ASC LIMIT 1)
+		AND (SELECT COUNT(*) FROM users WHERE is_admin = 1) = 0`)
+	if err != nil {
+		return err
+	}
+	if rows, _ := res.RowsAffected(); rows == 1 {
+		log.Println("Promoted the oldest dashboard user to admin (is_admin migration)")
 	}
 	return nil
 }
@@ -573,11 +611,21 @@ func (db *DB) UserCount() (int, error) {
 	return n, err
 }
 
-// AddUser creates an account. Returns the driver error (SQLITE_CONSTRAINT
+// AddUser creates an account. The FIRST account is the admin (the same
+// invariant as the in-app setup bootstrap — see AddUserMode); later
+// accounts are regular users. Returns the driver error (SQLITE_CONSTRAINT
 // → "user already exists" in the caller).
 func (db *DB) AddUser(username, passwordHash string) error {
-	_, err := db.Exec("INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-		username, passwordHash, tsNow())
+	admin := 0
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+		return err
+	}
+	if n == 0 {
+		admin = 1
+	}
+	_, err := db.Exec("INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
+		username, passwordHash, tsNow(), admin)
 	return err
 }
 
@@ -606,26 +654,45 @@ func (db *DB) SetUserPassword(username, passwordHash string) error {
 
 // RemoveUser deletes one account, refusing to delete the last one. The
 // count guard lives INSIDE the DELETE so check-and-delete is one atomic
-// statement: the old COUNT-then-DELETE let two concurrent removals both pass
-// the count and delete the last two users, silently turning auth off
-// (2026-10-19 review M4). 0 rows affected = the last user, or no such user —
-// the latter stays the pre-existing silent no-op.
+// statement: the old COUNT-then-DELETE let two concurrent removals both
+// pass the count and delete the last two users, silently turning auth off
+// (2026-10-19 review M4). If the removed account was the LAST ADMIN, the
+// oldest remaining user is promoted in the SAME transaction — the install
+// must never be left without an admin (that would lock every
+// account-management endpoint). 0 rows affected = the last user, or no
+// such user — the latter stays the pre-existing silent no-op.
 func (db *DB) RemoveUser(username string) error {
-	res, err := db.Exec("DELETE FROM users WHERE username = ? AND (SELECT COUNT(*) FROM users) > 1", username)
-	if err != nil {
-		return err
-	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		var exists int
-		if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ?", username).Scan(&exists); err != nil {
+	ctx := context.Background()
+	return db.ImmediateTx(ctx, func(c *sql.Conn) error {
+		res, err := c.ExecContext(ctx,
+			"DELETE FROM users WHERE username = ? AND (SELECT COUNT(*) FROM users) > 1", username)
+		if err != nil {
 			return err
 		}
-		if exists == 0 {
-			return nil
+		if n, _ := res.RowsAffected(); n == 0 {
+			var exists int
+			if err := c.QueryRowContext(ctx, "SELECT COUNT(*) FROM users WHERE username = ?", username).Scan(&exists); err != nil {
+				return err
+			}
+			if exists == 0 {
+				return nil
+			}
+			return fmt.Errorf("cannot remove the last user — disable authentication instead")
 		}
-		return fmt.Errorf("cannot remove the last user — disable authentication instead")
-	}
-	return nil
+		// The removed account was the last admin: hand the flag to the
+		// oldest remaining user so the install is never left without an
+		// admin (2026-10-19 external review, admin-flag fix).
+		res, err = c.ExecContext(ctx, `UPDATE users SET is_admin = 1
+			WHERE rowid = (SELECT rowid FROM users ORDER BY created_at ASC, username ASC LIMIT 1)
+			AND (SELECT COUNT(*) FROM users WHERE is_admin = 1) = 0`)
+		if err != nil {
+			return err
+		}
+		if rows, _ := res.RowsAffected(); rows == 1 {
+			log.Println("Last admin removed — promoted the oldest remaining user to admin")
+		}
+		return nil
+	})
 }
 
 // RemoveAllUsers clears every account (the "disable authentication" path).
@@ -637,12 +704,13 @@ func (db *DB) RemoveAllUsers() error {
 type authUser struct {
 	Username  string `json:"username"`
 	CreatedAt string `json:"created_at"`
+	IsAdmin   bool   `json:"is_admin"`
 }
 
 // ListUsers returns every account, oldest first (created_at is the standard
 // app timestamp, RFC3339Nano).
 func (db *DB) ListUsers() ([]authUser, error) {
-	rows, err := db.Query("SELECT username, created_at FROM users ORDER BY created_at, username")
+	rows, err := db.Query("SELECT username, created_at, is_admin FROM users ORDER BY created_at, username")
 	if err != nil {
 		return nil, err
 	}
@@ -650,9 +718,11 @@ func (db *DB) ListUsers() ([]authUser, error) {
 	out := []authUser{}
 	for rows.Next() {
 		var u authUser
-		if err := rows.Scan(&u.Username, &u.CreatedAt); err != nil {
+		var admin int
+		if err := rows.Scan(&u.Username, &u.CreatedAt, &admin); err != nil {
 			return nil, err
 		}
+		u.IsAdmin = admin == 1
 		out = append(out, u)
 	}
 	return out, rows.Err()

@@ -398,9 +398,13 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 			// username was fine, the install just isn't fresh anymore.
 			return errBootstrapped
 		}
+		admin := 0
+		if n == 0 {
+			admin = 1 // first account = the admin (the account panel is admin-gated)
+		}
 		if _, err := c.ExecContext(ctx,
-			"INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
-			username, string(hash), tsNow()); err != nil {
+			"INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
+			username, string(hash), tsNow(), admin); err != nil {
 			// Only the exact UNIQUE-constraint text means "account
 			// exists" — any other db failure must surface as a 500, not
 			// be misreported as a duplicate (2026-10-19 review m7).
@@ -444,10 +448,23 @@ func (a *AuthState) Bootstrapped() bool {
 	return a.db.GetSetting("auth_bootstrapped") == "1"
 }
 
+// IsAdmin reports whether the username holds the admin flag — the gate for
+// the account-management endpoints (add/remove user, disable auth). A
+// deleted or unknown user is not an admin; a db error fails closed.
+func (a *AuthState) IsAdmin(username string) bool {
+	var n int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ? AND is_admin = 1", strings.ToLower(username)).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
 // RemoveUser deletes an account and every live session it owns. The last
 // remaining user is protected — use Disable (auth-off) for that. The count
 // below is only a fast path; the authoritative guard is the atomic
-// conditional DELETE in db.RemoveUser (2026-10-19 review M4).
+// conditional DELETE in db.RemoveUser (2026-10-19 review M4). Removing the
+// last admin promotes the oldest remaining user in the same transaction, so
+// the install is never left without an admin.
 func (a *AuthState) RemoveUser(username string) error {
 	username = strings.ToLower(username)
 	n, err := a.db.UserCount()
@@ -1021,6 +1038,15 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// An authenticated admin add is never setup mode.
 		_, sessErr := r.Cookie(authSessionName)
 		setup := sessErr != nil && !s.auth.Enabled()
+		// Account creation is an admin operation: the setup-mode
+		// bootstrap (unauthenticated, first user) stays open, but an
+		// authenticated NON-admin session cannot mint accounts —
+		// otherwise a shared/compromised helper account grows its own
+		// persistence (2026-10-19 external review, admin-flag fix).
+		if !setup && !s.auth.IsAdmin(s.sessionFrom(r)) {
+			respondWithError(w, http.StatusForbidden, "admin only")
+			return
+		}
 		if err := s.auth.AddUserMode(req.Username, req.Password, setup); err != nil {
 			// Only the duplicate-account and validation cases are client
 			// errors; any other failure (db, KDF) is a 500 with the detail
@@ -1085,6 +1111,15 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// Removing an account is an admin operation (the UI offers it to
+	// admins only). Self-removal is allowed — the last-user guard in
+	// db.RemoveUser stops it from ever locking the install out, and
+	// removing the last admin promotes the oldest remaining user
+	// (2026-10-19 external review, admin-flag fix).
+	if !s.auth.IsAdmin(s.sessionFrom(r)) {
+		respondWithError(w, http.StatusForbidden, "admin only")
+		return
+	}
 	user := strings.ToLower(r.PathValue("username"))
 	if err := s.auth.RemoveUser(user); err != nil {
 		respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1100,6 +1135,12 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	// Disabling auth wipes EVERY account and opens the dashboard to the
+	// whole LAN — admin only (2026-10-19 external review, admin-flag fix).
+	if !s.auth.IsAdmin(s.sessionFrom(r)) {
+		respondWithError(w, http.StatusForbidden, "admin only")
 		return
 	}
 	if err := s.auth.Disable(); err != nil {

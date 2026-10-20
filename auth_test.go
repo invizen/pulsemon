@@ -1300,3 +1300,292 @@ func TestPasswordOver72Bytes(t *testing.T) {
 		t.Fatalf("SetUserPassword 73 bytes: err %v, want errPasswordTooLong", err)
 	}
 }
+
+// ---------- admin-flag tests (2026-10-19 external review fix) ----------
+
+func adminFlagServer(t *testing.T) (*DB, *httptest.Server) {
+	t.Helper()
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	t.Cleanup(httpSrv.Close)
+	return db, httpSrv
+}
+
+func userByName(t *testing.T, db *DB, name string) (authUser, bool) {
+	t.Helper()
+	users, err := db.ListUsers()
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	for _, u := range users {
+		if u.Username == name {
+			return u, true
+		}
+	}
+	return authUser{}, false
+}
+
+// TestSetupBootstrapUserIsAdmin pins the admin-flag invariant: the first
+// account created through the setup gate is the admin, and later accounts
+// (added by the admin) are regular users.
+func TestSetupBootstrapUserIsAdmin(t *testing.T) {
+	db, httpSrv := adminFlagServer(t)
+
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+
+	// Setup mode: unauthenticated first account.
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/users",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("bootstrap: %d", code)
+	}
+	// Log in as admin, add a helper.
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login: %d", code)
+	}
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/users",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("admin add helper: %d", code)
+	}
+
+	admin, ok := userByName(t, db, "admin")
+	if !ok || !admin.IsAdmin {
+		t.Fatalf("bootstrap user must be admin: %+v (ok=%v)", admin, ok)
+	}
+	helper, ok := userByName(t, db, "helper")
+	if !ok || helper.IsAdmin {
+		t.Fatalf("admin-added user must NOT be admin: %+v (ok=%v)", helper, ok)
+	}
+}
+
+// TestNonAdminCannotManageUsers is the horizontal-privilege-escalation repro
+// from the 2026-10-19 external review: a regular (non-admin) session must
+// NOT be able to remove users (anyone's, including its own), add users, or
+// disable auth. Each attempt is a 403 AND the state must be unchanged.
+func TestNonAdminCannotManageUsers(t *testing.T) {
+	db, httpSrv := adminFlagServer(t)
+
+	jar, _ := cookiejar.New(nil)
+	admin := &http.Client{Jar: jar}
+	bootstrapAdmin(t, admin, httpSrv.URL)
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("admin login: %d", code)
+	}
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("admin add helper: %d", code)
+	}
+
+	// The attacker: a legitimately logged-in regular account.
+	hjar, _ := cookiejar.New(nil)
+	helper := &http.Client{Jar: hjar}
+	if code := postJSONStatus(t, helper, httpSrv.URL+"/api/auth/login",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("helper login: %d", code)
+	}
+
+	if code := deleteStatus(t, helper, httpSrv.URL+"/api/auth/users/admin"); code != http.StatusForbidden {
+		t.Errorf("helper delete admin: got %d, want 403", code)
+	}
+	if code := deleteStatus(t, helper, httpSrv.URL+"/api/auth/users/helper"); code != http.StatusForbidden {
+		t.Errorf("helper delete self: got %d, want 403", code)
+	}
+	if code := postJSONStatus(t, helper, httpSrv.URL+"/api/auth/users",
+		`{"username":"evil","password":"evilevpw1"}`); code != http.StatusForbidden {
+		t.Errorf("helper add user: got %d, want 403", code)
+	}
+	if code := postJSONStatus(t, helper, httpSrv.URL+"/api/auth/disable", "{}"); code != http.StatusForbidden {
+		t.Errorf("helper disable auth: got %d, want 403", code)
+	}
+
+	// State must be exactly as before: both accounts exist, no "evil",
+	// auth still enabled.
+	if _, ok := userByName(t, db, "admin"); !ok {
+		t.Error("admin account missing after helper attacks")
+	}
+	if _, ok := userByName(t, db, "helper"); !ok {
+		t.Error("helper account missing after self-delete attempt")
+	}
+	if _, ok := userByName(t, db, "evil"); ok {
+		t.Error("'evil' account was created by a non-admin")
+	}
+	bare := &http.Client{}
+	resp, err := bare.Get(httpSrv.URL + "/api/auth/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		Enabled bool `json:"enabled"`
+	}
+	json.NewDecoder(resp.Body).Decode(&st)
+	resp.Body.Close()
+	if !st.Enabled {
+		t.Error("auth was disabled by a non-admin")
+	}
+}
+
+// TestAdminRemovalAndPromotion: an admin CAN remove a regular user; when
+// the LAST ADMIN is removed, the oldest remaining user is promoted in the
+// same transaction (the install is never left without an admin); and the
+// last user still cannot be removed at all.
+func TestAdminRemovalAndPromotion(t *testing.T) {
+	db, httpSrv := adminFlagServer(t)
+
+	jar, _ := cookiejar.New(nil)
+	admin := &http.Client{Jar: jar}
+	bootstrapAdmin(t, admin, httpSrv.URL)
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("admin login: %d", code)
+	}
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("admin add helper: %d", code)
+	}
+
+	// Admin removes the regular user: allowed, no promotion needed.
+	if code := deleteStatus(t, admin, httpSrv.URL+"/api/auth/users/helper"); code != http.StatusOK {
+		t.Fatalf("admin remove helper: got %d, want 200", code)
+	}
+	if _, ok := userByName(t, db, "helper"); ok {
+		t.Fatal("helper still exists after admin removal")
+	}
+	if a, _ := userByName(t, db, "admin"); !a.IsAdmin {
+		t.Fatal("admin must keep the flag after removing a regular user")
+	}
+
+	// Admin re-adds helper, then removes SELF — the last admin. Allowed:
+	// the oldest remaining user (helper) is promoted atomically.
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("admin re-add helper: %d", code)
+	}
+	if code := deleteStatus(t, admin, httpSrv.URL+"/api/auth/users/admin"); code != http.StatusOK {
+		t.Fatalf("admin self-remove (last admin): got %d, want 200", code)
+	}
+	if _, ok := userByName(t, db, "admin"); ok {
+		t.Fatal("admin account must be gone after self-removal")
+	}
+	helper, ok := userByName(t, db, "helper")
+	if !ok {
+		t.Fatal("helper missing after admin self-removal")
+	}
+	if !helper.IsAdmin {
+		t.Fatal("oldest remaining user must be promoted to admin")
+	}
+
+	// The promoted helper is now the ONLY user: removal refused.
+	hjar, _ := cookiejar.New(nil)
+	hclient := &http.Client{Jar: hjar}
+	if code := postJSONStatus(t, hclient, httpSrv.URL+"/api/auth/login",
+		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		t.Fatalf("helper login: %d", code)
+	}
+	req, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/api/auth/users/helper", nil)
+	resp, err := hclient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "last user") {
+		t.Fatalf("last-user self-remove: got %d %s, want 400 'last user'", resp.StatusCode, body)
+	}
+	if n, _ := db.UserCount(); n != 1 {
+		t.Fatalf("UserCount = %d, want 1 (last user must be protected)", n)
+	}
+}
+
+// TestLegacyTokenMigrationUserIsAdmin: a pre-user-model install (single
+// auth_token) migrates to the 'admin' account, which must carry the admin
+// flag — otherwise a long-running legacy install would boot with zero
+// admins and every account-management endpoint locked.
+func TestLegacyTokenMigrationUserIsAdmin(t *testing.T) {
+	db := newTestDB(t)
+	const tok = "pm_abcdefGhijklMNopqr4567"
+	hash, err := bcrypt.GenerateFromPassword([]byte(tok), bcryptCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSetting("auth_token", string(hash)); err != nil {
+		t.Fatal(err)
+	}
+	// Re-init the schema: this is what a server boot does on the old DB.
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	admin, ok := userByName(t, db, "admin")
+	if !ok {
+		t.Fatal("legacy 'admin' account missing after migration")
+	}
+	if !admin.IsAdmin {
+		t.Fatal("legacy-migrated 'admin' account must be the admin")
+	}
+}
+
+// TestAdminColumnMigration: a DB created before the is_admin column existed
+// (old users schema, two accounts) boots through InitSchema and comes out
+// with the column added and the OLDEST user promoted — an existing install
+// must never boot with zero admins.
+func TestAdminColumnMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	db, err := NewDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// Build the PRE-migration schema by hand (no is_admin column).
+	if _, err := db.Exec(`CREATE TABLE users (
+		username TEXT PRIMARY KEY,
+		password_hash TEXT NOT NULL,
+		created_at TEXT
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO users VALUES ('oldest', 'x', '2020-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO users VALUES ('newer', 'y', '2021-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema on old-schema DB: %v", err)
+	}
+
+	oldest, ok := userByName(t, db, "oldest")
+	if !ok || !oldest.IsAdmin {
+		t.Fatalf("oldest user must be promoted to admin: %+v (ok=%v)", oldest, ok)
+	}
+	newer, ok := userByName(t, db, "newer")
+	if !ok || newer.IsAdmin {
+		t.Fatalf("newer user must stay a regular user: %+v (ok=%v)", newer, ok)
+	}
+
+	// Idempotent: a second boot must not change anything.
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	newer, _ = userByName(t, db, "newer")
+	if newer.IsAdmin {
+		t.Fatal("second InitSchema must not promote a second admin")
+	}
+}
+
+func deleteStatus(t *testing.T, client *http.Client, url string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}

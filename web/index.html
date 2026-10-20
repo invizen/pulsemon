@@ -436,7 +436,7 @@
           <div class="text-[12px] text-slate-400 font-mono">Current session: <span id="auth-me" class="text-slate-200 font-semibold"></span></div>
           <div class="space-y-1.5" id="auth-user-list"></div>
           
-          <div class="border border-surface-800 rounded-lg p-2.5 bg-surface-900/60 space-y-2">
+          <div id="auth-add-user-box" class="border border-surface-800 rounded-lg p-2.5 bg-surface-900/60 space-y-2">
             <div class="text-[11px] font-mono text-slate-400 font-semibold">Add User Account</div>
             <div class="flex flex-col sm:flex-row gap-2">
               <input id="auth-new-username" type="text" placeholder="Username" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
@@ -450,7 +450,7 @@
           <div class="flex flex-wrap gap-2 pt-1">
             <button onclick="openChangePasswordDialog()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Change Password</button>
             <button onclick="logoutAuth()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Sign Out</button>
-            <button onclick="confirmDisableAuth(this)" class="px-2.5 py-1 rounded-lg bg-bad/10 border border-bad/30 text-bad hover:bg-bad/20 text-[11px] font-mono">Disable Auth</button>
+            <button id="auth-disable-btn" onclick="confirmDisableAuth(this)" class="px-2.5 py-1 rounded-lg bg-bad/10 border border-bad/30 text-bad hover:bg-bad/20 text-[11px] font-mono">Disable Auth</button>
           </div>
         </div>
       </div>
@@ -1516,13 +1516,21 @@ async function renderAuthPanel() {
     offBox.classList.add('hidden');
     $('auth-me').textContent = status.user || '…';
     const users = await api('/api/auth/users').catch(() => []);
+    const me = users.find(u => u.username === status.user);
+    const meIsAdmin = !!(me && me.is_admin);
+    // Admin-only surface: adding users, removing users, and disabling auth
+    // are gated server-side (403 for non-admin sessions); the UI just hides
+    // the controls a regular account can't use.
+    $('auth-add-user-box').classList.toggle('hidden', !meIsAdmin);
+    $('auth-disable-btn').classList.toggle('hidden', !meIsAdmin);
     const list = $('auth-user-list');
-    list.innerHTML = (users.length ? users : [{ username: status.user }]).map(u =>
+    list.innerHTML = (users.length ? users : [{ username: status.user, is_admin: true }]).map(u =>
       '<div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-surface-900 border border-surface-800">' +
       '<span class="text-[12px] font-mono text-slate-200">' + esc(u.username) +
       (u.username === status.user ? ' <span class="text-[10px] text-ok font-mono">(you)</span>' : '') +
+      (u.is_admin ? ' <span class="text-[10px] text-amber-400 font-mono">admin</span>' : '') +
       '</span>' +
-      (u.username === status.user ? '' : '<button onclick="removeAuthUser(\'' + escJs(u.username) + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>') +
+      (meIsAdmin && u.username !== status.user ? '<button onclick="removeAuthUser(\'' + escJs(u.username) + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>' : '') +
       '</div>'
     ).join('');
   } else {
