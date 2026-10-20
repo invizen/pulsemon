@@ -139,7 +139,14 @@ func TestFix_g8_CloneGivesUpWith409(t *testing.T) {
 // TestFix_g8_CloneNameTruncatesByRunes pins the 2026-10-20 external review
 // fix: the clone base is truncated to the RUNE cap (60 minus the longest
 // suffix), not the byte cap. A 60-rune CJK name (180 bytes) keeps 52 runes
-// before "-copy" — the old byte cut left only ~17.
+// before "-copy" — the old byte cut left only ~17. The same old byte cut
+// was also the invalid-UTF-8 hazard: its continuation-byte rollback strip
+// removed the split rune's trailing bytes but kept its FIRST byte
+// (20×"网" cut at 52 B = 17 runes + dangling 0xE7), which the dashboard
+// rendered as U+FFFD and validSensorName's utf8.ValidString gate later
+// rejected on any PATCH renaming the clone. Rune slicing (9a5ba74) makes
+// both failure modes unreachable; this assertion pins the exact valid
+// result, which implies utf8.ValidString.
 func TestFix_g8_CloneNameTruncatesByRunes(t *testing.T) {
 	d := newTestDB(t)
 	mux := NewServer(d, NewProbeWorker(d)).Mux()
