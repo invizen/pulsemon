@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -127,8 +128,20 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 		}
 		return nil
 	}
-	if ip := net.ParseIP(host); ip != nil {
-		return judge(ip)
+	// netip — not net.ParseIP — for the literal path (2026-10-19 external
+	// review #3): ParseIP returns nil for ZONED IPv6 literals (fe80::1%eth0,
+	// incl. the %25-encoded form URL.Hostname() yields), which pushed them
+	// onto the resolution path below. That path is fail-closed (the
+	// resolver fast-paths zoned literals back and judge() blocks them), but
+	// judging a literal as a literal is the total, deterministic form:
+	// Unmap normalizes IPv4-mapped forms, and a zone identifier has no
+	// dialable meaning in a redirect, so zoned addresses are refused
+	// explicitly.
+	if addr, err := netip.ParseAddr(host); err == nil {
+		if addr.Zone() != "" {
+			return fmt.Errorf("redirect target %q contains a zone identifier", host)
+		}
+		return judge(addr.Unmap().AsSlice())
 	}
 	// Resolve under the probe's context (g5): a slow DNS lookup must not
 	// be able to outlive the probe timeout.

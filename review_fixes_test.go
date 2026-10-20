@@ -47,6 +47,12 @@ func TestRedirectTargetAllowed(t *testing.T) {
 		{"100.64.0.1", "example.com", true, "carrier NAT"},
 		{"10.99.99.50", "example.com", false, "LAN redirect stays allowed"},
 		{"10.0.0.7", "example.com", false, "RFC1918 redirect allowed"},
+		{"::ffff:169.254.169.254", "example.com", true, "IPv4-mapped metadata literal"},
+		{"::ffff:127.0.0.1", "example.com", true, "IPv4-mapped loopback literal"},
+		{"fe80::1%eth0", "example.com", true, "zoned link-local literal"},
+		{"fe80::1%25eth0", "example.com", true, "zoned literal, percent-encoded zone (URL.Hostname form)"},
+		{"203.0.113.5", "example.com", false, "public literal stays allowed"},
+		{"2001:db8::1", "example.com", false, "public IPv6 literal stays allowed"},
 		{"", "example.com", true, "empty host"},
 	}
 	for _, c := range cases {
