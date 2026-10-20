@@ -139,6 +139,8 @@ sabotage-verified (reverting the fix fails the new test).
   `Expires` with a skewed clock get correct expiry.
 
 
+# v0.3.21 — External review hardening (10 findings)
+
 Second-round external review of the full codebase produced 10 findings.
 All ten were verified against the real code before any change: six were
 valid and fixed, one was partial (half fixed, half kept by design), one
