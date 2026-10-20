@@ -720,7 +720,7 @@ func (db *DB) RemoveUser(username string) error {
 			if exists == 0 {
 				return nil
 			}
-			return fmt.Errorf("cannot remove the last user — disable authentication instead")
+			return errLastUser
 		}
 		// The removed account was the last admin: hand the flag to the
 		// oldest remaining user so the install is never left without an

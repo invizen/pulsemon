@@ -346,6 +346,12 @@ var (
 	// maps it to 409 — the install is no longer fresh, the account
 	// already exists.
 	errBootstrapped = fmt.Errorf("an account already exists — this install is set up")
+	// errLastUser: RemoveUser refuses to delete the final account (use
+	// auth-off for that). A sentinel, not an inline fmt.Errorf, so the
+	// HTTP handler can errors.Is it to a 400 while every other db
+	// failure 500s (2026-10-20 external review — the handler used to
+	// echo every RemoveUser error, raw driver text included, as a 400).
+	errLastUser = fmt.Errorf("cannot remove the last user — disable authentication instead")
 )
 
 func validUsername(u string) bool {
@@ -484,7 +490,7 @@ func (a *AuthState) RemoveUser(username string) error {
 		return err
 	}
 	if n <= 1 {
-		return fmt.Errorf("cannot remove the last user — disable authentication instead")
+		return errLastUser
 	}
 	if err := a.db.RemoveUser(username); err != nil {
 		return err
@@ -1163,7 +1169,16 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		keep = c.Value
 	}
 	if err := s.auth.SetUserPassword(user, req.Password, keep); err != nil {
-		respondWithError(w, http.StatusBadRequest, err.Error())
+		// Only the validation sentinels are client errors; any other
+		// failure (db, KDF) is a 500 with the detail logged — a raw
+		// driver string (e.g. "database is locked") is not a client
+		// fault and must not be echoed back as a 400 (2026-10-20
+		// external review; same pattern as AddUser, 2026-10-19 m2).
+		if errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
+			respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		respondInternal(w, "change password", err)
 		return
 	}
 	respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
@@ -1185,7 +1200,15 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	user := strings.ToLower(r.PathValue("username"))
 	if err := s.auth.RemoveUser(user); err != nil {
-		respondWithError(w, http.StatusBadRequest, err.Error())
+		// The last-user guard is a client-facing business rule (400);
+		// any other failure (db) is a 500 with the detail logged — a
+		// raw driver string is not a client fault (2026-10-20 external
+		// review; same pattern as AddUser, 2026-10-19 m2).
+		if errors.Is(err, errLastUser) {
+			respondWithError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		respondInternal(w, "delete user", err)
 		return
 	}
 	respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
