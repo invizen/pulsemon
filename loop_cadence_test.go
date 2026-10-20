@@ -78,7 +78,7 @@ func TestSensorLoopResetCadence(t *testing.T) {
 	go pw.sensorLoop(ctx, sensorConfig{
 		id: id, name: id, target: "127.0.0.1", probeType: "icmp",
 		intervalS: intervalS, timeoutMS: 200,
-	})
+	}, false) // false = first-spawn semantics (this test never went through syncSensors)
 
 	// Let it tick. interval=1s + a deterministic per-sensor phase (>=0.25s)
 	// puts ticks ~1.25s apart; 5.5s yields ~4 ticks.

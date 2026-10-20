@@ -151,6 +151,22 @@ type ProbeWorker struct {
 	loops   map[string]context.CancelFunc
 	db      *DB
 
+	// spawnedIDs records every id this worker has ever spawned a loop for,
+	// so syncSensors can tell a FIRST spawn (process start, brand-new
+	// sensor) from a RESPAWN (loop dropped by the vanished pass after a
+	// >5s pause, by maintenance-mode end, or by Restart after a config
+	// edit). A respawn's first tick is capped at respawnFirstTickCap
+	// instead of the full staggered phase: the operator explicitly
+	// resumed/edited the sensor and wants data now, not up to a whole
+	// interval later (2026-10-20 external review — before the cap, an
+	// hourly sensor resumed after a >5s pause, or after ANY maintenance
+	// mode ended, waited up to an hour for its first probe, because
+	// SetPaused's F28 kick is a no-op once the sync pass has dropped the
+	// paused loop). Ids are UUIDs, never reused, so the map only grows
+	// with distinct sensors ever monitored (negligible); Remove deletes
+	// its entry anyway.
+	spawnedIDs map[string]bool
+
 	// syncReq requests an immediate syncSensors pass (buffered 1, so the
 	// non-blocking send from Restart never stalls; a second request while a
 	// pass is in flight is coalesced into the next select iteration and
@@ -232,6 +248,7 @@ func NewProbeWorker(db *DB) *ProbeWorker {
 	return &ProbeWorker{
 		sensors:         make(map[string]*ProbeState),
 		loops:           make(map[string]context.CancelFunc),
+		spawnedIDs:      make(map[string]bool),
 		db:              db,
 		syncReq:         make(chan struct{}, 1),
 		statsCache:      make(map[string]*probeSeries),
@@ -410,12 +427,22 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			if !found {
 				continue
 			}
+			// First spawn vs RESPAWN (see the spawnedIDs field): a
+			// respawned loop — resume after a >5s pause, maintenance-mode
+			// end, config-edit Restart — caps its first tick at
+			// respawnFirstTickCap so the sensor is not dark for up to a
+			// whole interval (2026-10-20 external review).
+			if pw.spawnedIDs == nil { // bare test workers
+				pw.spawnedIDs = make(map[string]bool)
+			}
+			resumed := pw.spawnedIDs[c.id]
+			pw.spawnedIDs[c.id] = true
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
 			pw.wg.Add(1)
 			go func() {
 				defer pw.wg.Done()
-				pw.sensorLoop(lctx, cfg)
+				pw.sensorLoop(lctx, cfg, resumed)
 			}()
 		}
 	}
@@ -498,6 +525,15 @@ func (pw *ProbeWorker) freshConfig(id string) (sensorConfig, bool, error) {
 // paused, so without the kick the first probe after a resume would be up to
 // a whole interval late (60s on a 60s sensor). The kick makes the loop
 // re-evaluate and probe on its next wake.
+//
+// Scope: the kick only reaches a LIVE loop. The sync pass drops paused
+// sensors within ~5s (the vanished pass deletes loop + state), so a resume
+// after a longer pause finds no entry here and the kick is a no-op — the
+// sensor is then RESPAWNED by the next syncSensors pass, and the respawn
+// path caps the first tick at respawnFirstTickCap (1s) so the resume delay
+// is bounded the same way (2026-10-20 external review: before that cap,
+// an hourly sensor resumed after a >5s pause — or after ANY maintenance
+// mode ended — waited up to an hour for its first probe).
 func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
@@ -526,8 +562,11 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 // pass — now requested IMMEDIATELY via the syncReq channel (Run's select
 // runs it on the next iteration) instead of waiting out the 5s tick
 // (2026-10-19 external review #2). The <=5s + staggered-phase gap the old
-// passive design left is closed; the DB is still the source of truth and
-// deriveStatus re-derives state from probe history on the next probe. This
+// passive design left is closed (and the respawn's first tick is capped at
+// respawnFirstTickCap, so a config edit is not dark for up to a full
+// interval — 2026-10-20 external review); the DB is still the source of
+// truth and deriveStatus re-derives state from probe history on the next
+// probe. This
 // is the documented M2 design (see api_restart_test.go), with the
 // immediate-sync extension.
 //
@@ -586,6 +625,7 @@ func (pw *ProbeWorker) Remove(id string) {
 		delete(pw.loops, id)
 	}
 	delete(pw.sensors, id)
+	delete(pw.spawnedIDs, id) // nil-map delete is a safe no-op
 	delete(pw.lastPulse, id)
 	// Drop the cached stats series too, or a deleted sensor's 24h history
 	// stays pinned in memory for the process lifetime (2026-10-19 review
@@ -1004,7 +1044,7 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 	return &st
 }
 
-func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
+func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed bool) {
 	interval := time.Duration(c.intervalS) * time.Second
 	if interval <= 0 {
 		interval = time.Minute // a zeroed row must not divide by zero or spin
@@ -1015,7 +1055,17 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig) {
 	// or every sensor sharing an interval — fires on the same wall-clock second,
 	// producing a write thundering-herd against SQLite. Spreading the phases
 	// turns N simultaneous writes into N writes spread across the interval.
+	//
+	// RESPAWN exception (resumed, set by syncSensors via spawnedIDs): the
+	// operator just resumed this sensor (pause >5s, maintenance-mode end)
+	// or edited its config (Restart), so a full phase here would leave it
+	// dark for up to a whole interval — an hour on an hourly sensor, with
+	// no data, no status, and no alerts in between. Cap the first tick at
+	// respawnFirstTickCap; see that constant for the anti-herd tradeoff.
 	phase := staggerPhase(c.id, interval)
+	if resumed && phase > respawnFirstTickCap {
+		phase = respawnFirstTickCap
+	}
 
 	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
 	// ERROR is re-checked on the fast-retry cadence (errorRetryInterval,
@@ -1106,6 +1156,17 @@ func staggerPhase(id string, interval time.Duration) time.Duration {
 	}
 	return phase
 }
+
+// respawnFirstTickCap caps the first-tick delay of a RESPAWNED loop (a
+// first spawn after the previous loop was dropped — resume after a >5s
+// pause, maintenance-mode end, config-edit Restart; see spawnedIDs). A
+// full stagger here would leave a resumed sensor dark for up to a whole
+// interval (an hour on an hourly sensor). Capping at 1s keeps the
+// anti-herd property in the one case that matters — a maintenance-mode
+// end with N sensors respawning together lands N probes across ~1s, not
+// the same wall-clock instant — while bounding the resume/edit delay
+// (2026-10-20 external review).
+const respawnFirstTickCap = time.Second
 
 // safeProbe runs one probe and contains a panic: one bad probe must not take
 // the whole monitor (every other sensor) down with it.
