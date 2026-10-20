@@ -340,6 +340,20 @@ func (s *Server) authGate() http.Handler {
 			respondWithError(w, http.StatusForbidden, "dashboard setup required: create the first account in Settings")
 			return
 		}
+		// Authenticated traffic is intentionally NOT host-gated:
+		// PULSEMON_ALLOWED_HOSTS is documented setup-mode hardening
+		// (README: "Has no effect once an account exists") — it closes
+		// the unauthenticated rebinding-bootstrap window, not a global
+		// access boundary. The session cookie is the credential, and
+		// the Host header is client-controlled: a cookie holder can
+		// set any Host, so a gate here would lock out direct-IP login
+		// and use while protecting no one. Rebinding-with-cookie is
+		// already defeated by cookie domain scoping (the browser won't
+		// attach a 192.168.1.10 cookie to a request addressed to
+		// evil.com), and browser cross-origin vectors on authenticated
+		// endpoints are the Origin/Sec-Fetch-Site gate above.
+		// (2026-10-20 external review — mechanism verified, documented
+		// as by design.)
 		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
 			s.mux.ServeHTTP(w, r)
 			return
