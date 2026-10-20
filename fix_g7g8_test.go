@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestFix_g7_StaticCharsetETag304(t *testing.T) {
@@ -132,5 +133,28 @@ func TestFix_g8_CloneGivesUpWith409(t *testing.T) {
 	mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/sensors/id-src/clone", nil))
 	if rr.Code != http.StatusConflict || strings.Contains(rr.Body.String(), "UNIQUE") {
 		t.Fatalf("exhausted clone => %d %s, want 409 without driver text", rr.Code, rr.Body.String())
+	}
+}
+
+// TestFix_g8_CloneNameTruncatesByRunes pins the 2026-10-20 external review
+// fix: the clone base is truncated to the RUNE cap (60 minus the longest
+// suffix), not the byte cap. A 60-rune CJK name (180 bytes) keeps 52 runes
+// before "-copy" — the old byte cut left only ~17.
+func TestFix_g8_CloneNameTruncatesByRunes(t *testing.T) {
+	d := newTestDB(t)
+	mux := NewServer(d, NewProbeWorker(d)).Mux()
+	src := strings.Repeat("网", 60) // 60 runes, 180 bytes
+	if _, err := d.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('id-src', ?, '10.0.0.1', 60, 1000, 25, 3, 3, 'paused', 'up', 'x')`, src); err != nil {
+		t.Fatal(err)
+	}
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/sensors/id-src/clone", nil))
+	var got Sensor
+	_ = json.Unmarshal(rr.Body.Bytes(), &got)
+	want := strings.Repeat("网", 52) + "-copy"
+	if rr.Code != http.StatusCreated || got.Name != want {
+		t.Fatalf("clone => %d name %q (%d runes), want 201 %d runes (%s)",
+			rr.Code, got.Name, utf8.RuneCountInString(got.Name), utf8.RuneCountInString(want), rr.Body.String())
 	}
 }

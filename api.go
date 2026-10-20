@@ -1319,20 +1319,18 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	name := ""
 	created := false
 	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
-	// The clone name must itself satisfy validSensorName (≤60 bytes) —
+	// The clone name must itself satisfy validSensorName (≤60 runes) —
 	// otherwise the API would reject a later PATCH that renames the clone
 	// (2026-10-19 review F13). Reserve room for the LONGEST suffix
-	// ("-copy100", 8 bytes) by truncating the source name first; the
-	// shorter suffixes ("-copy", "-copy2") then always fit.
+	// ("-copy100", 8 ASCII runes) by truncating the source name first; the
+	// shorter suffixes ("-copy", "-copy2") then always fit. Truncate by
+	// RUNES, not bytes: the cap is a rune cap (0c35448), so a byte cut
+	// would shrink CJK/emoji names to a third of their allowed length
+	// (2026-10-20 external review).
 	cloneBase := src.Name
 	const cloneSuffixCeil = 8 // len("-copy100")
-	if len(cloneBase) > 60-cloneSuffixCeil {
-		cloneBase = cloneBase[:60-cloneSuffixCeil]
-		// Never split a multi-byte UTF-8 rune: roll back continuation
-		// bytes (top bits 10) to the last rune boundary.
-		for len(cloneBase) > 0 && (cloneBase[len(cloneBase)-1]&0xC0) == 0x80 {
-			cloneBase = cloneBase[:len(cloneBase)-1]
-		}
+	if r := []rune(cloneBase); len(r) > 60-cloneSuffixCeil {
+		cloneBase = string(r[:60-cloneSuffixCeil])
 	}
 	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
 		for ; ; next++ {
