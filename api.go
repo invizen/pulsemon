@@ -254,7 +254,24 @@ func (s *Server) authGate() http.Handler {
 		// CSRF and passes. A reverse proxy must preserve the original
 		// Host header (Caddy does by default) for the comparison to
 		// match. (2026-10-13 external review — valid finding.)
+		//
+		// Sec-Fetch-Site is the second arm: modern browsers send it on
+		// every request (fetch, XHR, form POST) and compute it from the
+		// URL's site, so it also covers the narrow window where a
+		// browser omits Origin on a POST (legacy quirks, some redirect
+		// chains) — and the DNS-rebinding residual noted below. A
+		// MISSING value passes (curl, server-to-server, the test
+		// suite): a non-browser cannot be a browser CSRF, and
+		// cookie-authenticated non-browser API clients must keep
+		// working. "same-site" is refused: a page on another PORT of
+		// the same IP is same-site, and that is exactly the cross-port
+		// vector this gate exists for. (2026-10-20 external review.)
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" &&
+				sfs != "same-origin" && sfs != "none" {
+				respondWithError(w, http.StatusForbidden, "cross-origin request blocked")
+				return
+			}
 			if orig := r.Header.Get("Origin"); orig != "" {
 				u, err := url.Parse(orig)
 				if err != nil || !strings.EqualFold(u.Host, r.Host) {

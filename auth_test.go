@@ -1748,3 +1748,80 @@ func TestSetupBootstrapGate(t *testing.T) {
 		t.Fatal("auth not re-enabled after CLI AddUser")
 	}
 }
+
+// TestCSRFCrossPortGate pins both arms of the cross-port CSRF gate
+// (authGate): state-changing requests are refused on a non-same-origin
+// Sec-Fetch-Site (the modern-browser signal — "same-site" included, i.e.
+// a page on another PORT of the same IP) or a foreign Origin, and pass
+// for same-origin browsers and for Origin-less non-browser clients
+// (curl, server-to-server, the test suite), which cannot be a browser
+// CSRF. (2026-10-20 external review — SFS arm; the Origin arm dates to
+// 2026-10-13.)
+func TestCSRFCrossPortGate(t *testing.T) {
+	db := newTestDB(t)
+	// Operator-disabled state: zero users + bootstrapped flag → the
+	// documented "auth off = fully open" mode, so a POST that passes the
+	// CSRF gate reaches the handler and 201s — a clean pass/fail signal.
+	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	postWith := func(name, sfs, origin string) int {
+		body := `{"name":"` + name + `","target":"127.0.0.1","type":"icmp","tags":[],"interval_s":60,"timeout_ms":1000,"loss_warn":25,"down_after":2,"spike_mult":5}`
+		req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/sensors", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		if sfs != "" {
+			req.Header.Set("Sec-Fetch-Site", sfs)
+		}
+		if origin != "" {
+			req.Header.Set("Origin", origin)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Pass: non-browser client (no SFS, no Origin) — the documented
+	// curl / server-to-server path must keep working.
+	if code := postWith("csrf-curl", "", ""); code != http.StatusCreated {
+		t.Fatalf("no SFS, no Origin (curl): got %d, want 201", code)
+	}
+	// Pass: same-origin browser (the dashboard UI itself), with and
+	// without a matching Origin.
+	if code := postWith("csrf-same-origin", "same-origin", ""); code != http.StatusCreated {
+		t.Fatalf("SFS same-origin: got %d, want 201", code)
+	}
+	if code := postWith("csrf-same-origin-orig", "same-origin", httpSrv.URL); code != http.StatusCreated {
+		t.Fatalf("SFS same-origin + matching Origin: got %d, want 201", code)
+	}
+	// Block: the cross-port vector — a page on another port of the same
+	// IP is same-site, and modern browsers report exactly that.
+	if code := postWith("csrf-same-site", "same-site", ""); code != http.StatusForbidden {
+		t.Fatalf("SFS same-site: got %d, want 403", code)
+	}
+	// Block: cross-site (includes the DNS-rebinding page).
+	if code := postWith("csrf-cross-site", "cross-site", ""); code != http.StatusForbidden {
+		t.Fatalf("SFS cross-site: got %d, want 403", code)
+	}
+	// Block: foreign Origin (the pre-existing arm, 2026-10-13).
+	if code := postWith("csrf-foreign-origin", "", "http://192.168.1.10:8080"); code != http.StatusForbidden {
+		t.Fatalf("foreign Origin: got %d, want 403", code)
+	}
+	// GETs are exempt from the gate — reads stay open.
+	req, _ := http.NewRequest(http.MethodGet, httpSrv.URL+"/api/sensors", nil)
+	req.Header.Set("Sec-Fetch-Site", "cross-site")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET with SFS cross-site: got %d, want 200 (reads exempt)", resp.StatusCode)
+	}
+}
