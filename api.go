@@ -2203,6 +2203,13 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	}
 	// Every asset revalidates (no-cache) against a strong ETag, so an update
 	// is never served stale and an unchanged asset costs a 304 with no body.
+	// The hash behind that ETag is MEMOIZED per path for the process life
+	// (static_etag.go, v0.3.17): the one-time sha256 of the ~110KB
+	// index.html measures ~54µs, paid once, not per request (2026-10-20
+	// external review #8 — already addressed). The remaining per-request
+	// cost is the in-memory embed copy (~6.5µs), which the 200 path needs
+	// for the body; skipping it on 304 was measured not worth the extra
+	// code path.
 	tag := staticETag(path, data)
 	w.Header().Set("ETag", tag)
 	w.Header().Set("Cache-Control", "no-cache")
