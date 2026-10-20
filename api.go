@@ -1029,29 +1029,14 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// setSensorTagsInTx is the transaction-aware twin of db.SetSensorTags:
-// replace the sensor's tags (DELETE + INSERTs) on the CALLER's transaction,
-// so the PATCH path can commit the tag change atomically with the sensor
-// UPDATE. db.SetSensorTags keeps its own transaction and can't join one, so
-// the twin lives here rather than in db.go.
-func setSensorTagsInTx(tx *sql.Tx, id string, tags []string) error {
-	if _, err := tx.Exec("DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
-		return err
-	}
-	for _, tag := range tags {
-		if _, err := tx.Exec("INSERT OR IGNORE INTO sensor_tags (sensor_id, tag) VALUES (?, ?)", id, tag); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// setSensorTagsInConn is the *sql.Conn twin of setSensorTagsInTx, for the
-// PATCH sensor write path that runs inside a BEGIN IMMEDIATE ImmediateTx
-// (2026-10-19 review F14) — a *sql.Tx from db.Begin can't join it because
-// the transaction lives on the pinned connection. The caller's ctx is
-// threaded through (2026-10-19 external review #5): every statement on this
-// path honors request cancellation, matching the ImmediateTx boundary.
+// setSensorTagsInConn replaces the sensor's tags (DELETE + INSERTs) on the
+// CALLER's pinned connection, for the PATCH sensor write path that runs
+// inside a BEGIN IMMEDIATE ImmediateTx (2026-10-19 review F14) — a *sql.Tx
+// from db.Begin can't join it because the transaction lives on the pinned
+// connection (db.SetSensorTags keeps its own transaction and can't join one
+// either, so the in-conn twin lives here rather than in db.go). The caller's
+// ctx is threaded through (2026-10-19 external review #5): every statement on
+// this path honors request cancellation, matching the ImmediateTx boundary.
 func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
 	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
 		return err
@@ -2016,11 +2001,15 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 	return nil
 }
 
-// applyProviderUpdate persists one provider's URL / enabled flag. URL is a
-// pointer so nil = "don't touch this field" (the dashboard only sends what
-// changed); an empty string clears; a non-empty value is validated first.
-// This is the single write path for provider config, so the validation and
-// key-naming stay consistent no matter how many providers exist.
+// applyProviderUpdate persists one provider's URL / enabled flag in its own
+// transaction — the standalone entry point the provider tests drive
+// (smtp_test.go, telegram_settings_test.go). handleSettingsPut uses
+// applyProviderUpdateInTx directly so every provider and the routing field
+// commit atomically. URL is a pointer so nil = "don't touch this field" (the
+// dashboard only sends what changed); an empty string clears; a non-empty
+// value is validated first. This is the single write path for provider
+// config, so the validation and key-naming stay consistent no matter how
+// many providers exist.
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -2035,7 +2024,7 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 
 // applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
 // caller's transaction so handleSettingsPut can apply every provider and
-// routing field atomically (2026-10-19 review m8; mirrors setSensorTagsInTx).
+// routing field atomically (2026-10-19 review m8; mirrors db.SetSensorTags).
 func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra map[string]string) error {
 	// Format-only validation (2026-10-19 review N6): the DNS reachability
 	// check runs in the PRE-transaction pass (handleSettingsPut →
