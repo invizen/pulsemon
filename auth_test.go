@@ -1189,13 +1189,22 @@ func TestClientIPRightmostUntrusted(t *testing.T) {
 	}
 }
 
-// TestThrottleKey pins the 2026-10-19 review M3b bucketing: IPv4 shares a
-// /24 budget, IPv6 a /64, unparseable strings pass through.
+// TestThrottleKey pins the 2026-10-19 review M3b bucketing as refined by
+// external review #7: private/loopback IPv4 per host (/32), other IPv4
+// shares a /24, IPv6 shares a /64, unparseable strings pass through.
 func TestThrottleKey(t *testing.T) {
 	cases := map[string]string{
-		"10.99.99.7":           "10.99.99.0",
-		"10.99.99.250":         "10.99.99.0",
-		"::ffff:10.99.99.7":    "10.99.99.0",
+		// private + loopback IPv4: per-host
+		"10.99.99.7":        "10.99.99.7",
+		"10.99.99.250":      "10.99.99.250",
+		"192.168.1.5":       "192.168.1.5",
+		"172.16.0.1":        "172.16.0.1",
+		"127.0.0.1":         "127.0.0.1",
+		"::ffff:10.99.99.7": "10.99.99.7",
+		// public IPv4: /24 (rotation within the /24 stays in one bucket)
+		"93.184.216.34": "93.184.216.0",
+		"93.184.216.99": "93.184.216.0",
+		// IPv6: /64
 		"2001:db8:1:2:3:4:5:6": "2001:db8:1:2::",
 		"2001:db8:1:2:ffff::9": "2001:db8:1:2::",
 		"2001:db8:1:3::1":      "2001:db8:1:3::",
@@ -1237,6 +1246,42 @@ func TestLoginThrottleIPv6Slash64(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("other /64: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestLoginThrottleLANPerHost is the 2026-10-19 external review #7
+// regression: private IPv4 is bucketed per host (/32), NOT per /24 — one
+// misbehaving LAN client (stale saved password, an old polling script)
+// must not lock out every other device on the homelab subnet. The
+// "other LAN host still logs in" assertion is what the /24-era code
+// fails: it answered 429 there.
+func TestLoginThrottleLANPerHost(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < loginFailMax; i++ {
+		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, "192.168.1.7")
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("attempt %d: got %d, want 401", i, resp.StatusCode)
+		}
+	}
+	// The locked host stays locked...
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "192.168.1.7")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("locked host: got %d, want 429", resp.StatusCode)
+	}
+	// ...while a DIFFERENT host on the same /24 is unaffected.
+	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "192.168.1.8")
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("other LAN host: got %d, want 200", resp.StatusCode)
 	}
 }
 

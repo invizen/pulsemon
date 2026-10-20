@@ -670,14 +670,28 @@ func (a *AuthState) trustedIP(p net.IP) bool {
 }
 
 // throttleKey maps a client IP to its login-throttle bucket (2026-10-19
-// review M3b): IPv4 → the /24 ("a.b.c.0"), IPv6 → the /64. An unparseable
-// string is returned as-is.
+// review M3b, refined by external review #7):
+//
+//   - private (RFC1918) and loopback IPv4 → the exact address (/32): on a
+//     LAN each device is a distinct host with no address rotation, so a
+//     shared /24 bucket let one misbehaving client (stale saved password,
+//     an old polling script) lock out every other device on the homelab
+//     subnet for loginLockout.
+//   - other IPv4 → the /24: an internet attacker rotating within a /24
+//     stays in one bucket.
+//   - IPv6 → the /64: one host owns a whole /64 (privacy-extension
+//     rotation), so per-address keying handed it 2^64 separate budgets.
+//
+// An unparseable string is returned as-is.
 func throttleKey(ip string) string {
 	p := net.ParseIP(ip)
 	if p == nil {
 		return ip
 	}
 	if v4 := p.To4(); v4 != nil {
+		if v4.IsPrivate() || v4.IsLoopback() {
+			return v4.String()
+		}
 		return fmt.Sprintf("%d.%d.%d.0", v4[0], v4[1], v4[2])
 	}
 	return p.Mask(net.CIDRMask(64, 128)).String()
@@ -954,10 +968,14 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// shouldn't get to run it at all). beginAttempt counts the attempt in
 	// the SAME locked section that admits it — a failed attempt is NOT
 	// recorded again below, it is already counted here.
-	// The throttle is keyed on the client's /24 (IPv4) or /64 (IPv6), not
-	// the full address: one IPv6 host owns a whole /64, so per-address
-	// keying handed it 2^64 separate 7-attempt budgets (2026-10-19 review
-	// M3b). ip stays the full address for log lines.
+	// The throttle is bucketed, not keyed on the full address: private and
+	// loopback IPv4 per host (/32 — LAN devices are distinct hosts, and a
+	// shared /24 budget let one client lock out the whole homelab subnet),
+	// other IPv4 by /24 (an attacker rotating within a /24 stays in one
+	// bucket), IPv6 by /64 (one host owns a whole /64 via
+	// privacy-extension rotation, so per-address keying handed it 2^64
+	// separate budgets) (2026-10-19 review M3b + external review #7). ip
+	// stays the full address for log lines.
 	ip := s.auth.ClientIP(r)
 	key := throttleKey(ip)
 	if ok, wait := s.auth.beginAttempt(key); !ok {
