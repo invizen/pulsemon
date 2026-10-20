@@ -65,6 +65,10 @@ type ProbeState struct {
 type probeEntry struct {
 	ts  int64 // UTC epoch seconds (matches CAST(strftime('%s', ts)))
 	rtt *float64
+	// manual marks a "Pulse Now" row: it stays in the series (sparkline
+	// honesty) but is excluded from status derivation (recentFromCache
+	// skips it) — see the probes.manual column.
+	manual bool
 }
 
 // probeSeries is an append-only, oldest-first log of probeEntry with a
@@ -1201,9 +1205,19 @@ const pulseNowCooldown = 2 * time.Second
 // pulse is a diagnostic: recording it keeps the history honest (the user saw
 // a real RTT / loss at that instant), while keeping status and alerts driven
 // only by the scheduled probe loop (a single manual probe must not flip a
-// healthy sensor to error or fire a recovery webhook). Works while paused
-// (SPEC §2). Dispatches by sensor type, so an HTTP sensor's manual pulse
-// makes an HTTP request (the card's "Pulse Now" shows its status code).
+// healthy sensor to error or fire a recovery webhook).
+//
+// The "status and alerts are unaffected" half is enforced, not assumed
+// (2026-10-20 external review): the row is tagged manual=1, and status
+// derivation (recentFromDB / recentFromCache) excludes manual rows. Before
+// the tag, a manual pulse's loss row was indistinguishable from a scheduled
+// loss, so ONE lost manual pulse + one lost scheduled probe tripped the
+// down_after=2 consecutive-loss test — the fixed 1s pulse timeout (a
+// sensor whose configured timeout is longer can look lost on a pulse while
+// answering fine on schedule) made the spurious loss likelier, not less.
+// Works while paused (SPEC §2). Dispatches by sensor type, so an HTTP
+// sensor's manual pulse makes an HTTP request (the card's "Pulse Now"
+// shows its status code).
 func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
 	var target, probeType string
 	if err := pw.db.QueryRow("SELECT target, type FROM sensors WHERE id = ?", id).Scan(&target, &probeType); err != nil {
@@ -1231,7 +1245,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		rttVal = o.rttMs
 	}
 	ts := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)",
+	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, ?, ?, ?, 1)",
 		id, fmtTS(ts), rttVal, o.ip, o.httpCode); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
@@ -1248,7 +1262,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		v := o.rttMs
 		rttPtr = &v
 	}
-	pw.recordProbe(id, probeEntry{ts: ts.Unix(), rtt: rttPtr})
+	pw.recordProbe(id, probeEntry{ts: ts.Unix(), rtt: rttPtr, manual: true})
 	return o, nil
 }
 
@@ -1786,14 +1800,29 @@ func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]*float64, bool) 
 	}
 	out := make([]*float64, 0, limit)
 	for i := len(s.data) - 1; i >= s.start && len(out) < limit; i-- {
+		// Manual "Pulse Now" rows are excluded from status derivation
+		// (probes.manual): they stay in the series for the sparkline,
+		// but never count toward loss % or the consecutive-loss test
+		// (2026-10-20 external review — see the PingNow doc).
+		if s.data[i].manual {
+			continue
+		}
 		out = append(out, s.data[i].rtt)
+	}
+	// A FULL window of scheduled probes is required. Manual pulses can
+	// dilute the tail (a 2s cooldown allows many), and a partial window
+	// would change the loss math — so fall back to the DB, which filters
+	// the same way.
+	if len(out) < limit {
+		return nil, false
 	}
 	return out, true
 }
 
-// recentFromDB is the durable equivalent of recentFromCache.
+// recentFromDB is the durable equivalent of recentFromCache. manual = 0
+// excludes "Pulse Now" rows from status derivation (see PingNow).
 func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]*float64, error) {
-	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, limit)
+	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? AND manual = 0 ORDER BY ts DESC LIMIT ?", id, limit)
 	if err != nil {
 		return nil, err
 	}

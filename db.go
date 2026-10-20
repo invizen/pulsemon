@@ -98,6 +98,7 @@ func (db *DB) InitSchema() error {
 		rtt_ms REAL,
 		resolved_ip TEXT,
 		http_status INTEGER,
+		manual INTEGER NOT NULL DEFAULT 0,
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
@@ -185,6 +186,20 @@ func (db *DB) InitSchema() error {
 	var httpStatusCol int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'http_status'`).Scan(&httpStatusCol); err == nil && httpStatusCol == 0 {
 		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN http_status INTEGER`); err != nil {
+			return err
+		}
+	}
+	// One-time migration: tag "Pulse Now" manual probes (manual=1). Manual
+	// rows stay in history — sparkline, graph, inspector — but are EXCLUDED
+	// from status derivation (recentFromDB/recentFromCache filter them),
+	// honoring the documented contract that a manual pulse never affects
+	// status or alerts (2026-10-20 external review: before the tag, one
+	// lost manual pulse + one lost scheduled probe tripped the
+	// down_after=2 consecutive-loss test into an "error" alert). Existing
+	// rows are all scheduled probes, so DEFAULT 0 is exactly right.
+	var manualCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'manual'`).Scan(&manualCol); err == nil && manualCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`); err != nil {
 			return err
 		}
 	}
