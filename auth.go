@@ -201,6 +201,18 @@ func (a *AuthState) userExists(username string) bool {
 // userExistsCached is the TTL-cached wrapper session validation uses,
 // capping the users-table lookups at one per user per userOKTTL. Caller
 // must hold a.mu.
+//
+// The lookup runs UNDER the session lock on purpose (2026-10-20 external
+// review flagged the contention; verified and kept): the query is a
+// point lookup on the tiny users table (local SQLite, sub-millisecond),
+// it runs at most once per user per userOKTTL (2s) because of the cache,
+// and moving it outside the lock would need an unlock → query → re-lock →
+// RE-VALIDATE dance — the session could be deleted (or the user
+// re-created) in the gap — adding a race window and a second code path
+// to buy back a sub-millisecond critical section. At homelab scale
+// (a handful of dashboard clients) the contention is not measurable;
+// the F1 correctness property (out-of-band deletions rejected within
+// userOKTTL) is what this check exists for.
 func (a *AuthState) userExistsCached(username string) bool {
 	if t, ok := a.userOKCache[username]; ok && time.Since(t) < userOKTTL {
 		return true
@@ -904,6 +916,16 @@ type authStatusPayload struct {
 
 // sessionFrom returns the username the request's session belongs to
 // ("" when there is no live session).
+//
+// Handlers that call this are re-validating a session the auth gate
+// already validated for the same request (2026-10-20 external review
+// noted the double check; it is deliberate): the handler's
+// authorization decision (admin-only gates, per-user scoping) must not
+// rest on the gate having run — a route registered without the gate,
+// or a future gate change, must not silently widen authorization. The
+// cost is one extra short a.mu critical section: the second pass
+// almost always hits the userOKTTL cache (no DB query), and the
+// sliding-expiry update is idempotent.
 func (s *Server) sessionFrom(r *http.Request) string {
 	c, err := r.Cookie(authSessionName)
 	if err != nil {
