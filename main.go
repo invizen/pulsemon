@@ -609,8 +609,31 @@ func runServer(stop <-chan struct{}) {
 	<-stop
 	log.Println("Shutting down...")
 
-	// 1. Stop background probing FIRST so no new probe writes start, and wait
-	// for in-flight probes to finish (Run blocks until its sensor loops exit).
+	// 1. Stop the HTTP server FIRST: the listener closes immediately, and
+	// every ACTIVE handler (dashboard polls, settings tests, sensor edits)
+	// drains up to 5s while the DB is still open and the probe worker is
+	// still alive. The server used to stop LAST (2026-10-20 external
+	// review): a handler slower than the 5s drain budget — an SMTP test
+	// against a hanging server runs up to ~25s (10s dial + 15s conn
+	// deadline), a webhook test up to its 10s client timeout, a plain DB
+	// read blocked on a write lock just as easily — kept running past the
+	// deferred db.Close() below and answered with "sql: Database is
+	// closed". Stopping the worker/alerts first was never a dependency of
+	// any handler: they read the DB (open until the very end) and the
+	// in-memory stats cache (frozen once the worker stops, still
+	// readable).
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	// log.Printf (NOT Fatalf): a shutdown error must not exit before the
+	// deferred db.Close() runs — an aborted Close can leave the WAL in a
+	// state the next boot has to recover from.
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server shutdown error: %v", err)
+	}
+	log.Println("Server exited")
+
+	// 2. Stop background probing so no new probe writes start, and wait for
+	// in-flight probes to finish (Run blocks until its sensor loops exit).
 	cancel()
 	select {
 	case <-workerDone:
@@ -624,13 +647,13 @@ func runServer(stop <-chan struct{}) {
 		log.Println("WARNING: probe worker did not stop in 10s; in-flight probes may be aborted")
 	}
 
-	// 2. Abort in-flight webhook POSTs. Without this, a delivery stuck in a
+	// 3. Abort in-flight webhook POSTs. Without this, a delivery stuck in a
 	// network blip keeps its connection open until the client's 10s timeout
 	// and holds process exit that long; with stopCtx cancelled, it aborts at
 	// the next read instead.
 	pw.StopAlerts()
 
-	// 3. Drain in-flight alert deliveries BEFORE the deferred db.Close: an
+	// 4. Drain in-flight alert deliveries BEFORE the deferred db.Close: an
 	// alert fired on the final probe tick is a fire-and-forget goroutine
 	// whose first act is a settings read — without this, Close() lands mid
 	// delivery and the alert dies. In-flight POSTs are already aborted by
@@ -638,15 +661,4 @@ func runServer(stop <-chan struct{}) {
 	// backstop only.
 	pw.DrainAlerts(15 * time.Second)
 	log.Println("Alert deliveries drained")
-
-	// 4. Drain active HTTP connections.
-	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer shutdownCancel()
-	// log.Printf (NOT Fatalf): a shutdown error must not exit before the
-	// deferred db.Close() runs — an aborted Close can leave the WAL in a
-	// state the next boot has to recover from.
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Printf("Server shutdown error: %v", err)
-	}
-	log.Println("Server exited")
 }
