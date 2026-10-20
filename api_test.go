@@ -32,6 +32,12 @@ func TestValidSensorName(t *testing.T) {
 		{"nul\x00x", false},              // control char (NUL)
 		{strings.Repeat("x", 61), false}, // over 60
 		{strings.Repeat("x", 60), true},  // exactly 60 ok
+		// Rune-length cap (external review #8): 60 CJK chars = 180 bytes
+		// must pass — the UI maxlength="60" allows exactly this.
+		{strings.Repeat("网", 60), true},
+		{strings.Repeat("网", 61), false},
+		// Invalid UTF-8 is refused at the write path (external review #8).
+		{"ok\xff\xfe", false},
 	}
 	for _, c := range cases {
 		if got := validSensorName(c.name); got != c.ok {
@@ -73,6 +79,12 @@ func TestCleanTagsXSSGate(t *testing.T) {
 	long := cleanTags([]string{strings.Repeat("x", 31), strings.Repeat("x", 30)})
 	if len(long) != 1 || long[0] != strings.Repeat("x", 30) {
 		t.Fatalf("30-char cap broken: %v", long)
+	}
+	// The cap counts RUNES (external review #8): 30 CJK chars = 90 bytes
+	// must pass, 31 must be dropped.
+	longCJK := cleanTags([]string{strings.Repeat("网", 31), strings.Repeat("网", 30)})
+	if len(longCJK) != 1 || longCJK[0] != strings.Repeat("网", 30) {
+		t.Fatalf("30-rune tag cap broken: %v", longCJK)
 	}
 	many := cleanTags([]string{"a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9", "a10"})
 	if len(many) != 8 {

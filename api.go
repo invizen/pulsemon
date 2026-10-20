@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 //go:embed web/*
@@ -655,8 +656,17 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // the complete set needed to prevent string-context escape in every consumer.
 // As a defense-in-depth gate behind output encoding, it needs to be precise,
 // not exhaustive.
+//
+// The length cap is in RUNES, not bytes (2026-10-19 external review #8): the
+// UI's maxlength="60" counts characters, so a byte cap silently truncated
+// CJK/emoji names to ~20 chars and the server 400'd what the form allowed.
+// Invalid UTF-8 is refused at the write path so SQLite never stores a
+// mojibake name.
 func validSensorName(name string) bool {
-	if name == "" || len(name) > 60 {
+	if name == "" || utf8.RuneCountInString(name) > 60 {
+		return false
+	}
+	if !utf8.ValidString(name) {
 		return false
 	}
 	// Reject the string-escape-relevant characters (quotes, backslash, angle
@@ -687,7 +697,8 @@ func cleanTags(in []string) []string {
 	out := []string{}
 	for _, t := range in {
 		t = strings.TrimSpace(t)
-		if t == "" || len(t) > 30 || !validSensorName(t) || seen[t] {
+		// 30-RUNE cap, matching the UI maxlength="30" (external review #8).
+		if t == "" || utf8.RuneCountInString(t) > 30 || !validSensorName(t) || seen[t] {
 			continue
 		}
 		seen[t] = true
