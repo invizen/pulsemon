@@ -117,21 +117,15 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 	if strings.EqualFold(host, origHost) {
 		return nil // same-host hop: the operator's own target
 	}
-	judge := func(ip net.IP) error {
-		if v4 := ip.To4(); v4 != nil {
-			ip = v4
-		}
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
-			ip.IsUnspecified() || ip.IsMulticast() {
-			return fmt.Errorf("redirect target %q resolves to a blocked address (%s)", host, ip)
-		}
-		for _, n := range blockedSubnets {
-			if n.Contains(ip) {
-				return fmt.Errorf("redirect target %q resolves to a reserved address (%s)", host, ip)
-			}
-		}
-		return nil
-	}
+	// Address judging delegates to checkWebhookIP — the single canonical
+	// implementation (2026-10-20 external review). This path used to carry
+	// a HAND-COPIED judge that had drifted: when P1 (2026-10-19) added the
+	// IPv4-embedded IPv6 view (embeddedIPv4) to checkWebhookIP, the copy
+	// here never got it, so IPv4-embedded literals like ::7f00:1
+	// (=127.0.0.1) and ::a9fe:a9fe (=169.254.169.254) — which pass To4()
+	// and every IPv6 range check — slipped past this guard while the
+	// webhook path blocked them. One shared implementation means the two
+	// paths can't drift again.
 	// netip — not net.ParseIP — for the literal path (2026-10-19 external
 	// review #3): ParseIP returns nil for ZONED IPv6 literals (fe80::1%eth0,
 	// incl. the %25-encoded form URL.Hostname() yields), which pushed them
@@ -145,7 +139,7 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 		if addr.Zone() != "" {
 			return fmt.Errorf("redirect target %q contains a zone identifier", host)
 		}
-		return judge(addr.Unmap().AsSlice())
+		return checkWebhookIP(addr.Unmap().AsSlice(), host)
 	}
 	// Resolve under the probe's context (g5): a slow DNS lookup must not
 	// be able to outlive the probe timeout.
@@ -154,7 +148,7 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 		return fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
 	}
 	for _, addr := range addrs {
-		if err := judge(addr.IP); err != nil {
+		if err := checkWebhookIP(addr.IP, host); err != nil {
 			return err
 		}
 	}
