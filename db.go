@@ -529,7 +529,14 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 		return err
 	}
 	if err := fn(conn); err != nil {
-		_, _ = conn.ExecContext(ctx, "ROLLBACK")
+		// Rollback on a fresh context: cleanup must reach the driver even
+		// when the caller's ctx is already canceled (client disconnect) —
+		// a canceled ctx makes ExecContext return before the ROLLBACK is
+		// sent, leaving the transaction open on a conn that defer
+		// conn.Close() would hand back to the pool, where the next
+		// BEGIN IMMEDIATE on it fails "cannot start a transaction within
+		// a transaction".
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		return err
 	}
 	_, err = conn.ExecContext(ctx, "COMMIT")

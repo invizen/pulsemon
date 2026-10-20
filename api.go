@@ -950,7 +950,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if req.Tags != nil {
-				return setSensorTagsInConn(c, id, newTags)
+				return setSensorTagsInConn(r.Context(), c, id, newTags)
 			}
 			return nil
 		})
@@ -1030,9 +1030,10 @@ func setSensorTagsInTx(tx *sql.Tx, id string, tags []string) error {
 // setSensorTagsInConn is the *sql.Conn twin of setSensorTagsInTx, for the
 // PATCH sensor write path that runs inside a BEGIN IMMEDIATE ImmediateTx
 // (2026-10-19 review F14) — a *sql.Tx from db.Begin can't join it because
-// the transaction lives on the pinned connection.
-func setSensorTagsInConn(c *sql.Conn, id string, tags []string) error {
-	ctx := context.Background()
+// the transaction lives on the pinned connection. The caller's ctx is
+// threaded through (2026-10-19 external review #5): every statement on this
+// path honors request cancellation, matching the ImmediateTx boundary.
+func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
 	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
 		return err
 	}
