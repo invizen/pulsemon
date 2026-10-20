@@ -170,19 +170,23 @@ var httpClient = &http.Client{
 		if err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost); err != nil {
 			return err
 		}
-		// Force a fresh connection on every hop that changes host:port or
-		// scheme (2026-10-19 review N4): the transport pools idle conns per
-		// host, and a redirect landing on a DIFFERENT server — or a scheme
-		// flip — must not inherit a pooled conn. The critical case is
-		// http→https: a reused pooled conn would report the cert from its
-		// ORIGINAL handshake, so a renewed cert stays invisible in the
-		// displayed expiry until the conn recycles (the same staleness the
-		// first-request req.Close in probeHTTP closes for the initial hop).
-		if len(via) > 0 {
-			prev := via[len(via)-1].URL
-			if prev.Host != req.URL.Host || !strings.EqualFold(prev.Scheme, req.URL.Scheme) {
-				req.Close = true
-			}
+		// Force a fresh connection on EVERY HTTPS hop (2026-10-19 review
+		// N4, extended by the 2026-10-20 external review): the transport
+		// pools idle conns per host for up to IdleConnTimeout (10 min),
+		// and a redirect hop that REUSES a pooled conn reports the cert
+		// from that conn's ORIGINAL handshake — a renewed cert stays
+		// invisible in the displayed expiry (and verifyHTTPCert judges
+		// the STALE cert, so a renewed-and-valid install can read as
+		// "expired") until the conn recycles. N4 covered only hops that
+		// CHANGE host or scheme; a SAME-host redirect (https://h/a →
+		// https://h/b) reused the pooled conn a previous probe's
+		// redirect hop left behind, because M5's first-hop Close never
+		// touches the redirect hops. Closing every HTTPS hop costs one
+		// handshake per such hop — redirects are rare, and M5 already
+		// accepts one handshake per probe on the first hop. Plain-HTTP
+		// hops carry no cert data, so they keep reusing pooled conns.
+		if req.URL.Scheme == "https" {
+			req.Close = true
 		}
 		return nil
 	},
