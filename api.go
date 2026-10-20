@@ -756,20 +756,18 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Target and type validate as a pair against the RESULTING type:
-		// the dashboard edits both in one modal, so a target must be valid
-		// for the type the sensor will end up with (URL for http, host for
-		// icmp), whether the user changed the target, the type, or both.
-		var currentType string
-		var storedIntervalS, storedTimeoutMS int
-		if err := s.db.QueryRow("SELECT type, interval_s, timeout_ms FROM sensors WHERE id = ?", id).Scan(&currentType, &storedIntervalS, &storedTimeoutMS); err != nil {
-			respondWithError(w, http.StatusNotFound, "sensor not found")
-			return
-		}
-		if currentType == "" {
-			currentType = "icmp"
-		}
-		resultType := currentType
+		// Target and type validate as a pair against the RESULTING type —
+		// INSIDE the ImmediateTx below, where the row is read under the
+		// write lock: the dashboard edits both in one modal, so a target
+		// must be valid for the type the sensor will end up with (URL for
+		// http, host for icmp), whether the user changed the target, the
+		// type, or both. (2026-10-19 external review #10: this used to run
+		// twice — here against a pre-lock snapshot fed by up to two extra
+		// SELECTs, and in-tx against fresh values. The in-tx check is a
+		// superset returning the identical 400s, so only pure
+		// request-shape checks — empty fields, ranges — run before the
+		// write lock.)
+		resultType := ""
 		if req.Type != nil {
 			resultType = normalizeProbeType(*req.Type)
 		}
@@ -803,34 +801,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				respondWithError(w, http.StatusBadRequest, "target cannot be empty")
 				return
 			}
-			if resultType == "http" {
-				if !validURL(resultTarget) {
-					respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
-					return
-				}
-			} else if !validTarget(resultTarget) {
-				respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
-				return
-			}
+			// Format validation against the RESULTING type runs in-tx (see
+			// above): the pre-tx copy validated a possibly-stale pair.
 			add("target", resultTarget)
 		}
 		if req.Type != nil {
 			add("type", resultType)
-			// Type changed: re-validate the EXISTING target against it.
-			// (Both target+type changed is already covered above.)
-			if req.Target == nil {
-				var existing string
-				_ = s.db.QueryRow("SELECT target FROM sensors WHERE id = ?", id).Scan(&existing)
-				if resultType == "http" {
-					if !validURL(existing) {
-						respondWithError(w, http.StatusBadRequest, "existing target is not an http:// or https:// URL")
-						return
-					}
-				} else if !validTarget(existing) {
-					respondWithError(w, http.StatusBadRequest, "existing target is not an IPv4 address or hostname")
-					return
-				}
-			}
 		}
 		if req.Tags != nil {
 			// Validated (cleanTags) but NOT written yet: the tag write moves
@@ -854,21 +830,10 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			add("timeout_ms", *req.TimeoutMS)
 		}
-		// Cross-check the EFFECTIVE (post-patch) values: when only one of
-		// the two is supplied, the stored value stands in for the other,
-		// so a PATCH can't leave a timeout longer than the interval.
-		effIntervalS := storedIntervalS
-		if req.IntervalS != nil {
-			effIntervalS = *req.IntervalS
-		}
-		effTimeoutMS := storedTimeoutMS
-		if req.TimeoutMS != nil {
-			effTimeoutMS = *req.TimeoutMS
-		}
-		if effTimeoutMS > effIntervalS*1000 {
-			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
-			return
-		}
+		// The effective timeout-vs-interval cross-check runs in-tx against
+		// the fresh stored values (external review #10): the pre-tx copy
+		// existed only to fast-fail, and the in-tx check returns the
+		// identical 400.
 		if req.LossWarn != nil {
 			if *req.LossWarn < 1 || *req.LossWarn > 100 {
 				respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
@@ -901,17 +866,18 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "no fields to update")
 			return
 		}
-		// One BEGIN IMMEDIATE transaction (2026-10-19 review F14): the row is
-		// re-read INSIDE it and the type/target pair (plus the effective
-		// interval/timeout cross-check) re-validated against the FRESH values
-		// before the UPDATE. The pre-tx reads above only feed the per-field
-		// validation and the 404 check; a concurrent PATCH that changed the
-		// target/type between that read and the write used to slip through
-		// validated against the stale pair. BEGIN IMMEDIATE holds the write
-		// lock from the start, so no concurrent writer can change the row
-		// between the re-read and the UPDATE. The UPDATE and the tag replace
-		// commit together, so a constraint failure (rename) or a crash can't
-		// leave the tags changed while the row is not (or vice versa).
+		// One BEGIN IMMEDIATE transaction (2026-10-19 review F14, single-
+		// read shape per external review #10): the row is read ONCE,
+		// INSIDE it, and the type/target pair (plus the effective
+		// interval/timeout cross-check) validated against those FRESH
+		// values before the UPDATE — this read also carries the 404. A
+		// concurrent PATCH that changed the target/type between a pre-lock
+		// read and the write used to slip through validated against the
+		// stale pair; BEGIN IMMEDIATE holds the write lock from the start,
+		// so no concurrent writer can change the row between the read and
+		// the UPDATE. The UPDATE and the tag replace commit together, so a
+		// constraint failure (rename) or a crash can't leave the tags
+		// changed while the row is not (or vice versa).
 		var patchErr error
 		patchErr = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			ctx := r.Context()

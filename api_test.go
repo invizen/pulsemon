@@ -536,3 +536,80 @@ func TestMaintenanceModeFlipsInMemoryPauseImmediately(t *testing.T) {
 		t.Fatalf("db state = %q, want active", st)
 	}
 }
+
+// TestPatchSingleReadValidation pins the 2026-10-19 external review #10
+// shape: PATCH /api/sensors/{id} reads the row ONCE, inside the
+// ImmediateTx, and validates the type/target pair plus the effective
+// timeout-vs-interval cross-check against those fresh values. Every case
+// below used to be answered by a pre-lock SELECT + validation pass; the
+// responses (status + message) must be byte-identical to that era, and no
+// partial write may survive a 400.
+func TestPatchSingleReadValidation(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+	mk := func(target string, intervalS int) string {
+		id := newID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,?,'icmp',?,1000,25,2,5,'paused','up',?)`, id, id, target, intervalS, tsNow()); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	patch := func(id, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PATCH", "/api/sensors/"+id, strings.NewReader(body))
+		req.SetPathValue("id", id)
+		rr := httptest.NewRecorder()
+		srv.handleSensorByID(rr, req)
+		return rr
+	}
+	rowType := func(id string) string {
+		var typ string
+		if err := db.QueryRow("SELECT type FROM sensors WHERE id = ?", id).Scan(&typ); err != nil {
+			t.Fatal(err)
+		}
+		return typ
+	}
+
+	// 1. Type-only change to http with a bare-host stored target: 400,
+	//    type unchanged. (The case the pre-tx SELECT target path used to
+	//    catch.)
+	id := mk("10.0.0.1", 60)
+	if rr := patch(id, `{"type":"http"}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("type-only change, bare-host target: %d, want 400: %s", rr.Code, rr.Body.String())
+	} else if rowType(id) != "icmp" {
+		t.Errorf("type changed after a 400: %q", rowType(id))
+	}
+
+	// 2. Target-only change to a bare host on an http sensor: 400.
+	idHTTP := newID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'h','http://example.com/health','http',60,1000,25,2,5,'paused','up',?)`, idHTTP, tsNow()); err != nil {
+		t.Fatal(err)
+	}
+	if rr := patch(idHTTP, `{"target":"bare-host"}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("bare host on http sensor: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// 3. Target + type changed together, invalid pair: 400.
+	if rr := patch(id, `{"target":"bare-host","type":"http"}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("target+type invalid pair: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// 4. Valid target+type pair in one PATCH: 200, both persisted.
+	if rr := patch(id, `{"target":"http://example.com/health","type":"http"}`); rr.Code != http.StatusOK {
+		t.Fatalf("valid pair: %d, want 200: %s", rr.Code, rr.Body.String())
+	} else if rowType(id) != "http" {
+		t.Errorf("type = %q, want http", rowType(id))
+	}
+
+	// 5. Effective timeout-vs-interval cross-check against the STORED
+	//    interval (only timeout_ms sent): interval 5s allows at most
+	//    5000ms, so 6000 (inside the 100-30000 field range) must 400.
+	//    (The case the pre-tx storedTimeoutMS cross-check used to catch.)
+	idShort := mk("10.0.0.2", 5)
+	if rr := patch(idShort, `{"timeout_ms":6000}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("timeout above stored interval*1000: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// 6. Nonexistent sensor: 404 (now carried by the in-tx read).
+	if rr := patch(newID(), `{"name":"ghost"}`); rr.Code != http.StatusNotFound {
+		t.Fatalf("PATCH nonexistent sensor: %d, want 404: %s", rr.Code, rr.Body.String())
+	}
+}
