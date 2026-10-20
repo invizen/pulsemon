@@ -1,4 +1,143 @@
-# v0.3.21 — External review hardening (10 findings)
+# v0.3.22 — External review hardening (17 findings)
+
+Third-round external review (two parallel passes) produced 17 findings.
+Every one was verified against the real code before any change: thirteen
+were valid and fixed, four were documented (two by design, two stale
+from earlier fixes). Every commit was gated with gofmt, go vet,
+GOOS=windows go vet, and the full -race suite, and behavior changes were
+sabotage-verified (reverting the fix fails the new test).
+
+## Security
+
+- **Setup-mode bootstrap is keyed off a valid session, fresh-install
+  only** (`d1b78b3`). Setup mode was detected by the session cookie being
+  ABSENT, so a browser holding a stale 30-day cookie got "403 admin
+  only" when creating the first admin. Conversely, once auth was
+  intentionally disabled, an unauthenticated LAN client could still win
+  the bootstrap and lock the operator out — the new account is admin and
+  re-enables auth server-wide. Setup now requires auth disabled + no
+  valid session + not bootstrapped; the status payload gains
+  `bootstrapped` so the UI shows the bootstrap button only on fresh
+  installs and a CLI re-enable hint on operator-disabled ones.
+- **Sec-Fetch-Site arm on the cross-port CSRF gate** (`0412032`). The
+  Origin-only check missed browsers that send `Sec-Fetch-Site` without a
+  usable Origin. Non-GET/HEAD requests with `Sec-Fetch-Site` other than
+  `same-origin`/`none` are now refused — including `same-site` (another
+  port on the same IP). Requests without the header (curl,
+  server-to-server, tests) pass, as before.
+- **Every HTTPS redirect hop gets a fresh connection** (`37f54ee`). The
+  2026-10-19 fix closed only host/scheme-changing hops; a SAME-host
+  HTTPS redirect reused the pooled conn a previous probe's redirect hop
+  left behind (the shared transport pools idle conns for 10 min), so the
+  hop reported the cert from that conn's ORIGINAL handshake — a renewed
+  cert stayed invisible in the displayed expiry for up to 10 min, and
+  cert verification judged the STALE cert (a renewed-and-valid install
+  could read as "expired"). `req.Close` is now set on every HTTPS hop;
+  plain-HTTP hops keep pooling (no cert data).
+- **Redirect guard delegates to the canonical IP check** (`e60ac37`).
+  `redirectTargetAllowed` carried a hand-copied judge that lacked the
+  `embeddedIPv4` check, so a cross-host 302 to `http://[::7f00:1]/`
+  (loopback) or `[::a9fe:a9fe]` (cloud metadata) got through. The copy
+  is gone; both the literal-IP and DNS paths call `checkWebhookIP` — no
+  more drift. Regression cases for all three embedded forms added.
+- **Change-password / delete-user 500 real failures** (`5412207`). Both
+  handlers mapped their ENTIRE error space to 400 with raw `err.Error()`
+  text — a failed UPDATE/DELETE surfaced the driver string
+  ("no such table", "database is locked") as a client error. Validation
+  sentinels (and the last-user guard, now the `errLastUser` sentinel)
+  stay 400; everything else is a generic 500 with the detail logged —
+  the same pattern AddUser got in the 2026-10-19 review.
+- **Removing a nonexistent user fails with 404** (`60aee7b`).
+  `db.RemoveUser` treated no-such-user as a silent no-op, so a mistyped
+  username reported success end to end: the API answered 200 and the CLI
+  printed "User removed: <name>". It now returns the `errUserNotFound`
+  sentinel; the API answers 404 (same policy as the password endpoint),
+  the CLI exits 1 with the message, and a mistyped name in a single-user
+  install is "no such user" rather than "cannot remove the last user".
+
+## Reliability
+
+- **A respawned probe loop probes within 1s** (`0cc3e9e`). The sync pass
+  drops paused sensors within ~5s, so the resume "kick" never found them
+  — a resumed sensor (and every sensor after maintenance mode ends)
+  started a fresh loop with a random start delay of up to one interval:
+  up to an hour of darkness for an hourly sensor. `ProbeWorker` now
+  tracks which sensors it spawned; respawns cap the first tick at 1s
+  while first spawns keep the stagger (no thundering herd on boot).
+- **Pulse Now never touches status or alerts** (`38eb4ba`). The docs
+  say manual pulses never affect status, but the rows landed in the same
+  history the status logic reads — one lost manual pulse (1s timeout)
+  plus one lost scheduled probe could trigger a `down_after=2` alert.
+  `probes` gains a `manual` column (one-time migration); Pulse Now rows
+  are tagged and excluded from status derivation, while history,
+  sparkline, and graph keep showing them.
+- **Shutdown stops the HTTP server first** (`7b92e29`). The server used
+  to stop LAST, so requests were still handled after the probe worker
+  and alerts had stopped, and slow handlers (e.g. a webhook test) could
+  run into the closed database. New order: `srv.Shutdown(5s)` → probe
+  worker → alerts → DB close. A/B-verified against a real slow handler
+  at SIGTERM: the old order closed the DB mid-operation.
+
+## API / data integrity
+
+- **Clone name truncation is by runes, not bytes** (`9a5ba74`).
+  `handleSensorClone` truncated the base name at 52 BYTES with a
+  continuation-byte rollback, over-truncating (and in the worst case
+  invalidating) multibyte names. It now slices to 52 runes; a 60-rune
+  CJK name clones to 52 runes + `-copy`.
+- **The SMTP `tls_mode=none` guard evaluates the effective state**
+  (`0e1c92b`). Settings PUTs are partial — omitted keys keep stored
+  values — but the guard checked only the incoming map, so a
+  `{"tls_mode":"none"}` PUT over stored credentials bypassed the
+  "no credentials with TLS off" rule. Validation and apply now share one
+  pre-transaction stored snapshot per provider and judge the merged
+  state; a deliberate none+clears still succeeds.
+- **The session cookie carries Max-Age alongside Expires** (`733b413`).
+  Only `Expires` was sent, leaving expiry to client clock accuracy.
+  `Max-Age` (30 days) is now sent on set — RFC 6265 §5.3 gives it
+  precedence — and `Max-Age=0` on deletion (negative values omit the
+  attribute in Go).
+
+## Performance
+
+- **Graph queries range-seek the probe index** (`347d53e`). The window
+  filter ran on `CAST(strftime('%s', ts) AS INTEGER)`, which defeats the
+  index and full-scans every row for the sensor. A coarse seekable
+  `ts >= ?` bound (1s slack for legacy variable-width fractionals) is
+  added alongside the exact epoch filter, which remains the arbiter.
+  The plan changes from `sensor_id=?` to `sensor_id=? AND ts>?`; on a
+  17,280-row sensor the 1h window drops scanned rows to ~720
+  (191.7µs → 185.8µs, and the scan bound no longer grows with history).
+
+## Documented (no behavior change)
+
+- **`PULSEMON_ALLOWED_HOSTS` is setup-mode hardening by design**
+  (`83c65f2`). The README defines it as having no effect once an account
+  exists; a global host gate would lock out direct-IP operator use
+  (Host is client-controlled, and authenticated browser traffic is
+  already covered by the Origin/Sec-Fetch-Site gate).
+- **Static ETag hashes are memoized** (`ea36475`). Measured on the
+  toolchain box: one-time SHA-256 of the 109 KB index.html ~54µs, warm
+  lookup ~9ns, per-request read ~6.5µs.
+- **The clone rune-truncation test also pins the invalid-UTF-8 variant**
+  (`0ae869c`). The old byte-cut algorithm was empirically shown to
+  produce a dangling 0xE7 (invalid UTF-8) for CJK names; the rune test
+  is annotated so the hazard isn't re-flagged.
+- **Session validation keeps its lock scope** (`de45f89`). The
+  users-table lookup under the session lock is a sub-millisecond point
+  query capped by a 2s TTL; moving it outside would need
+  unlock/query/re-lock/re-validate and open a race window. The gate +
+  handler double validation is deliberate layered authorization.
+
+## Upgrade notes
+
+- One-time schema migration: `probes` gains `manual INTEGER NOT NULL
+  DEFAULT 0` (existing rows are scheduled probes). No action needed.
+- If you relied on `DELETE /api/auth/users/<name>` succeeding for a name
+  that doesn't exist, it now returns 404 (it always said "ok" before).
+- Session cookies now include `Max-Age`; browsers that honored only
+  `Expires` with a skewed clock get correct expiry.
+
 
 Second-round external review of the full codebase produced 10 findings.
 All ten were verified against the real code before any change: six were
