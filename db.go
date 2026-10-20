@@ -702,8 +702,10 @@ func (db *DB) SetUserPassword(username, passwordHash string) error {
 // (2026-10-19 review M4). If the removed account was the LAST ADMIN, the
 // oldest remaining user is promoted in the SAME transaction — the install
 // must never be left without an admin (that would lock every
-// account-management endpoint). 0 rows affected = the last user, or no
-// such user — the latter stays the pre-existing silent no-op.
+// account-management endpoint). 0 rows affected = the last user (
+// errLastUser) or no such user (errUserNotFound — the 2026-10-20 external
+// review replaced the silent no-op, which made the API answer 200 and the
+// CLI print "User removed" for a mistyped name).
 func (db *DB) RemoveUser(username string) error {
 	ctx := context.Background()
 	return db.ImmediateTx(ctx, func(c *sql.Conn) error {
@@ -718,7 +720,7 @@ func (db *DB) RemoveUser(username string) error {
 				return err
 			}
 			if exists == 0 {
-				return nil
+				return fmt.Errorf("%w: %s", errUserNotFound, username)
 			}
 			return errLastUser
 		}

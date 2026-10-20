@@ -352,6 +352,14 @@ var (
 	// failure 500s (2026-10-20 external review — the handler used to
 	// echo every RemoveUser error, raw driver text included, as a 400).
 	errLastUser = fmt.Errorf("cannot remove the last user — disable authentication instead")
+	// errUserNotFound: RemoveUser of a name that doesn't exist. The db
+	// layer used to treat this as a silent no-op, so the API answered
+	// 200 and the CLI printed "User removed: <name>" for a mistyped
+	// username — a false success on an admin operation (2026-10-20
+	// external review). The handler maps it to 404, the same policy as
+	// the password endpoint (unknown username → 404, not 403, so the
+	// endpoint doesn't confirm which names exist).
+	errUserNotFound = fmt.Errorf("no such user")
 )
 
 func validUsername(u string) bool {
@@ -490,6 +498,12 @@ func (a *AuthState) RemoveUser(username string) error {
 		return err
 	}
 	if n <= 1 {
+		// A mistyped name in a single-user install is "no such user",
+		// not "cannot remove the last user" — check existence before
+		// blaming the guard (2026-10-20 external review).
+		if !a.userExists(username) {
+			return fmt.Errorf("%w: %s", errUserNotFound, username)
+		}
 		return errLastUser
 	}
 	if err := a.db.RemoveUser(username); err != nil {
@@ -1200,6 +1214,16 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	user := strings.ToLower(r.PathValue("username"))
 	if err := s.auth.RemoveUser(user); err != nil {
+		// A name that doesn't exist is a 404 — the same policy as the
+		// password endpoint (unknown username → 404, not 403, so the
+		// endpoint doesn't confirm which names exist). Checked before
+		// the last-user guard so a mistyped name in a single-user
+		// install is 404, not 400. This used to report SUCCESS for a
+		// nonexistent user (2026-10-20 external review).
+		if errors.Is(err, errUserNotFound) {
+			respondWithError(w, http.StatusNotFound, err.Error())
+			return
+		}
 		// The last-user guard is a client-facing business rule (400);
 		// any other failure (db) is a 500 with the detail logged — a
 		// raw driver string is not a client fault (2026-10-20 external
