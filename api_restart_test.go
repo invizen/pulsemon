@@ -8,7 +8,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // patchSensorRespawned drives a real PATCH through the API against a live
@@ -217,4 +219,143 @@ func TestSpikeMultLifecycle(t *testing.T) {
 // (regression guard for the one-line change that added the new fields).
 func TestPatchTargetStillRespawns(t *testing.T) {
 	patchSensorRespawned(t, `{"target": "192.0.2.2"}`, true)
+}
+
+// ---------- immediate-sync tests (2026-10-19 external review #2) ----------
+
+// TestRestartSignalsImmediateSync pins the 5s-blind-spot fix: a
+// config-changing PATCH must queue an immediate sync request on pw.syncReq,
+// so Run's select respawns the loop on its next iteration instead of
+// waiting out the 5s ticker.
+func TestRestartSignalsImmediateSync(t *testing.T) {
+	dir := t.TempDir()
+	db, err := NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lctx, lcancel := context.WithCancel(context.Background())
+	defer db.Close()
+	defer lcancel()
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 's1', '192.0.2.1', 15, 1000, 10, 10, 5, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+
+	pw := NewProbeWorker(db)
+	srv := NewServer(db, pw)
+	pw.syncSensors(lctx)
+
+	req, _ := http.NewRequest(http.MethodPatch, "/api/sensors/s1", bytes.NewBufferString(`{"loss_warn": 20}`))
+	rr := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PATCH = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+
+	// The signal must be queued — that is what Run's select consumes.
+	select {
+	case <-pw.syncReq:
+	default:
+		t.Fatal("PATCH+Restart did not queue an immediate sync request on pw.syncReq")
+	}
+
+	// The signal-driven sync pass (what Run's select runs) respawns the
+	// loop — no 5s wait.
+	pw.mu.Lock()
+	_, gone := pw.loops["s1"]
+	pw.mu.Unlock()
+	if gone {
+		t.Fatal("loop still registered after PATCH — Restart was not called")
+	}
+	pw.syncSensors(lctx)
+	pw.mu.Lock()
+	_, respawned := pw.loops["s1"]
+	pw.mu.Unlock()
+	if !respawned {
+		t.Fatal("signal-driven sync pass did not respawn the loop")
+	}
+}
+
+// TestRespawnUsesFreshConfig pins the M1b TOCTOU fix end-to-end: a
+// (re)spawned loop must run the NEW config, not the pre-lock read.
+// Behavioral: an http sensor pointed at a local server A; a real PATCH
+// re-points it at server B; the signal-driven sync respawns the loop;
+// probes must flow to B and stop flowing to A.
+func TestRespawnUsesFreshConfig(t *testing.T) {
+	var hitsA, hitsB int64
+	srvA := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hitsA, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvA.Close()
+	srvB := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&hitsB, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srvB.Close()
+
+	dir := t.TempDir()
+	db, err := NewDB(filepath.Join(dir, "test.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lctx, lcancel := context.WithCancel(context.Background())
+	defer db.Close()
+	defer lcancel()
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 's1', ?, 'http', 1, 1000, 10, 10, 5, 'active', 'up', '2026-01-01T00:00:00Z')`, srvA.URL); err != nil {
+		t.Fatal(err)
+	}
+
+	pw := NewProbeWorker(db)
+	srv := NewServer(db, pw)
+	pw.syncSensors(lctx)
+
+	// The loop must probe A first (1s interval, staggered phase <= 1s).
+	deadline := time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&hitsA) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("loop never probed server A")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// Re-point the sensor at B through the real API (commit + Restart + signal).
+	req, _ := http.NewRequest(http.MethodPatch, "/api/sensors/s1",
+		bytes.NewBufferString(fmt.Sprintf(`{"target": %q}`, srvB.URL)))
+	rr := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PATCH target = %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-pw.syncReq:
+	default:
+		t.Fatal("PATCH+Restart did not queue an immediate sync request")
+	}
+	aAtSwitch := atomic.LoadInt64(&hitsA)
+
+	// The signal-driven sync pass (what Run's select runs) respawns the
+	// loop — and it must come up on the FRESH config (server B).
+	pw.syncSensors(lctx)
+	deadline = time.Now().Add(10 * time.Second)
+	for atomic.LoadInt64(&hitsB) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("respawned loop never probed server B — it is running the stale config")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	// A must stop receiving probes (one in-flight request at the moment of
+	// the PATCH is tolerated).
+	time.Sleep(1500 * time.Millisecond)
+	if got := atomic.LoadInt64(&hitsA); got > aAtSwitch+1 {
+		t.Fatalf("server A still probed after re-point: %d hits (was %d at switch) — stale config in the respawned loop", got, aAtSwitch)
+	}
 }

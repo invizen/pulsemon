@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -150,6 +151,15 @@ type ProbeWorker struct {
 	loops   map[string]context.CancelFunc
 	db      *DB
 
+	// syncReq requests an immediate syncSensors pass (buffered 1, so the
+	// non-blocking send from Restart never stalls; a second request while a
+	// pass is in flight is coalesced into the next select iteration and
+	// fires a follow-up pass). Restart pings it so a config edit respawns
+	// the loop promptly instead of waiting out the 5s tick (2026-10-19
+	// external review #2). Only the Run goroutine consumes it — syncSensors
+	// stays single-goroutine, so no new locking is needed.
+	syncReq chan struct{}
+
 	// wg tracks every spawned sensorLoop so Run can't return (and thus the
 	// process's db.Close() can't run) while a loop is still mid-probe. Without
 	// this, cancelling the context makes Run return the instant it sees
@@ -223,6 +233,7 @@ func NewProbeWorker(db *DB) *ProbeWorker {
 		sensors:         make(map[string]*ProbeState),
 		loops:           make(map[string]context.CancelFunc),
 		db:              db,
+		syncReq:         make(chan struct{}, 1),
 		statsCache:      make(map[string]*probeSeries),
 		lastPulse:       make(map[string]time.Time),
 		alertOrderGates: make(map[string]chan func()),
@@ -288,6 +299,14 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 			pw.wg.Wait()
 			return
 		case <-ticker.C:
+			pw.syncSensors(ctx)
+		case <-pw.syncReq:
+			// A Restart requested an immediate re-sync (config edit):
+			// run the pass now instead of waiting for the 5s tick. If a
+			// pass was already in flight when the request arrived, the
+			// buffered request fires this case again right after it —
+			// the follow-up pass reads the post-commit row, so a stale
+			// in-flight pass can never leave the install on old config.
 			pw.syncSensors(ctx)
 		case <-retention.C:
 			pw.purgeOld()
@@ -371,13 +390,28 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			ps.isPaused = state == "paused" // keep pause in sync with DB (fresh read, F28)
 		}
 		if _, ok := pw.loops[c.id]; !ok {
-			// Known TOCTOU (2026-10-19 review M1b, fix deferred): configs was read
-			// from the DB above, before pw.mu — a PATCH+Restart landing in that gap
-			// re-spawns here with the pre-read cfg, and the next sync won't
-			// re-spawn (loop exists). Fix: re-read this sensor's cfg under the lock.
+			// Re-read the row UNDER the lock (2026-10-19 external review #2,
+			// closes the M1b TOCTOU): configs was read from the DB above,
+			// before pw.mu — a PATCH+Restart landing in that gap would
+			// otherwise respawn here with the pre-read cfg, and the next
+			// sync won't respawn (loop exists), so the sensor would run the
+			// stale config until process restart. The under-lock re-read
+			// returns the freshest committed row, so a spawned loop always
+			// carries config that is current at spawn time. A row deleted
+			// in the gap is skipped — the vanished-sensor pass owns deleted
+			// ids. A read ERROR falls back to the pre-read cfg (probe with
+			// slightly stale config rather than drop the loop); the next
+			// pass retries.
+			cfg, found, err := pw.freshConfig(c.id)
+			if err != nil {
+				log.Printf("ProbeWorker: fresh config read for %s failed: %v (using pre-read cfg)", c.id, err)
+				cfg = c.sensorConfig
+			}
+			if !found {
+				continue
+			}
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
-			cfg := c.sensorConfig
 			pw.wg.Add(1)
 			go func() {
 				defer pw.wg.Done()
@@ -433,6 +467,31 @@ func (pw *ProbeWorker) freshStates(ids []string) map[string]string {
 	return out
 }
 
+// freshConfig re-reads one sensor's spawn config from the DB (2026-10-19
+// external review #2): syncSensors calls it UNDER pw.mu in the respawn
+// branch, where the pre-lock configs slice can be arbitrarily stale (a
+// PATCH+Restart lands in the read→apply gap). Returns the row's CURRENT
+// values plus its tags; found=false when the row was deleted in the gap
+// (the caller skips the spawn — the vanished-sensor pass owns deleted
+// ids). Mirrors syncSensors' pre-lock SELECT column set exactly.
+func (pw *ProbeWorker) freshConfig(id string) (sensorConfig, bool, error) {
+	var c sensorConfig
+	err := pw.db.QueryRow(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after
+		FROM sensors WHERE id = ?`, id).
+		Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter)
+	if err == sql.ErrNoRows {
+		return c, false, nil
+	}
+	if err != nil {
+		return c, false, err
+	}
+	if c.probeType == "" {
+		c.probeType = "icmp" // legacy rows pre-migration
+	}
+	c.tags = pw.db.SensorTagsFor([]string{id})[id]
+	return c, true, nil
+}
+
 // SetPaused flips the in-memory pause flag immediately (API PATCH fast path).
 // A resume (paused=false) also KICKS the sensor's loop (2026-10-19 review
 // F28): the loop's timer was holding a full interval while the sensor was
@@ -463,14 +522,14 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 // and loss_warn/down_after by deriveStatus, all from the spawn-time config
 // copy captured in syncSensors.
 //
-// Deliberate: cancel + delete ONLY. The respawn is the NEXT syncSensors
-// pass (Run's 5s ticker), not an immediate re-spawn here. That leaves a
-// <=5s + staggered-phase gap before the sensor's next probe, which is
-// WITHIN its normal per-interval cadence (15-60s) and is not a missed
-// alert: the DB is the source of truth and deriveStatus re-derives state
-// from probe history on the next probe, so a down sensor is caught within
-// ~5s of the respawn. This is the documented M2 design (see
-// api_restart_test.go).
+// Deliberate: cancel + delete + SIGNAL. The respawn is the NEXT syncSensors
+// pass — now requested IMMEDIATELY via the syncReq channel (Run's select
+// runs it on the next iteration) instead of waiting out the 5s tick
+// (2026-10-19 external review #2). The <=5s + staggered-phase gap the old
+// passive design left is closed; the DB is still the source of truth and
+// deriveStatus re-derives state from probe history on the next probe. This
+// is the documented M2 design (see api_restart_test.go), with the
+// immediate-sync extension.
 //
 // Security/concurrency-review note (deliberate, do NOT "fix" by re-spawning
 // in Restart): there is NO duplicate-loop race and NO map race. pw.loops is
@@ -505,6 +564,17 @@ func (pw *ProbeWorker) Restart(id string) {
 	}
 	delete(pw.sensors, id)
 	pw.mu.Unlock()
+	// Request an IMMEDIATE sync pass: Run's select runs it on the next
+	// iteration and respawns the loop with the post-commit config, so a
+	// config edit no longer waits out the 5s tick (2026-10-19 external
+	// review #2). The spawn re-reads the row under pw.mu (see the
+	// syncSensors respawn branch), so even a sync pass that started before
+	// this commit can't respawn a stale config. Non-blocking: a request
+	// already queued is enough — the follow-up pass will see this change.
+	select {
+	case pw.syncReq <- struct{}{}:
+	default:
+	}
 }
 
 // Remove drops a deleted sensor's loop and state.
