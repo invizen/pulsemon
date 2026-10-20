@@ -1453,11 +1453,12 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	var bucketSecs int
 	var from string
+	var dur time.Duration
 	switch r.URL.Query().Get("range") {
 	case "24h":
-		bucketSecs, from = 900, "-24 hours"
+		bucketSecs, from, dur = 900, "-24 hours", 24*time.Hour
 	case "1h":
-		bucketSecs, from = 60, "-1 hour"
+		bucketSecs, from, dur = 60, "-1 hour", time.Hour
 	default:
 		respondWithError(w, http.StatusBadRequest, "range must be 1h or 24h")
 		return
@@ -1501,14 +1502,38 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// strftime-epoch form is the format-robust comparison. And the range
 	// seek would save no rows anyway: the 24h graph window equals the 24h
 	// retention, so every row of a sensor is inside the window.
+	//
+	// THIRD PROPOSAL (2026-10-20 external review — APPLIED): a seekable
+	// string bound ADDED ALONGSIDE the epoch filter, which the epoch filter
+	// alone cannot express. The strftime filter stays the EXACT arbiter;
+	// `ts >= ?` only lets the planner range-seek idx_probes_sensor_ts to
+	// the 1h tail instead of scanning the sensor's full 24h slice
+	// (17,280 rows @ 5s minIntervalS -> 720). The 1s slack makes the bound
+	// safe against legacy variable-width fractional rows: any row the
+	// epoch filter includes has strictly greater integer seconds than the
+	// bound's instant (cutoff >= bound + 1s), so the seconds digits decide
+	// the string comparison regardless of fractional width; extras inside
+	// the slack are dropped by the epoch filter. Replacing the epoch
+	// filter with a string compare remains UNSAFE (second proposal). The
+	// 24h query gains nothing (window == retention), which is why the
+	// bound is harmless there. FORMAT CONTRACT: the bound only compares
+	// correctly against the single-writer fmtTS format (Z-suffix, 9-digit
+	// fraction — db.go tsLayout). Rows written in other RFC3339
+	// renderings (e.g. "+00:00" offsets, which sort BELOW the bound)
+	// would be silently excluded — test seeders must use fmtTS.
+	// Measured (17,280 rows, one sensor): plan goes from "scan sensor
+	// slice + strftime per row" to a B-tree range seek; see commit
+	// message for timings.
+	cutoffStr := fmtTS(time.Now().UTC().Add(-dur - time.Second))
 	rows, err := s.db.Query(`SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
 		AVG(rtt_ms) AS avg_rtt,
 		MAX(rtt_ms) AS max_rtt
 		FROM probes WHERE sensor_id = ?
+			AND ts >= ?
 			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)
-		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, from)
+		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, cutoffStr, from)
 	if err != nil {
 		respondInternal(w, "graph query", err)
 		return

@@ -368,7 +368,11 @@ func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 			rtt = 0
 			isLost = true
 		}
-		ts := now.Add(time.Duration(-i) * time.Minute).Format(time.RFC3339Nano)
+		// The seekable ts >= bound in handleSensorGraph presumes the
+		// single-writer fmtTS format (Z-suffix, db.go tsLayout) — seed with
+		// it, not RFC3339Nano, which on a UTC host renders "+00:00" and
+		// sorts lexicographically BELOW the bound.
+		ts := fmtTS(now.Add(time.Duration(-i) * time.Minute))
 		var rttVal interface{}
 		if isLost {
 			rttVal = nil
