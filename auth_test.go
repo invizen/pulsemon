@@ -531,6 +531,13 @@ func TestAuthGateEndToEnd(t *testing.T) {
 		if !found.Expires.After(time.Now()) {
 			t.Fatal("session cookie must have a future expiry")
 		}
+		// Max-Age is relative to the client's receipt time (RFC 6265
+		// §5.3 gives it precedence over Expires), so a client clock
+		// skewed ahead of the server can't treat the expiry as already
+		// past and drop the cookie (2026-10-20 external review).
+		if found.MaxAge != int(authSessionTTL.Seconds()) {
+			t.Fatalf("session cookie MaxAge = %d, want %d", found.MaxAge, int(authSessionTTL.Seconds()))
+		}
 		// API is open with the session.
 		resp = get("/api/sensors")
 		resp.Body.Close()
@@ -632,6 +639,22 @@ func TestAuthGateEndToEnd(t *testing.T) {
 
 	t.Run("logout locks out again", func(t *testing.T) {
 		resp := post("/api/auth/logout", "{}")
+		// The deletion cookie must carry Max-Age=0 ("delete now" per
+		// RFC 6265) — a negative MaxAge would OMIT the attribute and
+		// leave only the clock-absolute 1970 Expires (2026-10-20
+		// external review).
+		var del *http.Cookie
+		for _, c := range resp.Cookies() {
+			if c.Name == authSessionName {
+				del = c
+			}
+		}
+		if del == nil {
+			t.Fatalf("logout did not send a deletion cookie: %v", resp.Cookies())
+		}
+		if del.MaxAge != 0 {
+			t.Fatalf("deletion cookie MaxAge = %d, want 0", del.MaxAge)
+		}
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Fatalf("logout: got %d", resp.StatusCode)

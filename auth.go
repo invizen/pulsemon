@@ -1202,15 +1202,27 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 // LAN install it is omitted so the dashboard keeps working.
 func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
 	expires := time.Now().Add(authSessionTTL)
+	maxAge := int(authSessionTTL.Seconds())
 	if value == "" {
 		expires = time.Unix(0, 0) // past: delete the cookie
+		maxAge = 0                // Max-Age=0: delete NOW. (Not -1 — a
+		// negative MaxAge OMITS the attribute in Go's http.Cookie,
+		// leaving only the 1970 Expires.)
 	}
+	// Both Expires and Max-Age are sent: RFC 6265 §5.3 gives Max-Age
+	// precedence, and it is relative to the client's receipt time — an
+	// absolute Expires computed from the SERVER clock is mishandled by a
+	// client whose clock runs ahead (unsynced homelab Pi): a "future"
+	// expiry can already be in the client's past, so the browser drops
+	// the session cookie immediately after a successful login (2026-10-20
+	// external review).
 	http.SetCookie(w, &http.Cookie{
 		Name:     authSessionName,
 		Value:    value,
 		Path:     "/",
 		Domain:   "",
 		Expires:  expires,
+		MaxAge:   maxAge,
 		Secure:   s.cookieSecure(r),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
