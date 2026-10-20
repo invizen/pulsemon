@@ -1,3 +1,83 @@
+# v0.3.21 — External review hardening (10 findings)
+
+Second-round external review of the full codebase produced 10 findings.
+All ten were verified against the real code before any change: six were
+valid and fixed, one was partial (half fixed, half kept by design), one
+was a real mechanism with an overstated impact (hardened), and one was
+invalid as described (documented). Every commit was gated with gofmt,
+go vet, GOOS=windows go vet, and the full -race suite.
+
+## Security
+
+- **Admin flag gates the account panel** (`f3eddbf`). Any authenticated
+  user could delete other accounts, disable auth entirely, or create new
+  users. `users.is_admin` now exists: the first bootstrapped account is
+  admin, legacy `admin` tokens migrate as admin, and a one-time migration
+  promotes the oldest user on pre-existing DBs with no admin. Deleting
+  the last admin atomically promotes the oldest remaining user in the
+  same transaction (no lockout window). UI shows an admin badge and hides
+  admin-only controls from non-admins.
+- **Login throttle is per-host on the LAN** (`167489d`). The /24 IPv4
+  bucket let 7 failed logins from one device lock out the entire
+  homelab subnet for 5 minutes. Private (RFC1918) and loopback IPv4 now
+  bucket per host (/32); public IPv4 stays /24 (anti-rotation) and IPv6
+  stays /64 (privacy-extension address rotation).
+- **Zoned IPv6 redirect literals are judged, not skipped** (`16b0e9f`).
+  `net.ParseIP` returns nil for zoned literals (`fe80::1%eth0`), which
+  fell through to DNS resolution. The SSRF guard now uses
+  `netip.ParseAddr`, explicitly refuses zone-bearing literals, and
+  judges `Unmap()`-ed addresses so IPv4-mapped metadata/loopback forms
+  are blocked on the literal path deterministically. Fail-closed either
+  way; the literal path is now total.
+
+## API / data integrity
+
+- **Single-read PATCH validation** (`3a7c170`). `PATCH /api/sensors/{id}`
+  ran up to two pre-lock SELECTs and duplicated the type/target pair and
+  timeout-vs-interval cross-check validation, then re-read the row inside
+  the write transaction and re-ran the same checks. Only pure
+  request-shape checks run before the lock now; the row is read once,
+  in-transaction, and all DB-dependent validation runs on fresh values.
+  Same status codes and messages for every request shape; one new
+  regression test pins all six moved cases.
+- **`rows.Err()` checked in every iteration loop** (`6654b3e`). A
+  mid-stream SQLite error (busy timeout, I/O) previously produced a
+  truncated 200 OK array that looked complete. All 9 unchecked loops in
+  api.go and db.go now surface the error per each site's existing
+  contract.
+- **Rune-length caps + UTF-8 validation** (`0c35448`). Sensor names and
+  tags were capped in bytes, so CJK/emoji names hit the UI's 60/30
+  character limit 3–4x early, and invalid UTF-8 could be stored. Caps
+  now count runes (matching the UI `maxlength`) and invalid UTF-8 is
+  rejected at the write path.
+- **Request context threaded through tag writes** (`3d0308b`). The last
+  `context.Background()` in api.go is gone; a cancelled request now
+  aborts in-flight tag updates. `ImmediateTx` rollback additionally runs
+  on a fresh context so a cancelled caller can no longer strand an open
+  transaction on a pooled connection.
+
+## Probe engine
+
+- **Restart syncs immediately, respawn reads fresh config** (`035822a`).
+  A PATCH/Restart deferred the loop respawn to the next 5-second
+  `syncSensors` tick (blind spot) and spawned with the config snapshot
+  taken before the request's write committed (stale-config TOCTOU,
+  deferred M1b). `Restart` now signals a dedicated sync pass that runs
+  under lock, and the respawn branch re-reads the row from the DB inside
+  `syncSensors`. The shutdown invariant is preserved: loop spawning
+  stays inside `syncSensors` under the `Run` context.
+
+## Housekeeping
+
+- **Dead code removed, test seam documented** (`2568182`).
+  `setSensorTagsInTx` (zero callers) removed; `applyProviderUpdate`
+  documented as the standalone provider-test seam (12 test call sites)
+  so it stops getting re-flagged.
+- **`httpClient` keep-alive strategy documented** (`03a42d5`). The
+  HTTPS no-keep-alive trade (fresh TLS cert readings, M5) and the
+  bounded-pool rationale are now stated on the client so the transport
+  values stop reading as contradictory.
+
 # v0.3.20 — Review-hardening batch (REVIEW3 full-codebase audit)
 
 Third-round full-codebase review (REVIEW3) produced 31 confirmed findings,
