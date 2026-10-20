@@ -1737,14 +1737,21 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest, "realert_min must be 0-1440 (0 = alert once only)")
 		return
 	}
-	for _, prov := range req.Providers {
-		if err := validateProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
+	// One stored-state snapshot per provider, taken BEFORE the tx and
+	// reused by the apply pass below, so validation and apply evaluate the
+	// same effective state and the two paths can't drift. (A concurrent
+	// settings PUT can interleave between the snapshot and the tx — the
+	// same read-then-write window the rest of this handler has.)
+	storedExtras := make([]map[string]string, len(req.Providers))
+	for i, prov := range req.Providers {
+		storedExtras[i] = s.storedProviderExtra(prov.Kind)
+		if err := validateProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := validateProviderUpdate("google_chat", req.WebhookURL, nil, nil); err != nil {
+		if err := validateProviderUpdate("google_chat", req.WebhookURL, nil, nil, nil); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -1792,16 +1799,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback() // no-op after Commit
-	for _, prov := range req.Providers {
-		if err := applyProviderUpdateInTx(tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra); err != nil {
+	for i, prov := range req.Providers {
+		if err := applyProviderUpdateInTx(tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
 			// Validation errors are unreachable after the pass above
-			// (nothing reads the DB in between); a 500 covers write failures.
+			// (same request data, same stored snapshot); a 500 covers
+			// write failures.
 			respondInternal(w, "apply provider "+prov.Kind, err)
 			return
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := applyProviderUpdateInTx(tx, "google_chat", req.WebhookURL, nil, nil); err != nil {
+		if err := applyProviderUpdateInTx(tx, "google_chat", req.WebhookURL, nil, nil, nil); err != nil {
 			respondInternal(w, "apply provider google_chat", err)
 			return
 		}
@@ -1924,22 +1932,25 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // validateProviderUpdate checks one provider update WITHOUT writing
 // anything. handleSettingsPut runs it over the whole request BEFORE any
 // write, so a 400 never leaves a partial save; applyProviderUpdate reuses
-// it so the two paths can't drift. The withDNS variants split the URL
-// checks: the in-transaction save path must not run the 5s DNS lookup
-// under the SQLite write lock (2026-10-19 review N6).
-func validateProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
-	return validateProviderUpdateInternal(kind, url, enabled, extra, true)
+// it so the two paths can't drift. storedExtra carries the provider's
+// currently-stored extra values (nil = none) so field-combining checks
+// evaluate the EFFECTIVE state (incoming value if sent, else stored) —
+// see the tls_mode=none guard. The withDNS variants split the URL checks:
+// the in-transaction save path must not run the 5s DNS lookup under the
+// SQLite write lock (2026-10-19 review N6).
+func validateProviderUpdate(kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
+	return validateProviderUpdateInternal(kind, url, enabled, extra, storedExtra, true)
 }
 
 // validateProviderUpdateNoDNS is the format-only twin for the
 // in-transaction save path (see N6 above). DNS reachability is already
 // enforced by the pre-transaction pass in handleSettingsPut, so a URL that
 // cannot be resolved is rejected before the write begins.
-func validateProviderUpdateNoDNS(kind string, url *string, enabled *bool, extra map[string]string) error {
-	return validateProviderUpdateInternal(kind, url, enabled, extra, false)
+func validateProviderUpdateNoDNS(kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
+	return validateProviderUpdateInternal(kind, url, enabled, extra, storedExtra, false)
 }
 
-func validateProviderUpdateInternal(kind string, url *string, enabled *bool, extra map[string]string, withDNS bool) error {
+func validateProviderUpdateInternal(kind string, url *string, enabled *bool, extra, storedExtra map[string]string, withDNS bool) error {
 	if _, ok := providerByKey(kind); !ok {
 		return fmt.Errorf("unknown alert provider: %q", kind)
 	}
@@ -2012,13 +2023,39 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 	// too, not store a config that can only ever fail per-alert. (The UI's
 	// "••••••••" mask counts as a present password: clearing the field is
 	// the deliberate act that makes tls_mode=none valid.)
+	//
+	// The check runs on the EFFECTIVE state, not just the incoming map
+	// (2026-10-20 external review): omitted extra keys keep their stored
+	// values (applyProviderUpdateInTx only persists what was sent), so a
+	// partial PUT {"tls_mode":"none"} over stored credentials must fail
+	// here, not slip through and leave a plaintext-mode config behind.
 	if kind == "smtp" {
-		mode := strings.TrimSpace(extra["tls_mode"])
-		if mode == "none" && (strings.TrimSpace(extra["username"]) != "" || strings.TrimSpace(extra["password"]) != "") {
+		eff := func(k string) string {
+			if v, ok := extra[k]; ok {
+				return strings.TrimSpace(v)
+			}
+			return strings.TrimSpace(storedExtra[k])
+		}
+		if eff("tls_mode") == "none" && (eff("username") != "" || eff("password") != "") {
 			return fmt.Errorf("smtp tls_mode=none cannot use credentials (clear username/password)")
 		}
 	}
 	return nil
+}
+
+// storedProviderExtra returns the provider's currently-stored extra values
+// (only keys in extraFields[kind]), so validation can evaluate the
+// effective state of partial updates. Unknown kinds return nil.
+func (s *Server) storedProviderExtra(kind string) map[string]string {
+	keys, ok := extraFields[kind]
+	if !ok {
+		return nil
+	}
+	m := make(map[string]string, len(keys))
+	for k := range keys {
+		m[k] = s.db.GetSetting(kind + "_" + k)
+	}
+	return m
 }
 
 // applyProviderUpdate persists one provider's URL / enabled flag in its own
@@ -2036,7 +2073,9 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 		return err
 	}
 	defer tx.Rollback()
-	if err := applyProviderUpdateInTx(tx, kind, url, enabled, extra); err != nil {
+	// Standalone entry point: read the stored snapshot fresh (there is no
+	// pre-tx validation pass to share one with).
+	if err := applyProviderUpdateInTx(tx, kind, url, enabled, extra, s.storedProviderExtra(kind)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2045,11 +2084,11 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
 // caller's transaction so handleSettingsPut can apply every provider and
 // routing field atomically (2026-10-19 review m8; mirrors db.SetSensorTags).
-func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra map[string]string) error {
+func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	// Format-only validation (2026-10-19 review N6): the DNS reachability
 	// check runs in the PRE-transaction pass (handleSettingsPut →
 	// validateProviderUpdate with DNS), never under the write lock.
-	if err := validateProviderUpdateNoDNS(kind, url, enabled, extra); err != nil {
+	if err := validateProviderUpdateNoDNS(kind, url, enabled, extra, storedExtra); err != nil {
 		return err
 	}
 	if url != nil {

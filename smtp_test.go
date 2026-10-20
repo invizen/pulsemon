@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -653,5 +655,59 @@ func TestSendSMTPContextCancelAborts(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ctx cancellation did not abort the in-flight SMTP conversation")
+	}
+}
+
+// TestSMTPTLSModeNoneEffectiveState pins the 2026-10-20 external review
+// fix: the tls_mode=none credential guard (F27) evaluates the EFFECTIVE
+// state — incoming extra fields merged over stored settings — not just
+// the incoming map. A partial PUT that only flips tls_mode must not
+// bypass the guard when credentials are already stored (omitted keys keep
+// their stored values in applyProviderUpdateInTx).
+func TestSMTPTLSModeNoneEffectiveState(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	mux := srv.Mux()
+
+	// Stored config: credentials + starttls (a valid combination).
+	seed := map[string]string{
+		"port": "587", "from": "pulsemon@home.lan", "to": "ops@home.lan",
+		"username": "pulsemon", "password": "secret", "tls_mode": "starttls",
+	}
+	if err := srv.applyProviderUpdate("smtp", strPtr("10.0.0.25"), boolPtr(true), seed); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	putSettings := func(body string) int {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(http.MethodPut, "/api/settings", strings.NewReader(body)))
+		return rr.Code
+	}
+
+	// 1. The F27 guard itself (single request, all fields present).
+	if code := putSettings(`{"providers":[{"kind":"smtp","extra":{"tls_mode":"none","username":"pulsemon","password":"secret"}}]}`); code != http.StatusBadRequest {
+		t.Fatalf("single-request none+credentials => %d, want 400", code)
+	}
+	// 2. THE BYPASS: partial PUT flipping only tls_mode over stored
+	// credentials. Pre-fix this passed validation and left
+	// smtp_tls_mode=none alongside the stored username/password.
+	if code := putSettings(`{"providers":[{"kind":"smtp","extra":{"tls_mode":"none"}}]}`); code != http.StatusBadRequest {
+		t.Fatalf("partial none over stored credentials => %d, want 400", code)
+	}
+	if got := db.GetSetting("smtp_tls_mode"); got != "starttls" {
+		t.Fatalf("rejected save mutated smtp_tls_mode to %q", got)
+	}
+	// 3. The deliberate path: none + explicit credential clearing works.
+	if code := putSettings(`{"providers":[{"kind":"smtp","extra":{"tls_mode":"none","username":"","password":""}}]}`); code != http.StatusOK {
+		t.Fatalf("none + cleared credentials => %d, want 200", code)
+	}
+	if got := db.GetSetting("smtp_tls_mode"); got != "none" {
+		t.Fatalf("smtp_tls_mode = %q, want none", got)
+	}
+	if got := db.GetSetting("smtp_username"); got != "" {
+		t.Fatalf("smtp_username = %q, want cleared", got)
+	}
+	if got := db.GetSetting("smtp_password"); got != "" {
+		t.Fatalf("smtp_password = %q, want cleared", got)
 	}
 }
