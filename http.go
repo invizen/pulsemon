@@ -47,12 +47,16 @@ const probeHTTPTimeout = 60 * time.Second
 const maxHTTPRedirects = 5
 
 // httpClient is shared by every HTTP sensor: the transport reuses
-// keep-alive connections per host, so N sensors hitting one host pay one
-// TCP+TLS handshake, not N. Per-host connection cap keeps a single chatty
-// host from monopolizing the pool. Redirects are followed (up to
-// maxHTTPRedirects) so a target that 301/302s to its real destination —
-// the common case for a web UI behind a redirect — is judged on where it
-// ends up, not the redirect itself.
+// keep-alive connections per host, so N HTTP sensors hitting one host pay
+// one TCP handshake, not N. HTTPS probes intentionally do NOT reuse —
+// probeHTTP sets req.Close per probe (M5) so every probe's cert reading
+// comes from a fresh handshake, not a pooled conn's original one; one
+// handshake per 5-60s probe is the accepted cost. The pool stays bounded
+// regardless (100 conns total / 32 per host / 10 min idle), so the sensor
+// list — small and stable, not ephemeral — cannot exhaust it. Redirects
+// are followed (up to maxHTTPRedirects) so a target that 301/302s to its
+// real destination — the common case for a web UI behind a redirect — is
+// judged on where it ends up, not the redirect itself.
 //
 // TLS: the transport sets InsecureSkipVerify so the handshake always
 // succeeds and the server's presented certificates are handed back instead
