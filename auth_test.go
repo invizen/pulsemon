@@ -1634,3 +1634,117 @@ func deleteStatus(t *testing.T, client *http.Client, url string) int {
 	resp.Body.Close()
 	return resp.StatusCode
 }
+
+// TestSetupBootstrapGate pins the 2026-10-20 external review fix:
+// setup mode (unauthenticated first-account creation) is keyed off a
+// VALID session, not raw cookie presence, and is a FRESH-INSTALL
+// surface only.
+//
+//   - Fresh install + a dead pulsemon_session cookie (30-day TTL, or a
+//     replayed one): bootstrap proceeds (200). The old cookie-presence
+//     check made setup=false here and 403'd "Create First Account".
+//   - Operator-disabled install (accounts wiped, auth_bootstrapped
+//     set): unauthenticated account creation is refused (403) — the
+//     one open-mode operation with a lockout consequence (the new
+//     account is admin and re-enables auth server-wide). /api/auth/
+//     status reports bootstrapped so the UI swaps the bootstrap button
+//     for the CLI hint.
+//   - The CLI path (AddUser, setupMode=false) stays the operator's
+//     re-enable route in the disabled state.
+func TestSetupBootstrapGate(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	// (1) Fresh install with a STALE cookie: present but dead (no such
+	// session), so setup mode must still apply.
+	req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/users",
+		strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+	req.AddCookie(&http.Cookie{Name: authSessionName, Value: "stale-token-from-an-old-install"})
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("fresh install + stale cookie: got %d, want 200 (bootstrap)", resp.StatusCode)
+	}
+
+	// Log in, then disable auth (wipes the account, keeps the
+	// auth_bootstrapped flag).
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	resp, err = client.Post(httpSrv.URL+"/api/auth/login", "application/json",
+		strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	resp, err = client.Post(httpSrv.URL+"/api/auth/disable", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("disable: %d", resp.StatusCode)
+	}
+
+	// status must report the disabled (bootstrapped) state so the UI
+	// can swap the bootstrap button for the CLI hint.
+	stResp, err := http.Get(httpSrv.URL + "/api/auth/status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stBody, _ := io.ReadAll(stResp.Body)
+	stResp.Body.Close()
+	var st struct {
+		Enabled      bool `json:"enabled"`
+		Bootstrapped bool `json:"bootstrapped"`
+	}
+	if err := json.Unmarshal(stBody, &st); err != nil {
+		t.Fatalf("status unmarshal: %v", err)
+	}
+	if st.Enabled {
+		t.Fatal("status.enabled = true after disable, want false")
+	}
+	if !st.Bootstrapped {
+		t.Fatal("status.bootstrapped = false after disable, want true")
+	}
+
+	// (2) Disabled install: unauthenticated account creation is
+	// refused — no LAN client can mint the admin account and re-enable
+	// auth. With AND without the (now dead) session cookie.
+	bare := &http.Client{}
+	for _, stale := range []bool{false, true} {
+		req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/users",
+			strings.NewReader(`{"username":"intruder","password":"intrapass1"}`))
+		if stale {
+			req.AddCookie(&http.Cookie{Name: authSessionName, Value: "stale-token-from-an-old-install"})
+		}
+		r2, err := bare.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r2.Body.Close()
+		label := "no cookie"
+		if stale {
+			label = "stale cookie"
+		}
+		if r2.StatusCode != http.StatusForbidden {
+			t.Fatalf("disabled install, %s: got %d, want 403", label, r2.StatusCode)
+		}
+	}
+	if n, _ := db.UserCount(); n != 0 {
+		t.Fatalf("user count after refused creates = %d, want 0", n)
+	}
+
+	// (3) CLI re-enable (direct AddUser, setupMode=false) keeps working
+	// in the disabled state.
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatalf("CLI re-enable (AddUser) in disabled state: %v", err)
+	}
+	if !srv.auth.Enabled() {
+		t.Fatal("auth not re-enabled after CLI AddUser")
+	}
+}

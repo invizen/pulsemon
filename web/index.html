@@ -426,10 +426,17 @@
         </div>
         
         <div id="auth-off-box">
-          <p class="text-[12px] text-slate-500 mb-2">Protect dashboard with secure credential gate.</p>
-          <button onclick="openFirstAccountDialog()" class="w-full py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">
+          <p id="auth-off-desc" class="text-[12px] text-slate-500 mb-2">Protect dashboard with secure credential gate.</p>
+          <button id="auth-create-first-btn" onclick="openFirstAccountDialog()" class="w-full py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">
             Create First Account
           </button>
+          <!-- Operator-disabled state (auth_bootstrapped): unauthenticated
+               account creation is refused server-side (403) — re-enabling
+               is a CLI operation. renderAuthPanel swaps this in. -->
+          <div id="auth-disabled-note" class="hidden text-[12px] font-mono text-slate-400 leading-relaxed">
+            To re-enable it, create an account on the host:
+            <code class="block mt-1.5 px-2 py-1.5 rounded bg-surface-950 border border-surface-800 text-[11px] text-slate-300">pulsemon auth-user add &lt;username&gt;</code>
+          </div>
         </div>
 
         <div id="auth-enabled-box" class="hidden space-y-2.5">
@@ -1538,6 +1545,16 @@ async function renderAuthPanel() {
     badge.className = 'px-1.5 py-0.2 rounded text-[10px] font-mono font-semibold border bg-surface-800 border-surface-700 text-slate-500';
     onBox.classList.add('hidden');
     offBox.classList.remove('hidden');
+    // Two "off" states: a fresh install (no account has ever existed)
+    // gets the bootstrap button; an operator-disabled install
+    // (bootstrapped) refuses unauthenticated account creation
+    // server-side, so it shows the CLI re-enable hint instead.
+    const wasDisabled = status.bootstrapped === true;
+    $('auth-off-desc').textContent = wasDisabled
+      ? 'Authentication is off — the dashboard is open to the network.'
+      : 'Protect dashboard with secure credential gate.';
+    $('auth-create-first-btn').classList.toggle('hidden', wasDisabled);
+    $('auth-disabled-note').classList.toggle('hidden', !wasDisabled);
   }
 }
 

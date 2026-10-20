@@ -894,6 +894,12 @@ type authStatusPayload struct {
 	Enabled bool   `json:"enabled"`
 	Authed  bool   `json:"authed"`
 	User    string `json:"user,omitempty"`
+	// Bootstrapped distinguishes the two "off" states for the UI: a
+	// fresh install (no account has ever existed) offers the bootstrap
+	// button, an operator-disabled install (flag set) must show the CLI
+	// re-enable hint instead — unauthenticated account creation is
+	// refused server-side there (2026-10-20 external review).
+	Bootstrapped bool `json:"bootstrapped,omitempty"`
 }
 
 // sessionFrom returns the username the request's session belongs to
@@ -917,9 +923,10 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	user := s.sessionFrom(r)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{
-		Enabled: s.auth.Enabled(),
-		Authed:  user != "",
-		User:    user,
+		Enabled:      s.auth.Enabled(),
+		Authed:       user != "",
+		User:         user,
+		Bootstrapped: s.auth.Bootstrapped(),
 	})
 }
 
@@ -1000,7 +1007,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	s.auth.loginSuccess(key)
 	s.setAuthCookie(w, r, tok)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username)})
+	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
@@ -1012,7 +1019,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		s.auth.DropSession(c.Value)
 	}
 	s.setAuthCookie(w, r, "")
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false})
+	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false, Bootstrapped: s.auth.Bootstrapped()})
 }
 
 // requireAuth runs h only for a valid session; otherwise 401 — but only
@@ -1054,14 +1061,30 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// POSTs only reach here while Enabled() is false (TTL-cached),
 		// so the in-tx user_count is the real arbiter (review F11).
 		// An authenticated admin add is never setup mode.
-		_, sessErr := r.Cookie(authSessionName)
-		setup := sessErr != nil && !s.auth.Enabled()
+		//
+		// Key setup off a VALID session (sessionFrom), not raw cookie
+		// presence: a stale pulsemon_session cookie (30-day TTL, or one
+		// replayed via curl) would make setup=false and 403 the
+		// legitimate "Create First Account" bootstrap. sessionFrom
+		// returns "" for dead tokens (the F1 user-table re-check), so
+		// an invalid cookie counts as unauthenticated.
+		//
+		// Unauthenticated bootstrap is a FRESH-INSTALL surface only
+		// (mirrors the outer gate in api.go): once auth_bootstrapped is
+		// set, an intentionally-disabled install stays fully open, but
+		// account creation is the one open-mode operation with a
+		// lockout consequence — the new account is admin and
+		// re-enables auth server-wide, so any LAN client could lock
+		// the operator out. Re-enable from the CLI:
+		// `pulsemon auth-user add` (2026-10-20 external review).
+		caller := s.sessionFrom(r)
+		setup := !s.auth.Enabled() && caller == "" && !s.auth.Bootstrapped()
 		// Account creation is an admin operation: the setup-mode
 		// bootstrap (unauthenticated, first user) stays open, but an
 		// authenticated NON-admin session cannot mint accounts —
 		// otherwise a shared/compromised helper account grows its own
 		// persistence (2026-10-19 external review, admin-flag fix).
-		if !setup && !s.auth.IsAdmin(s.sessionFrom(r)) {
+		if !setup && !s.auth.IsAdmin(caller) {
 			respondWithError(w, http.StatusForbidden, "admin only")
 			return
 		}
@@ -1166,7 +1189,7 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.setAuthCookie(w, r, "")
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: false, Authed: false})
+	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: false, Authed: false, Bootstrapped: true})
 }
 
 // setAuthCookie sets (or, with an empty value, clears) the session cookie.
