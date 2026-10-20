@@ -454,6 +454,14 @@ func (s *Server) fetchSensors() []Sensor {
 		}
 		out = append(out, sn)
 	}
+	// A mid-stream iteration error (DB file I/O failure) ends rows.Next()
+	// without a query error: surface it via the nil sentinel the callers
+	// already treat as "query failed" instead of a truncated fleet view
+	// (2026-10-19 external review #6).
+	if err := rows.Err(); err != nil {
+		log.Printf("API: sensor query failed mid-stream: %v", err)
+		return nil
+	}
 
 	// ONE batched tag query after the loop — never a per-sensor query inside
 	// rows.Next(): the outer iteration holds a pooled connection, and nested
@@ -1139,6 +1147,10 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 			Lost: rtt == nil,
 		})
 	}
+	if err := rows.Err(); err != nil {
+		respondInternal(w, "sensor history "+id, err)
+		return
+	}
 	respondWithJSON(w, http.StatusOK, map[string]interface{}{
 		"sensor_id": id,
 		"count":     len(out),
@@ -1411,6 +1423,13 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		rows.Close()
+		if err := rows.Err(); err != nil {
+			// Fail before DeleteTag: a truncated tagged list would delete
+			// the tag while leaving some loops un-respawned with stale
+			// alert routing (2026-10-19 external review #6).
+			respondInternal(w, "delete tag "+tag, err)
+			return
+		}
 		n, err := s.db.DeleteTag(tag)
 		if err != nil {
 			respondInternal(w, "delete tag "+tag, err)
@@ -1516,6 +1535,10 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 		}
 		points = append(points, p)
 	}
+	if err := rows.Err(); err != nil {
+		respondInternal(w, "graph query", err)
+		return
+	}
 
 	var total, lostTotal int
 	for _, p := range points {
@@ -1590,6 +1613,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		respondInternal(w, "query events", err)
+		return
 	}
 	respondWithJSON(w, http.StatusOK, events)
 }

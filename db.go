@@ -341,6 +341,13 @@ func (db *DB) SensorTags(id string) []string {
 			out = append(out, t)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		// Mid-stream iteration error (DB file I/O failure): same contract
+		// as the query error above — empty list — plus a log so the
+		// failure is visible (2026-10-19 external review #6).
+		log.Printf("db: sensor tag query failed mid-stream: %v", err)
+		return []string{}
+	}
 	return out
 }
 
@@ -388,6 +395,14 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 			if rows.Scan(&id, &tag) == nil {
 				out[id] = append(out[id], tag)
 			}
+		}
+		if err := rows.Err(); err != nil {
+			// Mid-stream chunk failure: log and keep the rows already read
+			// — the function has no error channel, and a DB file I/O
+			// failure this deep is visible in the service log
+			// (2026-10-19 external review #6).
+			log.Printf("db: sensor tag batch query failed mid-stream: %v", err)
+			return
 		}
 	}
 	for i := 0; i < len(ids); i += inQueryChunk {
@@ -505,6 +520,12 @@ func (db *DB) AllTags() map[string]int {
 		if rows.Scan(&t, &n) == nil {
 			out[t] = n
 		}
+	}
+	if err := rows.Err(); err != nil {
+		// Mid-stream iteration error: same contract as the query error
+		// above — empty map — plus a log (2026-10-19 external review #6).
+		log.Printf("db: all-tags query failed mid-stream: %v", err)
+		return map[string]int{}
 	}
 	return out
 }
