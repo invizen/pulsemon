@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"html"
 	"io"
 	"log"
 	"net"
@@ -240,6 +241,22 @@ type ProbeWorker struct {
 	// serves this cache. Guarded by provMu.
 	provMu        sync.Mutex
 	lastProviders []providerMeta
+
+	// Storm budget (2026-10-19 review M8): a global cap on individual
+	// non-recovery alerts per window. When the budget is exhausted (an
+	// upstream router dies and 23 sensors error within seconds), the
+	// excess alerts are NOT delivered individually — they are queued and
+	// emitted as ONE coalesced "storm summary" alert when the window
+	// elapses, instead of N parallel bursts that trip provider 429s and
+	// the retry schedule into a storm of their own. Recoveries
+	// (state == "up") are ALWAYS admitted: the operator must hear a
+	// recovery even mid-storm, and a storm of recoveries is far less
+	// noisy than a storm of failures. Guarded by stormMu.
+	stormMu          sync.Mutex
+	stormWindowStart time.Time
+	stormCount       int
+	stormQueue       []stormEntry
+	stormFlushArmed  bool
 }
 
 // retentionSeconds is how long of a probe history the in-memory series keeps.
@@ -2081,11 +2098,233 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 // The caller blocks until the delivery finishes (the launchAlert goroutine
 // is tracked in alertWG, so DrainAlerts still sees true completion).
 func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+	// Storm budget (2026-10-19 review M8): over-budget non-recovery alerts
+	// are coalesced into a single storm summary instead of delivered
+	// individually. A suppressed alert reports "delivered" (true) so the
+	// caller schedules no retry — the summary carries it.
+	if !pw.stormAdmit(id, name, target, oldState, state, rttMs) {
+		return true
+	}
 	done := make(chan bool, 1)
 	pw.alertGate(id) <- func() {
 		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
 	}
 	return <-done
+}
+
+// stormEntry is one alert suppressed by the storm budget, pending the
+// coalesced summary.
+type stormEntry struct {
+	id       string
+	name     string
+	target   string
+	oldState string
+	state    string
+	rttMs    float64
+}
+
+// stormBudget / stormWindow bound the global alert rate: at most
+// stormBudget individual non-recovery alerts per stormWindow. Vars so
+// tests can shrink them.
+var (
+	stormBudget = 10
+	stormWindow = 30 * time.Second
+)
+
+// stormAdmit reports whether this alert may be delivered individually.
+// See the stormMu field comment for the design.
+func (pw *ProbeWorker) stormAdmit(id, name, target, oldState, state string, rttMs float64) bool {
+	if state == "up" {
+		return true
+	}
+	pw.stormMu.Lock()
+	defer pw.stormMu.Unlock()
+	now := time.Now()
+	if now.Sub(pw.stormWindowStart) >= stormWindow {
+		pw.stormWindowStart = now
+		pw.stormCount = 0
+	}
+	if pw.stormCount < stormBudget {
+		pw.stormCount++
+		return true
+	}
+	pw.stormQueue = append(pw.stormQueue, stormEntry{
+		id: id, name: name, target: target, oldState: oldState, state: state, rttMs: rttMs,
+	})
+	pw.armStormFlushLocked(now)
+	return false
+}
+
+// armStormFlushLocked schedules the one-shot flush of the coalesced queue
+// at the end of the current storm window. Caller holds stormMu.
+func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
+	if pw.stormFlushArmed {
+		return
+	}
+	pw.stormFlushArmed = true
+	due := time.Until(pw.stormWindowStart.Add(stormWindow))
+	if due < 0 {
+		due = 0
+	}
+	go func() {
+		select {
+		case <-time.After(due):
+			pw.flushStorm()
+		case <-pw.stopCtx.Done():
+		}
+	}()
+}
+
+// flushStorm delivers the coalesced storm summary (when the queue is
+// non-empty) and resets the budget for the next window.
+func (pw *ProbeWorker) flushStorm() {
+	pw.stormMu.Lock()
+	q := pw.stormQueue
+	pw.stormQueue = nil
+	pw.stormFlushArmed = false
+	pw.stormWindowStart = time.Time{}
+	pw.stormCount = 0
+	pw.stormMu.Unlock()
+	if len(q) == 0 {
+		return
+	}
+	// Drop entries that recovered before the flush: a summary line for a
+	// sensor that is back up would contradict the recovery alert it raced.
+	// A vanished sensor (deleted mid-storm) is kept — the operator should
+	// still see it in the storm that took it down.
+	still := q[:0]
+	for _, e := range q {
+		if s, err := pw.db.SensorStatus(e.id); err == nil && s == "up" {
+			continue
+		}
+		still = append(still, e)
+	}
+	if len(still) == 0 {
+		return
+	}
+	pw.launchAlert(func() {
+		pw.deliverStormSummary(still)
+	})
+}
+
+// deliverStormSummary sends the coalesced summary to every active provider
+// in parallel (same fan-out contract as sendWebhookDeliver). It is a
+// global meta-alert — NOT queued on any sensor's alertGate — so it cannot
+// disturb a sensor's per-sensor ordering guarantee (F4).
+func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
+	dests, ok := pw.resolveDestinations()
+	if !ok {
+		log.Printf("alert: storm summary (%d sensors) not delivered — provider list unreadable", len(entries))
+		return
+	}
+	md := stormSummaryMarkdown(entries)
+	subject := fmt.Sprintf("pulsemon: alert storm — %d sensors changed state", len(entries))
+	body := stormSummaryPlain(entries)
+	var wg sync.WaitGroup
+	var delivered atomic.Bool
+	for _, d := range dests {
+		wg.Add(1)
+		go func(p providerMeta, url string) {
+			defer wg.Done()
+			var ok bool
+			switch p.Kind {
+			case "google_chat":
+				ok = pw.postJSON(url, map[string]interface{}{"text": md}) == nil
+			case "discord":
+				ok = pw.postJSON(url, map[string]interface{}{
+					"content":          md,
+					"allowed_mentions": map[string]interface{}{"parse": []string{}},
+				}) == nil
+			case "telegram":
+				ok = pw.postJSON(url, map[string]interface{}{
+					"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+					"text":       stormSummaryHTML(entries),
+					"parse_mode": "HTML",
+				}) == nil
+			case "smtp":
+				ok = pw.sendSMTP(pw.stopCtx, subject, body) == nil
+			}
+			if ok {
+				delivered.Store(true)
+			}
+		}(d.p, d.url)
+	}
+	wg.Wait()
+	if len(dests) > 0 && !delivered.Load() {
+		log.Printf("alert: storm summary (%d sensors) failed on all %d providers", len(entries), len(dests))
+	}
+}
+
+// stormSummaryLine renders one entry as a readable transition, with the
+// same hygiene as the per-sensor cards: credentials stripped (F22),
+// mention tokens neutralized (F23).
+func stormSummaryLine(e stormEntry) string {
+	name := discordMentionSafe(e.name)
+	target := alertTarget(e.target)
+	return fmt.Sprintf("%s: %s → %s (%s)", name, e.oldState, e.state, target)
+}
+
+// stormSummaryMarkdown renders the summary for google_chat / discord.
+func stormSummaryMarkdown(entries []stormEntry) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*\n", len(entries)))
+	for _, e := range entries {
+		b.WriteString("*" + stormSummaryLine(e) + "*\n")
+	}
+	return b.String()
+}
+
+// stormSummaryHTML renders the summary for telegram (html-escaped).
+func stormSummaryHTML(entries []stormEntry) string {
+	var b strings.Builder
+	b.WriteString(html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))))
+	for _, e := range entries {
+		b.WriteString(html.EscapeString(stormSummaryLine(e)) + "\n")
+	}
+	return b.String()
+}
+
+// stormSummaryPlain renders the summary for SMTP (plain text).
+func stormSummaryPlain(entries []stormEntry) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))
+	for _, e := range entries {
+		b.WriteString(stormSummaryLine(e) + "\n")
+	}
+	return b.String()
+}
+
+// dest is one configured provider with its resolved URL (a webhook POST
+// target, or the SMTP host for the smtp kind).
+type dest struct {
+	p   providerMeta
+	url string
+}
+
+// resolveDestinations returns the active, configured providers with their
+// URLs. ok=false means the provider list is unreadable (DB error with no
+// last-known-good cache) — the caller must treat the send as FAILED, not
+// delivered (2026-10-19 review N3).
+func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
+	providers, readOK := pw.activeProviders()
+	if !readOK {
+		return nil, false
+	}
+	var dests []dest
+	for _, p := range providers {
+		url, err := pw.db.GetSettingErr(p.Kind + "_url")
+		if err != nil {
+			return nil, false
+		}
+		if url == "" && p.EnvFallback != "" {
+			url = os.Getenv(p.EnvFallback)
+		}
+		if url == "" {
+			continue
+		}
+		dests = append(dests, dest{p, url})
+	}
+	return dests, true
 }
 
 // sendWebhookDeliver delivers one alert to every active provider IN
@@ -2101,33 +2340,14 @@ func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state stri
 	// was reported delivered (attempted == 0) and silently dropped. A real
 	// DB error now fails the send (2026-10-19 review m5); resolving up front
 	// means no provider has fired yet when we bail.
-	type dest struct {
-		p   providerMeta
-		url string
-	}
-	var dests []dest
-	providers, readOK := pw.activeProviders()
-	if !readOK {
+	dests, ok := pw.resolveDestinations()
+	if !ok {
 		// DB unreadable and no last-known-good list: the alert CANNOT be
 		// delivered, and it must be reported as such so the caller can
 		// retry — never "delivered" on an empty (error-induced) provider
 		// list (2026-10-19 review N3).
 		log.Printf("alert: provider list unreadable (no cache) — alert not delivered")
 		return false
-	}
-	for _, p := range providers {
-		url, err := pw.db.GetSettingErr(p.Kind + "_url")
-		if err != nil {
-			log.Printf("alert: settings read failed, alert not delivered: %v", err)
-			return false
-		}
-		if url == "" && p.EnvFallback != "" {
-			url = os.Getenv(p.EnvFallback)
-		}
-		if url == "" {
-			continue
-		}
-		dests = append(dests, dest{p, url})
 	}
 	var wg sync.WaitGroup
 	var delivered atomic.Bool

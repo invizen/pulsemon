@@ -793,6 +793,15 @@ func (db *DB) ActiveSensorIDs() ([]string, error) {
 	return ids, rows.Err()
 }
 
+// SensorStatus returns a sensor's current health status (up/warning/
+// error). A missing sensor is an error (sql.ErrNoRows) so callers can
+// tell "gone" from "up".
+func (db *DB) SensorStatus(id string) (string, error) {
+	var status string
+	err := db.QueryRow("SELECT status FROM sensors WHERE id = ?", id).Scan(&status)
+	return status, err
+}
+
 // SetSensorStates sets the state for a batch of sensor ids, running in
 // inQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
 // SQLite host-parameter limit (same rule as SensorTagsFor). Returns the number

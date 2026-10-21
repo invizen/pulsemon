@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -330,9 +331,56 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 	}
 	defer ln.Close()
 	srv.Addr = addr
+	// m10 (2026-10-19 review): ServeTLS(ln, cert, key) loads the pair ONCE,
+	// so a renewed cert (dashboard TLS upload, acme.sh cron) needed a process
+	// restart. GetCertificate re-reads the files when their mtime changes, so
+	// the renewal takes effect at the next handshake.
+	srv.TLSConfig.GetCertificate = hotReloadCert(cert, key)
+	tlsLn := tls.NewListener(ln, srv.TLSConfig)
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.ServeTLS(ln, cert, key) }()
+	go func() { errCh <- srv.Serve(tlsLn) }()
 	return <-errCh
+}
+
+// hotReloadCert returns a tls.Config.GetCertificate that serves the pair at
+// (certPath, keyPath), re-loading it whenever either file's mtime changes.
+// A failed reload (half-written file, transient mismatch) keeps the LAST
+// GOOD pair instead of failing every handshake — the next handshake retries
+// the reload. The initial load failure surfaces as a handshake error (the
+// pair was already validated by tlsKeyPairOK before serve starts, so this
+// only bites on a genuinely broken file at runtime).
+func hotReloadCert(certPath, keyPath string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+	var (
+		mu     sync.Mutex
+		cached *tls.Certificate
+		certMT time.Time
+		keyMT  time.Time
+	)
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		var cMT, kMT time.Time
+		if fi, err := os.Stat(certPath); err == nil {
+			cMT = fi.ModTime()
+		}
+		if fi, err := os.Stat(keyPath); err == nil {
+			kMT = fi.ModTime()
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if cached != nil && cMT.Equal(certMT) && kMT.Equal(keyMT) {
+			return cached, nil
+		}
+		pair, err := tls.LoadX509KeyPair(certPath, keyPath)
+		if err != nil {
+			if cached != nil {
+				log.Printf("tls: cert reload from %s/%s failed (%v) — keeping the previous pair", certPath, keyPath, err)
+				return cached, nil
+			}
+			return nil, err
+		}
+		cached = &pair
+		certMT, keyMT = cMT, kMT
+		return cached, nil
+	}
 }
 
 // authUserUsage is the single usage string for `pulsemon auth-user` (the
