@@ -1,3 +1,54 @@
+# v0.3.23 — Alert-storm coalescing + TLS cert hot-reload
+
+The two findings deferred from the v0.3.17 review round (M8 alert-storm
+throttling, m10 TLS certificate hot-reload) are now implemented. Every
+other item in that deferred batch was audited against v0.3.22 and found
+already fixed or present — this release closes the batch. Gated with
+gofmt, go vet, GOOS=windows go vet, and the full -race suite (182 s, 0
+failures); four new tests pin the new behavior.
+
+## Reliability
+
+- **M8: alert-storm coalescing** (`3a7990b`). A mass outage used to fan
+  out one webhook/email per sensor — twenty flapping sensors meant
+  twenty near-identical messages in the same second. There is now a
+  global budget of **10 individual non-recovery alerts per 30 s
+  window**. **Recoveries are always admitted** — you never miss the
+  "it's back up" — while over-budget down-alerts are queued and
+  delivered as **one coalesced storm summary** when the window
+  elapses: "pulsemon: alert storm — N sensors changed state" with one
+  `name: old → new (target)` line per sensor. Entries that recover
+  before the flush are dropped so the summary never contradicts the
+  recovery alert it raced. The summary is a global meta-alert sent
+  with the same per-provider fan-out (google_chat, discord, telegram,
+  SMTP) and is deliberately NOT queued on any sensor's per-sensor
+  ordering gate, so per-sensor alert ordering is untouched. The 429
+  `Retry-After` handling added in v0.3.22 still applies to the
+  individual deliveries.
+- **m10: TLS certificate hot-reload** (`3a7990b`). The TLS listener
+  loaded the cert/key pair ONCE at startup, so a renewed certificate
+  (dashboard TLS upload, acme.sh cron) required a process restart.
+  `GetCertificate` now re-reads `data/tls/{cert,key}.pem` whenever
+  either file's mtime changes — the renewal takes effect at the NEXT
+  handshake, no restart. A failed reload (half-written file, transient
+  cert/key mismatch) keeps the LAST GOOD pair instead of failing every
+  handshake; the next handshake retries the reload.
+
+## Tests
+
+- `TestStormCoalescing` — 5 simultaneous down-alerts at budget 3 =
+  exactly 3 individual deliveries + 1 summary carrying the 2
+  suppressed sensors; every sensor appears exactly once.
+- `TestStormRecoveryAlwaysAdmitted` — at budget 0, recoveries are
+  still delivered individually and never coalesced.
+- `TestStormFlushDropsRecovered` — a suppressed sensor that recovers
+  before the flush is absent from the summary.
+- `TestHotReloadCert` — renewal takes effect on the next call,
+  unchanged files serve the cached pair, a corrupt reload keeps the
+  last good pair, and a repaired file is picked up again.
+
+---
+
 # v0.3.22 — External review hardening (17 findings)
 
 Third-round external review (two parallel passes) produced 17 findings.
