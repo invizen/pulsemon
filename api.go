@@ -1155,6 +1155,11 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 		var ts time.Time
 		var rtt *float64
 		if err := rows.Scan(&ts, &rtt); err != nil {
+			// A corrupt row (e.g. a non-RFC3339 ts after a bad
+			// migration) must be visible in the service log, not a
+			// silently truncated history with a 200 — same contract
+			// as fetchSensors' per-row scan log.
+			log.Printf("API: skipping corrupt probe row for %s: %v", id, err)
 			continue
 		}
 		out = append(out, ProbeRow{
@@ -1376,7 +1381,12 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	taken := make(map[string]bool)
 	for rows.Next() {
 		var n string
-		if err := rows.Scan(&n); err == nil {
+		if err := rows.Scan(&n); err != nil {
+			// A skipped name is safe (a taken name that reaches the
+			// INSERT is rejected by the UNIQUE index and the retry
+			// advances), but log it like the other per-row scans.
+			log.Printf("API: skipping corrupt clone name row for %s: %v", id, err)
+		} else {
 			taken[n] = true
 		}
 	}
@@ -1485,7 +1495,12 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		}
 		for rows.Next() {
 			var id string
-			if err := rows.Scan(&id); err == nil {
+			if err := rows.Scan(&id); err != nil {
+				// A skipped id is safe (the rows.Err() check below 500s a
+				// mid-stream failure), but log it like the other per-row
+				// scans.
+				log.Printf("API: skipping corrupt sensor_tags row for tag %s: %v", tag, err)
+			} else {
 				tagged = append(tagged, id)
 			}
 		}
@@ -1620,6 +1635,11 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var p GraphPoint
 		if err := rows.Scan(&p.T, &p.Total, &p.Lost, &p.Avg, &p.Max); err != nil {
+			// Defensive: the WHERE clause already drops NULL-bucket
+			// rows, so a scan failure here means a schema-level
+			// type change — log it, don't ship a silently truncated
+			// graph (same contract as fetchSensors).
+			log.Printf("API: skipping corrupt graph bucket row for %s: %v", id, err)
 			continue
 		}
 		if p.Total > 0 {
@@ -1702,6 +1722,10 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var e EventView
 		if err := rows.Scan(&e.ID, &e.SensorID, &e.Sensor, &e.TS, &e.From, &e.To, &e.Note); err != nil {
+			// A corrupt row must be visible in the service log, not a
+			// silently truncated event feed with a 200 (same contract
+			// as fetchSensors).
+			log.Printf("API: skipping corrupt event row: %v", err)
 			continue
 		}
 		events = append(events, e)
