@@ -439,7 +439,7 @@ func (s *Server) routes() {
 // handleHealthz is a real check: DB must be reachable (SPEC §8, fix #5).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	var n int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
 		// 503, not 500: the API process is healthy, the DB is down. Keep
 		// the "db unreachable" wording (operators and health checks read
 		// it) and log the driver detail instead of leaking it.
@@ -474,8 +474,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, hz)
 }
 
-func (s *Server) fetchSensors() []Sensor {
-	rows, err := s.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
+func (s *Server) fetchSensors(ctx context.Context) []Sensor {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
 	if err != nil {
 		return nil
 	}
@@ -535,7 +535,7 @@ func (s *Server) fillHTTPView(v *SensorView) {
 func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		sensors := s.fetchSensors()
+		sensors := s.fetchSensors(r.Context())
 		if sensors == nil {
 			respondWithError(w, http.StatusInternalServerError, "failed to read sensors")
 			return
@@ -770,7 +770,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var sn Sensor
-		err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
+		err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
 			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
 		if err != nil {
 			if err == sql.ErrNoRows {
@@ -1032,7 +1032,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 
 	case http.MethodDelete:
-		res, err := s.db.Exec("DELETE FROM sensors WHERE id = ?", id)
+		res, err := s.db.ExecContext(r.Context(), "DELETE FROM sensors WHERE id = ?", id)
 		if err != nil {
 			respondInternal(w, "delete sensor "+id, err)
 			return
@@ -1138,12 +1138,12 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
 
-	rows, err := s.db.Query("SELECT ts, rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, n)
+	rows, err := s.db.QueryContext(r.Context(), "SELECT ts, rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, n)
 	if err != nil {
 		respondInternal(w, "sensor history "+id, err)
 		return
@@ -1186,7 +1186,7 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	id := r.PathValue("id")
 
 	var name string
-	if err := s.db.QueryRow("SELECT name FROM sensors WHERE id = ?", id).Scan(&name); err != nil {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT name FROM sensors WHERE id = ?", id).Scan(&name); err != nil {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
@@ -1196,30 +1196,30 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	// alert_state, and the status reset commit atomically, so a failure
 	// mid-clear can't leave the DB half-wiped. The old code ran four
 	// autocommit statements and ignored the last two errors.
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "clear history begin "+id, err)
 		return
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
-	if res, err := tx.Exec("DELETE FROM probes WHERE sensor_id = ?", id); err != nil {
+	if res, err := tx.ExecContext(r.Context(), "DELETE FROM probes WHERE sensor_id = ?", id); err != nil {
 		respondInternal(w, "clear probes "+id, err)
 		return
 	} else {
 		probes, _ = res.RowsAffected()
 	}
-	if res, err := tx.Exec("DELETE FROM events WHERE sensor_id = ?", id); err != nil {
+	if res, err := tx.ExecContext(r.Context(), "DELETE FROM events WHERE sensor_id = ?", id); err != nil {
 		respondInternal(w, "clear events "+id, err)
 		return
 	} else {
 		events, _ = res.RowsAffected()
 	}
-	if _, err := tx.Exec("DELETE FROM alert_state WHERE sensor_id = ?", id); err != nil {
+	if _, err := tx.ExecContext(r.Context(), "DELETE FROM alert_state WHERE sensor_id = ?", id); err != nil {
 		respondInternal(w, "clear alert_state "+id, err)
 		return
 	}
-	if _, err := tx.Exec("UPDATE sensors SET status = 'up' WHERE id = ?", id); err != nil {
+	if _, err := tx.ExecContext(r.Context(), "UPDATE sensors SET status = 'up' WHERE id = ?", id); err != nil {
 		respondInternal(w, "reset status "+id, err)
 		return
 	}
@@ -1254,30 +1254,30 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	var probes, events int64
 	// One transaction (the SetSensorTags house pattern): see
 	// handleSensorClearHistory for why.
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "clear all history begin", err)
 		return
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
-	if res, err := tx.Exec("DELETE FROM probes"); err != nil {
+	if res, err := tx.ExecContext(r.Context(), "DELETE FROM probes"); err != nil {
 		respondInternal(w, "clear all probes", err)
 		return
 	} else {
 		probes, _ = res.RowsAffected()
 	}
-	if res, err := tx.Exec("DELETE FROM events"); err != nil {
+	if res, err := tx.ExecContext(r.Context(), "DELETE FROM events"); err != nil {
 		respondInternal(w, "clear all events", err)
 		return
 	} else {
 		events, _ = res.RowsAffected()
 	}
-	if _, err := tx.Exec("DELETE FROM alert_state"); err != nil {
+	if _, err := tx.ExecContext(r.Context(), "DELETE FROM alert_state"); err != nil {
 		respondInternal(w, "clear all alert_state", err)
 		return
 	}
-	if _, err := tx.Exec("UPDATE sensors SET status = 'up'"); err != nil {
+	if _, err := tx.ExecContext(r.Context(), "UPDATE sensors SET status = 'up'"); err != nil {
 		respondInternal(w, "clear all reset status", err)
 		return
 	}
@@ -1322,7 +1322,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var src Sensor
-	err := s.db.QueryRow("SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
+	err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
 		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
 	if err != nil {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -1368,7 +1368,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if r := []rune(cloneBase); len(r) > 60-cloneSuffixCeil {
 		cloneBase = string(r[:60-cloneSuffixCeil])
 	}
-	rows, err := s.db.Query("SELECT name FROM sensors WHERE name GLOB ?", cloneBase+"-copy*")
+	rows, err := s.db.QueryContext(r.Context(), "SELECT name FROM sensors WHERE name GLOB ?", cloneBase+"-copy*")
 	if err != nil {
 		respondInternal(w, "clone sensor "+id, err)
 		return
@@ -1478,7 +1478,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		// stale routing (alerts it shouldn't send, or silence it should
 		// have) until the next process restart.
 		var tagged []string
-		rows, err := s.db.Query("SELECT sensor_id FROM sensor_tags WHERE tag = ?", tag)
+		rows, err := s.db.QueryContext(r.Context(), "SELECT sensor_id FROM sensor_tags WHERE tag = ?", tag)
 		if err != nil {
 			respondInternal(w, "delete tag "+tag, err)
 			return
@@ -1541,7 +1541,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	if err := s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
@@ -1601,7 +1601,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// slice + strftime per row" to a B-tree range seek; see commit
 	// message for timings.
 	cutoffStr := fmtTS(time.Now().UTC().Add(-dur - time.Second))
-	rows, err := s.db.Query(`SELECT (strftime('%s', ts) / ?) * ? AS bucket,
+	rows, err := s.db.QueryContext(r.Context(), `SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
 		AVG(rtt_ms) AS avg_rtt,
@@ -1665,7 +1665,7 @@ type EventView struct {
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
-		res, err := s.db.Exec("DELETE FROM events")
+		res, err := s.db.ExecContext(r.Context(), "DELETE FROM events")
 		if err != nil {
 			respondInternal(w, "delete events", err)
 			return
@@ -1689,7 +1689,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if n > 500 {
 		n = 500
 	}
-	rows, err := s.db.Query(`SELECT e.id, e.sensor_id, COALESCE(s.name, e.sensor_id), e.ts, e.from_status, e.to_status, e.note
+	rows, err := s.db.QueryContext(r.Context(), `SELECT e.id, e.sensor_id, COALESCE(s.name, e.sensor_id), e.ts, e.from_status, e.to_status, e.note
 		FROM events e LEFT JOIN sensors s ON s.id = e.sensor_id
 		ORDER BY e.ts DESC LIMIT ?`, n)
 	if err != nil {
@@ -1900,7 +1900,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// autocommit writes left a partial save behind a 500 (2026-10-19 review
 	// m8). Maintenance mode below stays outside — it has its own atomic
 	// snapshot transaction (SetMaintenanceMode).
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "begin settings update", err)
 		return
@@ -2175,6 +2175,9 @@ func (s *Server) storedProviderExtra(kind string) map[string]string {
 // config, so the validation and key-naming stay consistent no matter how
 // many providers exist.
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
+	// Standalone (non-HTTP) entry point — no request context to thread, so
+	// the plain Begin() stays (the HTTP save path uses BeginTx in
+	// handleSettingsPut).
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
