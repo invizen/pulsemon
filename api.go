@@ -628,9 +628,25 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
 		// mistyped, target can't fire down alerts before the user has a chance
 		// to review it. The user resumes it from the dashboard.
-		_, err := s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-			id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now)
+		//
+		// The row INSERT and the tag replace commit in ONE ImmediateTx (the
+		// same 2026-10-19 F14 idiom as the PATCH path): a tag-write failure
+		// used to be logged and swallowed while the handler still returned 201
+		// with the requested tags — the UI then showed tags the DB never had,
+		// and with alert_scope='tags' the (paused) sensor would route no alerts
+		// once the user resumed it. Now the INSERT rolls back and the request
+		// fails instead of half-committing.
+		err := s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
+			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+				id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now); err != nil {
+				return err
+			}
+			if len(req.Tags) > 0 {
+				return setSensorTagsInConn(r.Context(), c, id, req.Tags)
+			}
+			return nil
+		})
 		if err != nil {
 			// Exact constraint text, not a bare "UNIQUE" substring
 			// (2026-10-19 review m7).
@@ -640,11 +656,6 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			}
 			respondInternal(w, "create sensor", err)
 			return
-		}
-		if len(req.Tags) > 0 {
-			if err := s.db.SetSensorTags(id, req.Tags); err != nil {
-				log.Printf("API: failed to set tags for %s: %v", req.Name, err)
-			}
 		}
 		log.Printf("API: created sensor %s (%s) [%s] [paused]", req.Name, id, req.Type)
 		respondWithJSON(w, http.StatusCreated, Sensor{
@@ -1348,10 +1359,25 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 		}
-		// Clone starts PAUSED, matching new-sensor behavior.
-		_, err = s.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-			newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now)
+		// Clone starts PAUSED, matching new-sensor behavior. The row
+		// INSERT and the tag replace commit in ONE ImmediateTx (the same
+		// 2026-10-19 F14 idiom as the POST/PATCH paths): a tag-write
+		// failure used to be logged and swallowed while the clone was
+		// still returned 201 with the source's tags — the UI then showed
+		// tags the DB never had, and with alert_scope='tags' the (paused)
+		// clone would route no alerts once resumed. Now the INSERT rolls
+		// back and the request fails instead of half-committing.
+		err = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
+			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
+				newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now); err != nil {
+				return err
+			}
+			if len(src.Tags) > 0 {
+				return setSensorTagsInConn(r.Context(), c, newID, src.Tags)
+			}
+			return nil
+		})
 		if err == nil {
 			created = true
 			break
@@ -1367,11 +1393,6 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if !created {
 		respondWithError(w, http.StatusConflict, "too many clones with this name")
 		return
-	}
-	if len(src.Tags) > 0 {
-		if err := s.db.SetSensorTags(newID, src.Tags); err != nil {
-			log.Printf("API: failed to set tags on clone %s: %v", name, err)
-		}
 	}
 	respondWithJSON(w, http.StatusCreated, Sensor{
 		ID: newID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
