@@ -1333,13 +1333,26 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	}
 	src.Tags = s.db.SensorTags(id)
 
-	// Pick the first free name and insert it. Another request can take the
-	// name between the SELECT and the INSERT (the sensors.name UNIQUE index is
-	// the real arbiter), so a UNIQUE failure moves on to the next candidate:
-	// at most cloneMaxAttempts inserts, then 409.
+	// Pick the first free name and insert it. The existing clone names are
+	// fetched in ONE query and the first free suffix is picked in memory
+	// (the old loop ran up to 100 sequential SELECT COUNT(*) round-trips
+	// before the first INSERT — 2026-10-22 external review). Another
+	// request can take the name between the fetch and the INSERT (the
+	// sensors.name UNIQUE index is the real arbiter), so a UNIQUE failure
+	// marks the name taken and moves on to the next candidate: at most
+	// cloneMaxAttempts inserts, then 409.
+	//
+	// GLOB, not LIKE: the UNIQUE index is case-sensitive (BINARY
+	// collation) and GLOB matches case-sensitively, while LIKE folds ASCII
+	// case — a LIKE match set would drift from the uniqueness semantics.
+	// GLOB metacharacters in the base name (* ? [ are legal —
+	// validSensorName is a blacklist) can only distort the match set,
+	// never the outcome: an over-match skips free names (we pick a higher
+	// suffix), an under-match (a "[" class) lets a taken name through to
+	// the INSERT, where the UNIQUE index rejects it and the retry below
+	// moves on — the same contract the old exact-match loop had.
 	newID := newID()
 	now := tsNow()
-	name := ""
 	created := false
 	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
 	// The clone name must itself satisfy validSensorName (≤60 runes) —
@@ -1355,22 +1368,44 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if r := []rune(cloneBase); len(r) > 60-cloneSuffixCeil {
 		cloneBase = string(r[:60-cloneSuffixCeil])
 	}
-	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
-		for ; ; next++ {
-			if next > 100 { // same ceiling as before: the last usable name is -copy100
-				respondWithError(w, http.StatusConflict, "too many clones with this name")
-				return
-			}
-			name = cloneBase + "-copy"
-			if next > 1 {
-				name = fmt.Sprintf("%s-copy%d", cloneBase, next)
-			}
-			var exists int
-			_ = s.db.QueryRow("SELECT COUNT(*) FROM sensors WHERE name = ?", name).Scan(&exists)
-			if exists == 0 {
-				break
-			}
+	rows, err := s.db.Query("SELECT name FROM sensors WHERE name GLOB ?", cloneBase+"-copy*")
+	if err != nil {
+		respondInternal(w, "clone sensor "+id, err)
+		return
+	}
+	taken := make(map[string]bool)
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err == nil {
+			taken[n] = true
 		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		respondInternal(w, "clone sensor "+id, err)
+		return
+	}
+	nextFreeName := func() (string, bool) {
+		for {
+			if next > 100 { // same ceiling as before: the last usable name is -copy100
+				return "", false
+			}
+			cand := cloneBase + "-copy"
+			if next > 1 {
+				cand = fmt.Sprintf("%s-copy%d", cloneBase, next)
+			}
+			if !taken[cand] {
+				return cand, true
+			}
+			next++
+		}
+	}
+	name, ok := nextFreeName()
+	if !ok {
+		respondWithError(w, http.StatusConflict, "too many clones with this name")
+		return
+	}
+	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
 		// Clone starts PAUSED, matching new-sensor behavior. The row
 		// INSERT and the tag replace commit in ONE ImmediateTx (the same
 		// 2026-10-19 F14 idiom as the POST/PATCH paths): a tag-write
@@ -1400,7 +1435,15 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "clone sensor "+id, err)
 			return
 		}
-		next++ // lost the race for this name: try the next one
+		// Lost the race for this name: the racer owns it now, so mark it
+		// taken in the snapshot and advance (no re-query — the UNIQUE
+		// index is the arbiter, the same contract the old loop had).
+		taken[name] = true
+		name, ok = nextFreeName()
+		if !ok {
+			respondWithError(w, http.StatusConflict, "too many clones with this name")
+			return
+		}
 	}
 	if !created {
 		respondWithError(w, http.StatusConflict, "too many clones with this name")
