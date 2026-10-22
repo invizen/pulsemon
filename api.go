@@ -355,6 +355,18 @@ func (s *Server) authGate() http.Handler {
 		// (2026-10-20 external review — mechanism verified, documented
 		// as by design.)
 		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
+			// Sliding cookie: the login cookie carries a fixed
+			// Max-Age=30d, so without a re-issue the browser would
+			// delete it exactly 30 days after login even though
+			// ValidSession slides the in-memory expiry on every use —
+			// the sliding-session design was defeated by the cookie's
+			// fixed expiry (2026-10-22 external review). Re-issue the
+			// SAME token once the cookie ages past half the TTL: at
+			// most one Set-Cookie per ~15 days of activity, never per
+			// 5s poll.
+			if s.auth.CookieRenewalDue(c.Value) {
+				s.setAuthCookie(w, r, c.Value)
+			}
 			s.mux.ServeHTTP(w, r)
 			return
 		}

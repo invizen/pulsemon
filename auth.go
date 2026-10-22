@@ -116,6 +116,16 @@ var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcf
 type authSession struct {
 	user   string
 	expiry time.Time
+	// cookieIssued is when the browser cookie for this session was last
+	// (re)issued. The cookie carries a fixed Max-Age=authSessionTTL set at
+	// login, so without re-issuance the browser deletes it exactly TTL
+	// after login even though ValidSession slides the in-memory expiry on
+	// every use — the sliding-session design was defeated by the cookie's
+	// fixed expiry (2026-10-22 external review). authGate re-issues the
+	// same token once the cookie ages past half the TTL
+	// (CookieRenewalDue), keeping an active user's cookie ahead of its
+	// browser-side expiry.
+	cookieIssued time.Time
 }
 
 type AuthState struct {
@@ -589,7 +599,7 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	if len(a.sessions) > 64 {
 		a.sweepExpiredSessions(now)
 	}
-	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL)}
+	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), cookieIssued: now}
 	a.mu.Unlock()
 	return tok, true
 }
@@ -854,7 +864,10 @@ func (a *AuthState) ValidSession(tok string) bool {
 // safe to use as an authorization check on its own. Like ValidSession it
 // re-checks the owner against the users table (TTL-cached): the in-memory
 // session map alone cannot see an out-of-band account deletion
-// (2026-10-19 review F1).
+// (2026-10-19 review F1), and like ValidSession it slides the expiry on a
+// live hit (2026-10-22 external review): this is the validation path for
+// the gate-exempt /api/auth/status, so without the slide a
+// status-poll-only client would never extend its session.
 func (a *AuthState) SessionUser(tok string) (string, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -867,7 +880,39 @@ func (a *AuthState) SessionUser(tok string) (string, bool) {
 		delete(a.sessions, tok)
 		return "", false
 	}
+	s.expiry = time.Now().Add(authSessionTTL)
+	a.sessions[tok] = s
 	return s.user, true
+}
+
+// CookieRenewalDue reports whether the session's browser cookie is old
+// enough to warrant a re-issue, and stamps cookieIssued=now when it is.
+// The cookie carries a fixed Max-Age=authSessionTTL set at login, so a
+// continuously-active user — whose in-memory expiry ValidSession slides on
+// every request — would still be logged out when the browser deletes the
+// cookie exactly TTL after login. Re-issuing once the cookie ages past
+// half the TTL keeps an active user's cookie at least half a TTL from its
+// browser-side expiry at all times, while an idle user's cookie and
+// session both lapse after TTL of inactivity (the intended sliding
+// behavior). The gate calls this after ValidSession and re-issues the
+// SAME token (no rotation) when it returns true — at most one Set-Cookie
+// per half-TTL of activity, never per request.
+func (a *AuthState) CookieRenewalDue(tok string) bool {
+	if tok == "" {
+		return false
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	s, ok := a.sessions[tok]
+	if !ok || !time.Now().Before(s.expiry) {
+		return false
+	}
+	if time.Since(s.cookieIssued) < authSessionTTL/2 {
+		return false
+	}
+	s.cookieIssued = time.Now()
+	a.sessions[tok] = s
+	return true
 }
 
 // DropSession removes one session (logout).
