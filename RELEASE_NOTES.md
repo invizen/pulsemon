@@ -1,3 +1,86 @@
+# v0.3.24 — External-review hardening pass
+
+Eight verified external-review findings, each fixed with a regression test
+that fails on the pre-fix baseline and gated with gofmt, go vet,
+GOOS=windows go vet, and the full -race suite. No behavior changes beyond
+the fixes; the 5-second poll hot path and probe engine are untouched.
+
+## Correctness
+
+- **Non-atomic sensor create + clone** (`abe0871`). `POST /api/sensors` and
+  `POST /api/sensors/{id}/clone` inserted the sensor row, then wrote its
+  tags in a second transaction — logging and swallowing any tag-write error
+  while still returning 201 with the tags in the response. A torn or empty
+  tag set with `alert_scope='tags'` silently changes which sensors alert, so
+  the API could claim tags were saved that the database never had. The
+  sensor INSERT and tag write now commit in ONE `ImmediateTx` (the same
+  pattern the PATCH path already used); a tag failure rolls back the sensor
+  row and returns 500.
+- **Unbounded, unvalidated `alert_filter`** (`956c1c6`). `PUT /api/settings`
+  stored the `alert_filter` list verbatim — up to the 1 MiB body cap, with
+  no per-entry validation — and it is re-read on every alert decision and
+  settings load. Entries are now trimmed, deduped, validated with
+  `validSensorName`, and capped at 500; an oversized or invalid list 400s
+  with the store (including sibling fields) left untouched.
+- **Dead non-atomic `(*DB).AddUser`** (`4934379`). The DB-level `AddUser`
+  ran `SELECT COUNT(*)` and `INSERT` as two separate auto-commit
+  statements, duplicating the first-admin invariant that `AuthState
+  .AddUserMode` already owns atomically — a concurrent call on an empty
+  table could create two admins. It had zero production callers (API,
+  in-app, and CLI all go through `AddUserMode`), so it was removed and the
+  one test that used it as a seeding shortcut now inserts rows directly. A
+  new test pins the production bootstrap path: 8 concurrent first-user
+  POSTs yield exactly one account.
+
+## Sessions
+
+- **Sliding session cookie defeated by the browser** (`c5dd319`). The login
+  cookie carries a fixed `Max-Age=30d`, so the browser deleted it exactly 30
+  days after login even though the server slid the in-memory session on
+  every use — an active user was logged out at day 30 with no way to renew.
+  The gate now re-issues the SAME token once the cookie ages past half the
+  TTL: at most one `Set-Cookie` per ~15 days of activity, never per 5-second
+  poll. The token is not rotated, so the client is never invalidated.
+
+## Performance
+
+- **Clone name pick ran up to 100 sequential queries** (`f0588a2`).
+  `handleSensorClone` probed `SELECT COUNT(*) ... WHERE name = ?` for
+  `-copy1` … `-copy100` one at a time before the first INSERT. Existing
+  clone names are now fetched in ONE `GLOB` query and the first free suffix
+  is picked in memory. `GLOB` (not `LIKE`) matches the case-sensitive
+  `BINARY`-collation `UNIQUE` index; the `UNIQUE` index + retry loop remain
+  the arbiter for metacharacter edge cases, so behavior is unchanged.
+
+## Hardening / observability
+
+- **Missing `request.Context()` propagation** (`704555e`). The read/write
+  queries in the sensor, history, graph, events, tags, and settings
+  handlers used `s.db.Query/QueryRow/Exec/Begin` without a context (the
+  PATCH path already threaded `r.Context()` through `ImmediateTx`). Every
+  in-handler DB call now uses its `*Context(r.Context(), ...)` counterpart,
+  so a request whose context is dead (client disconnect, proxy timeout)
+  fails fast at the pool level instead of executing its queries. (The
+  modernc driver does not interrupt a statement already blocked inside the
+  driver on the 15 s `busy_timeout` — verified empirically; that limit is
+  documented in-code.)
+- **Silent row-scan error swallowing** (`d68ef86`). `fetchSensors` logs a
+  per-row `rows.Scan` failure before skipping, but the history, graph,
+  events, clone, and tags loops dropped a corrupt row silently — a bad
+  timestamp or a schema-migration type mismatch produced a 200 with a
+  truncated list and zero visibility in the service log. All five loops now
+  log the failure before skipping (a mid-stream failure still 500s via the
+  existing `rows.Err()` checks).
+- **Missing `Cache-Control: no-store` on `/api/*`** (`458a7a0`). Static
+  assets set `no-cache`, but JSON API responses set no `Cache-Control` at
+  all — leaving sensitive payloads (`/api/settings`, `/api/auth/status`,
+  sensor data) exposed to intermediate proxies and aggressive browser
+  caching. The auth gate now answers `no-store` on every `/api/` response,
+  200s and error paths alike; static assets keep their own `no-cache`
+  contract.
+
+---
+
 # v0.3.23 — Alert-storm coalescing + TLS cert hot-reload
 
 The two findings deferred from the v0.3.17 review round (M8 alert-storm
