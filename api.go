@@ -241,6 +241,14 @@ func (s *Server) authGate() http.Handler {
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		// Sensitive JSON payloads (/api/settings, /api/auth/status, sensor
+		// data) must not be cached by browsers or intermediate proxies:
+		// no-store on every /api/ response. Static assets set their own
+		// no-cache in serveStatic and keep that contract (2026-10-22
+		// external review).
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			w.Header().Set("Cache-Control", "no-store")
+		}
 		// Cross-port CSRF gate (RFC 6265bis): the session cookie is
 		// SameSite=Strict, but "same-site" is scheme+host — the PORT is
 		// not part of the site. In a homelab, every other web app on the
