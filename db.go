@@ -654,24 +654,6 @@ func (db *DB) UserCount() (int, error) {
 	return n, err
 }
 
-// AddUser creates an account. The FIRST account is the admin (the same
-// invariant as the in-app setup bootstrap — see AddUserMode); later
-// accounts are regular users. Returns the driver error (SQLITE_CONSTRAINT
-// → "user already exists" in the caller).
-func (db *DB) AddUser(username, passwordHash string) error {
-	admin := 0
-	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n); err != nil {
-		return err
-	}
-	if n == 0 {
-		admin = 1
-	}
-	_, err := db.Exec("INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
-		username, passwordHash, tsNow(), admin)
-	return err
-}
-
 // UserHash returns the stored bcrypt hash for a username ("", sql.ErrNoRows
 // when absent).
 func (db *DB) UserHash(username string) (string, error) {

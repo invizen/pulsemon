@@ -1318,9 +1318,13 @@ func TestRemoveUserConcurrentNeverZero(t *testing.T) {
 		if err := db.RemoveAllUsers(); err != nil {
 			t.Fatal(err)
 		}
-		// Bypass bcrypt (cost is irrelevant here) — insert rows directly.
+		// Bypass bcrypt (cost is irrelevant here) — insert rows directly
+		// (the DB-level AddUser helper was removed: the non-atomic
+		// COUNT-then-INSERT duplicated the first-admin invariant that
+		// AuthState.AddUserMode owns atomically, with no production
+		// callers — 2026-10-22 external review).
 		for _, u := range []string{"alice", "bob"} {
-			if err := db.AddUser(u, "x"); err != nil {
+			if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, 'x', ?, 0)`, u, tsNow()); err != nil {
 				t.Fatal(err)
 			}
 		}
