@@ -1758,6 +1758,37 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest, "realert_min must be 0-1440 (0 = alert once only)")
 		return
 	}
+	// alert_filter items are tag names (scope=tags) or sensor ids
+	// (scope=sensors): bound and validate them like every other field in
+	// this handler. The 1 MiB body cap alone would let a caller store a
+	// near-1 MiB blob (thousands of unbounded strings) that GET
+	// /api/settings and every alert decision (shouldAlert) unmarshal on
+	// each read, and unvalidated strings in the store are a standing
+	// stored-XSS risk for any future render site. The UI only ever selects
+	// existing tags/ids — both validSensorName-clean (tags through
+	// cleanTags, ids are 36-char UUIDs) — so this never rejects a
+	// dashboard save. Trimmed, deduped, and capped like cleanTags; an
+	// invalid entry 400s the whole save (validate-everything-first).
+	if req.AlertFilter != nil {
+		if len(*req.AlertFilter) > 500 {
+			respondWithError(w, http.StatusBadRequest, "alert_filter cannot exceed 500 entries")
+			return
+		}
+		cleaned := make([]string, 0, len(*req.AlertFilter))
+		seen := make(map[string]bool, len(*req.AlertFilter))
+		for _, item := range *req.AlertFilter {
+			item = strings.TrimSpace(item)
+			if item == "" || utf8.RuneCountInString(item) > 60 || !validSensorName(item) {
+				respondWithError(w, http.StatusBadRequest, "invalid entry in alert_filter")
+				return
+			}
+			if !seen[item] {
+				seen[item] = true
+				cleaned = append(cleaned, item)
+			}
+		}
+		req.AlertFilter = &cleaned
+	}
 	// One stored-state snapshot per provider, taken BEFORE the tx and
 	// reused by the apply pass below, so validation and apply evaluate the
 	// same effective state and the two paths can't drift. (A concurrent
