@@ -265,3 +265,54 @@ func TestPingNowCacheUsesPostProbeTimestamp(t *testing.T) {
 		t.Errorf("cache entry ts = %d, want %d (the DB row's post-probe instant; the pre-probe timestamp breaks oldest-first ordering and 1-minute bucketing)", last.ts, dbTs.Unix())
 	}
 }
+
+// TestPingNowSlowHTTPTargetReadsUp is the behavioral half of the F5 fix.
+// TestEchoNowProbeRowCount pins the timeout VALUE passed to the probe (8s, the
+// sensor's configured timeout, not the old fixed 1s); this test proves the
+// OUTCOME: a real HTTP target that answers in 1.5s — longer than the OLD
+// hard-coded 1s pingNowTimeout, well within the sensor's 8s timeout — reads as
+// UP on a pulse, not a false loss. It drives the REAL probe path (no
+// probeTarget stub): PingNow -> probeTarget -> probeHTTP with the sensor's 8s
+// timeout. On the pre-F5 fixed-1s code this 1.5s target timed out and read as
+// lost, so a slow-but-healthy endpoint showed a spurious loss on every pulse.
+func TestPingNowSlowHTTPTargetReadsUp(t *testing.T) {
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(1500 * time.Millisecond)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer slow.Close()
+
+	db, err := NewDB(filepath.Join(t.TempDir(), "slow.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('slow','slow',?, 'http', 15, 8000, 25, 1, 3, 'active','up',?)`,
+		slow.URL, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert sensor: %v", err)
+	}
+
+	pw := NewProbeWorker(db)
+	o, err := pw.PingNow(context.Background(), "slow")
+	if err != nil {
+		t.Fatalf("PingNow: %v", err)
+	}
+	if o.lost {
+		t.Fatalf("slow (1.5s) target read as LOST — the pulse must run the sensor's timeout (8s), not a fixed 1s (F5)")
+	}
+	if o.rttMs < 1000 {
+		t.Errorf("pulse rtt = %.0fms, want >= 1000ms (the server sleeps 1.5s before responding)", o.rttMs)
+	}
+	// The recorded row carries a valid rtt (not NULL = not a loss).
+	var rtt sql.NullFloat64
+	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sensor_id = 'slow'").Scan(&rtt); err != nil {
+		t.Fatalf("read rtt_ms: %v", err)
+	}
+	if !rtt.Valid {
+		t.Fatal("recorded rtt_ms is NULL — the slow target was recorded as a loss")
+	}
+}

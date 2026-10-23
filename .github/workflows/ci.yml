@@ -1,0 +1,43 @@
+name: CI
+
+# Linux test gate: go vet + the full -race suite. Before this workflow the
+# ONLY CI was the Windows release builder — nothing ran the tests, and
+# release.sh runs `go test -count=1 .` (no -race, single package). For code
+# this concurrent (probe worker, in-memory stats cache, per-sensor alert
+# gates, storm budget), a data race caught in CI is the whole point
+# (2026-10-23 external review F15).
+#
+# Benchmarks are NOT run here (no -bench flag): BenchmarkPurgeOld and
+# BenchmarkComputeSensorStats (bench_test.go) are opt-in regression
+# benchmarks — run them explicitly with
+# `go test -run=^$ -bench=. -benchtime=1x .`.
+#
+# KNOWN FLAKE: TestStormFlushDropsRecovered is a pre-existing ~50-60%
+# bimodal flake (A/B-confirmed on the pristine v0.3.24 tree, unrelated to
+# this batch — no storm code is touched here). Until it is fixed it will
+# make this gate intermittently red; a targeted retry or the flake fix is
+# the follow-up, not a reason to skip the -race gate.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test -race
+        run: go test -race -count=1 ./...
