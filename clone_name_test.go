@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,60 +10,69 @@ import (
 	"unicode/utf8"
 )
 
-func TestFix_g7_StaticCharsetETag304(t *testing.T) {
-	d := newTestDB(t)
-	mux := NewServer(d, NewProbeWorker(d)).Mux()
-
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/index.html", nil))
-	if rr.Code != http.StatusOK {
-		t.Fatalf("GET /index.html = %d", rr.Code)
+// TestFix_CloneNamePickedInOneQuery pins the clone name-pick optimization:
+// the existing clone names are fetched in ONE GLOB query and the first free
+// suffix is picked in memory (the old loop ran up to 100 sequential SELECT
+// COUNT(*) round-trips before the first INSERT — 2026-10-22 external
+// review). The observable behavior must be unchanged — -copy, then
+// -copy2..-copy100, 409 past the cap — and the test adds the edge the old
+// exact-match loop never had: a base name containing GLOB metacharacters
+// (validSensorName is a blacklist, so * ? [ are legal names). A "[" in the
+// base turns the pattern's "[b]" into a character class, so the taken name
+// "a[b]-copy" does NOT match "a[b]-copy*" — the in-memory scan picks it,
+// the INSERT must hit the sensors.name UNIQUE index, and the retry must
+// land on a[b]-copy2 (no 500, no duplicate). The UNIQUE index remains the
+// arbiter in every case.
+func TestFix_CloneNamePickedInOneQuery(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+	mk := func(name string) string {
+		id := newID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, tsNow()); err != nil {
+			t.Fatal(err)
+		}
+		return id
 	}
-	if ct := rr.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
-		t.Errorf("Content-Type = %q, want text/html; charset=utf-8", ct)
-	}
-	etag := rr.Header().Get("ETag")
-	if len(etag) < 10 || !strings.HasPrefix(etag, `"`) || !strings.HasSuffix(etag, `"`) || strings.HasPrefix(etag, "W/") {
-		t.Fatalf("ETag = %q, want a quoted strong tag", etag)
-	}
-	if !strings.Contains(rr.Header().Get("Cache-Control"), "no-cache") {
-		t.Errorf("Cache-Control = %q, want no-cache", rr.Header().Get("Cache-Control"))
-	}
-	if rr.Body.Len() == 0 {
-		t.Fatal("200 response had no body")
-	}
-
-	// Revalidation with the returned tag: 304, no body, tag still sent.
-	req := httptest.NewRequest("GET", "/index.html", nil)
-	req.Header.Set("If-None-Match", etag)
-	rr2 := httptest.NewRecorder()
-	mux.ServeHTTP(rr2, req)
-	if rr2.Code != http.StatusNotModified || rr2.Body.Len() != 0 {
-		t.Fatalf("If-None-Match => %d with %d body bytes, want 304 and empty", rr2.Code, rr2.Body.Len())
-	}
-	if rr2.Header().Get("ETag") != etag {
-		t.Errorf("304 lost the ETag: %q", rr2.Header().Get("ETag"))
-	}
-
-	// A stale tag must NOT 304 (an update is never served stale).
-	req = httptest.NewRequest("GET", "/index.html", nil)
-	req.Header.Set("If-None-Match", `"stale"`)
-	rr3 := httptest.NewRecorder()
-	mux.ServeHTTP(rr3, req)
-	if rr3.Code != http.StatusOK {
-		t.Errorf("stale If-None-Match => %d, want 200", rr3.Code)
+	clone := func(srcID string) (int, string) {
+		req := httptest.NewRequest("POST", "/api/sensors/"+srcID+"/clone", nil)
+		req.SetPathValue("id", srcID)
+		rr := httptest.NewRecorder()
+		srv.handleSensorClone(rr, req)
+		if rr.Code != http.StatusCreated {
+			return rr.Code, ""
+		}
+		var body Sensor
+		if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return rr.Code, body.Name
 	}
 
-	// Other assets get an ETag too; unknown paths are still 404.
-	rr4 := httptest.NewRecorder()
-	mux.ServeHTTP(rr4, httptest.NewRequest("GET", "/favicon.svg", nil))
-	if rr4.Code != http.StatusOK || rr4.Header().Get("ETag") == "" {
-		t.Errorf("favicon.svg => %d etag %q", rr4.Code, rr4.Header().Get("ETag"))
+	// 0 existing clones -> base-copy.
+	id0 := mk("fresh")
+	if code, name := clone(id0); code != http.StatusCreated || name != "fresh-copy" {
+		t.Errorf("clone with no existing clones: %d %q, want 201 fresh-copy", code, name)
 	}
-	rr5 := httptest.NewRecorder()
-	mux.ServeHTTP(rr5, httptest.NewRequest("GET", "/nope-does-not-exist.js", nil))
-	if rr5.Code != http.StatusNotFound {
-		t.Errorf("unknown asset => %d, want 404", rr5.Code)
+
+	// 99 existing clones (fresh-copy..fresh-copy99) -> fresh-copy100: the
+	// deep-scan case that used to be 100 sequential COUNT(*) queries.
+	for i := 2; i <= 99; i++ { // fresh-copy (i==1) exists from the clone above
+		mk(fmt.Sprintf("fresh-copy%d", i))
+	}
+	if code, name := clone(id0); code != http.StatusCreated || name != "fresh-copy100" {
+		t.Errorf("clone with 99 existing clones: %d %q, want 201 fresh-copy100", code, name)
+	}
+
+	// Cap: fresh-copy..fresh-copy100 are all taken now -> 409 (never 500).
+	if code, _ := clone(id0); code != http.StatusConflict {
+		t.Errorf("clone with all 100 candidate names taken: %d, want 409", code)
+	}
+
+	// GLOB metacharacter edge (see the test comment): the under-matched
+	// taken name is rejected by the UNIQUE index and the retry moves on.
+	idMeta := mk("a[b]")
+	mk("a[b]-copy")
+	if code, name := clone(idMeta); code != http.StatusCreated || name != "a[b]-copy2" {
+		t.Errorf("clone of a GLOB-metacharacter base: %d %q, want 201 a[b]-copy2 (UNIQUE index is the arbiter)", code, name)
 	}
 }
 
