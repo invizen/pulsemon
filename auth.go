@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -687,9 +688,30 @@ func (a *AuthState) ClientIP(r *http.Request) string {
 				return leftmost.String()
 			}
 		}
+		return peer
+	}
+	// Untrusted peer: the header is IGNORED (a sender can rotate it to
+	// dodge the throttle — see the ClientIP doc), but its PRESENCE is the
+	// signature of a reverse proxy sitting in front of pulsemon WITHOUT
+	// PULSEMON_TRUSTED_PROXIES: every client behind that proxy is
+	// attributed to the proxy's IP and shares its throttle bucket, so
+	// loginFailMax bad guesses from ANYONE lock everyone out for
+	// loginLockout. Surface that misconfiguration once (2026-10-23
+	// external review F8) — the diagnostic is a log line only; the
+	// ignore-the-header security behavior is unchanged. (A direct
+	// connection that happens to send the header is a false positive,
+	// hence the hedged wording.)
+	if r.Header.Get("X-Forwarded-For") != "" && xffMisconfigWarned.CompareAndSwap(false, true) {
+		log.Printf("auth: ignoring X-Forwarded-For from untrusted peer %s — if pulsemon sits behind a reverse proxy, set PULSEMON_TRUSTED_PROXIES to the proxy's address; until then every client behind it shares the proxy's login-throttle bucket, so %d failed guesses from anyone lock everyone out for %s (logged once)", peer, loginFailMax, loginLockout)
 	}
 	return peer
 }
+
+// xffMisconfigWarned: logged-once flag for the "untrusted peer carrying
+// X-Forwarded-For" shape (see ClientIP) — the signature of a reverse
+// proxy missing from PULSEMON_TRUSTED_PROXIES. atomic.Bool rather than
+// sync.Once so tests can reset it between runs.
+var xffMisconfigWarned atomic.Bool
 
 // trustedPeer reports whether the IP string (host, no port) is inside any of
 // the trusted-proxy CIDRs. An unparseable IP is never trusted.
