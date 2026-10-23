@@ -2008,9 +2008,21 @@ document.addEventListener('keydown', e => {
 function startPolling() {
   refresh();
   refreshAdminState();
-  setInterval(refresh, 5000);
+  // Gate the 5s pollers on tab visibility: a hidden tab's polls are pure
+  // server cost (each refresh re-scans stats on the backend, external review
+  // F4) with no viewer to show them to (2026-10-23 external review F14). The
+  // timers keep ticking (a cheap visibility check each tick) and the poll is
+  // simply skipped while hidden; on return, visibilitychange fires an
+  // immediate refresh so the data is fresh the moment the tab is shown again.
+  setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
   let _sparkRt; window.addEventListener('resize', () => { clearTimeout(_sparkRt); _sparkRt = setTimeout(layoutSparklines, 120); });
-  setInterval(() => { if (inspectId) loadInspector(); }, 5000);
+  setInterval(() => { if (document.visibilityState === 'visible' && inspectId) loadInspector(); }, 5000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      refresh();
+      if (inspectId) loadInspector();
+    }
+  });
   checkUpdate(false);                    // initial update check
   setInterval(() => checkUpdate(false), 10 * 60 * 1000);  // re-check every 10 min (backend caches 30)
 }
