@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -45,7 +46,7 @@ func seedFailingHTTPSensor(t *testing.T, id, name string) (*DB, *ProbeWorker, *S
 		lastCertExpiry: &expiry,
 	}
 	pw.mu.Unlock()
-	pw.recordProbe(id, probeEntry{ts: time.Now().Unix() - 60, rtt: nil})
+	pw.recordProbe(id, probeEntry{ts: time.Now().Unix() - 60, rtt: float32(math.NaN())})
 	return db, pw, srv
 }
 
@@ -106,7 +107,7 @@ func TestClearAllHistoryResetsProbeState(t *testing.T) {
 	pw.mu.Lock()
 	pw.sensors["clr2b"] = &ProbeState{id: "clr2b", lastStatus: "error", fastRetry: true, lastHTTPStatus: &code}
 	pw.mu.Unlock()
-	pw.recordProbe("clr2b", probeEntry{ts: time.Now().Unix() - 30, rtt: nil})
+	pw.recordProbe("clr2b", probeEntry{ts: time.Now().Unix() - 30, rtt: float32(math.NaN())})
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/history", nil)
 	w := httptest.NewRecorder()

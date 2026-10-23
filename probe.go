@@ -11,12 +11,14 @@ import (
 	"html"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	neturl "net/url"
 	"os"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,12 +66,31 @@ type ProbeState struct {
 // dashboard read path (GetStats) an O(1) map lookup instead of 4 SQLite
 // queries per sensor — the whole point of v0.1.18.
 type probeEntry struct {
-	ts  int64 // UTC epoch seconds (matches CAST(strftime('%s', ts)))
-	rtt *float64
+	ts int64 // UTC epoch seconds (matches CAST(strftime('%s', ts)))
+	// rtt is the reply time in ms; NaN = lost probe (matches SQL
+	// rtt_ms IS NULL). A value — not *float64 — so the series is
+	// pointer-free: 16-byte entries, no per-reply heap float for the GC to
+	// scan (2026-10-23 external review F4: at 100 sensors x 24h x 5s that
+	// is ~1.7M entries, so the old layout was tens of MB of heap pointers).
+	rtt float32
 	// manual marks a "Pulse Now" row: it stays in the series (sparkline
 	// honesty) but is excluded from status derivation (recentFromCache
 	// skips it) — see the probes.manual column.
 	manual bool
+}
+
+// isLost reports whether a series RTT is a lost probe (NaN). Written as a
+// self-comparison because Go's math.IsNaN only takes float64.
+func isLost(rtt float32) bool { return rtt != rtt }
+
+// rttToPtr converts a series RTT (NaN = lost) to the API shape
+// (*float64, nil = lost) without changing the JSON contract.
+func rttToPtr(rtt float32) *float64 {
+	if isLost(rtt) {
+		return nil
+	}
+	v := float64(rtt)
+	return &v
 }
 
 // probeSeries is an append-only, oldest-first log of probeEntry with a
@@ -80,6 +101,24 @@ type probeEntry struct {
 type probeSeries struct {
 	data  []probeEntry
 	start int // index (into data) of the oldest live entry
+
+	// Incremental 24h counters (2026-10-23 external review F4): total24 and
+	// lost24 count the LIVE entries inside the 24h window so the per-poll
+	// stats read is O(1) for uptime instead of a full-series scan. append
+	// maintains them: the new entry is always inside its own window (+1),
+	// and in24Start — the first live index still inside the window — walks
+	// forward as the cutoff (newest ts - retention, monotonic) passes
+	// entries out of it (-1). in24Start only moves forward, so the
+	// bookkeeping is amortized O(1). The invariant start <= in24Start holds
+	// by induction: eviction (start) only passes entries that are OUT of
+	// the window, which in24Start has already passed — so the evict loop
+	// never touches the counters (decrementing there would double-count).
+	// A long-interval sensor's last-60 tail can hold entries older than 24h
+	// (kept by the 60-probe rule): in24Start passes them out of the
+	// counters even though start keeps them in the series.
+	total24   int
+	lost24    int
+	in24Start int
 }
 
 func (ps *probeSeries) len() int { return len(ps.data) - ps.start }
@@ -99,23 +138,42 @@ func (ps *probeSeries) append(e probeEntry) {
 	if ps.start > 0 && (ps.start >= 4096 || ps.start*2 >= len(ps.data)) {
 		// Reclaim front space so future appends reuse the backing array
 		// instead of reallocating every time (the classic "resliced slice
-		// grows unbounded" trap).
+		// grows unbounded" trap). Entries are value types, so no zeroing
+		// is needed to free memory — shifting is all it takes.
 		n := copy(ps.data, ps.data[ps.start:])
-		for i := n; i < len(ps.data); i++ {
-			ps.data[i] = probeEntry{} // drop *float64 refs so they can GC
-		}
 		ps.data = ps.data[:n]
+		ps.in24Start -= ps.start // the window pointer shifts with the array
 		ps.start = 0
 	}
 	ps.data = append(ps.data, e)
-	keep := ps.len() - 60 // everything beyond the last 60 is a candidate
-	if keep < 0 {
-		keep = 0
+	// Eviction boundary: the INDEX of the first entry beyond the last 60
+	// (len(data)-60) — NOT len()-60, which is off by `start` and, once
+	// start grows, stops evicting entirely: a long-interval sensor's
+	// series would then grow unbounded (the start < start+len-60 test
+	// fails at half density). 2026-10-23 external review F4: caught by
+	// TestSeriesCountersTrackRecount (6000 hourly appends → len 3030
+	// instead of 60 on the pre-fix code).
+	boundary := len(ps.data) - 60
+	if boundary < 0 {
+		boundary = 0
 	}
 	cutoff := e.ts - retentionSeconds
-	for ps.start < keep && ps.data[ps.start].ts < cutoff {
-		ps.data[ps.start] = probeEntry{} // release the *float64
+	// 24h window bookkeeping: entries the window has passed drop out of the
+	// counters HERE (see the field doc for why the evict loop below must
+	// not touch them).
+	for ps.in24Start < len(ps.data) && ps.data[ps.in24Start].ts < cutoff {
+		if isLost(ps.data[ps.in24Start].rtt) {
+			ps.lost24--
+		}
+		ps.total24--
+		ps.in24Start++
+	}
+	for ps.start < boundary && ps.data[ps.start].ts < cutoff {
 		ps.start++
+	}
+	ps.total24++
+	if isLost(e.rtt) {
+		ps.lost24++
 	}
 }
 
@@ -778,7 +836,11 @@ func (pw *ProbeWorker) warmStats() {
 				a = &acc{series: &probeSeries{}}
 				byID[sid] = a
 			}
-			a.series.append(probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
+			e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN())}
+			if rtt != nil {
+				e.rtt = float32(*rtt)
+			}
+			a.series.append(e)
 			built++
 		}
 		if err := rows.Err(); err != nil {
@@ -832,16 +894,16 @@ func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
 func (pw *ProbeWorker) statsFor(id string, nowUnix int64) *SensorStats {
 	// Compute under the read lock directly over the live slice: appends take
 	// the write lock, so the series cannot mutate mid-read, and
-	// computeSensorStats only reads (the *float64 values it keeps are
-	// immutable). This avoids copying up to 24h of entries (1.4 MB for a
-	// 1s sensor) per sensor per dashboard poll.
+	// computeSensorStats only reads (the *float64 API values it derives are
+	// per-read copies). This avoids copying up to 24h of entries (276 KB for
+	// a 5s sensor) per sensor per dashboard poll.
 	pw.statsMu.RLock()
 	defer pw.statsMu.RUnlock()
 	s, ok := pw.statsCache[id]
 	if !ok || s.len() == 0 {
 		return nil
 	}
-	return computeSensorStats(s.data[s.start:], nowUnix)
+	return computeSensorStats(s.data[s.start:], nowUnix, s.total24, s.lost24)
 }
 
 // GetStats computes a sensor's SensorStats from the in-memory series,
@@ -906,9 +968,13 @@ func (pw *ProbeWorker) ResetStatsAll() {
 // nowUnix (epoch seconds) is the "current time" the time windows anchor to.
 // GetStats passes time.Now().Unix(); the differential test passes a fixed
 // value to both the SQL and in-memory paths so they compare deterministically
-// (no flake from a minute-boundary crossing mid-test). A nil rtt is a lost
+// (no flake from a minute-boundary crossing mid-test). A NaN rtt is a lost
 // probe (matches SQL `rtt_ms IS NULL`).
-func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
+//
+// total24/lost24 are the series' incremental 24h counters (probeSeries);
+// production passes the live values, tests pass a recount of the slice —
+// either way they must count the entries with ts >= nowUnix-86400.
+func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int) *SensorStats {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -925,18 +991,18 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 	st.Total = len(window)
 	for i := len(window) - 1; i >= 0; i-- {
 		rtt := window[i].rtt
-		if st.RTTLast == nil && rtt != nil { // first non-lost from the newest
-			v := *rtt
+		if st.RTTLast == nil && !isLost(rtt) { // first non-lost from the newest
+			v := float64(rtt)
 			st.RTTLast = &v
 		}
 		if len(st.Recent) < 30 {
-			st.Recent = append(st.Recent, rtt)
+			st.Recent = append(st.Recent, rttToPtr(rtt))
 		}
-		if rtt == nil {
+		if isLost(rtt) {
 			st.LostCount++
 			continue
 		}
-		v := *rtt
+		v := float64(rtt)
 		if !have {
 			min, max, have = v, v, true
 		} else {
@@ -957,17 +1023,18 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
 	}
 
-	// Past-hour loss % + avg RTT.
+	// Past-hour loss % + avg RTT. The series is ts-sorted, so binary-search
+	// the first entry inside the hour and skip the older tail (2026-10-23
+	// external review F4 — before, this scanned all 24h on every poll).
 	h1, l1 := 0, 0
 	var h1sum float64
-	for _, e := range entries {
-		if e.ts >= nowUnix-3600 {
-			h1++
-			if e.rtt == nil {
-				l1++
-			} else {
-				h1sum += *e.rtt
-			}
+	i1 := sort.Search(len(entries), func(i int) bool { return entries[i].ts >= nowUnix-3600 })
+	for _, e := range entries[i1:] {
+		h1++
+		if isLost(e.rtt) {
+			l1++
+		} else {
+			h1sum += float64(e.rtt)
 		}
 	}
 	if h1 > 0 {
@@ -990,7 +1057,7 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 		sw = sw[len(sw)-statusWindow:]
 	}
 	for _, e := range sw {
-		if e.rtt == nil {
+		if isLost(e.rtt) {
 			st.StatusLostCount++
 		}
 	}
@@ -998,16 +1065,10 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 		st.StatusLossPct = float64(st.StatusLostCount) / float64(len(sw)) * 100
 	}
 
-	// 24h uptime.
-	d24, l24 := 0, 0
-	for _, e := range entries {
-		if e.ts >= nowUnix-86400 {
-			d24++
-			if e.rtt == nil {
-				l24++
-			}
-		}
-	}
+	// 24h uptime — straight from the incremental counters (maintained in
+	// probeSeries.append), no full-series scan (2026-10-23 external review
+	// F4).
+	d24, l24 := total24, lost24
 	if d24 > 0 {
 		st.Uptime24h = float64(d24-l24) / float64(d24) * 100
 	}
@@ -1027,8 +1088,8 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 	}
 	buckets := make([]bmin, 60)
 	nowMin := nowUnix / 60 * 60
-	for _, e := range entries {
-		if e.ts < nowUnix-3600 || e.ts > nowUnix {
+	for _, e := range entries[i1:] {
+		if e.ts > nowUnix {
 			continue
 		}
 		// Floor the probe to its minute FIRST (matching SQL's
@@ -1042,8 +1103,8 @@ func computeSensorStats(entries []probeEntry, nowUnix int64) *SensorStats {
 		}
 		b := &buckets[pos]
 		b.hasAny = true
-		if e.rtt != nil {
-			v := *e.rtt
+		if !isLost(e.rtt) {
+			v := float64(e.rtt)
 			if !b.hasRTT || v < b.minRTT {
 				b.minRTT = v
 				b.hasRTT = true
@@ -1274,12 +1335,11 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	// an older entry), and the sparkline floors each entry to its minute —
 	// a pulse straddling a minute boundary would bucket differently in the
 	// warm cache than in the DB.
-	var rttPtr *float64
+	rtt := float32(math.NaN())
 	if !o.lost {
-		v := o.rttMs
-		rttPtr = &v
+		rtt = float32(o.rttMs)
 	}
-	pw.recordProbe(id, probeEntry{ts: ts.Unix(), rtt: rttPtr, manual: true})
+	pw.recordProbe(id, probeEntry{ts: ts.Unix(), rtt: rtt, manual: true})
 	return o, nil
 }
 
@@ -1362,12 +1422,11 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row so the
 	// dashboard read path stays O(1) (no per-poll SQLite queries).
-	var rttPtr *float64
+	rtt := float32(math.NaN())
 	if !o.lost {
-		v := rttMs
-		rttPtr = &v
+		rtt = float32(rttMs)
 	}
-	pw.recordProbe(c.id, probeEntry{ts: now.Unix(), rtt: rttPtr})
+	pw.recordProbe(c.id, probeEntry{ts: now.Unix(), rtt: rtt})
 
 	// The previous status feeds deriveStatus's fast-recovery rule (a sensor
 	// recovering from ERROR flips to up on one good probe). Memory is
@@ -1739,7 +1798,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	}
 	totalLost := 0
 	for _, r := range sw {
-		if r == nil {
+		if isLost(r) {
 			totalLost++
 		}
 	}
@@ -1756,11 +1815,11 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// (loss_warn == 0 keeps the pre-gate steady-state behavior — the
 	// defensive zeroed-row path, unreachable via the API.)
 	upRule := false
-	if recent[0] != nil {
+	if !isLost(recent[0]) {
 		switch {
 		case lastStatus == "error" || len(recent) == 1:
 			upRule = true
-		case recent[1] != nil && (c.lossWarn == 0 || lossPct < float64(c.lossWarn)):
+		case !isLost(recent[1]) && (c.lossWarn == 0 || lossPct < float64(c.lossWarn)):
 			upRule = true
 		}
 	}
@@ -1773,7 +1832,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// exclusive.)
 	consec := 0
 	for _, r := range recent {
-		if r == nil {
+		if isLost(r) {
 			consec++
 		} else {
 			break
@@ -1806,16 +1865,16 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 }
 
 // recentFromCache returns up to limit most-recent RTTs (index 0 = newest,
-// nil = lost) from the in-memory series. ok is false when the series holds
+// NaN = lost) from the in-memory series. ok is false when the series holds
 // fewer than limit entries, in which case the DB may know more history.
-func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]*float64, bool) {
+func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]float32, bool) {
 	pw.statsMu.RLock()
 	defer pw.statsMu.RUnlock()
 	s, ok := pw.statsCache[id]
 	if !ok || s.len() < limit {
 		return nil, false
 	}
-	out := make([]*float64, 0, limit)
+	out := make([]float32, 0, limit)
 	for i := len(s.data) - 1; i >= s.start && len(out) < limit; i-- {
 		// Manual "Pulse Now" rows are excluded from status derivation
 		// (probes.manual): they stay in the series for the sparkline,
@@ -1838,19 +1897,23 @@ func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]*float64, bool) 
 
 // recentFromDB is the durable equivalent of recentFromCache. manual = 0
 // excludes "Pulse Now" rows from status derivation (see PingNow).
-func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]*float64, error) {
+func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]float32, error) {
 	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? AND manual = 0 ORDER BY ts DESC LIMIT ?", id, limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close() // top-level: closed on every return path (the pool is capped; a leak would hang)
-	var recent []*float64
+	var recent []float32
 	for rows.Next() {
 		var rtt *float64
 		if err := rows.Scan(&rtt); err != nil {
 			return nil, err
 		}
-		recent = append(recent, rtt)
+		v := float32(math.NaN())
+		if rtt != nil {
+			v = float32(*rtt)
+		}
+		recent = append(recent, v)
 	}
 	return recent, rows.Err()
 }

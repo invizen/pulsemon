@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -85,7 +86,11 @@ func readSeries(t *testing.T, db *DB, id string) []probeEntry {
 		if err := rows.Scan(&sid, &ts, &rtt); err != nil {
 			t.Fatalf("readSeries scan: %v", err)
 		}
-		out = append(out, probeEntry{ts: ts.UTC().Unix(), rtt: rtt})
+		e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN())}
+		if rtt != nil {
+			e.rtt = float32(*rtt)
+		}
+		out = append(out, e)
 	}
 	return out
 }
@@ -352,7 +357,21 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 	for _, id := range []string{"rich", "sparse", "all-lost-hour"} {
 		t.Run(id, func(t *testing.T) {
 			want := sqlStats(t, db, id)
-			got := computeSensorStats(readSeries(t, db, id), testNowUnix)
+			entries := readSeries(t, db, id)
+			// Brute-force 24h recount anchored at testNowUnix — the same
+			// window the SQL reference uses (production passes the series'
+			// incremental counters instead; the round-trip test covers that
+			// path with the newest row at testNowUnix).
+			total24, lost24 := 0, 0
+			for _, e := range entries {
+				if e.ts >= testNowUnix-86400 {
+					total24++
+					if isLost(e.rtt) {
+						lost24++
+					}
+				}
+			}
+			got := computeSensorStats(entries, testNowUnix, total24, lost24)
 			compareStats(t, id, got, want)
 		})
 	}
@@ -396,7 +415,7 @@ func TestSeriesEviction(t *testing.T) {
 	// (100) dominates the last-60 (60) — all 100 kept.
 	var fast probeSeries
 	for i := 0; i < 100; i++ {
-		fast.append(probeEntry{ts: testNowUnix - int64(100-i), rtt: f64(10)})
+		fast.append(probeEntry{ts: testNowUnix - int64(100-i), rtt: 10})
 	}
 	if got := fast.len(); got != 100 {
 		t.Errorf("fast: len = %d, want 100 (all within 24h)", got)
@@ -406,7 +425,7 @@ func TestSeriesEviction(t *testing.T) {
 	// dominates; the oldest (>24h, beyond the last 60) is evicted -> 60 kept.
 	var slow probeSeries
 	for i := 0; i < 61; i++ {
-		slow.append(probeEntry{ts: testNowUnix - int64(61-1-i)*3600, rtt: f64(10)})
+		slow.append(probeEntry{ts: testNowUnix - int64(61-1-i)*3600, rtt: 10})
 	}
 	if got := slow.len(); got != 60 {
 		t.Errorf("slow: len = %d, want 60 (last-60 window dominates)", got)
@@ -478,10 +497,9 @@ func TestRecordProbeConcurrent(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < readsPerWriter; i++ {
 				ts := testNowUnix + int64(w*readsPerWriter+i)
-				var rtt *float64
+				rtt := float32(math.NaN())
 				if i%4 != 3 {
-					v := float64(5 + i%20)
-					rtt = &v
+					rtt = float32(5 + i%20)
 				}
 				pw.recordProbe("hot", probeEntry{ts: ts, rtt: rtt})
 				if i%8 == 0 {
@@ -502,5 +520,55 @@ func TestRecordProbeConcurrent(t *testing.T) {
 	// just guards against the series ending up empty/truncated.
 	if got.Total != 60 {
 		t.Errorf("Total = %d, want 60 (full window after %d writes)", got.Total, writers*readsPerWriter)
+	}
+}
+
+// TestSeriesCountersTrackRecount locks the incremental 24h counters
+// (total24/lost24/in24Start) against a brute-force recount at EVERY append:
+// a 1h-interval sensor (so the last-60 tail holds entries OLDER than 24h —
+// they must stay in the series but drop out of the counters), a 1/3 loss
+// pattern, and 6000 appends (enough to force the compaction path,
+// start >= 4096, several times). Any drift in append's bookkeeping — a
+// double-decrement on evict, a missed aging-out, a compaction index bug —
+// surfaces as a divergence at some step.
+func TestSeriesCountersTrackRecount(t *testing.T) {
+	var s probeSeries
+	const total = 6000
+	for i := 0; i < total; i++ {
+		// 1h-interval sensor: entry i is (total-1-i) hours old.
+		ts := testNowUnix - int64(total-1-i)*3600
+		var rtt = float32(math.NaN())
+		if i%3 != 2 {
+			rtt = float32(10 + i%50)
+		}
+		s.append(probeEntry{ts: ts, rtt: rtt})
+		if s.in24Start < s.start {
+			t.Fatalf("after append %d: invariant broken, in24Start %d < start %d", i, s.in24Start, s.start)
+		}
+		// Brute-force recount: live entries inside the 24h window, anchored
+		// at the NEWEST entry (the same anchor append's cutoff uses).
+		newest := s.data[len(s.data)-1].ts
+		wantT, wantL := 0, 0
+		for _, e := range s.data[s.start:] {
+			if e.ts >= newest-retentionSeconds {
+				wantT++
+				if isLost(e.rtt) {
+					wantL++
+				}
+			}
+		}
+		if s.total24 != wantT || s.lost24 != wantL {
+			t.Fatalf("after append %d: counters total24/lost24 = %d/%d, recount %d/%d", i, s.total24, s.lost24, wantT, wantL)
+		}
+	}
+	// End state: the 1h-interval series holds exactly the last-60 tail
+	// (60h span); only the newest 24 are inside the 24h window.
+	if s.len() != 60 {
+		t.Fatalf("len = %d, want 60 (last-60 tail)", s.len())
+	}
+	if s.total24 != 25 {
+		// Hourly cadence: ages 0,1,...,24h are all >= newest-24h (the
+		// boundary is inclusive) — 25 entries, not 24.
+		t.Fatalf("total24 = %d, want 25 (entries older than 24h are kept by the 60-probe rule but must not count)", s.total24)
 	}
 }

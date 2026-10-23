@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -385,7 +386,7 @@ func TestFix_M10a_DeriveStatusReadsMemoryWhenWarm(t *testing.T) {
 		fcProbe(t, db, "a", now.Add(time.Duration(i-20)*time.Second), 5.0)
 	}
 	for i := 0; i < 8; i++ {
-		pw.recordProbe("a", probeEntry{ts: now.Unix() + int64(i), rtt: nil})
+		pw.recordProbe("a", probeEntry{ts: now.Unix() + int64(i), rtt: float32(math.NaN())})
 	}
 	c := sensorConfig{id: "a", downAfter: 2, lossWarn: 25}
 	if got := pw.deriveStatus(c, "up"); got != "error" {
@@ -401,7 +402,7 @@ func TestFix_M10a_DeriveStatusFallsBackToDBWhenCacheCold(t *testing.T) {
 	for i := 0; i < 4; i++ {
 		fcProbe(t, db, "a", now.Add(time.Duration(i-10)*time.Second), nil)
 	}
-	pw.recordProbe("a", probeEntry{ts: now.Unix(), rtt: nil}) // 1 cached entry < limit => DB path
+	pw.recordProbe("a", probeEntry{ts: now.Unix(), rtt: float32(math.NaN())}) // 1 cached entry < limit => DB path
 	c := sensorConfig{id: "a", downAfter: 2, lossWarn: 25}
 	if got := pw.deriveStatus(c, "up"); got != "error" {
 		t.Fatalf("derived %q via cold cache fallback, want error", got)
@@ -474,18 +475,19 @@ func TestFix_M10a_StatsForDoesNotCopyAndMatches(t *testing.T) {
 	pw := NewProbeWorker(nil)
 	now := time.Now().Unix()
 	for i := 0; i < 500; i++ {
-		v := float64(i%7 + 1)
-		pw.recordProbe("a", probeEntry{ts: now - int64(500-i), rtt: &v})
+		pw.recordProbe("a", probeEntry{ts: now - int64(500-i), rtt: float32(i%7 + 1)})
 	}
 	pw.statsMu.RLock()
-	want := computeSensorStats(pw.statsCache["a"].snapshot(), now)
+	sa := pw.statsCache["a"]
+	want := computeSensorStats(sa.snapshot(), now, sa.total24, sa.lost24)
 	pw.statsMu.RUnlock()
 	got := pw.statsFor("a", now)
 	if got.Total != want.Total || got.Uptime24h != want.Uptime24h || *got.RTTAvg != *want.RTTAvg {
 		t.Fatalf("statsFor diverged from snapshot-based stats: %+v vs %+v", got, want)
 	}
 	allocs := testing.AllocsPerRun(20, func() { _ = pw.statsFor("a", now) })
-	base := testing.AllocsPerRun(20, func() { _ = computeSensorStats(pw.statsCache["a"].snapshot(), now) })
+	t24, l24 := sa.total24, sa.lost24
+	base := testing.AllocsPerRun(20, func() { _ = computeSensorStats(sa.snapshot(), now, t24, l24) })
 	if allocs >= base {
 		t.Errorf("statsFor allocs %.0f not lower than snapshot path %.0f", allocs, base)
 	}

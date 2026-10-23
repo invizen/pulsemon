@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"math"
 	"path/filepath"
 	"testing"
 	"time"
@@ -97,27 +98,27 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 	// (6) recentFromCache skips manual entries and NEVER returns a partial
 	// window (a diluted tail falls back to the DB instead).
 	pw2 := NewProbeWorker(db)
-	rtt := 5.0
+	rtt := float32(5)
 	// "c1": 8 scheduled UP + a NEWER manual LOST → the window is the 8
 	// scheduled rows (all non-nil), the manual loss excluded.
 	for i := 0; i < 8; i++ {
-		pw2.recordProbe("c1", probeEntry{ts: int64(1000 + i), rtt: &rtt})
+		pw2.recordProbe("c1", probeEntry{ts: int64(1000 + i), rtt: rtt})
 	}
-	pw2.recordProbe("c1", probeEntry{ts: 1008, manual: true}) // lost → rtt nil
+	pw2.recordProbe("c1", probeEntry{ts: 1008, rtt: float32(math.NaN()), manual: true}) // lost → rtt NaN
 	c1, ok := pw2.recentFromCache("c1", 8)
 	if !ok || len(c1) != 8 {
 		t.Fatalf("recentFromCache(c1) = (%d rows, ok=%v), want 8 rows — the manual tail must be skipped, not count", len(c1), ok)
 	}
 	for i, r := range c1 {
-		if r == nil {
-			t.Fatalf("recentFromCache(c1)[%d] = nil — the manual LOST leaked into the status window", i)
+		if isLost(r) {
+			t.Fatalf("recentFromCache(c1)[%d] = lost — the manual LOST leaked into the status window", i)
 		}
 	}
 	// "c2": 1 manual LOST + 1 scheduled LOST, limit 2 → only ONE scheduled
 	// row exists, so the cache must refuse (DB fallback), not compute on a
 	// partial window.
-	pw2.recordProbe("c2", probeEntry{ts: 2000, rtt: &rtt})
-	pw2.recordProbe("c2", probeEntry{ts: 2001, manual: true})
+	pw2.recordProbe("c2", probeEntry{ts: 2000, rtt: rtt})
+	pw2.recordProbe("c2", probeEntry{ts: 2001, rtt: float32(math.NaN()), manual: true})
 	if _, ok := pw2.recentFromCache("c2", 2); ok {
 		t.Fatal("recentFromCache(c2) = ok with only 1 scheduled entry — a partial window must fall back to the DB")
 	}
