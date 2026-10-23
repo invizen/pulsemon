@@ -576,10 +576,11 @@ func TestValidURL(t *testing.T) {
 		{"https://example.com", true},
 		{"http://nas:8080", true},            // single-label internal host + explicit port
 		{"https://myhost:8443/health", true}, // single-label + port
+		{"https://router", true},             // single-label host: same stance as validTarget (F11)
+		{"http://9", false},                  // bare numeric label is not a hostname
 		{"ftp://example.com", false},
-		{"example.com", false},    // no scheme
-		{"http://", false},        // no host
-		{"https://router", false}, // single-label, no dot/brackets/port
+		{"example.com", false}, // no scheme
+		{"http://", false},     // no host
 		{"", false},
 	}
 	for _, c := range cases {

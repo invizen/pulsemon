@@ -3018,18 +3018,53 @@ func newID() string {
 
 // validTarget accepts only well-formed probe targets (all SQL is parameterized; this is input hygiene).
 //
-// Hostnames must be dotted labels ending in an alphabetic TLD (one or more
-// labels). Bare single-label hostnames (a plain "router", "NAS", "home")
-// are deliberately REJECTED: for an ICMP tool a bare label is almost always
-// a typo (the user meant "router.local" or the actual IP) and most resolvers
-// won't resolve it anyway — so it must fail at save time with a clear error,
-// not hang every probe tick. This is intentional, not a bug.
+// A target is one of:
+//   - an IPv4 address (range-checked via net.ParseIP), or
+//   - a dotted hostname: one or more RFC 1123 labels ending in an
+//     alphabetic TLD (targetRe), or
+//   - a BARE single-label hostname (validSingleLabel): "nas", "pve",
+//     "router". These resolve on most home LANs via the resolver's
+//     search domain (resolv.conf "search") — the same names HTTP
+//     targets have always used. A label made purely of digits is
+//     rejected: net.ParseIP has already taken real IPv4s, so a bare
+//     numeric label is a truncated-IP typo, not a hostname.
+//
+// Save-time validation is FORMAT hygiene, not a resolvability promise:
+// a target that doesn't resolve on this box simply probes down with a
+// clear DNS error. That is safe because the probe's resolver is
+// deadline-bounded (resolveIPAddrWithTimeout) — a hung lookup becomes a
+// loss row, never a wedged tick. (The pre-2026-10-23 stance rejected
+// bare single labels for fear of per-tick DNS hangs; the bounded
+// resolver closed that hole, and the rejection was asymmetric with
+// validURL, which already let http://nas:8080 through — 2026-10-23
+// external review F11.)
 var targetRe = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$`)
 
+// singleLabelRe is one RFC 1123 label with no dot: length 1-63,
+// alphanumeric ends, hyphens inside. validSingleLabel additionally
+// requires at least one letter.
+var singleLabelRe = regexp.MustCompile(`^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$`)
+
+// letterRe reports whether its argument contains at least one ASCII letter
+// (a character CLASS, unlike strings.ContainsAny, whose second argument is
+// a set of literal runes — "a-zA-Z" there means a, -, z, A, Z).
+var letterRe = regexp.MustCompile(`[a-zA-Z]`)
+
+// validSingleLabel reports whether t is a usable bare hostname: one RFC
+// 1123 label containing at least one letter. A purely numeric label is
+// rejected: net.ParseIP has already taken real IPv4s, so a bare numeric
+// string is a truncated-IP typo, not a hostname. Shared by validTarget
+// (ICMP) and validURL (HTTP) so the two validators keep the same stance
+// on single labels (2026-10-23 external review F11).
+func validSingleLabel(t string) bool {
+	return singleLabelRe.MatchString(t) && letterRe.MatchString(t)
+}
+
 // validTarget reports whether t is a usable probe target: a range-checked
-// IPv4 address, or a dotted hostname. IPv4 is checked with net.ParseIP so
-// out-of-range octets like "999.999.999.999" are rejected up front instead
-// of passing validation and then failing DNS every tick.
+// IPv4 address, a dotted hostname, or a bare single-label hostname. IPv4
+// is checked with net.ParseIP so out-of-range octets like
+// "999.999.999.999" are rejected up front instead of passing validation
+// and then failing DNS every tick.
 func validTarget(t string) bool {
 	if t == "" {
 		return false
@@ -3037,5 +3072,8 @@ func validTarget(t string) bool {
 	if ip := net.ParseIP(t); ip != nil {
 		return ip.To4() != nil // accept IPv4; IPv6 targets are not supported
 	}
-	return targetRe.MatchString(t)
+	if targetRe.MatchString(t) {
+		return true
+	}
+	return validSingleLabel(t)
 }

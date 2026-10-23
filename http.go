@@ -486,9 +486,12 @@ func certNotAfterFromErr(err error) *time.Time {
 }
 
 // validURL reports whether t is a usable HTTP/HTTPS target: an absolute URL
-// with an http(s) scheme and a dotted or bracketed host. The dotted-host
-// requirement matches validTarget's stance for ICMP (bare single-label
-// hostnames are almost always typos) and is enforced on the host part.
+// with an http(s) scheme and a dotted, bracketed, port-carrying, or bare
+// single-label host. The single-label stance matches validTarget for ICMP
+// (2026-10-23 external review F11): "nas" resolves on most home LANs via
+// the resolver's search domain, and the probe's deadline-bounded resolver
+// makes an unresolvable name a loss row, not a wedged tick. The port
+// override below predates that change and stays.
 func validURL(t string) bool {
 	u, err := url.Parse(t)
 	if err != nil {
@@ -502,15 +505,12 @@ func validURL(t string) bool {
 	if host == "" {
 		return false
 	}
-	// A dotted host, a bracketed/IPv6 host, or a host with an EXPLICIT port
-	// is accepted. The dotted-host rule otherwise rejects bare single-label
-	// names ("router") that are almost always typos — but a port makes the
-	// target deliberate and unambiguous (e.g. an internal server at
-	// http://nas:8080), so a port overrides the dot requirement.
+	// A dotted host, a bracketed/IPv6 host, a host with an EXPLICIT port,
+	// or a bare single-label host (validSingleLabel) is accepted.
 	if strings.Contains(host, ".") || strings.Contains(host, ":") || u.Port() != "" {
 		return true
 	}
-	return false
+	return validSingleLabel(host)
 }
 
 // httpStatusText formats a status code for display ("503"), or "no response"

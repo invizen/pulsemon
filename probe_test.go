@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -341,11 +342,20 @@ func TestValidTarget(t *testing.T) {
 		{"sub.example.com", true},
 		{"a-b.example.co", true},
 		{"9router.local", true}, // digits in a label are fine
-		// Bare single-label hostnames: deliberately rejected.
-		{"router", false},
-		{"NAS", false},
-		{"home", false},
-		{"9", false}, // bare label, even numeric
+		// Bare single-label hostnames: accepted (an RFC 1123 label with
+		// at least one letter) — 2026-10-23 external review F11. They
+		// resolve on most home LANs via the resolver's search domain;
+		// an unresolvable one simply probes down (bounded resolver).
+		{"router", true},
+		{"NAS", true},
+		{"home", true},
+		{"a-b", true},
+		{"9nas", true},
+		{strings.Repeat("a", 63), true},  // RFC 1123 max label length
+		{strings.Repeat("a", 64), false}, // over the 63-char label cap
+		{"router-", false},               // label can't end with '-'
+		{"-router", false},               // label can't start with '-'
+		{"9", false},                     // bare numeric label: truncated-IP typo, not a hostname
 		// IPv6 is not a supported probe target.
 		{"::1", false},
 		{"fe80::1", false},
