@@ -1855,6 +1855,12 @@ func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]*float64, error) {
 	return recent, rows.Err()
 }
 
+// purgeBatchSize caps the rows deleted per statement in purgeOld. Each batch
+// is its own short write transaction, so probe INSERTs can take the write
+// lock BETWEEN batches instead of waiting behind the entire purge
+// (2026-10-23 external review — see the plan note in purgeOld).
+const purgeBatchSize = 5000
+
 // purgeOld enforces 24-hour retention on probes/events (SPEC §3). 24h is the
 // longest window the dashboard reads, so nothing on screen needs older data.
 //
@@ -1864,16 +1870,45 @@ func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]*float64, error) {
 // comparison can be off by under one second right at the cutoff, which only
 // ever over- or under-retains a single boundary row once and ages out within a
 // day - harmless for a 24h window.
+//
+// PLAN (2026-10-23 external review): the old body was one
+// `DELETE FROM <table> WHERE ts < ?` per table. ts is the SECOND column of
+// idx_probes_sensor_ts(sensor_id, ts), so the planner cannot range-seek it
+// (SQLite will not skip-scan a non-leading column without ANALYZE stats) and
+// the statement full-scanned the whole table — at 100 sensors @ 5s that is
+// ~1.7M rows — and deleted ~72k of them in ONE write transaction, with every
+// probe INSERT blocked behind it up to the 15s busy_timeout: stalled probes
+// and timing jitter right at the top of the hour. The fix deletes per sensor
+// (the inner select is an index range scan on the (sensor_id, ts) prefix) in
+// bounded batches of purgeBatchSize rows, so the write lock is held only for
+// one batch (a few ms) and released between batches. A sensor whose rows are
+// all inside the window costs one cheap empty round trip.
 func (pw *ProbeWorker) purgeOld() {
 	cutoff := fmtTS(time.Now().Add(-24 * time.Hour))
+	ids, err := pw.db.SensorIDs()
+	if err != nil {
+		log.Printf("retention: failed to list sensors: %v", err)
+		return
+	}
 	for _, table := range []string{"probes", "events"} {
-		res, err := pw.db.Exec("DELETE FROM "+table+" WHERE ts < ?", cutoff)
-		if err != nil {
-			log.Printf("retention: failed to purge %s: %v", table, err)
-			continue
+		total := int64(0)
+		for _, id := range ids {
+			for {
+				res, err := pw.db.Exec(`DELETE FROM `+table+` WHERE id IN (
+					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
+				if err != nil {
+					log.Printf("retention: failed to purge %s for sensor %s: %v", table, id, err)
+					break
+				}
+				n, _ := res.RowsAffected()
+				total += n
+				if n < purgeBatchSize {
+					break
+				}
+			}
 		}
-		if n, _ := res.RowsAffected(); n > 0 {
-			log.Printf("retention: purged %d rows from %s", n, table)
+		if total > 0 {
+			log.Printf("retention: purged %d rows from %s", total, table)
 		}
 	}
 }

@@ -775,6 +775,27 @@ func (db *DB) ActiveSensorIDs() ([]string, error) {
 	return ids, rows.Err()
 }
 
+// SensorIDs lists the ids of every sensor in ANY state, in name order.
+// Used by the retention purge: every probes/events row references a current
+// sensor (FK ON DELETE CASCADE removes a deleted sensor's rows), so
+// per-sensor purging over this set covers the whole table.
+func (db *DB) SensorIDs() ([]string, error) {
+	rows, err := db.Query("SELECT id FROM sensors ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
 // SensorStatus returns a sensor's current health status (up/warning/
 // error). A missing sensor is an error (sql.ErrNoRows) so callers can
 // tell "gone" from "up".
