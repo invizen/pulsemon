@@ -152,3 +152,46 @@ func TestLossWarnIsARealGate(t *testing.T) {
 		}
 	}
 }
+
+// TestLossWarnZeroedRowNeverReadsUp pins the defensive contract after the
+// unreachable loss_warn == 0 branch was deleted: loss_warn is API-enforced
+// to 1-100, but a hand-zeroed row (DB surgery) must NEVER read up — the up
+// rule's threshold comparison (lossPct < 0) can never pass, and any window
+// loss meets the (always-true) warning test. The first case fails on the
+// pre-deletion code: its `c.lossWarn == 0 ||` up-rule arm read up on a
+// 2-straight-good tick.
+func TestLossWarnZeroedRowNeverReadsUp(t *testing.T) {
+	probeErrCount.Store(0) // isolate from the broken-socket gate
+	db, err := NewDB(filepath.Join(t.TempDir(), "losswarn0.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+
+	// Steady state (newest two ok) with 2/8 = 25% window loss.
+	pw := seedSensor(t, db, "lw0-steady", 0, 2, 3,
+		[]*float64{nil, f64(10), nil, f64(10), f64(10), f64(10), f64(10), f64(10)})
+	c := sensorConfig{id: "lw0-steady", lossWarn: 0, downAfter: 2}
+	if got := pw.deriveStatus(c, "up"); got != "warning" {
+		t.Errorf("zeroed row, steady state = %q, want warning (zeroed row never reads up)", got)
+	}
+
+	// Single loss as the newest probe: any loss meets the threshold.
+	pw = seedSensor(t, db, "lw0-single", 0, 2, 3,
+		[]*float64{f64(10), f64(10), f64(10), f64(10), f64(10), f64(10), f64(10), nil})
+	c = sensorConfig{id: "lw0-single", lossWarn: 0, downAfter: 2}
+	if got := pw.deriveStatus(c, "up"); got != "warning" {
+		t.Errorf("zeroed row, single newest loss = %q, want warning", got)
+	}
+
+	// down_after consecutive losses still beats the zeroed threshold.
+	pw = seedSensor(t, db, "lw0-down", 0, 2, 3,
+		[]*float64{f64(10), f64(10), nil, nil})
+	c = sensorConfig{id: "lw0-down", lossWarn: 0, downAfter: 2}
+	if got := pw.deriveStatus(c, "up"); got != "error" {
+		t.Errorf("zeroed row, 2 consecutive losses = %q, want error", got)
+	}
+}

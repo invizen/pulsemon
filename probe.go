@@ -1855,8 +1855,7 @@ const statusWindow = 8
 //	            by the LOSS metric and the red sparkline bar.
 //	error     — `down_after` consecutive losses from the newest probe
 //	warning   — window loss% (last `statusWindow` probes) >= loss_warn
-//	            (and not error); loss_warn == 0 (disabled, API-unreachable)
-//	            warns on any loss in the window
+//	            (and not error)
 //
 // loss_warn is the SOLE warning gate, and the up rule honors it: the
 // steady-state branch checks the window loss% before returning up, so a
@@ -1870,6 +1869,10 @@ const statusWindow = 8
 // always computed over the newest statusWindow probes, the same window the
 // inspector displays. A probe-level ICMP error (broken socket) forces
 // warning so a dead probe path never reads as "up".
+//
+// loss_warn is API-enforced to 1-100 (create and PATCH both reject 0), so
+// the threshold is always a real value. A hand-zeroed row (DB surgery)
+// reads warning by construction — it never reads up.
 func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// Broken probe path (the ICMP engine is unusable): this probe never
 	// landed, so we cannot know the real state — flag warning, never up. An
@@ -1940,14 +1943,12 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// gated on the threshold so the up rule can't short-circuit the sole
 	// warning gate: a flapping sensor whose window loss has crossed
 	// loss_warn reads warning, not up, even on a 2-straight-good tick.
-	// (loss_warn == 0 keeps the pre-gate steady-state behavior — the
-	// defensive zeroed-row path, unreachable via the API.)
 	upRule := false
 	if !isLost(recent[0]) {
 		switch {
 		case lastStatus == "error" || len(recent) == 1:
 			upRule = true
-		case !isLost(recent[1]) && (c.lossWarn == 0 || lossPct < float64(c.lossWarn)):
+		case !isLost(recent[1]) && lossPct < float64(c.lossWarn):
 			upRule = true
 		}
 	}
@@ -1974,22 +1975,16 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	// SOLE warning gate: loss_warn is a real threshold, not a decoration.
 	// A sensor whose window loss is below it reads "up" even when the
 	// newest probe is a single loss — the LOSS metric and the red
-	// sparkline bar still show the blip.
-	if c.lossWarn > 0 {
-		if lossPct >= float64(c.lossWarn) {
-			return "warning"
-		}
-		// Below the threshold: the window is statistically healthy, so the
-		// sensor reads up (a single recent loss among sub-threshold stats
-		// is a blip, not degradation).
-		return "up"
+	// sparkline bar still show the blip. (A zeroed loss_warn — impossible
+	// via the API — meets this test for any loss, so a corrupted row
+	// degrades loudly rather than reading up while dropping packets.)
+	if lossPct >= float64(c.lossWarn) {
+		return "warning"
 	}
-
-	// loss_warn == 0 (threshold disabled): any loss in the window that
-	// isn't an error degrades the sensor. Unreachable via the API — it
-	// validates 1-100 — kept so a zeroed row degrades loudly rather than
-	// reading up while dropping packets.
-	return "warning"
+	// Below the threshold: the window is statistically healthy, so the
+	// sensor reads up (a single recent loss among sub-threshold stats
+	// is a blip, not degradation).
+	return "up"
 }
 
 // recentFromCache returns up to limit most-recent RTTs (index 0 = newest,

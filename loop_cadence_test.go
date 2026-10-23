@@ -66,10 +66,11 @@ func TestSensorLoopResetCadence(t *testing.T) {
 	defer func() { probeTarget = origTarget }()
 
 	pw := &ProbeWorker{
-		sensors:    make(map[string]*ProbeState),
-		loops:      make(map[string]context.CancelFunc),
-		db:         db,
-		statsCache: make(map[string]*probeSeries),
+		sensors:         make(map[string]*ProbeState),
+		loops:           make(map[string]context.CancelFunc),
+		db:              db,
+		statsCache:      make(map[string]*probeSeries),
+		alertOrderGates: make(map[string]chan func()),
 	}
 	pw.sensors[id] = &ProbeState{id: id}
 
@@ -78,6 +79,10 @@ func TestSensorLoopResetCadence(t *testing.T) {
 	go pw.sensorLoop(ctx, sensorConfig{
 		id: id, name: id, target: "127.0.0.1", probeType: "icmp",
 		intervalS: intervalS, timeoutMS: 200,
+		// Match the seeded row (loss_warn=25, down_after=2): a zeroed
+		// config is unreachable via the API and would trip the
+		// consec >= downAfter check on every tick.
+		lossWarn: 25, downAfter: 2,
 	}, false) // false = first-spawn semantics (this test never went through syncSensors)
 
 	// Let it tick. interval=1s + a deterministic per-sensor phase (>=0.25s)
