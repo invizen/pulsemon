@@ -531,6 +531,10 @@
       <label class="text-[11px] font-mono text-slate-400">Username</label>
       <input id="acc-u" type="text" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
     </div>
+    <div id="acc-modal-current-wrap" class="hidden">
+      <label class="text-[11px] font-mono text-slate-400">Current Password</label>
+      <input id="acc-p0" type="password" autocomplete="current-password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
+    </div>
     <div>
       <label class="text-[11px] font-mono text-slate-400">Password (8+ chars)</label>
       <input id="acc-p" type="password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
@@ -1589,7 +1593,8 @@ async function renderAuthPanel() {
 function openFirstAccountDialog() {
   accountModalMode = 'create';
   $('acc-modal-title').textContent = 'Create Admin Account';$('acc-modal-user-wrap').classList.remove('hidden');
-  $('acc-u').value = '';$('acc-p').value = '';
+  $('acc-modal-current-wrap').classList.add('hidden');
+  $('acc-u').value = '';$('acc-p0').value = '';$('acc-p').value = '';
   $('acc-p2').value = '';$('acc-err').classList.add('hidden');
   $('acc-modal').classList.remove('hidden');$('acc-u').focus();
 }
@@ -1597,15 +1602,18 @@ function openFirstAccountDialog() {
 function openChangePasswordDialog() {
   accountModalMode = 'password';
   $('acc-modal-title').textContent = 'Change Password (' + ($('auth-me').textContent || 'User') + ')';
-  $('acc-modal-user-wrap').classList.add('hidden');$('acc-p').value = '';
+  $('acc-modal-user-wrap').classList.add('hidden');$('acc-modal-current-wrap').classList.remove('hidden');
+  $('acc-p0').value = '';$('acc-p').value = '';
   $('acc-p2').value = '';$('acc-err').classList.add('hidden');
-  $('acc-modal').classList.remove('hidden');$('acc-p').focus();
+  $('acc-modal').classList.remove('hidden');$('acc-p0').focus();
 }
 
 async function submitAccountModal() {
+  const p0 = $('acc-p0').value;
   const p = $('acc-p').value;
   const p2 = $('acc-p2').value;
   const err = $('acc-err');
+  if (accountModalMode === 'password' && p0 === '') { err.textContent = 'Current password is required'; err.classList.remove('hidden'); return; }
   if (p.length < 8) { err.textContent = 'Password must be 8+ characters'; err.classList.remove('hidden'); return; }
   if (p !== p2) { err.textContent = 'Passwords do not match'; err.classList.remove('hidden'); return; }
 
@@ -1618,7 +1626,7 @@ async function submitAccountModal() {
       setMsg('authentication enabled', 'ok');
     } else {
       const me = (authState && authState.user) || $('auth-me').textContent;
-      await api('/api/auth/users/' + encodeURIComponent(me) + '/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password: p }) });
+      await api('/api/auth/users/' + encodeURIComponent(me) + '/password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: p0, password: p }) });
       setMsg('password updated', 'ok');
     }
     $('acc-modal').classList.add('hidden');

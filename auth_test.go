@@ -567,8 +567,9 @@ func TestAuthGateEndToEnd(t *testing.T) {
 		if resp.StatusCode != 400 {
 			t.Fatalf("duplicate user: got %d, want 400", resp.StatusCode)
 		}
-		// Change my own password.
-		resp = post("/api/auth/users/admin/password", `{"password":"newpass9"}`)
+		// Change my own password (current password required since the
+		// 2026-10-23 external-review fix).
+		resp = post("/api/auth/users/admin/password", `{"current_password":"secretpw","password":"newpass9"}`)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Fatalf("change own password: got %d", resp.StatusCode)

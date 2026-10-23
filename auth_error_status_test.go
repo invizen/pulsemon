@@ -56,8 +56,9 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 		t.Fatalf("login: got %d (%s), want 200", code, body)
 	}
 
-	// 1. Weak password: validation sentinel → 400 with our text.
-	if code, body := do(http.MethodPost, "/api/auth/users/admin/password", `{"password":"short"}`); code != 400 {
+	// 1. Weak password: validation sentinel → 400 with our text (current
+	// password correct, so the check reaches the new-password validation).
+	if code, body := do(http.MethodPost, "/api/auth/users/admin/password", `{"current_password":"secretpw123","password":"short"}`); code != 400 {
 		t.Fatalf("weak password change: got %d (%s), want 400", code, body)
 	} else if !strings.Contains(body, "password") {
 		t.Fatalf("weak password change: body %q does not carry the validation message", body)
@@ -80,17 +81,18 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 		t.Fatalf("delete last user: body %q does not carry the guard message", body)
 	}
 
-	// 4. DB failure: with the users table gone, change-password must
-	// answer a generic 500 — NOT a 400 echoing the raw driver text. The
-	// session's user-existence check is TTL-cached (2s) and was primed by
-	// the requests above, so the gate still passes and the handler runs
-	// into the missing table (this call must stay within that window of
-	// step 3 — it is back-to-back).
+	// 4. DB failure: with the users table gone, the current-password
+	// verification (2026-10-23) hits the missing table FIRST and must
+	// answer a generic 403 — NOT a 400/500 echoing the raw driver text.
+	// The session's user-existence check is TTL-cached (2s) and was
+	// primed by the requests above, so the gate still passes and the
+	// handler runs (this call must stay within that window of step 3 —
+	// it is back-to-back).
 	if _, err := db.Exec("DROP TABLE users"); err != nil {
 		t.Fatalf("drop users table: %v", err)
 	}
-	if code, body := do(http.MethodPost, "/api/auth/users/admin/password", `{"password":"secretpw123"}`); code != 500 {
-		t.Fatalf("password change with broken db: got %d (%s), want 500", code, body)
+	if code, body := do(http.MethodPost, "/api/auth/users/admin/password", `{"current_password":"secretpw123","password":"secretpw123"}`); code != 403 {
+		t.Fatalf("password change with broken db: got %d (%s), want 403", code, body)
 	} else if strings.Contains(body, "no such table") {
 		t.Fatalf("password change with broken db: body %q leaks the raw driver text", body)
 	}

@@ -1224,6 +1224,15 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 // only (the {username} in the path must match the session's user — anyone
 // else gets 404, not 403, so the endpoint doesn't even confirm other
 // usernames exist).
+//
+// The CURRENT password is required (2026-10-23 external review): without
+// it, any valid session — a stolen cookie, an unlocked browser left on
+// the 30-day session — could set a new password, and SetUserPassword's
+// dropUserSessionsExcept would then log out every other session, so the
+// real owner was permanently locked out (account takeover). The check
+// runs through the login throttle (beginAttempt, same per-IP bucketing)
+// with the same constant rejection delay, so the endpoint is not a free
+// online-guessing channel for the current password either.
 func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1236,6 +1245,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req struct {
+		Current  string `json:"current_password"`
 		Password string `json:"password"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1243,6 +1253,40 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, code, msg)
 		return
 	}
+	if req.Current == "" || req.Password == "" {
+		// Malformed, not a credential attempt — same treatment as login's
+		// empty-credentials path: 400, and NOT counted against the throttle
+		// (no KDF ran, so it's not an online-cracking vector).
+		respondWithError(w, http.StatusBadRequest, "current password and new password required")
+		return
+	}
+
+	// Per-IP failure throttle, identical bucketing to login: this endpoint
+	// verifies a real password, so it must carry the same 7-failures/60s →
+	// 5-minute lockout. beginAttempt counts the attempt in the same locked
+	// section that admits it (a failure is not recorded again below).
+	ip := s.auth.ClientIP(r)
+	key := throttleKey(ip)
+	if ok, wait := s.auth.beginAttempt(key); !ok {
+		secs := int((wait + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		respondWithError(w, http.StatusTooManyRequests, "too many failed attempts — try again in a few minutes")
+		return
+	}
+
+	if _, ok := s.auth.VerifyUser(user, req.Current); !ok {
+		// Constant-time-ish delay on rejection, same as a rejected login:
+		// caps an online attacker at ~5 guesses/second per IP. The attempt
+		// was already counted by beginAttempt before the KDF.
+		time.Sleep(loginSlowDown)
+		respondWithError(w, http.StatusForbidden, "current password incorrect")
+		return
+	}
+	s.auth.loginSuccess(key)
+
 	keep := ""
 	if c, err := r.Cookie(authSessionName); err == nil {
 		keep = c.Value
