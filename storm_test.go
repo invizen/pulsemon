@@ -180,7 +180,7 @@ func TestStormRecoveryAlwaysAdmitted(t *testing.T) {
 // flush must not appear in the summary (it would contradict the recovery
 // alert it raced).
 func TestStormFlushDropsRecovered(t *testing.T) {
-	withStormBudget(t, 1, 500*time.Millisecond, func() {
+	withStormBudget(t, 0, 500*time.Millisecond, func() {
 		withPlainTransport(t, func() { // loopback httptest vs the SSRF blocklist
 			pw, db, getBodies, cleanup := newStormTestWorker(t)
 			defer cleanup()
@@ -193,14 +193,22 @@ func TestStormFlushDropsRecovered(t *testing.T) {
 				t.Fatalf("set a0/a1 error: %v", err)
 			}
 
-			// Wait until BOTH are in the suppressed queue (budget 1: the first
-			// is admitted individually, the second is queued).
+			// Wait until BOTH are in the suppressed queue. Budget is 0, not 1:
+			// with a budget of 1 the FIRST alert is admitted individually and
+			// only the second is queued, so WHICH one ends up queued is a coin
+			// flip between the two concurrent launchAlert goroutines — and the
+			// assertions below (summary has a0, not a1) only hold when a0 is
+			// the queued one. When the race went the other way (a0 admitted,
+			// a1 queued), a1 recovered → dropped → empty queue → no summary
+			// ("summaries = 0, want 1"): the flake. Budget 0 queues BOTH
+			// deterministically (no admission), so the recovered-sensor drop is
+			// tested against a guaranteed non-empty summary.
 			deadline := time.Now().Add(3 * time.Second)
 			for {
 				pw.stormMu.Lock()
 				n := len(pw.stormQueue)
 				pw.stormMu.Unlock()
-				if n >= 1 || time.Now().After(deadline) {
+				if n >= 2 || time.Now().After(deadline) {
 					break
 				}
 				time.Sleep(5 * time.Millisecond)
