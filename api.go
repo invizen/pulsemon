@@ -2180,7 +2180,18 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 			}
 			return strings.TrimSpace(storedExtra[k])
 		}
-		if eff("tls_mode") == "none" && (eff("username") != "" || eff("password") != "") {
+		// Credential PRESENCE is judged on the RAW value (F10):
+		// credentials are stored untrimmed, so a spaces-only password is
+		// still a credential and must block tls_mode=none. (eff stays
+		// trimmed — it also reads tls_mode, which is format-validated in
+		// trimmed form.)
+		cred := func(k string) string {
+			if v, ok := extra[k]; ok {
+				return v
+			}
+			return storedExtra[k]
+		}
+		if eff("tls_mode") == "none" && (cred("username") != "" || cred("password") != "") {
 			return fmt.Errorf("smtp tls_mode=none cannot use credentials (clear username/password)")
 		}
 	}
@@ -2264,11 +2275,21 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 	// Non-URL fields (e.g. telegram chat_id): validated above; the loop
 	// persists the accepted keys.
 	for k, v := range extra {
-		vv := strings.TrimSpace(v)
+		// Credentials (username/password) are stored RAW, not trimmed
+		// (2026-10-23 external review F10): a leading/trailing space in
+		// an SMTP credential is part of the value, and trimming it would
+		// silently change the AUTH exchange. Every other extra field
+		// keeps the trim.
+		vv := v
+		if k != "username" && k != "password" {
+			vv = strings.TrimSpace(v)
+		}
 		// SMTP password: the mask value means "unchanged" (the UI returns
 		// the fixed mask for a stored password). Skip the write so we never
-		// clobber the real credential with the mask string.
-		if kind == "smtp" && k == "password" && vv == "••••••••" {
+		// clobber the real credential with the mask string. Compared on the
+		// RAW value — the exact mask is the token; a masked value with
+		// surrounding spaces is a (weird) literal password, not the mask.
+		if kind == "smtp" && k == "password" && v == "••••••••" {
 			continue
 		}
 		if kind == "smtp" && (k == "from" || k == "to") {
