@@ -297,12 +297,17 @@ type ProbeWorker struct {
 	// (2026-10-19 review F4): an "error" alert whose webhook attempt fails
 	// and retries must not be delivered AFTER the sensor's later
 	// "recovered" alert — a chat whose last word is "error" on a recovered
-	// sensor is worse than a late alert. One lazily-started consumer
-	// goroutine per sensor drains a small FIFO; jobs run strictly in queue
-	// order. Guarded by alertMu. Remove drops a deleted sensor's map entry;
-	// its idle consumer (blocked on the unclosed channel) is left behind —
-	// one per deleted sensor, negligible at homelab sensor counts, and
-	// closing the channel would panic a sender still queued on it.
+	// sensor is worse than a late alert. One consumer goroutine per sensor
+	// drains a small FIFO; jobs run strictly in queue order. Guarded by
+	// alertMu. The channel is NEVER closed: an in-flight sendWebhook may
+	// still hold it and send, and a send on a closed channel panics.
+	// Instead the consumer exits after alertGateIdle with an empty queue
+	// (2026-10-23 external review F7) — the old "range ch" consumer lived
+	// forever, leaking one goroutine per deleted sensor, and Remove's map
+	// delete was the only cleanup. Idle exit recycles both a deleted
+	// sensor's consumer (Remove drops the entry; the next idle fire finds
+	// an empty queue and goes away) and a quiet live sensor's consumer
+	// (the next alert re-creates the gate).
 	alertMu         sync.Mutex
 	alertOrderGates map[string]chan func()
 
@@ -353,26 +358,88 @@ func NewProbeWorker(db *DB) *ProbeWorker {
 	}
 }
 
-// alertGate returns the FIFO job channel that serializes one sensor's
-// alert deliveries, starting its consumer goroutine on first use
-// (2026-10-19 review F4 — see the alertOrderGates field comment). The queue is
-// small on purpose: alert cadence is bounded by the probe interval and
-// realert_min, so a deep queue would only mean a wedged provider is
-// stacking undeliverable alerts.
-func (pw *ProbeWorker) alertGate(id string) chan func() {
+// alertGateIdle is how long an idle per-sensor alert consumer waits for
+// its next job before exiting and dropping its map entry (2026-10-23
+// external review F7). A var so tests can shrink it; 10 minutes is far
+// beyond any real alert cadence gap for a sensor that is alerting, so a
+// live alerting sensor's consumer is effectively permanent — the idle
+// exit only reclaims consumers whose sensor is quiet (deleted, or simply
+// healthy).
+var alertGateIdle = 10 * time.Minute
+
+// enqueueAlert queues job on the sensor's alert FIFO, creating the gate
+// and its consumer on first use (2026-10-19 review F4). The SEND happens
+// under alertMu (2026-10-23 external review F7): the consumer's idle-exit
+// check runs under the same lock, so it can never observe an empty queue
+// and exit while a send is in flight — that window would orphan the job
+// in the buffer with no reader (a silently dropped alert). Holding the
+// lock across the send is safe: the 8-slot buffer bounds any wait, the
+// consumer drains WITHOUT holding alertMu (job() is alert delivery —
+// webhook/SMTP I/O), and no job takes alertMu, so there is no deadlock.
+func (pw *ProbeWorker) enqueueAlert(id string, job func()) {
 	pw.alertMu.Lock()
 	defer pw.alertMu.Unlock()
 	ch, ok := pw.alertOrderGates[id]
 	if !ok {
 		ch = make(chan func(), 8)
 		pw.alertOrderGates[id] = ch
-		go func() {
-			for job := range ch {
-				job()
-			}
-		}()
+		// The idle duration is captured HERE, on the caller's goroutine,
+		// and passed in: the consumer must not read the package var
+		// itself. A test shrinks alertGateIdle and restores it in
+		// t.Cleanup, and a consumer spawned near test end can be
+		// unscheduled past that restore — the consumer reading the var
+		// concurrently with the restore is a data race (caught by -race).
+		// In production the var is never mutated, so the capture is
+		// invisible there.
+		go pw.alertGateConsumer(id, ch, alertGateIdle)
 	}
-	return ch
+	ch <- job
+}
+
+// alertGateConsumer drains one sensor's alert FIFO and exits after
+// alertGateIdle with no queued jobs (2026-10-23 external review F7).
+// The old "for job := range ch" consumer lived forever: Remove drops the
+// map entry but the channel is never closed (an in-flight sendWebhook
+// sending on a closed channel panics), so one goroutine leaked per
+// deleted sensor for the process lifetime. Idle exit replaces the leak:
+// the consumer reaps itself when the queue is empty.
+//
+// The exit check runs under alertMu — the same lock enqueueAlert holds
+// across its send — so len(ch) == 0 under the lock means no job is
+// queued AND no send is in flight: exiting drops nothing. When the map
+// entry is gone (Remove) or points at a newer channel (a quiet sensor's
+// gate was recycled and re-created), the consumer just exits without
+// touching the map.
+func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time.Duration) {
+	idle := time.NewTimer(idleDur)
+	for {
+		select {
+		case job := <-ch:
+			job()
+			// Drain-then-Reset (the canonical safe pattern): the timer
+			// may have fired while job() was running; a Reset without
+			// draining the fired value would leave a stale ready in
+			// idle.C.
+			if !idle.Stop() {
+				select {
+				case <-idle.C:
+				default:
+				}
+			}
+			idle.Reset(idleDur)
+		case <-idle.C:
+			pw.alertMu.Lock()
+			if len(ch) == 0 {
+				if pw.alertOrderGates[id] == ch {
+					delete(pw.alertOrderGates, id)
+				}
+				pw.alertMu.Unlock()
+				return
+			}
+			pw.alertMu.Unlock()
+			idle.Reset(idleDur)
+		}
+	}
 }
 
 // Run reconciles the probe set from the DB every 5s, plus hourly retention.
@@ -728,9 +795,11 @@ func (pw *ProbeWorker) Remove(id string) {
 	delete(pw.statsCache, id)
 	pw.statsMu.Unlock()
 	// Same for the per-sensor alert gate (2026-10-19 review F4): drop the
-	// map entry so the channel isn't pinned by the map. The idle consumer
-	// goroutine (blocked on the unclosed channel) is left behind — see the
-	// alertOrderGates field comment for why the channel is not closed.
+	// map entry so the channel isn't pinned by the map. The consumer is
+	// NOT signalled — it reaps itself on its next idle fire (the queue is
+	// empty, so it exits within alertGateIdle); closing the channel here
+	// would panic an in-flight sendWebhook sending on it (2026-10-23
+	// external review F7). See the alertOrderGates field comment.
 	pw.alertMu.Lock()
 	delete(pw.alertOrderGates, id)
 	pw.alertMu.Unlock()
@@ -2264,9 +2333,9 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		return true
 	}
 	done := make(chan bool, 1)
-	pw.alertGate(id) <- func() {
+	pw.enqueueAlert(id, func() {
 		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
-	}
+	})
 	return <-done
 }
 
