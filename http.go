@@ -83,8 +83,10 @@ const maxHTTPRedirects = 5
 // cross-host hop is resolved and refused if ANY resolved address is in a
 // never-monitorable range (loopback, link-local incl. cloud metadata
 // 169.254.169.254, unspecified, multicast, or a webhook blockedSubnets
-// range). RFC1918/ULA cross-host hops pass: LAN-to-LAN redirects are
-// legitimate for monitoring.
+// range — with the CGNAT 100.64/10 entry skipped under the
+// PULSEMON_ALLOW_CGNAT opt-out, since a Tailscale/Headscale tailnet host
+// is a legitimate redirect target there). RFC1918/ULA cross-host hops
+// pass: LAN-to-LAN redirects are legitimate for monitoring.
 //
 // Known limitation (stated, not hidden): hostname resolution here has a
 // TOCTOU window that the webhook path closes by pinning its dial to the

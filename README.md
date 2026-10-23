@@ -130,6 +130,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | env | `PULSEMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
 | env | `PULSEMON_CERT` + `PULSEMON_KEY` — optional TLS certificate and key file paths (PEM). Set **both** together to serve HTTPS; omit both for plain HTTP. **When a valid pair is in place, pulsemon serves HTTPS ONLY on `listener_https_port` (Dashboard → Settings, default `443`) and does NOT bind the `PULSEMON_ADDR` port at all** — there is no plaintext fallback while a pair is configured. ⚠️ **Non-root and Docker users MUST set `listener_https_port` to an unprivileged port (e.g. `8443`)**: the default 443 bind fails without root, and the server will not start. If the files are missing, pulsemon warns and serves plain HTTP on `PULSEMON_ADDR` (so a fresh clone with no `certs/` dir doesn't crash-loop; opt back into this with `PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1`); if they exist but are corrupt or mismatched, startup fails — TLS is never silently degraded when a pair is in place. A self-signed or wildcard cert works for LAN use; use a real cert if the dashboard is reachable from outside. |
 | env | `PULSEMON_TRUSTED_PROXIES` — optional comma-separated list of CIDRs (or bare IPs) of **immediate TCP peers** whose `X-Forwarded-For` header is trusted for login rate-limiting. By default `X-Forwarded-For` is **ignored** (the throttle keys on the direct TCP peer), so a spoofed/rotated header can't dodge the per-IP lockout. When pulsemon sits behind a reverse proxy (Caddy, nginx, …) and you want attempts attributed to the real client, set this to the proxy's IP(s), e.g. `127.0.0.1` or `192.168.1.0/24`. The header is only ever read when the connection's source address is in this list. |
+| env | `PULSEMON_ALLOW_CGNAT` — optional. Set to `1` to allow the CGNAT range (`100.64.0.0/10`) as a webhook, SMTP, or sensor-redirect target. Tailscale and Headscale assign every tailnet node an address in `100.64.0.0/10`, so a self-hosted ntfy/Gotify relay over the tailnet — or an HTTP sensor whose target redirects to a tailnet host — is refused without it. The rest of the SSRF blocklist (loopback, `169.254/16` cloud metadata, …) is unaffected. |
 | Dashboard → Settings | Alert destinations (Google Chat, Discord — each with its own URL and toggle), alert routing, re-alert interval, maintenance mode, TLS certificate, **Authentication** (create the first account, add/remove accounts, change password, disable) |
 | Per sensor | Interval, timeout, loss %, error-after, tags |
 | CLI | `pulsemon auth-user add <user> <pass>` — create a dashboard account (the FIRST account is what turns authentication on). `pulsemon auth-user remove <user>` — delete an account (the last one is refused; use the dashboard's "Disable Authentication" for that). `pulsemon auth-user list` — list accounts. Auth is opt-in; with no accounts the dashboard is open, as before. |
@@ -155,6 +156,14 @@ When pulsemon sits behind Caddy, Traefik, nginx, or similar:
   DNS-rebinding route by which a malicious web page could claim the first
   account through a LAN browser. Unset = any Host (the LAN-trust default).
   Has no effect once an account exists.
+- **`PULSEMON_ALLOW_CGNAT`** — optional opt-out of the CGNAT
+  (`100.64.0.0/10`) entry in the webhook/SMTP/redirect blocklist. Tailscale
+  and Headscale assign every tailnet node an address in that range, so a
+  homelab that runs a tailnet and wants to reach a self-hosted relay (ntfy,
+  Gotify, mail) over it — or monitor a target that redirects to a tailnet
+  host — sets `PULSEMON_ALLOW_CGNAT=1`. It skips the CGNAT entry only;
+  loopback, `169.254/16` (cloud metadata), and every other blocked range
+  stay hard.
 - The proxy must preserve the original `Host` header (Caddy and Traefik do by
   default) — the cross-origin check compares it with the browser's `Origin`.
 

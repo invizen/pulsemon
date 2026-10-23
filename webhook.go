@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -230,12 +231,17 @@ func validateWebhookURL(raw string) error {
 //     reaching local services.
 //   - 198.18.0.0/15 (RFC 2544) — IETF-reserved-for-testing; never a valid
 //     destination.
-//   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. This is the ISP's
-//     carrier range, NOT the user's LAN: a self-hosted relay reachable from
-//     the homelab sits in RFC1918 space (still allowed, see
-//     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth
-//     without breaking the documented use case. A webhook pointed at a CGNAT
-//     address can never be a working relay.
+//   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. On a plain LAN this is
+//     the ISP's carrier range, NOT the user's LAN: a self-hosted relay
+//     reachable from the homelab sits in RFC1918 space (still allowed, see
+//     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth.
+//     EXCEPTION (2026-10-23 external review F6): a Tailscale/Headscale
+//     tailnet assigns EVERY node an address in exactly this range, so on a
+//     tailnet the "NOT the user's LAN" comment is false — a webhook to a
+//     self-hosted ntfy/Gotify over the tailnet, and an HTTP sensor whose
+//     target redirects to a tailnet host, were both refused. The opt-out:
+//     PULSEMON_ALLOW_CGNAT=1 skips this entry only (allowCGNAT);
+//     169.254/16 (cloud metadata) and the rest of the blocklist stay hard.
 //   - 64:ff9b::/96 (RFC 6052) — NAT64 well-known prefix: an IPv6 literal
 //     that TUNNELS an IPv4 destination (e.g. 64:ff9b::7f00:1 == 127.0.0.1).
 //     Without this, an attacker writes the loopback address in IPv6 dress.
@@ -246,13 +252,22 @@ func validateWebhookURL(raw string) error {
 //
 // RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are deliberately
 // NOT here: the design allows them so a LAN relay works.
-var blockedSubnets = []*net.IPNet{
-	mustCIDR("0.0.0.0/8"),
-	mustCIDR("198.18.0.0/15"),
-	mustCIDR("100.64.0.0/10"),
-	mustCIDR("64:ff9b::/96"),
-	mustCIDR("2002::/16"),
-	mustCIDR("240.0.0.0/4"),
+//
+// blockedRange is one entry of the list. cgnat marks 100.64.0.0/10, the one
+// entry an operator can opt out of (allowCGNAT / PULSEMON_ALLOW_CGNAT) —
+// see the CGNAT note above.
+type blockedRange struct {
+	cidr  *net.IPNet
+	cgnat bool
+}
+
+var blockedSubnets = []blockedRange{
+	{cidr: mustCIDR("0.0.0.0/8")},
+	{cidr: mustCIDR("198.18.0.0/15")},
+	{cidr: mustCIDR("100.64.0.0/10"), cgnat: true},
+	{cidr: mustCIDR("64:ff9b::/96")},
+	{cidr: mustCIDR("2002::/16")},
+	{cidr: mustCIDR("240.0.0.0/4")},
 }
 
 func mustCIDR(s string) *net.IPNet {
@@ -261,6 +276,24 @@ func mustCIDR(s string) *net.IPNet {
 		panic("pulsemon: bad hardcoded CIDR " + s + ": " + err.Error())
 	}
 	return n
+}
+
+// allowCGNAT reports whether the operator opted out of the CGNAT
+// (100.64.0.0/10) block via PULSEMON_ALLOW_CGNAT (2026-10-23 external
+// review F6). It is read once at startup — an install-time setting like
+// PULSEMON_ALLOWED_HOSTS — and the only other writer is tests. When set,
+// checkWebhookIP skips the CGNAT entry so webhooks, SMTP relays, and
+// sensor-redirect hops can reach a Tailscale/Headscale tailnet (every
+// tailnet node lives in 100.64.0.0/10). The opt-out is CGNAT-ONLY:
+// 169.254/16 (cloud metadata), loopback, and every other blocked range
+// stay hard.
+var allowCGNAT = parseCGNATOptOut()
+
+// parseCGNATOptOut parses PULSEMON_ALLOW_CGNAT: 1/true/yes (any case)
+// enables the opt-out; anything else (including unset) keeps the block.
+func parseCGNATOptOut() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PULSEMON_ALLOW_CGNAT")))
+	return v == "1" || v == "true" || v == "yes"
 }
 
 func checkWebhookIP(ip net.IP, host string) error {
@@ -274,11 +307,15 @@ func checkWebhookIP(ip net.IP, host string) error {
 		ip.IsUnspecified() || ip.IsMulticast() {
 		return fmt.Errorf("host %q resolves to a blocked address (%s)", host, ip)
 	}
-	// Reserved-for-testing (198.18/15), carrier-NAT (100.64/10), NAT64
-	// (64:ff9b::/96), Teredo (2002::/16) and Class E/broadcast (240/4)
-	// ranges: never a valid destination (see blockedSubnets).
+	// Reserved-for-testing (198.18/15), carrier-NAT (100.64/10 — skipped
+	// under the PULSEMON_ALLOW_CGNAT opt-out, where it is the tailnet),
+	// NAT64 (64:ff9b::/96), Teredo (2002::/16) and Class E/broadcast
+	// (240/4) ranges: never a valid destination (see blockedSubnets).
 	for _, n := range blockedSubnets {
-		if n.Contains(ip) {
+		if n.cgnat && allowCGNAT {
+			continue
+		}
+		if n.cidr.Contains(ip) {
 			return fmt.Errorf("host %q resolves to a reserved or carrier-NAT address (%s)", host, ip)
 		}
 	}
