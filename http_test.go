@@ -383,35 +383,18 @@ func TestVerifyHTTPCert(t *testing.T) {
 	}
 }
 
-// TestVariantHosts: the www/bare variant helper used by the system-trusted
-// verification path. A bare host gains a www. form; a www host gains its bare
-// form. The input is always first (exact match is tried before the variant).
-func TestVariantHosts(t *testing.T) {
-	if got := variantHosts("example.com"); len(got) != 2 || got[0] != "example.com" || got[1] != "www.example.com" {
-		t.Errorf("variantHosts(example.com) = %v, want [example.com www.example.com]", got)
-	}
-	if got := variantHosts("www.example.com"); len(got) != 2 || got[0] != "www.example.com" || got[1] != "example.com" {
-		t.Errorf("variantHosts(www.example.com) = %v, want [www.example.com example.com]", got)
-	}
-	// variantHosts is host-agnostic — it always appends the www form, even for
-	// an IP literal. The extra "www.10.0.0.5" entry is harmless: x509 matches
-	// an IP-literal DNSName against IP SANs only, so it can never match and
-	// the exact-match entry (got[0]) does the real work. We pin the shape.
-	if got := variantHosts("10.0.0.5"); len(got) != 2 || got[0] != "10.0.0.5" || got[1] != "www.10.0.0.5" {
-		t.Errorf("variantHosts(10.0.0.5) = %v, want [10.0.0.5 www.10.0.0.5]", got)
-	}
-}
-
-// TestVerifyHTTPCertSelfSignedExactMatchOnly: the self-signed (branch b) path
-// requires an EXACT hostname (or IP) match — NO www/bare variant fallback.
+// TestVerifyHTTPCertSelfSignedExactMatchOnly: BOTH verification branches
+// require an EXACT hostname (or IP) match — NO www/bare variant fallback.
 // The operator generated a self-signed cert and controls its SANs, so a
 // homelab cert carries the probed hostname itself; a www-variant SAN is a
-// public-CDN pattern that must not be accepted on the self-signed path, where
-// hostname match is the only security control (no CA chain). Self-signed
-// certs are used so the test is fully deterministic (no system trust store).
+// public-CDN pattern that must not be accepted, where hostname match is the
+// only security control (no CA chain). Self-signed certs are used so the
+// test is fully deterministic (no system trust store).
 //
-// This is the 2026-10-13 hardening: the www fallback now lives on the
-// system-trusted path only (see variantHosts / TestVariantHosts).
+// The 2026-10-13 hardening restricted the (then-existing) www fallback to
+// the system-trusted path; the 2026-10-23 external review (F13) removed it
+// from there too, so exact matching now applies everywhere (see
+// TestVerifyHTTPCertNoWWWVariant).
 func TestVerifyHTTPCertSelfSignedExactMatchOnly(t *testing.T) {
 	certFor := func(dns ...string) *x509.Certificate {
 		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -457,6 +440,41 @@ func TestVerifyHTTPCertSelfSignedExactMatchOnly(t *testing.T) {
 	// A different domain must NOT be accepted.
 	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "other.com"); err == nil {
 		t.Error("unrelated host accepted, want reject")
+	}
+}
+
+// TestVerifyHTTPCertNoWWWVariant: the 2026-10-23 external review (F13)
+// removed the www/bare variant fallback from the SYSTEM-TRUSTED branch too,
+// so a certificate covering only the www variant no longer passes for the
+// bare target (or vice versa) on ANY branch — matching what a browser does.
+// A monitoring tool must not be more permissive than the user's browser: a
+// www-only cert for a bare host is a real misconfiguration the operator
+// should be alerted to, not silently accepted.
+//
+// Self-signed certs are used so the test is deterministic (no system trust
+// store). Both cross-variant directions must be rejected; the exact-match
+// controls must be accepted. If this ever fails, a www-variant acceptance
+// path has been re-introduced — restore exact matching (see F13 in
+// verifyHTTPCert's doc).
+func TestVerifyHTTPCertNoWWWVariant(t *testing.T) {
+	wwwOnly := selfSignedWithSANs(t, nil, []string{"www.example.com"})
+	bareOnly := selfSignedWithSANs(t, nil, []string{"example.com"})
+
+	// Control: exact match is accepted.
+	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "www.example.com"); err != nil {
+		t.Errorf("exact www match rejected: %v", err)
+	}
+	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "example.com"); err != nil {
+		t.Errorf("exact bare match rejected: %v", err)
+	}
+	// F13: www-only cert vs bare target -> REJECTED (was accepted pre-F13 on
+	// the system-trusted branch).
+	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "example.com"); err == nil {
+		t.Error("www-only cert accepted for bare target, want reject (F13: no www variant fallback)")
+	}
+	// F13: bare-only cert vs www target -> REJECTED.
+	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "www.example.com"); err == nil {
+		t.Error("bare-only cert accepted for www target, want reject (F13: no www variant fallback)")
 	}
 }
 
