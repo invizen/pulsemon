@@ -153,7 +153,7 @@ func pubKeyEquals(priv, certPub any) bool {
 		b, ok := certPub.(*ecdsa.PublicKey)
 		return ok && a.Equal(b)
 	case ed25519.PublicKey:
-		// x509 yields ed25519.PublicKey by value (2026-10-19 review m3).
+		// x509 yields ed25519.PublicKey by value.
 		b, ok := certPub.(ed25519.PublicKey)
 		return ok && a.Equal(b)
 	case *ed25519.PublicKey:
@@ -199,7 +199,7 @@ func pubKeyFromAny(key interface{}) interface{} {
 		return &k.PublicKey
 	// PKCS8 Ed25519 keys parse to ed25519.PrivateKey; the default case
 	// passed the PRIVATE key through, so pubKeyEquals never matched and a
-	// valid Ed25519 pair was rejected (2026-10-19 review m3).
+	// valid Ed25519 pair was rejected.
 	case ed25519.PrivateKey:
 		return k.Public()
 	case *ed25519.PrivateKey:
@@ -260,7 +260,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 
 	if cert != "" {
 		// What lands on disk: the FULL chain (leaf + every intermediate),
-		// canonical PEM (2026-10-19 review F5).
+		// canonical PEM.
 		certFile, err := fullchainPEM(cert)
 		if err != nil {
 			respondWithError(w, http.StatusBadRequest, "invalid certificate: "+err.Error())
@@ -281,7 +281,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		// renames leaves the previously installed pair untouched — no
 		// mismatched pair, no boot crash loop.
 		//
-		// Crash safety (2026-10-19 review F18, minimum-acceptable variant
+		// Crash safety (minimum-acceptable variant
 		// of the spec's F2): both temps are fsynced BEFORE close and the
 		// directory is fsynced after the renames, so a crash loses at most
 		// the window between the two renames (microseconds) — the old
@@ -432,7 +432,7 @@ func normPEM(in, wantType string) string {
 }
 
 // fullchainPEM returns canonical PEM text containing ALL CERTIFICATE blocks
-// in the upload, in order (2026-10-19 review F5). The old normPEM path kept
+// in the upload, in order. The old normPEM path kept
 // only the FIRST block, so a fullchain upload (leaf + intermediates, the
 // normal "cat leaf.pem intermediate.pem" form) stored a leaf-only file and
 // clients failed with "unknown authority". Accepts the same input forms as

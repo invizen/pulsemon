@@ -193,7 +193,7 @@ func (db *DB) InitSchema() error {
 	// rows stay in history — sparkline, graph, inspector — but are EXCLUDED
 	// from status derivation (recentFromDB/recentFromCache filter them),
 	// honoring the documented contract that a manual pulse never affects
-	// status or alerts (2026-10-20 external review: before the tag, one
+	// status or alerts (before the tag, one
 	// lost manual pulse + one lost scheduled probe tripped the
 	// down_after=2 consecutive-loss test into an "error" alert). Existing
 	// rows are all scheduled probes, so DEFAULT 0 is exactly right.
@@ -256,7 +256,7 @@ func (db *DB) InitSchema() error {
 	// already set). Without this, existing installs would silently lose their
 	// configured alert webhook on upgrade.
 	//
-	// INSERT OR IGNORE (2026-10-19 review F6): the NOT EXISTS guard only
+	// INSERT OR IGNORE: the NOT EXISTS guard only
 	// checks for a NON-EMPTY google_chat_url, so an install whose operator
 	// later CLEARED the Google Chat URL (row exists, value = '') re-ran this
 	// INSERT on the next boot and hit the settings.setting_key PRIMARY KEY
@@ -359,7 +359,7 @@ func (db *DB) SensorTags(id string) []string {
 	if err := rows.Err(); err != nil {
 		// Mid-stream iteration error (DB file I/O failure): same contract
 		// as the query error above — empty list — plus a log so the
-		// failure is visible (2026-10-19 external review #6).
+		// failure is visible.
 		log.Printf("db: sensor tag query failed mid-stream: %v", err)
 		return []string{}
 	}
@@ -414,8 +414,7 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 		if err := rows.Err(); err != nil {
 			// Mid-stream chunk failure: log and keep the rows already read
 			// — the function has no error channel, and a DB file I/O
-			// failure this deep is visible in the service log
-			// (2026-10-19 external review #6).
+			// failure this deep is visible in the service log.
 			log.Printf("db: sensor tag batch query failed mid-stream: %v", err)
 			return
 		}
@@ -538,7 +537,7 @@ func (db *DB) AllTags() map[string]int {
 	}
 	if err := rows.Err(); err != nil {
 		// Mid-stream iteration error: same contract as the query error
-		// above — empty map — plus a log (2026-10-19 external review #6).
+		// above — empty map — plus a log.
 		log.Printf("db: all-tags query failed mid-stream: %v", err)
 		return map[string]int{}
 	}
@@ -550,7 +549,7 @@ func (db *DB) AllTags() map[string]int {
 // (db.Begin issues a DEFERRED begin), so two concurrent
 // check-then-insert flows cannot both observe the pre-insert state — the
 // setup-mode bootstrap race where N unauthenticated first-user POSTs each
-// read user_count=0 and all committed (2026-10-19 review F11). fn receives
+// read user_count=0 and all committed. fn receives
 // the pinned *sql.Conn and must run its statements through it (the
 // transaction lives on that connection); ImmediateTx commits on a nil
 // return and rolls back on error. The connection goes back to the pool
@@ -600,8 +599,7 @@ func (db *DB) GetSetting(key string) string {
 // GetSettingErr is GetSetting that surfaces real DB errors: an absent key is
 // ("", nil), any other failure ("", err). GetSetting's 83 call sites keep
 // their swallow-to-"" contract; this exists for paths where "unset" and
-// "read failed" must not look the same — alert delivery (2026-10-19 review
-// m5).
+// "read failed" must not look the same — alert delivery.
 func (db *DB) GetSettingErr(key string) (string, error) {
 	var v string
 	err := db.QueryRow("SELECT value FROM settings WHERE setting_key = ?", key).Scan(&v)
@@ -635,8 +633,7 @@ func (db *DB) SetSetting(key, value string) error {
 	return err
 }
 
-// setSettingInTx is SetSetting through a caller's transaction (2026-10-19
-// review m8 — lets handleSettingsPut apply a multi-key save atomically).
+// setSettingInTx is SetSetting through a caller's transaction (lets handleSettingsPut apply a multi-key save atomically).
 func setSettingInTx(tx *sql.Tx, key, value string) error {
 	_, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
@@ -681,12 +678,12 @@ func (db *DB) SetUserPassword(username, passwordHash string) error {
 // count guard lives INSIDE the DELETE so check-and-delete is one atomic
 // statement: the old COUNT-then-DELETE let two concurrent removals both
 // pass the count and delete the last two users, silently turning auth off
-// (2026-10-19 review M4). If the removed account was the LAST ADMIN, the
+// If the removed account was the LAST ADMIN, the
 // oldest remaining user is promoted in the SAME transaction — the install
 // must never be left without an admin (that would lock every
 // account-management endpoint). 0 rows affected = the last user (
-// errLastUser) or no such user (errUserNotFound — the 2026-10-20 external
-// review replaced the silent no-op, which made the API answer 200 and the
+// errLastUser) or no such user (errUserNotFound): the sentinel replaced the
+// silent no-op, which made the API answer 200 and the
 // CLI print "User removed" for a mistyped name).
 func (db *DB) RemoveUser(username string) error {
 	ctx := context.Background()
@@ -708,7 +705,7 @@ func (db *DB) RemoveUser(username string) error {
 		}
 		// The removed account was the last admin: hand the flag to the
 		// oldest remaining user so the install is never left without an
-		// admin (2026-10-19 external review, admin-flag fix).
+		// admin (admin-flag fix).
 		res, err = c.ExecContext(ctx, `UPDATE users SET is_admin = 1
 			WHERE rowid = (SELECT rowid FROM users ORDER BY created_at ASC, username ASC LIMIT 1)
 			AND (SELECT COUNT(*) FROM users WHERE is_admin = 1) = 0`)

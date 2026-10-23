@@ -52,8 +52,7 @@ const maxHTTPRedirects = 5
 // probeHTTP sets req.Close per probe (M5) so every probe's cert reading
 // comes from a fresh handshake, not a pooled conn's original one; one
 // handshake per 5-60s probe is the accepted cost. That handshake time is
-// EXCLUDED from the reported latency (2026-10-23 external review F12:
-// probeHTTP measures from connection-established to response headers), so
+// EXCLUDED from the reported latency (// probeHTTP measures from connection-established to response headers), so
 // an HTTPS sensor's number stays comparable to an HTTP sensor's. The pool
 // stays bounded regardless (100 conns total / 32 per host / 10 min idle),
 // so the sensor list — small and stable, not ephemeral — cannot exhaust it. Redirects
@@ -108,7 +107,7 @@ const maxHTTPRedirects = 5
 // is not an SSRF relay. The guard's real job is already closed: it stops an
 // EXTERNALLY-monitored public host from 302-ing the probe into cloud metadata
 // (169.254.169.254), loopback, or reserved space — the pivot that matters.
-// A blanket ip.IsPrivate() block here (as an external review proposed) would
+// A blanket ip.IsPrivate() block here would
 // regress the pinned legitimate case — a public hostname served via
 // split-horizon DNS to a LAN IP, or an external URL 302-ing to an internal
 // dashboard — while shrinking the real attack surface by zero, because the
@@ -123,16 +122,15 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 		return nil // same-host hop: the operator's own target
 	}
 	// Address judging delegates to checkWebhookIP — the single canonical
-	// implementation (2026-10-20 external review). This path used to carry
-	// a HAND-COPIED judge that had drifted: when P1 (2026-10-19) added the
+	// implementation. This path used to carry
+	// a HAND-COPIED judge that had drifted: when P1 added the
 	// IPv4-embedded IPv6 view (embeddedIPv4) to checkWebhookIP, the copy
 	// here never got it, so IPv4-embedded literals like ::7f00:1
 	// (=127.0.0.1) and ::a9fe:a9fe (=169.254.169.254) — which pass To4()
 	// and every IPv6 range check — slipped past this guard while the
 	// webhook path blocked them. One shared implementation means the two
 	// paths can't drift again.
-	// netip — not net.ParseIP — for the literal path (2026-10-19 external
-	// review #3): ParseIP returns nil for ZONED IPv6 literals (fe80::1%eth0,
+	// netip — not net.ParseIP — for the literal path: ParseIP returns nil for ZONED IPv6 literals (fe80::1%eth0,
 	// incl. the %25-encoded form URL.Hostname() yields), which pushed them
 	// onto the resolution path below. That path is fail-closed (the
 	// resolver fast-paths zoned literals back and judge() blocks them), but
@@ -175,8 +173,7 @@ var httpClient = &http.Client{
 		if err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost); err != nil {
 			return err
 		}
-		// Force a fresh connection on EVERY HTTPS hop (2026-10-19 review
-		// N4, extended by the 2026-10-20 external review): the transport
+		// Force a fresh connection on EVERY HTTPS hop: the transport
 		// pools idle conns per host for up to IdleConnTimeout (10 min),
 		// and a redirect hop that REUSES a pooled conn reports the cert
 		// from that conn's ORIGINAL handshake — a renewed cert stays
@@ -217,7 +214,7 @@ var httpClient = &http.Client{
 // same standard a browser applies. There is NO www/bare variant fallback:
 // a cert issued only for www.example.com does NOT pass for example.com (and
 // vice versa), because that would hide a real misconfiguration the user's
-// browser rejects (2026-10-23 external review F13). The fallback was added
+// browser rejects. The fallback was added
 // 2026-10-07 for a then-observed google.com quirk (a www-only cert served to
 // a bare request); that pattern is stale — current certs for google.com,
 // github.com, cloudflare.com, and the like carry the exact requested name
@@ -257,8 +254,7 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	// (a) Trusted by the system roots, with the presented intermediates —
 	// accept. Roots nil → the platform/system trust store. EXACT hostname
 	// match (optsA.DNSName = host): no www/bare variant fallback, so the
-	// probe's cert judgment matches what a browser does (2026-10-23
-	// external review F13).
+	// probe's cert judgment matches what a browser does.
 	optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	optsA.DNSName = host
 	if _, err := leaf.Verify(optsA); err == nil {
@@ -276,7 +272,7 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	// leaf against itself as a root re-checks hostname + validity without
 	// demanding a trusted issuing CA (Go accepts a self-signed leaf in the
 	// roots pool without CA/key-usage demands on it).
-	// NO www-variant fallback here (2026-10-13 review): the operator generated
+	// NO www-variant fallback here: the operator generated
 	// this cert and controls its SANs, so a homelab self-signed cert carries
 	// the probed hostname (or IP) itself — a www-variant SAN is a public-CDN
 	// pattern, not a homelab one. Hostname match is the only security control
@@ -317,7 +313,7 @@ const drainBodyCap = 1 << 20
 //
 // Elapsed is the time from the FINAL connection's establishment
 // (httptrace.GotConn) to the response headers — DNS, TCP, and the TLS
-// handshake are EXCLUDED (2026-10-23 external review F12), so an HTTPS
+// handshake are EXCLUDED, so an HTTPS
 // sensor's latency stays comparable to an HTTP sensor's and to what a
 // warm browser tab sees. M5's per-probe fresh handshake still happens
 // (cert freshness) and still counts against the probe timeout and
@@ -387,7 +383,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		return httpProbeResult{Lost: true, IP: resolved, Err: err}
 	}
 	if req.URL.Scheme == "https" {
-		// Force a fresh TLS handshake per probe (2026-10-19 review M5): the
+		// Force a fresh TLS handshake per probe: the
 		// shared httpClient keeps idle conns for up to 10 min, and a reused
 		// conn reports the cert from its ORIGINAL handshake — a server cert
 		// renewal stayed invisible in the displayed expiry until the conn
@@ -401,8 +397,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// headers. The DNS/TCP/TLS cost before connAt is the probe's own
 	// connection policy (M5 forces a fresh HTTPS handshake for cert
 	// freshness), not the server's responsiveness — excluding it keeps
-	// HTTP and HTTPS sensor latencies comparable (2026-10-23 external
-	// review F12). No conn established -> GotConn never fired -> the full
+	// HTTP and HTTPS sensor latencies comparable. No conn established -> GotConn never fired -> the full
 	// elapsed is the honest number.
 	rtt := el
 	if !connAt.IsZero() {
@@ -452,7 +447,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	}
 
 	// A redirect chain that ENDS on plain HTTP after the configured target
-	// was HTTPS is a loss (2026-10-19 review F3): the TLS endpoint is what
+	// was HTTPS is a loss: the TLS endpoint is what
 	// we configured to watch, and a 301 to the http URL is exactly what
 	// many servers emit when their cert is broken ("use the http version").
 	// Following it and reading the http hop's 2xx used to report UP while
@@ -507,7 +502,7 @@ func certNotAfterFromErr(err error) *time.Time {
 // validURL reports whether t is a usable HTTP/HTTPS target: an absolute URL
 // with an http(s) scheme and a dotted, bracketed, port-carrying, or bare
 // single-label host. The single-label stance matches validTarget for ICMP
-// (2026-10-23 external review F11): "nas" resolves on most home LANs via
+// "nas" resolves on most home LANs via
 // the resolver's search domain, and the probe's deadline-bounded resolver
 // makes an unresolvable name a loss row, not a wedged tick. The port
 // override below predates that change and stays.

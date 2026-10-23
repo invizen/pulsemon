@@ -160,7 +160,6 @@ func NewServer(db *DB, pw *ProbeWorker) *Server {
 
 // parseAllowedHosts splits PULSEMON_ALLOWED_HOSTS (comma-separated host or
 // host:port entries) into a lower-cased list, dropping blanks
-// (2026-10-19 review M2).
 func parseAllowedHosts(v string) []string {
 	var out []string
 	for _, h := range strings.Split(v, ",") {
@@ -171,8 +170,7 @@ func parseAllowedHosts(v string) []string {
 	return out
 }
 
-// hostAllowed reports whether r.Host matches the allowlist (2026-10-19 review
-// M2). An entry with a port must equal r.Host exactly; an entry without a
+// hostAllowed reports whether r.Host matches the allowlist. An entry with a port must equal r.Host exactly; an entry without a
 // port matches r.Host or r.Host's host portion (port stripped). Matching is
 // case-insensitive. r.Host is client-controlled, so this is the only Host
 // check that a DNS-rebinding page can't satisfy — the Origin==Host CSRF gate
@@ -198,7 +196,7 @@ func (s *Server) hostAllowed(host string) bool {
 }
 
 // unauthMutateAllowed reports whether a state-changing request arriving
-// WITHOUT a session from r.Host is permitted (2026-10-19 review N2). With
+// WITHOUT a session from r.Host is permitted. With
 // PULSEMON_ALLOWED_HOSTS unset the LAN-trust default stands (allowed); with
 // it set, "auth off = fully open" becomes "open to allowlisted hosts" — a
 // DNS-rebinding page fires simple credentials-including requests and, with
@@ -244,8 +242,7 @@ func (s *Server) authGate() http.Handler {
 		// Sensitive JSON payloads (/api/settings, /api/auth/status, sensor
 		// data) must not be cached by browsers or intermediate proxies:
 		// no-store on every /api/ response. Static assets set their own
-		// no-cache in serveStatic and keep that contract (2026-10-22
-		// external review).
+		// no-cache in serveStatic and keep that contract.
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
@@ -261,7 +258,7 @@ func (s *Server) authGate() http.Handler {
 		// with no Origin (curl, server-to-server) cannot be a browser
 		// CSRF and passes. A reverse proxy must preserve the original
 		// Host header (Caddy does by default) for the comparison to
-		// match. (2026-10-13 external review — valid finding.)
+		// match. (valid finding.)
 		//
 		// Sec-Fetch-Site is the second arm: modern browsers send it on
 		// every request (fetch, XHR, form POST) and compute it from the
@@ -273,7 +270,7 @@ func (s *Server) authGate() http.Handler {
 		// cookie-authenticated non-browser API clients must keep
 		// working. "same-site" is refused: a page on another PORT of
 		// the same IP is same-site, and that is exactly the cross-port
-		// vector this gate exists for. (2026-10-20 external review.)
+		// vector this gate exists for.
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			if sfs := r.Header.Get("Sec-Fetch-Site"); sfs != "" &&
 				sfs != "same-origin" && sfs != "none" {
@@ -303,7 +300,7 @@ func (s *Server) authGate() http.Handler {
 				// Auth was disabled by the operator (all accounts deleted):
 				// the documented "auth off = fully open" behavior applies.
 				// With PULSEMON_ALLOWED_HOSTS set, mutating requests from a
-				// non-allowlisted Host are 403 (2026-10-19 review N2 — see
+				// non-allowlisted Host are 403 (see
 				// unauthMutateAllowed); reads stay open.
 				switch r.Method {
 				case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
@@ -321,7 +318,7 @@ func (s *Server) authGate() http.Handler {
 			// (sensor create/pulse, settings, TLS upload, user list) is 403
 			// until an account exists, so an unauthenticated LAN host can't
 			// use the fresh-install window for SSRF or internal port scanning
-			// (2026-10-13 external review — valid finding).
+			// (valid finding).
 			//
 			// ACCEPTED LIMITATION: the first-user bootstrap itself is open to
 			// any LAN host — whoever POSTs /api/auth/users first wins it, and
@@ -333,7 +330,7 @@ func (s *Server) authGate() http.Handler {
 			// attacker-controlled), so a remote page could win the bootstrap;
 			// operators who set PULSEMON_ALLOWED_HOSTS close that hole — the
 			// bootstrap POST is then refused unless r.Host is allowlisted
-			// (2026-10-19 review M2). Unset = the LAN-trust default above.
+			// Unset = the LAN-trust default above.
 			if r.Method == http.MethodPost && r.URL.Path == "/api/auth/users" &&
 				len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
 				respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
@@ -360,7 +357,7 @@ func (s *Server) authGate() http.Handler {
 		// attach a 192.168.1.10 cookie to a request addressed to
 		// evil.com), and browser cross-origin vectors on authenticated
 		// endpoints are the Origin/Sec-Fetch-Site gate above.
-		// (2026-10-20 external review — mechanism verified, documented
+		// (mechanism verified, documented
 		// as by design.)
 		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
 			// Sliding cookie: the login cookie carries a fixed
@@ -368,7 +365,7 @@ func (s *Server) authGate() http.Handler {
 			// delete it exactly 30 days after login even though
 			// ValidSession slides the in-memory expiry on every use —
 			// the sliding-session design was defeated by the cookie's
-			// fixed expiry (2026-10-22 external review). Re-issue the
+			// fixed expiry. Re-issue the
 			// SAME token once the cookie ages past half the TTL: at
 			// most one Set-Cookie per ~15 days of activity, never per
 			// 5s poll.
@@ -382,7 +379,7 @@ func (s *Server) authGate() http.Handler {
 			// The login/status endpoints must be reachable WITHOUT a
 			// session — the UI's gate calls them to decide whether to
 			// show the login form. Login is exempt from the Host gate
-			// (2026-10-19 review N2) — it is the auth entry point and has
+			// it is the auth entry point and has
 			// its own per-IP rate limiting; logout (a POST) is gated like
 			// any other sessionless mutating endpoint.
 			if r.URL.Path == "/api/auth/login" || r.URL.Path == "/api/auth/status" {
@@ -394,7 +391,7 @@ func (s *Server) authGate() http.Handler {
 			// gets the same treatment as the other sessionless mutating
 			// endpoints: allowed by default on the trusted LAN, 421 when
 			// PULSEMON_ALLOWED_HOSTS is set and the Host isn't listed
-			// (2026-10-19 review N2). An allowed logout must be FORWARDED
+			// An allowed logout must be FORWARDED
 			// to the handler — falling through to the 401 below would
 			// break every sessionless logout (csrf_test.go pins this).
 			if r.URL.Path == "/api/auth/logout" {
@@ -508,8 +505,7 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 	}
 	// A mid-stream iteration error (DB file I/O failure) ends rows.Next()
 	// without a query error: surface it via the nil sentinel the callers
-	// already treat as "query failed" instead of a truncated fleet view
-	// (2026-10-19 external review #6).
+	// already treat as "query failed" instead of a truncated fleet view.
 	if err := rows.Err(); err != nil {
 		log.Printf("API: sensor query failed mid-stream: %v", err)
 		return nil
@@ -650,7 +646,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		// to review it. The user resumes it from the dashboard.
 		//
 		// The row INSERT and the tag replace commit in ONE ImmediateTx (the
-		// same 2026-10-19 F14 idiom as the PATCH path): a tag-write failure
+		// same single-tx idiom as the PATCH path): a tag-write failure
 		// used to be logged and swallowed while the handler still returned 201
 		// with the requested tags — the UI then showed tags the DB never had,
 		// and with alert_scope='tags' the (paused) sensor would route no alerts
@@ -669,7 +665,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		})
 		if err != nil {
 			// Exact constraint text, not a bare "UNIQUE" substring
-			// (2026-10-19 review m7).
+
 			if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
 				return
@@ -707,8 +703,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // but would let a malicious name through to the non-HTML consumers (alert
 // cards, logs, the inspector) where output encoding does not apply.
 //
-// Why a blacklist and NOT the suggested whitelist (2026-10-13 review,
-// dismissed): a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
+// Why a blacklist and NOT the suggested whitelist (dismissed): a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
 // but a REGRESSION — it rejects legitimate operator labels this gate is
 // meant to allow: non-ASCII names (ÜberNAS) and benign punctuation
 // (wifi:guest, nas/01, camera@front), all pinned VALID in
@@ -719,7 +714,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // As a defense-in-depth gate behind output encoding, it needs to be precise,
 // not exhaustive.
 //
-// The length cap is in RUNES, not bytes (2026-10-19 external review #8): the
+// The length cap is in RUNES, not bytes: the
 // UI's maxlength="60" counts characters, so a byte cap silently truncated
 // CJK/emoji names to ~20 chars and the server 400'd what the form allowed.
 // Invalid UTF-8 is refused at the write path so SQLite never stores a
@@ -759,7 +754,7 @@ func cleanTags(in []string) []string {
 	out := []string{}
 	for _, t := range in {
 		t = strings.TrimSpace(t)
-		// 30-RUNE cap, matching the UI maxlength="30" (external review #8).
+		// 30-RUNE cap, matching the UI maxlength="30".
 		if t == "" || utf8.RuneCountInString(t) > 30 || !validSensorName(t) || seen[t] {
 			continue
 		}
@@ -823,8 +818,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// write lock: the dashboard edits both in one modal, so a target
 		// must be valid for the type the sensor will end up with (URL for
 		// http, host for icmp), whether the user changed the target, the
-		// type, or both. (2026-10-19 external review #10: this used to run
-		// twice — here against a pre-lock snapshot fed by up to two extra
+		// type, or both. (here against a pre-lock snapshot fed by up to two extra
 		// SELECTs, and in-tx against fresh values. The in-tx check is a
 		// superset returning the identical 400s, so only pure
 		// request-shape checks — empty fields, ranges — run before the
@@ -893,7 +887,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			add("timeout_ms", *req.TimeoutMS)
 		}
 		// The effective timeout-vs-interval cross-check runs in-tx against
-		// the fresh stored values (external review #10): the pre-tx copy
+		// the fresh stored values: the pre-tx copy
 		// existed only to fast-fail, and the in-tx check returns the
 		// identical 400.
 		if req.LossWarn != nil {
@@ -928,8 +922,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "no fields to update")
 			return
 		}
-		// One BEGIN IMMEDIATE transaction (2026-10-19 review F14, single-
-		// read shape per external review #10): the row is read ONCE,
+		// One BEGIN IMMEDIATE transaction (single-read shape): the row is read ONCE,
 		// INSIDE it, and the type/target pair (plus the effective
 		// interval/timeout cross-check) validated against those FRESH
 		// values before the UPDATE — this read also carries the 404. A
@@ -986,7 +979,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				if err != nil {
 					// A rename hitting the UNIQUE name constraint is a 409,
 					// exactly like POST — not a 500 with raw SQL text. Exact
-					// constraint text (2026-10-19 review m7).
+					// constraint text.
 					if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 						return errPatchNameConflict
 					}
@@ -1028,7 +1021,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// picks up the new values: target/interval/timeout are read by the
 		// loop itself, type by probeTarget, and loss_warn/down_after by
 		// deriveStatus — all from the spawn-time config copy, none are
-		// hot-reloaded. name and tags respawn too (2026-10-19 review M1): the
+		// hot-reloaded. name and tags respawn too: the
 		// alert path reads c.name (alert text) and c.tags (alertGates routing)
 		// from the same spawn-time copy, so a name/tags PATCH without a respawn
 		// left stale alert behavior until process restart.
@@ -1059,11 +1052,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 
 // setSensorTagsInConn replaces the sensor's tags (DELETE + INSERTs) on the
 // CALLER's pinned connection, for the PATCH sensor write path that runs
-// inside a BEGIN IMMEDIATE ImmediateTx (2026-10-19 review F14) — a *sql.Tx
+// inside a BEGIN IMMEDIATE ImmediateTxa *sql.Tx
 // from db.Begin can't join it because the transaction lives on the pinned
 // connection (db.SetSensorTags keeps its own transaction and can't join one
 // either, so the in-conn twin lives here rather than in db.go). The caller's
-// ctx is threaded through (2026-10-19 external review #5): every statement on
+// ctx is threaded through: every statement on
 // this path honors request cancellation, matching the ImmediateTx boundary.
 func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
 	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
@@ -1312,8 +1305,7 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 // the same name.
 const cloneMaxAttempts = 5
 
-// Sentinel errors from the PATCH sensor write transaction (2026-10-19 review
-// F14): the re-validation runs inside the BEGIN IMMEDIATE tx, so its
+// Sentinel errors from the PATCH sensor write transaction: the re-validation runs inside the BEGIN IMMEDIATE tx, so its
 // failures are returned as sentinels and mapped to HTTP codes by the
 // handler (the response can't be written from inside the closure without
 // tangling the commit/rollback path).
@@ -1349,7 +1341,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// Pick the first free name and insert it. The existing clone names are
 	// fetched in ONE query and the first free suffix is picked in memory
 	// (the old loop ran up to 100 sequential SELECT COUNT(*) round-trips
-	// before the first INSERT — 2026-10-22 external review). Another
+	// before the first INSERT). Another
 	// request can take the name between the fetch and the INSERT (the
 	// sensors.name UNIQUE index is the real arbiter), so a UNIQUE failure
 	// marks the name taken and moves on to the next candidate: at most
@@ -1370,12 +1362,11 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
 	// The clone name must itself satisfy validSensorName (≤60 runes) —
 	// otherwise the API would reject a later PATCH that renames the clone
-	// (2026-10-19 review F13). Reserve room for the LONGEST suffix
+	// Reserve room for the LONGEST suffix
 	// ("-copy100", 8 ASCII runes) by truncating the source name first; the
 	// shorter suffixes ("-copy", "-copy2") then always fit. Truncate by
 	// RUNES, not bytes: the cap is a rune cap (0c35448), so a byte cut
-	// would shrink CJK/emoji names to a third of their allowed length
-	// (2026-10-20 external review).
+	// would shrink CJK/emoji names to a third of their allowed length.
 	cloneBase := src.Name
 	const cloneSuffixCeil = 8 // len("-copy100")
 	if r := []rune(cloneBase); len(r) > 60-cloneSuffixCeil {
@@ -1426,7 +1417,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	for attempt := 0; attempt < cloneMaxAttempts && !created; attempt++ {
 		// Clone starts PAUSED, matching new-sensor behavior. The row
 		// INSERT and the tag replace commit in ONE ImmediateTx (the same
-		// 2026-10-19 F14 idiom as the POST/PATCH paths): a tag-write
+		// single-tx idiom as the POST/PATCH paths): a tag-write
 		// failure used to be logged and swallowed while the clone was
 		// still returned 201 with the source's tags — the UI then showed
 		// tags the DB never had, and with alert_scope='tags' the (paused)
@@ -1448,7 +1439,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		// Only a name collision is retryable — exact constraint text
-		// (2026-10-19 review m7).
+
 		if !strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
 			respondInternal(w, "clone sensor "+id, err)
 			return
@@ -1491,7 +1482,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		// Collect the tagged sensors BEFORE the delete: each probe loop
 		// holds a spawn-time copy of its tag set (alert routing reads
 		// c.tags from that copy), so every affected loop must be respawned
-		// to pick up the new set (2026-10-19 review N5) — without this, a
+		// to pick up the new setwithout this, a
 		// sensor that just left the alert_filter's tag scope keeps the
 		// stale routing (alerts it shouldn't send, or silence it should
 		// have) until the next process restart.
@@ -1516,7 +1507,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		if err := rows.Err(); err != nil {
 			// Fail before DeleteTag: a truncated tagged list would delete
 			// the tag while leaving some loops un-respawned with stale
-			// alert routing (2026-10-19 external review #6).
+			// alert routing.
 			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
@@ -1576,7 +1567,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// and the "1h"/"24h" graphs silently showed the ENTIRE history.
 	// CAST(strftime('%s', ...)) normalizes both sides to epoch seconds.
 	//
-	// PERF NOTE (2026-10-13 external review — dismissed): a covering index
+	// PERF NOTE (dismissed): a covering index
 	// probes(sensor_id, ts, rtt_ms) was proposed to avoid the base-table row
 	// fetches for COUNT/SUM/AVG/MAX. Measured at the review's own worst-case
 	// scale (72,000 rows = 50 sensors x 24h @ 60s): the query takes 0.74 ms
@@ -1602,7 +1593,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// seek would save no rows anyway: the 24h graph window equals the 24h
 	// retention, so every row of a sensor is inside the window.
 	//
-	// THIRD PROPOSAL (2026-10-20 external review — APPLIED): a seekable
+	// THIRD PROPOSAL (APPLIED): a seekable
 	// string bound ADDED ALONGSIDE the epoch filter, which the epoch filter
 	// alone cannot express. The strftime filter stays the EXACT arbiter;
 	// `ts >= ?` only lets the planner range-seek idx_probes_sensor_ts to
@@ -1626,8 +1617,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	cutoffStr := fmtTS(time.Now().UTC().Add(-dur - time.Second))
 	// manual = 0: "Pulse Now" rows are diagnostic clicks, not scheduled
 	// samples — the card's loss/uptime aggregates (computeSensorStats)
-	// skip them, so the graph must too (2026-10-23 external review F5):
-	// a lost pulse on a healthy sensor must not draw a loss bucket here.
+	// skip them, so the graph must too: // a lost pulse on a healthy sensor must not draw a loss bucket here.
 	rows, err := s.db.QueryContext(r.Context(), `SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
@@ -1902,14 +1892,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Maintenance-mode entry validation runs BEFORE the settings tx opens
-	// (2026-10-19 review F12): "no active sensors to pause" is a derived
+	// "no active sensors to pause" is a derived
 	// check, and a 400 must leave the store exactly as it was — the old
 	// order committed the other settings first, then 400'd on the empty
 	// snapshot. The snapshot ids computed here are reused by the apply
 	// phase (nothing mutates the sensors table in between).
 	//
-	// Re-enable (mode already ON) takes NO new snapshot (2026-10-19 review
-	// F9): the snapshot belongs to the original off→on transition. A fresh
+	// Re-enable (mode already ON) takes NO new snapshot: the snapshot belongs to the original off→on transition. A fresh
 	// snapshot would capture the currently-ACTIVE set, which excludes any
 	// sensor the operator resumed during maintenance — and those sensors
 	// would be left paused forever, because resume restores only the
@@ -1934,8 +1923,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// sent — nil means keep, so a partial save no longer resets routing.
 	// The whole apply phase is ONE transaction: validation can't rule out a
 	// mid-sequence write failure (disk full, SQLITE_BUSY), and the old
-	// autocommit writes left a partial save behind a 500 (2026-10-19 review
-	// m8). Maintenance mode below stays outside — it has its own atomic
+	// autocommit writes left a partial save behind a 500. Maintenance mode below stays outside — it has its own atomic
 	// snapshot transaction (SetMaintenanceMode).
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
@@ -1987,12 +1975,12 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				// Already in maintenance: keep the ORIGINAL snapshot and
 				// the existing pause set — re-snapshotting would drop
 				// sensors resumed during maintenance from the restore set
-				// (2026-10-19 review F9). Nothing to write.
+				// Nothing to write.
 				log.Printf("API: maintenance mode already ON (snapshot preserved)")
 			} else {
 				// Entering maintenance (off→on): the snapshot ids were
 				// computed and validated above, before the settings tx
-				// committed (2026-10-19 review F12).
+				// committed.
 				//
 				// Atomic: pause + snapshot + mode flag in ONE transaction
 				// so a crash can't leave sensors paused without the mode
@@ -2081,7 +2069,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // evaluate the EFFECTIVE state (incoming value if sent, else stored) —
 // see the tls_mode=none guard. The withDNS variants split the URL checks:
 // the in-transaction save path must not run the 5s DNS lookup under the
-// SQLite write lock (2026-10-19 review N6).
+// SQLite write lock.
 func validateProviderUpdate(kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	return validateProviderUpdateInternal(kind, url, enabled, extra, storedExtra, true)
 }
@@ -2161,7 +2149,7 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 			}
 		}
 	}
-	// tls_mode=none cannot carry credentials (2026-10-19 review F27): with
+	// tls_mode=none cannot carry credentials: with
 	// no TLS the AUTH exchange would ride the wire in plaintext — the
 	// transport fails clearly at send time, so the SAVE must fail clearly
 	// too, not store a config that can only ever fail per-alert. (The UI's
@@ -2169,7 +2157,7 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 	// the deliberate act that makes tls_mode=none valid.)
 	//
 	// The check runs on the EFFECTIVE state, not just the incoming map
-	// (2026-10-20 external review): omitted extra keys keep their stored
+	// omitted extra keys keep their stored
 	// values (applyProviderUpdateInTx only persists what was sent), so a
 	// partial PUT {"tls_mode":"none"} over stored credentials must fail
 	// here, not slip through and leave a plaintext-mode config behind.
@@ -2241,9 +2229,9 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 
 // applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
 // caller's transaction so handleSettingsPut can apply every provider and
-// routing field atomically (2026-10-19 review m8; mirrors db.SetSensorTags).
+// routing field atomically (mirrors db.SetSensorTags).
 func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
-	// Format-only validation (2026-10-19 review N6): the DNS reachability
+	// Format-only validation: the DNS reachability
 	// check runs in the PRE-transaction pass (handleSettingsPut →
 	// validateProviderUpdate with DNS), never under the write lock.
 	if err := validateProviderUpdateNoDNS(kind, url, enabled, extra, storedExtra); err != nil {
@@ -2276,7 +2264,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 	// persists the accepted keys.
 	for k, v := range extra {
 		// Credentials (username/password) are stored RAW, not trimmed
-		// (2026-10-23 external review F10): a leading/trailing space in
+		// a leading/trailing space in
 		// an SMTP credential is part of the value, and trimming it would
 		// silently change the AUTH exchange. Every other extra field
 		// keeps the trim.
@@ -2373,8 +2361,7 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	// is never served stale and an unchanged asset costs a 304 with no body.
 	// The hash behind that ETag is MEMOIZED per path for the process life
 	// (static_etag.go, v0.3.17): the one-time sha256 of the ~110KB
-	// index.html measures ~54µs, paid once, not per request (2026-10-20
-	// external review #8 — already addressed). The remaining per-request
+	// index.html measures ~54µs, paid once, not per request). The remaining per-request
 	// cost is the in-memory embed copy (~6.5µs), which the 200 path needs
 	// for the body; skipping it on 304 was measured not worth the extra
 	// code path.

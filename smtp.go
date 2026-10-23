@@ -214,7 +214,7 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 		// no TLS
 	}
 
-	// Q1 (2026-10-19 review F26): what TLS state did we ACTUALLY end up in?
+	// Q1: what TLS state did we ACTUALLY end up in?
 	// A relay without STARTTLS is legitimate in "auto" mode (a 25-port LAN
 	// relay) — but only credential-free: with NO username configured the
 	// plaintext send is allowed and gets a one-line warning per send (pre-fix

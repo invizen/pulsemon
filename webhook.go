@@ -14,8 +14,7 @@ import (
 
 // Google Chat webhook delivery lives on ProbeWorker (probe.go, sendAlert /
 // postCard) — one code path for state-transition alerts. This file holds the
-// shared outbound client and destination validation (SSRF hardening,
-// 2026-10-04 security review).
+// shared outbound client and destination validation (SSRF hardening).
 
 // webhookClient is the ONLY client used for alert delivery. Three deliberate
 // hardening choices:
@@ -118,7 +117,7 @@ var webhookClient = &http.Client{
 // literal is never a valid alert destination) — the old "rejected at
 // URL-parse" claim was stale.
 // validateWebhookURLNoDNS runs validateWebhookURL's checks WITHOUT the DNS
-// resolution pass (2026-10-19 review N6): URL shape, scheme, IP-literal
+// resolution pass: URL shape, scheme, IP-literal
 // blocklist, mDNS-suffix rejection. It returns the host and scheme so the
 // DNS variant can reuse them without re-parsing. The IN-TRANSACTION save
 // path uses this: a 5-second DNS lookup must never run while holding the
@@ -185,7 +184,7 @@ func validateWebhookURL(raw string) error {
 	// (httpAllowsPrivate + LookupIP), doubling DNS and letting the two
 	// answers disagree across a round-robin/rebind boundary. Bounded at 5s:
 	// a bare net.LookupIP has no deadline and a hung resolver stalled the
-	// caller indefinitely (2026-10-19 review m9).
+	// caller indefinitely.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
@@ -235,7 +234,7 @@ func validateWebhookURL(raw string) error {
 //     the ISP's carrier range, NOT the user's LAN: a self-hosted relay
 //     reachable from the homelab sits in RFC1918 space (still allowed, see
 //     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth.
-//     EXCEPTION (2026-10-23 external review F6): a Tailscale/Headscale
+//     EXCEPTION: a Tailscale/Headscale
 //     tailnet assigns EVERY node an address in exactly this range, so on a
 //     tailnet the "NOT the user's LAN" comment is false — a webhook to a
 //     self-hosted ntfy/Gotify over the tailnet, and an HTTP sensor whose
@@ -279,8 +278,7 @@ func mustCIDR(s string) *net.IPNet {
 }
 
 // allowCGNAT reports whether the operator opted out of the CGNAT
-// (100.64.0.0/10) block via PULSEMON_ALLOW_CGNAT (2026-10-23 external
-// review F6). It is read once at startup — an install-time setting like
+// (100.64.0.0/10) block via PULSEMON_ALLOW_CGNAT. It is read once at startup — an install-time setting like
 // PULSEMON_ALLOWED_HOSTS — and the only other writer is tests. When set,
 // checkWebhookIP skips the CGNAT entry so webhooks, SMTP relays, and
 // sensor-redirect hops can reach a Tailscale/Headscale tailnet (every
@@ -319,7 +317,7 @@ func checkWebhookIP(ip net.IP, host string) error {
 			return fmt.Errorf("host %q resolves to a reserved or carrier-NAT address (%s)", host, ip)
 		}
 	}
-	// P1 (2026-10-19 review): IPv4-embedded IPv6 forms. net.ParseIP
+	// P1: IPv4-embedded IPv6 forms. net.ParseIP
 	// normalizes the dotted-quad notation (::a.b.c.d, ::ffff:0:a.b.c.d)
 	// into 16-byte addresses whose IPv6 range checks (above) see only the
 	// zero/ffff prefix and never the real IPv4 destination in the trailing
@@ -381,7 +379,7 @@ func embeddedIPv4(ip net.IP) net.IP {
 // every answer is checked, closing the save-time DNS-rebinding hole the
 // webhook path closes.
 // validateSMTPHostNoDNS is validateSMTPHost without the resolution pass
-// (2026-10-19 review N6) — see validateWebhookURLNoDNS for why the
+// see validateWebhookURLNoDNS for why the
 // in-transaction save path must not run DNS under the write lock.
 func validateSMTPHostNoDNS(host string) error {
 	host = strings.TrimSpace(host)
@@ -404,8 +402,7 @@ func validateSMTPHost(host string) error {
 	if net.ParseIP(strings.TrimSpace(host)) != nil {
 		return nil // IP literal: fully judged by the NoDNS pass.
 	}
-	// 5s deadline — context.Background() alone never times out (2026-10-19
-	// review m9).
+	// 5s deadline — context.Background() alone never times out.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)

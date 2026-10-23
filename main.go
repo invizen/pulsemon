@@ -143,8 +143,7 @@ func runHealthcheck() dispatchKind {
 	return dExit0
 }
 
-// runHealthcheckHTTP is the HTTP form of the container healthcheck (K2,
-// 2026-10-19 review): the plain -healthz flag only opens the store, so a
+// runHealthcheckHTTP is the HTTP form of the container healthcheck (K2): the plain -healthz flag only opens the store, so a
 // wedged HTTP server (listener dead, handler panic-loop) still reports
 // "healthy" to the container runtime. This flag does a real GET against the
 // running server's /api/healthz and exits 0 ONLY when the pulsemon healthz
@@ -331,7 +330,7 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 	}
 	defer ln.Close()
 	srv.Addr = addr
-	// m10 (2026-10-19 review): ServeTLS(ln, cert, key) loads the pair ONCE,
+	// m10: ServeTLS(ln, cert, key) loads the pair ONCE,
 	// so a renewed cert (dashboard TLS upload, acme.sh cron) needed a process
 	// restart. GetCertificate re-reads the files when their mtime changes, so
 	// the renewal takes effect at the next handshake.
@@ -585,8 +584,7 @@ func main() {
 	// is ensured in runServer (the only path that opens the DB), NOT here —
 	// a `-version`/`update`/`healthz` invocation must work on a host where
 	// the default data dir can't be created (non-root, /data absent);
-	// fatalling at process start broke the whole CLI surface (2026-10-19
-	// v0.3.20 verification catch).
+	// fatalling at process start broke the whole CLI surface (v0.3.20 verification catch).
 	switch dispatch(os.Args) {
 	case dExit0:
 		return
@@ -660,8 +658,7 @@ func runServer(stop <-chan struct{}) {
 	// 1. Stop the HTTP server FIRST: the listener closes immediately, and
 	// every ACTIVE handler (dashboard polls, settings tests, sensor edits)
 	// drains up to 5s while the DB is still open and the probe worker is
-	// still alive. The server used to stop LAST (2026-10-20 external
-	// review): a handler slower than the 5s drain budget — an SMTP test
+	// still alive. The server used to stop LAST: a handler slower than the 5s drain budget — an SMTP test
 	// against a hanging server runs up to ~25s (10s dial + 15s conn
 	// deadline), a webhook test up to its 10s client timeout, a plain DB
 	// read blocked on a write lock just as easily — kept running past the

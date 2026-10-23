@@ -42,8 +42,7 @@ const (
 	payloadSize = 32 // max probe payload in bytes (probePayload must fit within this)
 )
 
-// rawEchoID is the ICMP echo ID used ONLY by the raw transport (2026-10-19
-// review F32): a per-process random value so two raw instances in the same
+// rawEchoID is the ICMP echo ID used ONLY by the raw transport: a per-process random value so two raw instances in the same
 // netns can't cross-accept each other's replies (the old fixed 0x5a11 was
 // a shared, guessable filter key). The DATAGRAM transports keep the fixed
 // probeID on purpose: the kernel (Linux) and the IP driver (Windows) demux
@@ -423,7 +422,7 @@ func (e *Engine) readRaw() {
 		n, src, err := e.rawConn.ReadFrom(buf)
 		if err != nil {
 			// errors.Is, not ==: ReadFrom wraps it in a *net.OpError, so the
-			// bare sentinel compare never matched (2026-10-19 review m4).
+			// bare sentinel compare never matched.
 			if !errors.Is(err, net.ErrClosed) {
 				log.Printf("pulsemon: icmp reader (raw): read: %v (reader stopping)", err)
 			}
@@ -596,7 +595,7 @@ func EngineDead() bool {
 var errNoIcmpTransport = errors.New("icmp: no transport available")
 
 // dnsCacheTTL is how long a resolved ICMP target is reused before
-// re-resolving (2026-10-19 review F24). A fresh A+AAAA lookup per probe
+// re-resolving. A fresh A+AAAA lookup per probe
 // added full DNS latency on top of the probe timeout (a 700ms-slow
 // resolver made every probe "time out" before the first packet went
 // out) and doubled the query load on the local resolver. With a 30s TTL a

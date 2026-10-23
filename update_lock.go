@@ -8,7 +8,7 @@ import (
 )
 
 // errUpdateLockHeld is the stable sentinel for "another process is updating
-// right now" (2026-10-19 review F19).
+// right now".
 var errUpdateLockHeld = errors.New("update already in progress (another process holds the update lock)")
 
 // updateLockPath is the cross-process update lock file:

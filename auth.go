@@ -64,8 +64,7 @@ const (
 	// (restarts clear it) — the threat model is "don't let an attacker spray
 	// passwords", not "survive a restart mid-attack".
 	//
-	// Why in-memory and NOT persisted to the settings table (2026-10-13
-	// review, dismissed): an attacker who can force a process restart — the
+	// Why in-memory and NOT persisted to the settings table (dismissed): an attacker who can force a process restart — the
 	// only way to reset the lockout — already has host/docker access, at
 	// which point brute-forcing the dashboard is moot (they can read the
 	// SQLite DB or change the password directly), OR a pre-existing remote
@@ -122,7 +121,7 @@ type authSession struct {
 	// login, so without re-issuance the browser deletes it exactly TTL
 	// after login even though ValidSession slides the in-memory expiry on
 	// every use — the sliding-session design was defeated by the cookie's
-	// fixed expiry (2026-10-22 external review). authGate re-issues the
+	// fixed expiry. authGate re-issues the
 	// same token once the cookie ages past half the TTL
 	// (CookieRenewalDue), keeping an active user's cookie ahead of its
 	// browser-side expiry.
@@ -145,7 +144,7 @@ type AuthState struct {
 	// in-memory, so an out-of-band `pulsemon auth-user remove` (a separate
 	// process with its own AuthState) cannot touch this map — session
 	// validation therefore re-checks the users table at most once per
-	// userOKTTL per user (2026-10-19 review F1). Populated only by
+	// userOKTTL per user. Populated only by
 	// validation, never by CreateSession: a freshly minted session gets a
 	// LIVE existence check on first use (the login/remove race, F2).
 	userOKCache map[string]time.Time
@@ -193,7 +192,7 @@ func NewAuthState(db *DB) *AuthState {
 // enabledTTL: an out-of-band `pulsemon auth-user remove` is a separate
 // process that cannot touch this process's in-memory session map, so a
 // removed user's sessions die within this window instead of living out
-// their 30-day TTL (2026-10-19 review F1).
+// their 30-day TTL.
 const userOKTTL = 2 * time.Second
 
 // userExists reports whether the account exists in the users table — the
@@ -213,8 +212,7 @@ func (a *AuthState) userExists(username string) bool {
 // capping the users-table lookups at one per user per userOKTTL. Caller
 // must hold a.mu.
 //
-// The lookup runs UNDER the session lock on purpose (2026-10-20 external
-// review flagged the contention; verified and kept): the query is a
+// The lookup runs UNDER the session lock on purpose (contention flagged; verified and kept): the query is a
 // point lookup on the tiny users table (local SQLite, sub-millisecond),
 // it runs at most once per user per userOKTTL (2s) because of the cache,
 // and moving it outside the lock would need an unlock → query → re-lock →
@@ -336,7 +334,6 @@ var (
 	// errPasswordTooLong: bcrypt rejects inputs over 72 bytes
 	// (ErrPasswordTooLong) — pre-check it so create maps to a 400 instead of
 	// a 500 and change-password returns our text, not the library's
-	// (2026-10-19 review m2).
 	errPasswordTooLong = fmt.Errorf("password exceeds 72 bytes")
 	// errUserExists is the ONLY db error AddUser maps to a user-facing
 	// message; every other db failure propagates as a raw error so the
@@ -344,21 +341,20 @@ var (
 	// a duplicate.
 	errUserExists = fmt.Errorf("user already exists")
 	// errBootstrapped: a concurrent unauthenticated first-user creation
-	// won the setup-mode bootstrap (2026-10-19 review F11). The handler
+	// won the setup-mode bootstrap. The handler
 	// maps it to 409 — the install is no longer fresh, the account
 	// already exists.
 	errBootstrapped = fmt.Errorf("an account already exists — this install is set up")
 	// errLastUser: RemoveUser refuses to delete the final account (use
 	// auth-off for that). A sentinel, not an inline fmt.Errorf, so the
 	// HTTP handler can errors.Is it to a 400 while every other db
-	// failure 500s (2026-10-20 external review — the handler used to
+	// failure 500s (the handler used to
 	// echo every RemoveUser error, raw driver text included, as a 400).
 	errLastUser = fmt.Errorf("cannot remove the last user — disable authentication instead")
 	// errUserNotFound: RemoveUser of a name that doesn't exist. The db
 	// layer used to treat this as a silent no-op, so the API answered
 	// 200 and the CLI printed "User removed: <name>" for a mistyped
-	// username — a false success on an admin operation (2026-10-20
-	// external review). The handler maps it to 404, the same policy as
+	// username — a false success on an admin operation. The handler maps it to 404, the same policy as
 	// the password endpoint (unknown username → 404, not 403, so the
 	// endpoint doesn't confirm which names exist).
 	errUserNotFound = fmt.Errorf("no such user")
@@ -372,7 +368,7 @@ func validUsername(u string) bool {
 // enables authentication.
 //
 // The check-and-create runs in ONE BEGIN IMMEDIATE transaction
-// (2026-10-19 review F11): on a fresh install the unauthenticated
+// on a fresh install the unauthenticated
 // bootstrap POST is open to the whole LAN, and with a DEFERRED begin
 // every concurrent first-user POST reads user_count=0 before any of them
 // writes — N racers, N "first" accounts. BEGIN IMMEDIATE serializes the
@@ -396,8 +392,7 @@ func (a *AuthState) AddUser(username, password string) error {
 // only the in-tx user_count (n > 0) distinguishes the winner from the
 // losers. Without it, four clients with four DIFFERENT usernames all see
 // an empty table at the gate, all pass the UNIQUE check (their names don't
-// collide), and four "first" accounts are created (2026-10-19 review F11 —
-// the ImmediateTx alone does not close the race; this check does).
+// collide), and four "first" accounts are created (// the ImmediateTx alone does not close the race; this check does).
 func (a *AuthState) AddUserMode(username, password string, setupMode bool) error {
 	username = strings.ToLower(username)
 	if !validUsername(username) {
@@ -406,7 +401,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
 	}
-	if len(password) > 72 { // bcrypt input limit (2026-10-19 review m2)
+	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
@@ -435,7 +430,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 			username, string(hash), tsNow(), admin); err != nil {
 			// Only the exact UNIQUE-constraint text means "account
 			// exists" — any other db failure must surface as a 500, not
-			// be misreported as a duplicate (2026-10-19 review m7).
+			// be misreported as a duplicate.
 			if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
 				if n == 0 {
 					// Lost the bootstrap race to a concurrent first user
@@ -490,7 +485,7 @@ func (a *AuthState) IsAdmin(username string) bool {
 // RemoveUser deletes an account and every live session it owns. The last
 // remaining user is protected — use Disable (auth-off) for that. The count
 // below is only a fast path; the authoritative guard is the atomic
-// conditional DELETE in db.RemoveUser (2026-10-19 review M4). Removing the
+// conditional DELETE in db.RemoveUser. Removing the
 // last admin promotes the oldest remaining user in the same transaction, so
 // the install is never left without an admin.
 func (a *AuthState) RemoveUser(username string) error {
@@ -502,7 +497,7 @@ func (a *AuthState) RemoveUser(username string) error {
 	if n <= 1 {
 		// A mistyped name in a single-user install is "no such user",
 		// not "cannot remove the last user" — check existence before
-		// blaming the guard (2026-10-20 external review).
+		// blaming the guard.
 		if !a.userExists(username) {
 			return fmt.Errorf("%w: %s", errUserNotFound, username)
 		}
@@ -525,7 +520,7 @@ func (a *AuthState) SetUserPassword(username, password, keepSession string) erro
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
 	}
-	if len(password) > 72 { // bcrypt input limit (2026-10-19 review m2)
+	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
@@ -575,7 +570,7 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	a.mu.Lock()
 	now := time.Now()
 	// Re-verify the account STILL exists, under the session-map lock,
-	// BEFORE minting (2026-10-19 review F2): VerifyUser's bcrypt check ran
+	// BEFORE minting: VerifyUser's bcrypt check ran
 	// against the hash as of a moment ago; a concurrent RemoveUser in that
 	// gap used to mint a live 30-day session for an already-deleted user.
 	// This is a live check (no cache): the mint path is cold (login rate),
@@ -640,8 +635,7 @@ func peerIP(r *http.Request) string {
 // LEFT and the first entry that parses and is NOT itself a trusted proxy is
 // used — attributing attempts to the real client, not the proxy. Rightmost-
 // untrusted, not leftmost: proxies APPEND, so everything left of the hop our
-// proxy added is client-supplied and rotatable per request (2026-10-19
-// review M3a). If every entry is trusted (nested trusted proxies only), the
+// proxy added is client-supplied and rotatable per request. If every entry is trusted (nested trusted proxies only), the
 // leftmost parseable entry is used.
 // Trusting the header is gated on the PEER being in a trusted CIDR, so the
 // header is only ever read from a connection we know is our proxy; a direct
@@ -653,8 +647,7 @@ func peerIP(r *http.Request) string {
 func (a *AuthState) ClientIP(r *http.Request) string {
 	peer := peerIP(r)
 	if a.trustedPeer(peer) {
-		// Combine ALL X-Forwarded-For lines before parsing (2026-10-19
-		// review N7): HAProxy-style proxies APPEND a new header line
+		// Combine ALL X-Forwarded-For lines before parsing: HAProxy-style proxies APPEND a new header line
 		// instead of extending the first, and r.Header.Get returns only
 		// the first — the CLIENT-CONTROLLED one. Reading it alone
 		// attributed every attempt to the attacker's chosen address.
@@ -687,8 +680,7 @@ func (a *AuthState) ClientIP(r *http.Request) string {
 	// PULSEMON_TRUSTED_PROXIES: every client behind that proxy is
 	// attributed to the proxy's IP and shares its throttle bucket, so
 	// loginFailMax bad guesses from ANYONE lock everyone out for
-	// loginLockout. Surface that misconfiguration once (2026-10-23
-	// external review F8) — the diagnostic is a log line only; the
+	// loginLockout. Surface that misconfiguration once — the diagnostic is a log line only; the
 	// ignore-the-header security behavior is unchanged. (A direct
 	// connection that happens to send the header is a false positive,
 	// hence the hedged wording.)
@@ -724,8 +716,7 @@ func (a *AuthState) trustedIP(p net.IP) bool {
 	return false
 }
 
-// throttleKey maps a client IP to its login-throttle bucket (2026-10-19
-// review M3b, refined by external review #7):
+// throttleKey maps a client IP to its login-throttle bucket:
 //
 //   - private (RFC1918) and loopback IPv4 → the exact address (/32): on a
 //     LAN each device is a distinct host with no address rotation, so a
@@ -854,7 +845,7 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 // account is re-checked against the users table (TTL-cached, see
 // userOKTTL) so a user deleted out-of-band (CLI `auth-user remove`) is
 // rejected within the window even though the in-memory map can't know
-// about it (2026-10-19 review F1).
+// about it.
 func (a *AuthState) ValidSession(tok string) bool {
 	if tok == "" {
 		return false
@@ -877,8 +868,8 @@ func (a *AuthState) ValidSession(tok string) bool {
 // safe to use as an authorization check on its own. Like ValidSession it
 // re-checks the owner against the users table (TTL-cached): the in-memory
 // session map alone cannot see an out-of-band account deletion
-// (2026-10-19 review F1), and like ValidSession it slides the expiry on a
-// live hit (2026-10-22 external review): this is the validation path for
+// and like ValidSession it slides the expiry on a
+// live hit: this is the validation path for
 // the gate-exempt /api/auth/status, so without the slide a
 // status-poll-only client would never extend its session.
 func (a *AuthState) SessionUser(tok string) (string, bool) {
@@ -988,7 +979,7 @@ type authStatusPayload struct {
 	// fresh install (no account has ever existed) offers the bootstrap
 	// button, an operator-disabled install (flag set) must show the CLI
 	// re-enable hint instead — unauthenticated account creation is
-	// refused server-side there (2026-10-20 external review).
+	// refused server-side there.
 	Bootstrapped bool `json:"bootstrapped,omitempty"`
 }
 
@@ -996,8 +987,7 @@ type authStatusPayload struct {
 // ("" when there is no live session).
 //
 // Handlers that call this are re-validating a session the auth gate
-// already validated for the same request (2026-10-20 external review
-// noted the double check; it is deliberate): the handler's
+// already validated for the same request (the double check is deliberate): the handler's
 // authorization decision (admin-only gates, per-user scoping) must not
 // rest on the gate having run — a route registered without the gate,
 // or a future gate change, must not silently widen authorization. The
@@ -1089,7 +1079,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// other IPv4 by /24 (an attacker rotating within a /24 stays in one
 	// bucket), IPv6 by /64 (one host owns a whole /64 via
 	// privacy-extension rotation, so per-address keying handed it 2^64
-	// separate budgets) (2026-10-19 review M3b + external review #7). ip
+	// separate budgets). ip
 	// stays the full address for log lines.
 	ip := s.auth.ClientIP(r)
 	key := throttleKey(ip)
@@ -1153,7 +1143,7 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 // admin surface (self-update, settings incl. test, TLS cert/key,
 // wipe-all-history): a regular account is meant to be lower-trust and
 // must not be able to swap the binary, repoint alerts, change certs, or
-// wipe data (2026-10-23 external review — IsAdmin was previously checked
+// wipe data (IsAdmin was previously checked
 // only on the user-management handlers).
 func (s *Server) requireAdmin(h http.HandlerFunc) http.HandlerFunc {
 	return s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
@@ -1204,14 +1194,14 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// lockout consequence — the new account is admin and
 		// re-enables auth server-wide, so any LAN client could lock
 		// the operator out. Re-enable from the CLI:
-		// `pulsemon auth-user add` (2026-10-20 external review).
+		// `pulsemon auth-user add`.
 		caller := s.sessionFrom(r)
 		setup := !s.auth.Enabled() && caller == "" && !s.auth.Bootstrapped()
 		// Account creation is an admin operation: the setup-mode
 		// bootstrap (unauthenticated, first user) stays open, but an
 		// authenticated NON-admin session cannot mint accounts —
 		// otherwise a shared/compromised helper account grows its own
-		// persistence (2026-10-19 external review, admin-flag fix).
+		// persistence (admin-flag fix).
 		if !setup && !s.auth.IsAdmin(caller) {
 			respondWithError(w, http.StatusForbidden, "admin only")
 			return
@@ -1220,9 +1210,9 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			// Only the duplicate-account and validation cases are client
 			// errors; any other failure (db, KDF) is a 500 with the detail
 			// logged. Validation sentinels (incl. the 72-byte bcrypt limit)
-			// are 400, not 500 (2026-10-19 review m2). A lost setup-mode
+			// are 400, not 500. A lost setup-mode
 			// bootstrap race is a 409: the winner's account already
-			// exists (2026-10-19 review F11).
+			// exists.
 			if errors.Is(err, errUserExists) || errors.Is(err, errUsernameInvalid) ||
 				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
 				respondWithError(w, http.StatusBadRequest, err.Error())
@@ -1246,7 +1236,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 // else gets 404, not 403, so the endpoint doesn't even confirm other
 // usernames exist).
 //
-// The CURRENT password is required (2026-10-23 external review): without
+// The CURRENT password is required: without
 // it, any valid session — a stolen cookie, an unlocked browser left on
 // the 30-day session — could set a new password, and SetUserPassword's
 // dropUserSessionsExcept would then log out every other session, so the
@@ -1316,8 +1306,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		// Only the validation sentinels are client errors; any other
 		// failure (db, KDF) is a 500 with the detail logged — a raw
 		// driver string (e.g. "database is locked") is not a client
-		// fault and must not be echoed back as a 400 (2026-10-20
-		// external review; same pattern as AddUser, 2026-10-19 m2).
+		// fault and must not be echoed back as a 400 (same pattern as AddUser).
 		if errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
@@ -1337,7 +1326,7 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	// admins only). Self-removal is allowed — the last-user guard in
 	// db.RemoveUser stops it from ever locking the install out, and
 	// removing the last admin promotes the oldest remaining user
-	// (2026-10-19 external review, admin-flag fix).
+	// (admin-flag fix).
 	if !s.auth.IsAdmin(s.sessionFrom(r)) {
 		respondWithError(w, http.StatusForbidden, "admin only")
 		return
@@ -1349,15 +1338,14 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 		// endpoint doesn't confirm which names exist). Checked before
 		// the last-user guard so a mistyped name in a single-user
 		// install is 404, not 400. This used to report SUCCESS for a
-		// nonexistent user (2026-10-20 external review).
+		// nonexistent user.
 		if errors.Is(err, errUserNotFound) {
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		// The last-user guard is a client-facing business rule (400);
 		// any other failure (db) is a 500 with the detail logged — a
-		// raw driver string is not a client fault (2026-10-20 external
-		// review; same pattern as AddUser, 2026-10-19 m2).
+		// raw driver string is not a client fault (same pattern as AddUser).
 		if errors.Is(err, errLastUser) {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
@@ -1378,7 +1366,7 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Disabling auth wipes EVERY account and opens the dashboard to the
-	// whole LAN — admin only (2026-10-19 external review, admin-flag fix).
+	// whole LAN — admin only (admin-flag fix).
 	if !s.auth.IsAdmin(s.sessionFrom(r)) {
 		respondWithError(w, http.StatusForbidden, "admin only")
 		return
@@ -1413,8 +1401,7 @@ func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value str
 	// absolute Expires computed from the SERVER clock is mishandled by a
 	// client whose clock runs ahead (unsynced homelab Pi): a "future"
 	// expiry can already be in the client's past, so the browser drops
-	// the session cookie immediately after a successful login (2026-10-20
-	// external review).
+	// the session cookie immediately after a successful login.
 	http.SetCookie(w, &http.Cookie{
 		Name:     authSessionName,
 		Value:    value,

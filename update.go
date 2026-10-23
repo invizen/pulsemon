@@ -45,7 +45,7 @@ func uWarn(msg string) { fmt.Printf("%s%s[!]%s %s\n", uBold, uYellow, uReset, ms
 func uErr(msg string)  { fmt.Fprintf(os.Stderr, "%s%s[x]%s %s\n", uBold, uRed, uReset, msg) }
 
 // semVer is a parsed semver-ish version with its pre-release label KEPT
-// (2026-10-19 review F17): the old parseVer dropped the label, so a final
+// the old parseVer dropped the label, so a final
 // release compared EQUAL to its own pre-release and v0.4.0 never "upgraded"
 // a v0.4.0-rc1 install.
 type semVer struct {
@@ -157,7 +157,7 @@ func (a semVer) lessThan(b semVer) bool {
 // running version. An unstamped ("dev") binary is always treated as older.
 // Pre-releases order per semver, so a FINAL release is newer than its own
 // pre-release (v0.4.0 > v0.4.0-rc1) — the old label-stripping compare made
-// them equal and pinned rc installs forever (2026-10-19 review F17).
+// them equal and pinned rc installs forever.
 func newerRelease(releaseTag, running string) bool {
 	r := parseVer(releaseTag)
 	if !r.ok {
@@ -222,7 +222,7 @@ func targetAsset() string {
 }
 
 // targetAssetName is the pure (testable) form of targetAsset: the release
-// asset name for a given platform (2026-10-19: the bare os/arch join made
+// asset name for a given platform (the bare os/arch join made
 // the first real Windows self-update on zendev fail — the asset is
 // pulsemon-windows-amd64.exe, not pulsemon-windows-amd64).
 func targetAssetName(goos, goarch string) string {
@@ -382,7 +382,7 @@ func runUpdate(args []string) int {
 		return 2
 	}
 
-	// Cross-process install lock (2026-10-19 review F19): everything from
+	// Cross-process install lock: everything from
 	// here on mutates the on-disk binary. The lock is held (via the open
 	// file) until this process exits, covering the whole
 	// download→install→restart span; a concurrent update in another
@@ -425,7 +425,7 @@ func runUpdate(args []string) int {
 }
 
 // runWatchdog is the detached post-restart guardian for the API's
-// auto-restart path (2026-10-19 review, I2): the server process dies WITH
+// auto-restart path (I2): the server process dies WITH
 // the service restart it triggers, so without a watchdog a broken new
 // binary stays broken with no one to roll it back. The watchdog polls the
 // same healthz targets the CLI uses (accepting ok OR degraded — see
@@ -855,7 +855,7 @@ func installBinary(src, dst string) error {
 		tmp.Close()
 		return err
 	}
-	// F18b (2026-10-19): make the staged binary durable BEFORE the rename.
+	// F18b: make the staged binary durable BEFORE the rename.
 	// Without this, a crash between the copy and the rename can leave a
 	// truncated file that the rename then promotes over the good binary.
 	if err := tmp.Sync(); err != nil {
@@ -886,7 +886,7 @@ func installBinary(src, dst string) error {
 		}
 		return err
 	}
-	// F18b (2026-10-19): fsync the destination directory so the rename
+	// F18b: fsync the destination directory so the rename
 	// itself is durable (best effort — some filesystems, e.g. Windows,
 	// cannot open a directory for sync; the rename is already atomic).
 	if d, err := os.Open(dir); err == nil {
@@ -949,7 +949,7 @@ var runningExecutable = func() (string, error) {
 // verified digest. Shared by the CLI (runUpdate) and the dashboard endpoint
 // (handleUpdate) so the verification contract lives in one place.
 //
-// Security-review note (2026-10-23 external review F9 — deliberate, do NOT
+// Security-review note (deliberate, do NOT
 // re-flag as a bug): this check is INTEGRITY, not AUTHENTICITY. The SHA-256
 // comes from the SAME GitHub release as the binary (API digest or .sha256
 // sidecar), so it catches corruption, DNS poisoning, and MITM — but a
@@ -1062,7 +1062,7 @@ func journalHint(bus string) string {
 }
 
 // unitFileCandidates are the pulsemon systemd unit files the CLI consults
-// for unit-level environment (2026-10-19 review F16): the user unit first
+// for unit-level environment: the user unit first
 // (install.sh's default), then the system unit.
 func unitFileCandidates() []string {
 	var out []string
@@ -1074,7 +1074,7 @@ func unitFileCandidates() []string {
 }
 
 // unitEnvVar returns name's value from the pulsemon unit's Environment=
-// lines (2026-10-19 review F16): `pulsemon update --restart` runs from the
+// lines: `pulsemon update --restart` runs from the
 // operator's shell, which does NOT carry the unit's PULSEMON_ADDR /
 // PULSEMON_DB — the post-restart healthz poll and the DB lookup then fell
 // back to defaults, so a non-default-port install could never verify its
@@ -1198,8 +1198,7 @@ var healthzTimeout = 15 * time.Second
 // It accepts "ok" (healthy) AND "degraded" (up and serving, but ICMP
 // unavailable — e.g. a host without CAP_NET_RAW/ping_group_range): a
 // degraded service IS a successful update. The old "ok"-only marker rolled
-// back a perfectly working new binary on no-ICMP hosts (2026-10-19 review
-// F8). A 2xx/3xx from ANY other service sharing a candidate port (a reverse
+// back a perfectly working new binary on no-ICMP hosts. A 2xx/3xx from ANY other service sharing a candidate port (a reverse
 // proxy on 443, a stale process on the HTTP port) must not be mistaken for
 // the monitor — the body check is what makes polling several candidate
 // ports safe.

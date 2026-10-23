@@ -87,7 +87,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	defer updateMu.Unlock()
 
-	// Cross-process lock (2026-10-19 review F19): updateMu only serializes
+	// Cross-process lock: updateMu only serializes
 	// requests WITHIN this process — a concurrent `pulsemon update` CLI run
 	// (or a second server instance) would race this install on the .prev
 	// rename. The file lock covers the whole download→install→restart span.
@@ -210,7 +210,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 	fmt.Fprintf(os.Stderr, "pulsemon: updated to %s (sha256 %s); restarting %s service\n", rel.TagName, digest, d)
-	// I2 (2026-10-19 review): this process dies with the restart, so a
+	// I2: this process dies with the restart, so a
 	// broken new binary would stay broken with no one to roll it back.
 	// Spawn a detached watchdog that polls healthz after the restart and
 	// restores <exe>.prev if the new binary never comes up. If the spawn

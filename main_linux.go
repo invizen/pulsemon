@@ -29,7 +29,7 @@ func defaultDBPath() string {
 // that dir hardened, and the platform default dir is only created/touched
 // when the default is in effect.
 //
-// F15/N1 (2026-10-19 review): two pre-fix footguns, both fixed here.
+// F15/N1: two pre-fix footguns, both fixed here.
 //  1. A pre-existing parent dir was unconditionally chmod'd 0700 — a shared
 //     /data volume (other containers' files inside) got locked out, and a
 //     relative PULSEMON_DB chmod'd the process CWD on every start. Now ONLY
