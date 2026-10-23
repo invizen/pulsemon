@@ -152,11 +152,15 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 	}
 
 	// (2) Past-hour loss % + avg RTT (epoch cutoff = testNowUnix - 3600).
+	// manual = 0: the in-memory path excludes "Pulse Now" rows from every
+	// loss/uptime aggregate (2026-10-23 external review F5) — the
+	// 60-probe window above (q1) deliberately does not, because it reads
+	// the raw history.
 	var h1, l1 int
 	var h1avg *float64
 	hcutoff := time.Unix(testNowUnix-3600, 0).UTC().Format(time.RFC3339)
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0), AVG(rtt_ms)
-		FROM probes WHERE sensor_id = ? AND ts >= ?`, id, hcutoff).Scan(&h1, &l1, &h1avg); err != nil {
+		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ?`, id, hcutoff).Scan(&h1, &l1, &h1avg); err != nil {
 		t.Fatalf("q2: %v", err)
 	}
 	if h1 > 0 {
@@ -164,22 +168,24 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 		st.HourRTTAvg = h1avg
 	}
 
-	// (3) 24h uptime (epoch cutoff = testNowUnix - 86400).
+	// (3) 24h uptime (epoch cutoff = testNowUnix - 86400), scheduled rows
+	// only (manual exclusion — see q2).
 	var d24, l24 int
 	dcutoff := time.Unix(testNowUnix-retentionSeconds, 0).UTC().Format(time.RFC3339)
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM probes WHERE sensor_id = ? AND ts >= ?`, id, dcutoff).Scan(&d24, &l24); err != nil {
+		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ?`, id, dcutoff).Scan(&d24, &l24); err != nil {
 		t.Fatalf("q3: %v", err)
 	}
 	if d24 > 0 {
 		st.Uptime24h = float64(d24-l24) / float64(d24) * 100
 	}
 
-	// (3b) Status window: last statusWindow probes, loss count + %.
+	// (3b) Status window: last statusWindow SCHEDULED probes (manual = 0,
+	// mirroring deriveStatus), loss count + %.
 	st.StatusWindowSize = statusWindow
 	var swTotal, swLost int
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM (SELECT rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?)`,
+		FROM (SELECT rtt_ms FROM probes WHERE sensor_id = ? AND manual = 0 ORDER BY ts DESC LIMIT ?)`,
 		id, statusWindow).Scan(&swTotal, &swLost); err != nil {
 		t.Fatalf("q3b: %v", err)
 	}
@@ -195,7 +201,7 @@ func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
 		st.Hour[i] = &nd
 	}
 	r4, err := db.Query(`SELECT (strftime('%s', ts) / 60) * 60 AS bucket, MIN(rtt_ms)
-		FROM probes WHERE sensor_id = ? AND ts >= ? GROUP BY bucket`, id, hcutoff)
+		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ? GROUP BY bucket`, id, hcutoff)
 	if err != nil {
 		t.Fatalf("q4: %v", err)
 	}
@@ -361,10 +367,12 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 			// Brute-force 24h recount anchored at testNowUnix — the same
 			// window the SQL reference uses (production passes the series'
 			// incremental counters instead; the round-trip test covers that
-			// path with the newest row at testNowUnix).
+			// path with the newest row at testNowUnix). Manual rows are
+			// excluded: the counters (and the SQL reference) skip them
+			// (2026-10-23 external review F5).
 			total24, lost24 := 0, 0
 			for _, e := range entries {
-				if e.ts >= testNowUnix-86400 {
+				if !e.manual && e.ts >= testNowUnix-86400 {
 					total24++
 					if isLost(e.rtt) {
 						lost24++
@@ -406,6 +414,60 @@ func TestGetStatsRoundTrip(t *testing.T) {
 	got := pw.statsFor("rt", testNowUnix)
 	want := sqlStats(t, db, "rt")
 	compareStats(t, "roundtrip", got, want)
+}
+
+// TestManualPulseExcludedFromAggregates locks the F5 contract (2026-10-23
+// external review): a LOST "Pulse Now" row stays in the 60-probe inspector
+// window (it reads the raw history) but is excluded from every loss/uptime
+// aggregate — 1h loss/avg, status window, 24h counters, sparkline — so a
+// diagnostic click can never make a healthy sensor show packet loss.
+func TestManualPulseExcludedFromAggregates(t *testing.T) {
+	pw := &ProbeWorker{
+		sensors:    make(map[string]*ProbeState),
+		loops:      make(map[string]context.CancelFunc),
+		statsCache: make(map[string]*probeSeries),
+	}
+	// 30 good scheduled probes ending 90s before the anchor, 5s apart.
+	for i := 0; i < 30; i++ {
+		pw.recordProbe("m1", probeEntry{ts: testNowUnix - 90 - int64(29-i)*5, rtt: 10})
+	}
+	// One LOST manual pulse at the anchor: the newest entry, and the ONLY
+	// entry in its minute (the last scheduled probe is 90s older).
+	pw.recordProbe("m1", probeEntry{ts: testNowUnix, rtt: float32(math.NaN()), manual: true})
+
+	got := pw.statsFor("m1", testNowUnix)
+	if got == nil {
+		t.Fatal("statsFor: nil, want stats")
+	}
+	// 60-probe inspector window: the manual row IS in the raw history.
+	if got.Total != 31 {
+		t.Errorf("Total = %d, want 31 (manual row stays in the inspector window)", got.Total)
+	}
+	if got.LostCount != 1 {
+		t.Errorf("LostCount = %d, want 1 (the inspector window reads raw history)", got.LostCount)
+	}
+	// 1h loss/avg: the manual loss is excluded.
+	if got.HourLossPct != 0 {
+		t.Errorf("HourLossPct = %v, want 0 (a manual loss must not count toward the 1h aggregate)", got.HourLossPct)
+	}
+	// 24h uptime: the incremental counters skip manual rows.
+	if got.Uptime24h != 100 {
+		t.Errorf("Uptime24h = %v, want 100 (manual rows are never in the 24h counters)", got.Uptime24h)
+	}
+	// Status window: mirrors deriveStatus (scheduled probes only), skipped in
+	// BOTH numerator and denominator.
+	if got.StatusLostCount != 0 || got.StatusLossPct != 0 {
+		t.Errorf("status window = %d lost / %v%%, want 0/0 (the badge derives from scheduled probes only)", got.StatusLostCount, got.StatusLossPct)
+	}
+	// Sparkline: the pulse's minute holds only the manual loss → "no data"
+	// (-2 sentinel), NOT "all lost" (nil).
+	nowMin := testNowUnix / 60 * 60
+	pos := 59 - int((nowMin-(testNowUnix/60*60))/60)
+	if got.Hour[pos] == nil {
+		t.Error("sparkline current minute = nil (all-lost) — the manual loss leaked into the sparkline; want the -2 no-data sentinel")
+	} else if *got.Hour[pos] != -2 {
+		t.Errorf("sparkline current minute = %v, want the -2 no-data sentinel", *got.Hour[pos])
+	}
 }
 
 // TestSeriesEviction locks the retention rule: the series holds exactly the

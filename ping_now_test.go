@@ -79,12 +79,53 @@ func TestEchoNowProbeRowCount(t *testing.T) {
 		t.Errorf("status after echo = %q, want up (a manual probe must not flip status)", status)
 	}
 
-	// Fixed 1s timeout, independent of the sensor's 8000ms configured timeout.
+	// The sensor's configured timeout (8000ms), not a fixed 1s: the pulse
+	// is the same probe the sensor runs on schedule, so a slow-but-healthy
+	// target answers it (2026-10-23 external review F5 — this test used to
+	// pin the OLD fixed-1s behavior).
 	if captured == nil {
 		t.Fatal("pingNow was never called")
 	}
-	if *captured != time.Second {
-		t.Errorf("echo timeout = %v, want 1s (fixed, not the sensor's configured timeout)", *captured)
+	if *captured != 8000*time.Millisecond {
+		t.Errorf("pulse timeout = %v, want 8s (the sensor's configured timeout)", *captured)
+	}
+}
+
+// TestPingNowZeroedTimeoutFallsBack locks the legacy-row fallback: a sensor
+// whose timeout_ms is zeroed (pre-validation rows; the API now enforces
+// 100-30000) gets the pingNowTimeout fallback, not a zero-duration (instant)
+// timeout that would lose every probe (2026-10-23 external review F5).
+func TestPingNowZeroedTimeoutFallsBack(t *testing.T) {
+	db, err := NewDB(filepath.Join(t.TempDir(), "echoz.db"))
+	if err != nil {
+		t.Fatalf("NewDB: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('echoz','echoz','192.0.2.1',15,0,25,1,3,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("insert sensor: %v", err)
+	}
+	pw := NewProbeWorker(db)
+
+	var captured *time.Duration
+	orig := probeTarget
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
+		captured = &timeout
+		return probeOutcome{lost: true, ip: "192.0.2.1"}
+	}
+	defer func() { probeTarget = orig }()
+
+	if _, err := pw.PingNow(context.Background(), "echoz"); err != nil {
+		t.Fatalf("PingNow: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("probeTarget was never called")
+	}
+	if *captured != pingNowTimeout {
+		t.Errorf("pulse timeout = %v, want %v (the legacy fallback for a zeroed timeout_ms)", *captured, pingNowTimeout)
 	}
 }
 

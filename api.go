@@ -1079,10 +1079,10 @@ func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []str
 
 // handleSensorPing performs one immediate probe ("Pulse Now"). Works while
 // paused (SPEC §2). The probe IS recorded in history (a manual pulse is a real
-// sample the dashboard should reflect) but does not drive status or alerts —
-// see ProbeWorker.PingNow. It uses a fixed 1s timeout (pingNowTimeout),
-// independent of the sensor's configured timeout: a manual pulse is a quick
-// diagnostic, not a scheduled probe.
+// sample the dashboard should reflect) but does not drive status, alerts, or
+// the loss/uptime aggregates — see ProbeWorker.PingNow. It runs with the
+// sensor's own configured timeout (the pulse is the same probe the sensor
+// runs on schedule; 1s fallback for a legacy zeroed row).
 func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1624,12 +1624,17 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// slice + strftime per row" to a B-tree range seek; see commit
 	// message for timings.
 	cutoffStr := fmtTS(time.Now().UTC().Add(-dur - time.Second))
+	// manual = 0: "Pulse Now" rows are diagnostic clicks, not scheduled
+	// samples — the card's loss/uptime aggregates (computeSensorStats)
+	// skip them, so the graph must too (2026-10-23 external review F5):
+	// a lost pulse on a healthy sensor must not draw a loss bucket here.
 	rows, err := s.db.QueryContext(r.Context(), `SELECT (strftime('%s', ts) / ?) * ? AS bucket,
 		COUNT(*) AS total,
 		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
 		AVG(rtt_ms) AS avg_rtt,
 		MAX(rtt_ms) AS max_rtt
 		FROM probes WHERE sensor_id = ?
+			AND manual = 0
 			AND ts >= ?
 			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)
 		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, cutoffStr, from)

@@ -73,9 +73,13 @@ type probeEntry struct {
 	// scan (2026-10-23 external review F4: at 100 sensors x 24h x 5s that
 	// is ~1.7M entries, so the old layout was tens of MB of heap pointers).
 	rtt float32
-	// manual marks a "Pulse Now" row: it stays in the series (sparkline
-	// honesty) but is excluded from status derivation (recentFromCache
-	// skips it) — see the probes.manual column.
+	// manual marks a "Pulse Now" row: it stays in the series (the 60-probe
+	// inspector window reads it) but is excluded from status derivation
+	// (recentFromCache skips it) AND from every loss/uptime aggregate —
+	// the 1h loss/avg, the status window, the 24h counters, the sparkline
+	// (append + computeSensorStats skip it) — so a diagnostic click can
+	// never make a healthy sensor show packet loss. See the probes.manual
+	// column.
 	manual bool
 }
 
@@ -115,7 +119,10 @@ type probeSeries struct {
 	// never touches the counters (decrementing there would double-count).
 	// A long-interval sensor's last-60 tail can hold entries older than 24h
 	// (kept by the 60-probe rule): in24Start passes them out of the
-	// counters even though start keeps them in the series.
+	// counters even though start keeps them in the series. Manual "Pulse
+	// Now" rows are never counted (a diagnostic click must not move
+	// uptime_24h): append skips them on the way in and in24Start skips
+	// them on the way out (2026-10-23 external review F5).
 	total24   int
 	lost24    int
 	in24Start int
@@ -160,20 +167,28 @@ func (ps *probeSeries) append(e probeEntry) {
 	cutoff := e.ts - retentionSeconds
 	// 24h window bookkeeping: entries the window has passed drop out of the
 	// counters HERE (see the field doc for why the evict loop below must
-	// not touch them).
+	// not touch them). Manual rows were never counted, so they never
+	// decrement (2026-10-23 external review F5).
 	for ps.in24Start < len(ps.data) && ps.data[ps.in24Start].ts < cutoff {
-		if isLost(ps.data[ps.in24Start].rtt) {
-			ps.lost24--
+		if !ps.data[ps.in24Start].manual {
+			if isLost(ps.data[ps.in24Start].rtt) {
+				ps.lost24--
+			}
+			ps.total24--
 		}
-		ps.total24--
 		ps.in24Start++
 	}
 	for ps.start < boundary && ps.data[ps.start].ts < cutoff {
 		ps.start++
 	}
-	ps.total24++
-	if isLost(e.rtt) {
-		ps.lost24++
+	// Manual "Pulse Now" rows stay in the series (the inspector window
+	// reads them) but never enter the 24h counters: a diagnostic click
+	// must not move uptime_24h (2026-10-23 external review F5).
+	if !e.manual {
+		ps.total24++
+		if isLost(e.rtt) {
+			ps.lost24++
+		}
 	}
 }
 
@@ -965,6 +980,12 @@ func (pw *ProbeWorker) ResetStatsAll() {
 //     fields use time windows relative to nowUnix, matching the SQL
 //     `ts >= datetime('now', '-1 hour' / '-1 day')` filters.
 //
+// Manual "Pulse Now" rows count in the 60-probe inspector window (it reads
+// the raw history) but are EXCLUDED from every loss/uptime aggregate —
+// the 1h pass, the status window (which mirrors deriveStatus), the 24h
+// counters, and the sparkline (2026-10-23 external review F5): a
+// diagnostic click must not make a healthy sensor show packet loss.
+//
 // nowUnix (epoch seconds) is the "current time" the time windows anchor to.
 // GetStats passes time.Now().Unix(); the differential test passes a fixed
 // value to both the SQL and in-memory paths so they compare deterministically
@@ -1030,6 +1051,9 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 	var h1sum float64
 	i1 := sort.Search(len(entries), func(i int) bool { return entries[i].ts >= nowUnix-3600 })
 	for _, e := range entries[i1:] {
+		if e.manual {
+			continue
+		}
 		h1++
 		if isLost(e.rtt) {
 			l1++
@@ -1051,18 +1075,29 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 	// deriveStatus reads warning at/above this loss%, up below it (steady
 	// state on the newest 2, or a single blip); only the fast-recovery
 	// shortcut from error bypasses the % entirely.
+	//
+	// Manual rows are skipped in BOTH numerator and denominator: the badge
+	// derives from scheduled probes only (deriveStatus skips manual rows),
+	// so a manual loss in an otherwise healthy window must not read as
+	// loss% (2026-10-23 external review F5).
 	st.StatusWindowSize = statusWindow
 	sw := entries
 	if len(sw) > statusWindow {
 		sw = sw[len(sw)-statusWindow:]
 	}
+	swTotal, swLost := 0, 0
 	for _, e := range sw {
+		if e.manual {
+			continue
+		}
+		swTotal++
 		if isLost(e.rtt) {
-			st.StatusLostCount++
+			swLost++
 		}
 	}
-	if len(sw) > 0 {
-		st.StatusLossPct = float64(st.StatusLostCount) / float64(len(sw)) * 100
+	st.StatusLostCount = swLost
+	if swTotal > 0 {
+		st.StatusLossPct = float64(swLost) / float64(swTotal) * 100
 	}
 
 	// 24h uptime — straight from the incremental counters (maintained in
@@ -1089,6 +1124,9 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 	buckets := make([]bmin, 60)
 	nowMin := nowUnix / 60 * 60
 	for _, e := range entries[i1:] {
+		if e.manual {
+			continue
+		}
 		if e.ts > nowUnix {
 			continue
 		}
@@ -1261,12 +1299,15 @@ func (pw *ProbeWorker) safeProbe(ctx context.Context, c sensorConfig) {
 	pw.doProbe(ctx, c)
 }
 
-// pingNowTimeout bounds the "Pulse Now" manual probe. It is a fixed 1s,
-// independent of the sensor's configured timeout: a manual pulse is a quick
-// diagnostic, not a scheduled probe, so it shouldn't wait out a long
-// configured timeout. It is a var (like the other bounded call sites) so a
-// test can shorten it.
-var pingNowTimeout = time.Second
+// pingNowTimeout is the FALLBACK timeout for a "Pulse Now" probe on a legacy
+// row whose timeout_ms is zeroed (the API validates 100-30000, so only
+// pre-validation rows reach it). Real sensors run the pulse with their OWN
+// configured timeout: the pulse is the same probe the sensor runs on
+// schedule, and the old fixed-1s design made slow-but-healthy targets (a
+// cold Nextcloud, a Proxmox login) read as losses on a pulse while
+// answering fine on schedule (2026-10-23 external review F5 — the old
+// code documented that tradeoff in its own doc string).
+const pingNowTimeout = time.Second
 
 // errPulseCoolingDown is returned by PingNow when a manual pulse arrives
 // before the per-sensor cooldown elapses; the handler maps it to 429.
@@ -1290,15 +1331,25 @@ const pulseNowCooldown = 2 * time.Second
 // derivation (recentFromDB / recentFromCache) excludes manual rows. Before
 // the tag, a manual pulse's loss row was indistinguishable from a scheduled
 // loss, so ONE lost manual pulse + one lost scheduled probe tripped the
-// down_after=2 consecutive-loss test — the fixed 1s pulse timeout (a
-// sensor whose configured timeout is longer can look lost on a pulse while
-// answering fine on schedule) made the spurious loss likelier, not less.
+// down_after=2 consecutive-loss test.
+//
+// The same exclusion covers EVERY loss/uptime aggregate (2026-10-23
+// external review F5): computeSensorStats skips manual entries in the 1h
+// loss/avg, the status window, the sparkline, and the 24h counters, and
+// the graph endpoint filters manual = 0. Before F5 only status derivation
+// skipped them, so a lost manual pulse — likelier than it should be,
+// because the pulse used to run a fixed 1s timeout — could make a healthy
+// sensor show packet loss on the card and the graph. The pulse now runs
+// with the sensor's own timeout_ms (pingNowTimeout only covers a legacy
+// zeroed row), so a slow-but-healthy target answers the pulse exactly as
+// it answers the schedule.
 // Works while paused (SPEC §2). Dispatches by sensor type, so an HTTP
 // sensor's manual pulse makes an HTTP request (the card's "Pulse Now"
 // shows its status code).
 func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
 	var target, probeType string
-	if err := pw.db.QueryRow("SELECT target, type FROM sensors WHERE id = ?", id).Scan(&target, &probeType); err != nil {
+	var timeoutMS int
+	if err := pw.db.QueryRow("SELECT target, type, timeout_ms FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
 	}
 	// Per-sensor cooldown: a manual pulse is a quick diagnostic, and an
@@ -1316,7 +1367,15 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		probeType = "icmp"
 	}
 
-	o := probeTarget(ctx, probeType, target, pingNowTimeout)
+	// The sensor's own configured timeout (2026-10-23 external review F5):
+	// the pulse is the same probe the sensor runs on schedule, so a
+	// slow-but-healthy target answers it. A legacy zeroed row falls back
+	// to pingNowTimeout.
+	timeout := time.Duration(timeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = pingNowTimeout
+	}
+	o := probeTarget(ctx, probeType, target, timeout)
 
 	var rttVal interface{}
 	if !o.lost {
@@ -1877,9 +1936,10 @@ func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]float32, bool) {
 	out := make([]float32, 0, limit)
 	for i := len(s.data) - 1; i >= s.start && len(out) < limit; i-- {
 		// Manual "Pulse Now" rows are excluded from status derivation
-		// (probes.manual): they stay in the series for the sparkline,
-		// but never count toward loss % or the consecutive-loss test
-		// (2026-10-20 external review — see the PingNow doc).
+		// (probes.manual): they stay in the series for the 60-probe
+		// inspector window, but never count toward loss % or the
+		// consecutive-loss test (2026-10-20 external review — see the
+		// PingNow doc; the loss/uptime aggregates skip them too, F5).
 		if s.data[i].manual {
 			continue
 		}
