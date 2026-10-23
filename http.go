@@ -51,9 +51,12 @@ const maxHTTPRedirects = 5
 // one TCP handshake, not N. HTTPS probes intentionally do NOT reuse —
 // probeHTTP sets req.Close per probe (M5) so every probe's cert reading
 // comes from a fresh handshake, not a pooled conn's original one; one
-// handshake per 5-60s probe is the accepted cost. The pool stays bounded
-// regardless (100 conns total / 32 per host / 10 min idle), so the sensor
-// list — small and stable, not ephemeral — cannot exhaust it. Redirects
+// handshake per 5-60s probe is the accepted cost. That handshake time is
+// EXCLUDED from the reported latency (2026-10-23 external review F12:
+// probeHTTP measures from connection-established to response headers), so
+// an HTTPS sensor's number stays comparable to an HTTP sensor's. The pool
+// stays bounded regardless (100 conns total / 32 per host / 10 min idle),
+// so the sensor list — small and stable, not ephemeral — cannot exhaust it. Redirects
 // are followed (up to maxHTTPRedirects) so a target that 301/302s to its
 // real destination — the common case for a web UI behind a redirect — is
 // judged on where it ends up, not the redirect itself.
@@ -324,6 +327,16 @@ const drainBodyCap = 1 << 20
 // handshake; a cert that is neither system-trusted nor a valid self-signed
 // match is a loss.
 //
+// Elapsed is the time from the FINAL connection's establishment
+// (httptrace.GotConn) to the response headers — DNS, TCP, and the TLS
+// handshake are EXCLUDED (2026-10-23 external review F12), so an HTTPS
+// sensor's latency stays comparable to an HTTP sensor's and to what a
+// warm browser tab sees. M5's per-probe fresh handshake still happens
+// (cert freshness) and still counts against the probe timeout and
+// failure detection; it just no longer inflates the displayed number.
+// When no connection is ever established (dial/DNS/handshake failure),
+// GotConn never fires and Elapsed falls back to the full request time.
+//
 // The cert expiry is INFORMATIONAL ONLY: it never affects Lost or status.
 // A cert expiring in 3 days does not take the sensor down — it just earns
 // an amber/red note on the card so the user renews it on purpose.
@@ -361,9 +374,16 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// fires synchronously on this goroutine for every connection in the
 	// redirect chain; the last one wins, which is the final hop — the
 	// same connection that determines the terminal status and cert.
+	//
+	// connAt stamps that same final GotConn: it is the start of the
+	// reported RTT (see the Elapsed note on httpProbeResult) — the
+	// handshake/DNS/TCP cost that precedes it is deliberately excluded
+	// so HTTP and HTTPS sensors are comparable (F12).
 	var resolved string
+	var connAt time.Time
 	trace := &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
+			connAt = time.Now()
 			if info.Conn != nil && info.Conn.RemoteAddr() != nil {
 				if h, _, err := net.SplitHostPort(info.Conn.RemoteAddr().String()); err == nil {
 					resolved = h
@@ -389,6 +409,17 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	el := time.Since(start)
+	// Reported RTT = final-connection-established (GotConn) -> response
+	// headers. The DNS/TCP/TLS cost before connAt is the probe's own
+	// connection policy (M5 forces a fresh HTTPS handshake for cert
+	// freshness), not the server's responsiveness — excluding it keeps
+	// HTTP and HTTPS sensor latencies comparable (2026-10-23 external
+	// review F12). No conn established -> GotConn never fired -> the full
+	// elapsed is the honest number.
+	rtt := el
+	if !connAt.IsZero() {
+		rtt = time.Since(connAt)
+	}
 	if err != nil {
 		// A transport-level failure: timeout, connection refused, DNS, or a
 		// malformed TLS handshake. With InsecureSkipVerify the handshake
@@ -396,7 +427,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		// a certificate problem no longer surfaces here — it is caught by
 		// verifyHTTPCert below. certNotAfterFromErr stays as a safety net
 		// for the rare handshake error that does carry a cert.
-		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certNotAfterFromErr(err), Err: err}
+		return httpProbeResult{Elapsed: rtt, Lost: true, IP: resolved, CertExpiry: certNotAfterFromErr(err), Err: err}
 	}
 
 	// Capture the server's presented certs and their expiry, then close the
@@ -429,7 +460,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		verifyHost = resp.Request.URL.Hostname()
 	}
 	if vErr := verifyHTTPCert(presented, verifyHost); vErr != nil {
-		return httpProbeResult{Elapsed: el, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
+		return httpProbeResult{Elapsed: rtt, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
 	}
 
 	// A redirect chain that ENDS on plain HTTP after the configured target
@@ -444,7 +475,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		strings.EqualFold(resp.Request.URL.Scheme, "http") {
 		code := resp.StatusCode
 		return httpProbeResult{
-			Elapsed:    el,
+			Elapsed:    rtt,
 			Lost:       true,
 			Status:     &code,
 			IP:         resolved,
@@ -456,7 +487,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	code := resp.StatusCode
 	up := code >= 200 && code <= 299
 	return httpProbeResult{
-		Elapsed:    el,
+		Elapsed:    rtt,
 		Lost:       !up,
 		Status:     &code,
 		IP:         resolved,
