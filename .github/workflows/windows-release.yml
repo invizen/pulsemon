@@ -38,7 +38,12 @@ jobs:
       - name: Embed Windows icon + version (go-winres)
         shell: pwsh
         run: |
-          go install github.com/tc-hib/go-winres@latest
+          # Pin go-winres: @latest pulled whatever was newest at build time,
+          # and this tool writes the .syso resource file that is EMBEDDED in
+          # the binary — a compromised or broken new go-winres release would
+          # land in every Windows build (2026-10-23 external review F9).
+          # Same pinning discipline as the Inno Setup pin below.
+          go install github.com/tc-hib/go-winres@v0.3.3
           if ($LASTEXITCODE -ne 0) { throw "go install go-winres failed" }
           $gobin = Join-Path (go env GOPATH) "bin"
           & (Join-Path $gobin "go-winres.exe") make --arch amd64

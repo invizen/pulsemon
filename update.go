@@ -948,6 +948,23 @@ var runningExecutable = func() (string, error) {
 // DNS poisoning, MITM, or a compromised release pipeline). Returns the
 // verified digest. Shared by the CLI (runUpdate) and the dashboard endpoint
 // (handleUpdate) so the verification contract lives in one place.
+//
+// Security-review note (2026-10-23 external review F9 — deliberate, do NOT
+// re-flag as a bug): this check is INTEGRITY, not AUTHENTICITY. The SHA-256
+// comes from the SAME GitHub release as the binary (API digest or .sha256
+// sidecar), so it catches corruption, DNS poisoning, and MITM — but a
+// compromised repo/release that publishes both a trojaned binary and a
+// matching checksum passes. Closing that gap requires release SIGNING:
+// sign the assets in the pipeline with a key held in a GitHub secret
+// (minisign or cosign), embed the PUBLIC key here, and verify the
+// signature before the hash. That is a longer-term project — keypair
+// generation the operator owns, a secret in the repo settings, and
+// signing steps in BOTH release flows (the Linux cut from zenai and
+// windows-release.yml) plus a migration story for already-shipped
+// binaries — and is parked as a deliberate decision, not an oversight.
+// (The companion F9 item, the unpinned `go install go-winres@latest` in
+// windows-release.yml, is fixed: pinned to v0.3.3, because that tool
+// writes the .syso resource embedded in the Windows binary.)
 func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string) (string, error) {
 	verifySHA := strings.TrimPrefix(sel.sha, "sha256:")
 	if verifySHA == "" {
