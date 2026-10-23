@@ -46,15 +46,21 @@ func TestFix_FirstUserConcurrentSingleAdmin(t *testing.T) {
 	}
 	wg.Wait()
 
-	var ok, conflict int
+	var ok, conflict, unauthorized int
 	for i, c := range codes {
 		switch c {
 		case http.StatusOK:
 			ok++
 		case http.StatusConflict:
 			conflict++
+		case http.StatusUnauthorized:
+			// Latecomer: the winner's commit has already flipped
+			// Enabled() (user_count > 0), so the auth gate rejects
+			// the anonymous POST before it reaches the handler.
+			// Same single-admin invariant, just a later door.
+			unauthorized++
 		default:
-			t.Errorf("bootstrap POST %d: status %d, want 200 or 409", i, c)
+			t.Errorf("bootstrap POST %d: status %d, want 200, 409, or 401", i, c)
 		}
 	}
 	if ok != 1 {
