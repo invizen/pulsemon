@@ -281,44 +281,24 @@ func parseTrustedProxies(raw string) []*net.IPNet {
 // The count source is userCountFn (defaults to db.UserCount); the seam lets
 // a test count reads and prove the cache actually stops the query.
 //
-// On a COUNT error the LAST KNOWN value is kept (a transient "database is
-// locked" must not read as "auth disabled"); if there is no last known
-// value yet (first-ever read) the gate fails CLOSED — enabled — so a DB
-// hiccup can never open the dashboard.
+// The count-and-fallback rules live in refreshEnabledLocked (a COUNT error
+// keeps the last known value; the first-ever read fails closed).
 func (a *AuthState) Enabled() bool {
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
 	if time.Since(a.enabledAt) < enabledTTL && a.enabledAt != (time.Time{}) {
 		return a.enabled
 	}
-	fn := a.userCountFn
-	if fn == nil {
-		fn = a.db.UserCount
-	}
-	n, err := fn()
-	if err != nil {
-		log.Printf("auth: user count failed (keeping previous state): %v", err)
-		if a.enabledAt.IsZero() {
-			a.enabled = true // never read: fail closed
-		}
-		a.enabledAt = time.Now()
-		return a.enabled
-	}
-	a.enabled = n > 0
-	a.enabledAt = time.Now()
+	a.refreshEnabledLocked()
 	return a.enabled
 }
 
-// refreshEnabledNow re-reads the user count and updates the Enabled() cache
-// immediately. Called by the in-app user mutations (AddUser/RemoveUser/
-// Disable) so the gate reflects them on the very next request with no TTL
-// wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
-// handle and never reaches this method — which is exactly why the TTL exists.
-// Like Enabled(), an error keeps the last known value (fails closed when
-// there is none).
-func (a *AuthState) refreshEnabledNow() {
-	a.enabledMu.Lock()
-	defer a.enabledMu.Unlock()
+// refreshEnabledLocked re-reads the user count and updates the Enabled()
+// cache. The caller holds enabledMu. On a COUNT error the LAST KNOWN value
+// is kept (a transient "database is locked" must not read as "auth
+// disabled"); if there is no last known value yet (first-ever read) the gate
+// fails CLOSED — enabled — so a DB hiccup can never open the dashboard.
+func (a *AuthState) refreshEnabledLocked() {
 	fn := a.userCountFn
 	if fn == nil {
 		fn = a.db.UserCount
@@ -334,6 +314,17 @@ func (a *AuthState) refreshEnabledNow() {
 	}
 	a.enabled = n > 0
 	a.enabledAt = time.Now()
+}
+
+// refreshEnabledNow re-reads the user count and updates the Enabled() cache
+// immediately. Called by the in-app user mutations (AddUser/RemoveUser/
+// Disable) so the gate reflects them on the very next request with no TTL
+// wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
+// handle and never reaches this method — which is exactly why the TTL exists.
+func (a *AuthState) refreshEnabledNow() {
+	a.enabledMu.Lock()
+	defer a.enabledMu.Unlock()
+	a.refreshEnabledLocked()
 }
 
 // UserCount/CRUD live on *DB (see db.go); AuthState adds the password
