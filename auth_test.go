@@ -1853,3 +1853,51 @@ func TestCSRFCrossPortGate(t *testing.T) {
 		t.Fatalf("GET with SFS cross-site: got %d, want 200 (reads exempt)", resp.StatusCode)
 	}
 }
+
+// TestLoginOversizedBodyIs413 drives the real server: a valid login body that
+// exceeds the 1 MiB gate limit must be refused with 413 "request body too
+// large" — like every other JSON handler — not a 400 that hides the size
+// limit. Pre-fix, handleAuthLogin mapped every decode error to 400, so this
+// test fails on the unfixed build.
+func TestLoginOversizedBodyIs413(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	// Bootstrapped install (zero users, auth disabled): endpoints are open.
+	db.SetSetting("auth_bootstrapped", "1")
+
+	// Valid JSON, ~2 MiB: a 1 MiB password field of padding.
+	pad := strings.Repeat("x", 1<<20)
+	body := `{"username":"alice","password":"` + pad + `"}`
+	resp, err := http.Post(httpSrv.URL+"/api/auth/login", "application/json",
+		strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized login body: got %d, want 413", resp.StatusCode)
+	}
+
+	// A missing field is still a plain 400 with the credential message, and
+	// a malformed (undersized) body is still a 400.
+	resp, err = http.Post(httpSrv.URL+"/api/auth/login", "application/json",
+		strings.NewReader(`{"username":"alice"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing password: got %d, want 400", resp.StatusCode)
+	}
+	resp, err = http.Post(httpSrv.URL+"/api/auth/login", "application/json",
+		strings.NewReader(`not json`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("malformed body: got %d, want 400", resp.StatusCode)
+	}
+}

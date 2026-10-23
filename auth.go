@@ -1071,8 +1071,16 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
-		// Malformed / missing credentials: 400, and NOT counted against the
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// Route through the shared mapper like every other JSON handler:
+		// an oversized body (authGate's MaxBytesReader) is a 413, any other
+		// decode error a 400.
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
+		return
+	}
+	if req.Username == "" || req.Password == "" {
+		// Missing credentials: 400, and NOT counted against the
 		// login throttle — these never run the bcrypt KDF, so they're not a
 		// credential attempt (and not an online-cracking vector).
 		respondWithError(w, http.StatusBadRequest, "username and password required")
