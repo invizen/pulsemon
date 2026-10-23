@@ -1124,6 +1124,26 @@ func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// requireAdmin runs h only for a valid session that holds the admin flag:
+// 401 when there is no session, 403 for a non-admin — but only while
+// authentication is enabled. With auth off the dashboard is fully open
+// (the "auth off = fully open" contract), so the admin gate stands down
+// with the auth gate, exactly like requireAuth. Applied to the mutating
+// admin surface (self-update, settings incl. test, TLS cert/key,
+// wipe-all-history): a regular account is meant to be lower-trust and
+// must not be able to swap the binary, repoint alerts, change certs, or
+// wipe data (2026-10-23 external review — IsAdmin was previously checked
+// only on the user-management handlers).
+func (s *Server) requireAdmin(h http.HandlerFunc) http.HandlerFunc {
+	return s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
+		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
+			respondWithError(w, http.StatusForbidden, "admin only")
+			return
+		}
+		h(w, r)
+	})
+}
+
 func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:

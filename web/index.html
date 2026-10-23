@@ -166,7 +166,7 @@
       <button onclick="toggleTheme()" id="theme-toggle" title="Toggle light/dark theme" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i id="theme-icon" class="ph-bold ph-sun text-[19px]"></i>
       </button>
-      <button onclick="openAlerts()" title="Alerts" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+      <button id="alerts-btn" onclick="openAlerts()" title="Alerts" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i class="ph-bold ph-bell text-[19px]"></i>
       </button>
       <button onclick="openSettings()" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
@@ -363,8 +363,8 @@
         <i class="ph-bold ph-pause"></i> Maintenance Mode is active — all probes are paused.
       </div>
 
-      <!-- Maintenance toggle -->
-      <div class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/40">
+      <!-- Maintenance toggle (admin-only: PUT /api/settings) -->
+      <div id="maint-row" class="flex items-center justify-between border border-surface-800 rounded-lg px-3 py-2.5 bg-surface-950/40">
         <div>
           <span class="font-semibold text-slate-200 flex items-center gap-1.5">
             <i class="ph-bold ph-wrench text-warn"></i> Maintenance Mode
@@ -639,6 +639,32 @@ syncThemeIcon();
 
 // ---------- Authentication Flow ----------
 let authState = null;
+// meIsAdmin gates the admin-only UI surface (alerts, maintenance mode,
+// TLS, self-update). Server-side, requireAdmin 403s the same routes for
+// non-admin sessions; the UI just hides the controls a regular account
+// can't use. Default true: with auth off the dashboard is fully open,
+// so everything stays visible.
+let meIsAdmin = true;
+function applyAdminVisibility() {
+  const hide = !meIsAdmin;
+  for (const id of ['alerts-btn', 'tls-panel', 'maint-row']) {
+    const el = $(id);
+    if (el) el.classList.toggle('hidden', hide);
+  }
+}
+async function refreshAdminState() {
+  if (!(authState && authState.enabled && authState.authed)) {
+    meIsAdmin = true;
+    applyAdminVisibility();
+    return;
+  }
+  try {
+    const users = await api('/api/auth/users');
+    const me = (users || []).find(u => u.username === authState.user);
+    meIsAdmin = !!(me && me.is_admin);
+  } catch { meIsAdmin = true; }
+  applyAdminVisibility();
+}
 
 function showAuthGate() {
   const gate = $('auth-gate');
@@ -682,6 +708,7 @@ async function doLogin(username, password) {
     $('auth-username').value = '';
     $('auth-password').value = '';
     await refresh();
+    await refreshAdminState();
     return true;
   } catch (e) {
     const err = $('auth-err');
@@ -1382,8 +1409,8 @@ function renderUpdateUI(r) {
     body.innerHTML =
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
       '<span class="flex items-center gap-2">' +
-        '<button id="update-btn" onclick="startUpdate()" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' +
-        '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
+      (meIsAdmin ? '<button id="update-btn" onclick="startUpdate()" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' : '') +
+      '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
         (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
           : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + escJs(r.latest) + '\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
       '</span>';
@@ -1524,10 +1551,11 @@ async function renderAuthPanel() {
     $('auth-me').textContent = status.user || '…';
     const users = await api('/api/auth/users').catch(() => []);
     const me = users.find(u => u.username === status.user);
-    const meIsAdmin = !!(me && me.is_admin);
-    // Admin-only surface: adding users, removing users, and disabling auth
-    // are gated server-side (403 for non-admin sessions); the UI just hides
-    // the controls a regular account can't use.
+    meIsAdmin = !!(me && me.is_admin);
+    // Admin-only surface: user management, alerts, maintenance, TLS and
+    // self-update are gated server-side (403 for non-admin sessions);
+    // the UI just hides the controls a regular account can't use.
+    applyAdminVisibility();
     $('auth-add-user-box').classList.toggle('hidden', !meIsAdmin);
     $('auth-disable-btn').classList.toggle('hidden', !meIsAdmin);
     const list = $('auth-user-list');
@@ -1971,6 +1999,7 @@ document.addEventListener('keydown', e => {
 
 function startPolling() {
   refresh();
+  refreshAdminState();
   setInterval(refresh, 5000);
   let _sparkRt; window.addEventListener('resize', () => { clearTimeout(_sparkRt); _sparkRt = setTimeout(layoutSparklines, 120); });
   setInterval(() => { if (inspectId) loadInspector(); }, 5000);
