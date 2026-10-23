@@ -1,3 +1,146 @@
+# v0.3.25 — External-review hardening batch (15 findings)
+
+Fifth-round external review of the full codebase produced 15 findings.
+Every one was verified against the real code before any change and gated
+with gofmt, go vet, and the full -race suite; behavior changes were
+sabotage-verified (reverting the fix fails the new test). Two of the
+reviewer's proposed test cases were already covered by existing tests and
+are called out below rather than duplicated.
+
+## Security
+
+- **Mutating admin surface gated behind `requireAdmin`** (`c61e9e1`).
+  `IsAdmin` was checked only on the account-management handlers, so a
+  non-admin session could self-update, repoint webhooks/SMTP, swap the TLS
+  cert/key, and wipe all history. A `requireAdmin` wrapper (requireAuth +
+  IsAdmin; stands down when auth is off) now guards `POST /api/update`,
+  `PUT /api/settings`, `POST /api/settings/test`, `POST`+`DELETE
+  /api/settings/tls`, and `DELETE /api/history`; the UI hides those controls
+  from non-admins. (A same-class gap on sensor CRUD, per-sensor history
+  clear, and `DELETE /api/events` is intentionally out of scope here and
+  flagged for a follow-up.)
+- **Changing a password requires the current one** (`a62dd49`).
+  `POST /api/auth/users/{name}/password` accepted a new password from ANY
+  valid session and `SetUserPassword` drops the user's other sessions — a
+  stolen cookie / unlocked 30-day browser was a permanent account takeover.
+  The endpoint now requires `current_password`, verified through the login
+  throttle (7 fails/60s → 5-min lockout) with a 200ms slow-down on
+  rejection, so it is not a free guessing channel. The UI dialog gained a
+  Current Password field.
+- **Certificate verification requires an exact hostname** (`71136a9`).
+  `verifyHTTPCert`'s system-trusted branch accepted a cert whose SANs
+  covered only the `www.` variant of the target (www.example.com passing
+  for example.com, and the reverse) — more permissive than a browser, so a
+  real cert misconfig read UP here while the user's browser showed a cert
+  error. Both branches now verify the exact `DNSName`; wildcard SANs still
+  match per x509/RFC 6125.
+
+## Correctness
+
+- **Pulse Now uses the sensor's own timeout** (`01648d0`). `PingNow`
+  hard-coded a 1s timeout ignoring `timeout_ms`, so a slow-but-healthy
+  target (cold Nextcloud, Proxmox login) read as LOST on a pulse and the
+  loss was written to the aggregates. It now probes with the sensor's
+  timeout (1s is a fallback for legacy zeroed rows only), and manual pulse
+  rows are excluded from every loss/uptime aggregate (the 60-probe
+  inspector window deliberately keeps them as raw history).
+- **Single-label hostnames accepted as targets** (`a4f7db0`). `targetRe`
+  required a dot + alphabetic TLD, so `nas`/`pve`/`router` were rejected
+  for ICMP while HTTP got a port override. Bare RFC 1123 labels (≥1 letter)
+  are now accepted for both ICMP and HTTP; purely-numeric labels stay
+  rejected (truncated-IP typo).
+- **HTTP/HTTPS RTT measured from connection-established** (`61c5643`).
+  `probeHTTP`'s Elapsed was full request time, so HTTPS (fresh TLS
+  handshake per probe) read 2-3× HTTP. RTT is now `GotConn` → response
+  headers; DNS/TCP/TLS handshake is excluded.
+- **SMTP credentials stored untrimmed** (`696f49b`). The settings-save loop
+  trimmed every extra field including the SMTP password, so a space in a
+  credential was silently changed. `username`/`password` are now stored raw
+  (the "unchanged" mask check compares the raw value); all other extra
+  fields keep trimming.
+
+## Performance
+
+- **Per-sensor batched retention purge** (`ea5ef1e`). `purgeOld` ran one
+  full-table-scan `DELETE` per table (~72k rows/hour in one ~1.4s statement
+  on a 1.7M-row table). It now deletes per sensor through a
+  covering-index range scan + PK lookup in 5000-row batches, for both
+  probes and events; the largest single write drops from ~1.4s to ~13ms.
+- **No per-poll 24h rescan** (`bd46dbf`). `computeSensorStats` did three
+  full 24h passes per sensor per poll. The 1h and sparkline passes now
+  binary-search the hour boundary, the 24h uptime is O(1) from incremental
+  counters, and `probeEntry` is a pointer-free 16-byte struct (rtt is
+  `float32`, NaN = lost). At 17,280 entries/sensor this is ~5.5× faster per
+  poll. A pre-existing eviction off-by-one that let a long-interval
+  sensor's series grow unbounded was found and fixed by the new test.
+- **Dashboard pollers gated on tab visibility** (`a796fe4`). The 5s
+  `refresh` and 5s inspector intervals kept firing in a hidden tab (each
+  refresh is real server cost with no viewer). Both now skip work while
+  `document.visibilityState !== 'visible'`; a `visibilitychange` listener
+  catches up immediately on return. The 10-min update check stays ungated
+  (30-min-cached, not the cost profile).
+
+## Reliability
+
+- **No goroutine leak on sensor delete** (`85ff112`). The per-sensor
+  alert-consumer `for range ch` lived forever — `Remove` drops the map entry
+  but the channel is never closed (a closed-channel send would panic an
+  in-flight send), so one goroutine leaked per deleted sensor for the
+  process lifetime. The consumer now idle-exits after 10 quiet minutes and
+  re-creates on the next alert; the send moves under the alert mutex so no
+  alert is dropped in the hand-off window.
+
+## Hardening / observability
+
+- **One-time XFF misconfig warning** (`39a8bf4`). Behind a proxy without
+  `PULSEMON_TRUSTED_PROXIES`, every client shares the proxy's IP bucket, so
+  7 bad guesses from anyone locked everyone out for 5 min — with nothing to
+  surface it. An untrusted peer sending `X-Forwarded-For` now triggers ONE
+  log warning naming the peer IP + the shared-bucket consequence. Diagnostic
+  only: the header is still ignored.
+
+## Build / release
+
+- **`go-winres` pinned to v0.3.3** (`fc4fa46`). The Windows workflow used
+  `go install github.com/tc-hib/go-winres@latest`, an unpinned tool that
+  writes the `.syso` resource embedded in the Windows binary. It is now
+  pinned. The self-update SHA-256 is documented as integrity-only (the
+  checksum ships with the binary); release SIGNING for authenticity is a
+  deliberately deferred longer-term project (keypair + repo secret +
+  signing in both release flows + a migration story for already-shipped
+  binaries).
+
+## Testing / CI
+
+- **Linux `-race` CI gate + committed benchmarks** (`d0d8a58`). 71+ test
+  files existed but nothing ran `-race` (release.sh runs a single-package
+  non-race test; the only CI built Windows). A new `ci.yml` runs `go vet
+  ./...` + `go test -race -count=1 ./...` on every push and PR. Two opt-in
+  benchmarks are now committed (none existed): `BenchmarkPurgeOld` (1M
+  rows) and `BenchmarkComputeSensorStats` (100 sensors × 17,280 entries). A
+  new `TestPingNowSlowHTTPTargetReadsUp` proves the behavioral half of the
+  F5 timeout fix (a 1.5s target reads UP, not a false loss). The reviewer's
+  other two proposed cases were already covered: non-admin 403 on every
+  privileged endpoint (`TestNonAdminCannotReachAdminSurface`) and a wrong
+  current password (`TestChangePasswordRequiresCurrentPassword`).
+
+## Upgrade notes
+
+- **HTTPS cert verification is stricter** (`71136a9`): a sensor whose cert
+  only matched via a www-variant now reads as a cert failure. Intended
+  tightening, not a regression.
+- **HTTPS latency steps down once** (`61c5643`): RTT no longer includes the
+  TLS handshake, so existing HTTPS sensors' history drops at the update.
+  Intended metric-semantics change.
+- **New env var `PULSEMON_ALLOW_CGNAT`** (`9e334cd`): set to `1` to allow
+  webhooks / HTTP redirects / SMTP to a Tailscale/Headscale tailnet
+  (100.64/10). Off by default.
+- **CI:** a new `ci.yml` runs the full `-race` suite on every push/PR. The
+  known pre-existing `TestStormFlushDropsRecovered` flake may make it
+  intermittently red until separately fixed.
+
+---
+
 # v0.3.24 — External-review hardening pass
 
 Eight verified external-review findings, each fixed with a regression test
