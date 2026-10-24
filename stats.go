@@ -198,6 +198,20 @@ func (pw *ProbeWorker) warmStats() {
 	}
 	pw.statsMu.Lock()
 	for sid, a := range byID {
+		// Don't clobber a live write that landed DURING the warm read:
+		// recordProbe (probe loop or API PingNow) may have appended a
+		// fresher entry while this chunk query was in flight. Carry the
+		// newer tail over so the warm snapshot never goes backwards
+		// (review 2026-10-24; append keeps counters coherent).
+		if old := pw.statsCache[sid]; old != nil && a.series.len() > 0 {
+			newest := a.series.lastTs()
+			for _, e := range old.snapshot() {
+				if e.ts > newest {
+					a.series.append(e)
+					built++
+				}
+			}
+		}
 		pw.statsCache[sid] = a.series
 	}
 	pw.statsMu.Unlock()

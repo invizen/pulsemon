@@ -52,6 +52,16 @@ type ProbeState struct {
 
 func (ps *probeSeries) len() int { return len(ps.data) - ps.start }
 
+// lastTs is the timestamp of the newest appended entry (0 when empty).
+// Entries are appended in arrival order; callers use it only as a
+// monotonicity guard (warm-stats merge), not as an ordering guarantee.
+func (ps *probeSeries) lastTs() int64 {
+	if ps.len() == 0 {
+		return 0
+	}
+	return ps.data[len(ps.data)-1].ts
+}
+
 // append adds a new (newest) entry and evicts entries the dashboard can never
 // need. The retention is the UNION of the two windows the stats read:
 //   - the 60-probe stats window keeps the LAST 60 probes even if a sensor's

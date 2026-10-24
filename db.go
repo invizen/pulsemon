@@ -386,14 +386,20 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 		rows, err := db.Query("SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
 			strings.Join(q, ",")+") ORDER BY tag", args...)
 		if err != nil {
+			// A silently-skipped chunk made the affected sensors route
+			// alerts as if they had NO tags (review 2026-10-24) — the
+			// mid-stream path below already logs; do the same here.
+			log.Printf("db: sensor tag batch query failed for %d sensors (treated as untagged for alert routing): %v", len(chunk), err)
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var id, tag string
-			if rows.Scan(&id, &tag) == nil {
-				out[id] = append(out[id], tag)
+			if err := rows.Scan(&id, &tag); err != nil {
+				log.Printf("db: sensor tag batch skipping corrupt row: %v", err)
+				continue
 			}
+			out[id] = append(out[id], tag)
 		}
 		if err := rows.Err(); err != nil {
 			// Mid-stream chunk failure: log and keep the rows already read
