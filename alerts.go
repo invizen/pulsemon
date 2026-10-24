@@ -875,7 +875,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		return false, redactErr(err).Error()
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := webhookClient.Do(req)
+	resp, err := webhookClientFor(req.URL).Do(req)
 	if err != nil {
 		return false, redactErr(err).Error()
 	}
@@ -1133,7 +1133,7 @@ func (pw *ProbeWorker) postJSON(url string, payload map[string]interface{}) erro
 			return false, 0, redactErr(err)
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := webhookClient.Do(req)
+		resp, err := webhookClientFor(req.URL).Do(req)
 		if err != nil {
 			return pw.stopCtx.Err() == nil, 0, redactErr(err)
 		}

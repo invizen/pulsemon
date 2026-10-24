@@ -97,7 +97,15 @@ func withPlainTransport(t *testing.T, fn func()) {
 	t.Helper()
 	old := webhookClient.Transport
 	webhookClient.Transport = &http.Transport{}
-	defer func() { webhookClient.Transport = old }()
+	// http:// deliveries route to webhookClientCleartext (review
+	// 2026-10-24), so loopback test servers need the plain transport on
+	// BOTH clients or cleartext sends hit the SSRF dial guard.
+	oldPlain := webhookClientCleartext.Transport
+	webhookClientCleartext.Transport = &http.Transport{}
+	defer func() {
+		webhookClient.Transport = old
+		webhookClientCleartext.Transport = oldPlain
+	}()
 	fn()
 }
 

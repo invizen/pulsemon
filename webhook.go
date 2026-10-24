@@ -44,6 +44,62 @@ var webhookDialer = &net.Dialer{KeepAlive: 30 * time.Second}
 // different, forbidden IP; pinning the dial to the checked address closes
 // it. For TLS the transport still performs the handshake with the original
 // host as SNI/ServerName, so certificates and HSTS behave normally.
+// webhookResolver is the DNS seam for the webhook SSRF checks (tests
+// inject a fake resolver to exercise mixed-record and rebind shapes
+// deterministically). Production value is the system resolver.
+type ipResolver interface {
+	LookupIP(ctx context.Context, network, host string) ([]net.IP, error)
+}
+
+// systemIPResolver reads net.DefaultResolver AT CALL TIME, so tests that
+// swap the global fake-DNS resolver (startFakeDNS) keep working through
+// this seam; a value captured at init would freeze the original pointer.
+type systemIPResolver struct{}
+
+func (systemIPResolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, error) {
+	return net.DefaultResolver.LookupIP(ctx, network, host)
+}
+
+var webhookResolver ipResolver = systemIPResolver{}
+
+// dialCheckedCleartext is the http-scheme dialer. On top of dialChecked it
+// refuses every non-private address: a host that was allowed http:// only
+// because it resolved PRIVATE must never be dialed in cleartext at a
+// PUBLIC address (mixed A records, or DNS rebinding between the validation
+// resolution and this one; review 2026-10-24).
+func dialCheckedCleartext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ips, err := webhookResolver.LookupIP(ctx, "ip", host)
+	cancel()
+	if err != nil {
+		return nil, fmt.Errorf("resolve %q: %w", host, err)
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IP address for host %q", host)
+	}
+	for _, ip := range ips {
+		if err := checkWebhookIP(ip, host); err != nil {
+			return nil, err
+		}
+		if !ip.IsPrivate() {
+			return nil, fmt.Errorf("cleartext http:// webhook target %q resolved to a public address (%s); use https://", host, ip)
+		}
+	}
+	var lastErr error
+	for _, ip := range ips {
+		conn, err := webhookDialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		lastErr = err
+	}
+	return nil, lastErr
+}
+
 func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -53,7 +109,7 @@ func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		ips = []net.IP{ip}
 	} else {
-		if ips, err = net.DefaultResolver.LookupIP(ctx, "ip", host); err != nil {
+		if ips, err = webhookResolver.LookupIP(ctx, "ip", host); err != nil {
 			return nil, err
 		}
 	}
@@ -92,6 +148,28 @@ var webhookClient = &http.Client{
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
+}
+
+// webhookClientCleartext serves http:// webhook URLs so the strict
+// all-private dial rule (dialCheckedCleartext) applies to every cleartext
+// delivery without touching https (review 2026-10-24). Redirects stay off
+// on both clients.
+var webhookClientCleartext = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: func() *http.Transport {
+		t := webhookTransport.Clone()
+		t.DialContext = dialCheckedCleartext
+		return t
+	}(),
+	CheckRedirect: webhookClient.CheckRedirect,
+}
+
+// webhookClientFor picks the delivery client by URL scheme.
+func webhookClientFor(u *url.URL) *http.Client {
+	if u.Scheme == "http" {
+		return webhookClientCleartext
+	}
+	return webhookClient
 }
 
 // validateWebhookURL rejects webhook destinations that cannot be legitimate
@@ -187,7 +265,7 @@ func validateWebhookURL(raw string) error {
 	// caller indefinitely.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := webhookResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		if scheme == "http" {
 			// Match the old failure shape: an http host whose privacy
