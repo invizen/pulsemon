@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -217,6 +218,14 @@ func targetAsset() string {
 	goarch := os.Getenv("GOARCH")
 	if goarch == "" {
 		goarch = runtime.GOARCH
+	} else if goarch != runtime.GOARCH {
+		// Loud (review 2026-10-24): the override is a deliberate packaging
+		// feature (tests cross-arch asset naming), but a stray GOARCH in
+		// the SERVER's environment would fetch and INSTALL a wrong-arch
+		// binary that passes the SHA check (it IS the official asset) and
+		// only fails at exec. The watchdog now catches that and rolls
+		// back — but the log must not hide WHY the rollback happened.
+		log.Printf("update: GOARCH=%s override active while this host is %s — fetching the %s asset; a wrong-arch binary passes the hash check and is caught only at restart (watchdog rolls back)", goarch, runtime.GOARCH, targetAssetName(runtime.GOOS, goarch))
 	}
 	return targetAssetName(runtime.GOOS, goarch)
 }
@@ -938,7 +947,15 @@ func installBinary(src, dst, wantSHA string) error {
 			return fmt.Errorf("install refused: staged binary hash drifted from the verified download (expected %s, staged %s)", wantSHA, got)
 		}
 	}
-	if err := tmp.Chmod(0755); err != nil {
+	// Mode: PRESERVE the original binary's permission bits when dst
+	// exists (review nit 2026-10-24: forcing 0755 silently widened e.g.
+	// 0750), always ensuring owner-executable — a legacy 0600 dst must
+	// not come back unbootable. A fresh install with no dst is 0755.
+	dstMode := os.FileMode(0755)
+	if fi, err := os.Stat(dst); err == nil {
+		dstMode = fi.Mode().Perm() | 0100
+	}
+	if err := tmp.Chmod(dstMode); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -956,12 +973,25 @@ func installBinary(src, dst, wantSHA string) error {
 	// Keep the previous binary for `pulsemon update rollback`. A missing
 	// dst (no running binary to back up) is tolerated: there is simply no
 	// previous version to roll back to.
+	//
+	// HARDLINK, not rename (review 2026-10-24): the old "rename dst→prev,
+	// then rename tmp→dst" left a window in which dst did NOT exist — a
+	// power loss between the two renames booted an install with NO binary.
+	// Linking makes .prev a second name for the old inode: dst never
+	// disappears at any point, and the swap below atomically replaces the
+	// dst name with the new inode. A stale .prev is removed first (Link
+	// fails on an occupied name; removing .prev cannot lose the running
+	// binary). Filesystems without hardlink support fall back to the old
+	// rename — no worse than before the fix.
 	prev := dst + ".prev"
-	if err := os.Rename(dst, prev); err != nil {
-		if os.IsNotExist(err) {
-			uWarn("no previous binary to keep at " + prev + " (nothing to roll back to later)")
-		} else {
-			return fmt.Errorf("save previous binary as %s: %w", prev, err)
+	if _, err := os.Lstat(dst); err != nil {
+		uWarn("no previous binary to keep at " + prev + " (nothing to roll back to later)")
+	} else {
+		_ = os.Remove(prev)
+		if lerr := os.Link(dst, prev); lerr != nil {
+			if rerr := os.Rename(dst, prev); rerr != nil && !os.IsNotExist(rerr) {
+				return fmt.Errorf("save previous binary as %s: %w", prev, rerr)
+			}
 		}
 	}
 	if err := swapBinary(tmpName, dst); err != nil {
@@ -1000,6 +1030,14 @@ func rollbackBinary(exe string) error {
 	if _, err := os.Stat(prev); err != nil {
 		return fmt.Errorf("no previous binary at %s to roll back to", prev)
 	}
+	// Windows note (review 2026-10-24; Win32 semantics reasoned, not
+	// executed — no Windows runner verified this): renaming OVER a loaded
+	// image fails with a sharing violation (ERROR_USER_MAPPED_FILE).
+	// Consequences: (a) the watchdog's rollback is fine — it runs after
+	// the broken new binary has exited, so its image is no longer mapped;
+	// (b) a MANUAL `pulsemon update rollback` while the service still runs
+	// the image will FAIL here — fails safe (the running binary is
+	// untouched), but the operator must stop the service first on Windows.
 	if err := os.Rename(prev, exe); err != nil {
 		return fmt.Errorf("restore previous binary over %s: %w", exe, err)
 	}

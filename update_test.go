@@ -223,8 +223,11 @@ func TestInstallBinarySuccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi.Mode().Perm() != 0755 {
-		t.Fatalf("dst mode = %o, want 0755", fi.Mode().Perm())
+	// Contract change (review 2026-10-24): dst mode is PRESERVED (forced
+	// 0755 widened e.g. 0750), with owner-exec always guaranteed — this
+	// legacy 0600 dst comes back as 0700, not 0755.
+	if fi.Mode().Perm() != 0700 {
+		t.Fatalf("dst mode = %o, want 0600 preserved to 0700", fi.Mode().Perm())
 	}
 	for _, e := range entries(dir, t) {
 		if strings.HasPrefix(e, ".pulsemon-swap-") {

@@ -31,6 +31,8 @@ func swapBinary(tmpName, dst string) error {
 // cleanupStaleBinary removes a leftover <exe>.old from a prior self-update.
 // The previous process held a lock on it, so it couldn't be deleted then; now
 // that a fresh process is running, the old file is unlocked and can go.
+// (.old is the LEGACY swap scheme — the current code keeps .prev — this
+// cleanup stays so installs upgraded across that change shed the leftover.)
 func cleanupStaleBinary() {
 	exe, err := os.Executable()
 	if err != nil {
