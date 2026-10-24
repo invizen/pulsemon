@@ -823,7 +823,10 @@ function severityRank(s) {
   return sev * 2 + type;
 }
 
-function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+// String(v ?? '') not (v || ''): the old guard dropped a legitimate 0 and
+// threw on any non-string (a future numeric JSON field would blank the view
+// with a bare console error; review nit 2026-10-24).
+function esc(v) { return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 // escJs escapes a value for a JS string literal inside an inline HTML
 // attribute (onclick="setTag('...')"). The ORDER is load-bearing:
 // JS-escape FIRST (backslash, quote, CR, LF), then HTML-encode. If
@@ -831,7 +834,7 @@ function esc(v) { return (v || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 // nothing — and the browser's HTML parser decodes &#39; back to a literal '
 // before the JS engine ever sees it, so a stored tag like x');alert(1);//
 // breaks out of the string and executes.
-function escJs(v) { return esc((v || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n')); }
+function escJs(v) { return esc(String(v ?? '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n')); }
 
 // Sparkline bar colors: red > 200 ms (absolute — objectively slow), amber at
 // or above spikeMult × the window's own average (relative — a spike FOR THIS
@@ -1027,11 +1030,13 @@ function miniSpark(recent) {
   const vals = arr.filter(x => x != null);
   const maxVal = Math.max(...(vals.length ? vals : [0]), 20);
   return arr.map(v => {
-    if (v == null) return '<div class="w-[2.5px] h-4 bg-bad/80 rounded-sm"></div>';
+    // Per-bar title= like sparklineBars (review nit): the table Trend
+    // column had no per-point readout while the cards did.
+    if (v == null) return '<div class="w-[2.5px] h-4 bg-bad/80 rounded-sm" title="packet lost"></div>';
     const h = Math.min(18, Math.max(3, (v / maxVal) * 18));
     let cls = 'bg-ok/70';
     if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
-    return '<div class="w-[2.5px] rounded-sm ' + cls + '" style="height:' + h + 'px"></div>';
+    return '<div class="w-[2.5px] rounded-sm ' + cls + '" style="height:' + h + 'px" title="' + fmtRtt(v) + '"></div>';
   }).join('');
 }
 
@@ -1422,7 +1427,10 @@ function renderUpdateUI(r) {
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
       '<span class="flex items-center gap-2">' +
       (meIsAdmin ? '<button id="update-btn" onclick="startUpdate()" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' : '') +
-      '<a href="' + esc(r.url) + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
+      // Scheme allowlist (review nit): esc() blocks attribute breakout but
+      // NOT a javascript:/data: scheme. Safe with the built-in GitHub URL,
+      // but a future custom/proxied update source must not become XSS.
+      '<a href="' + (/^https:\/\//i.test(r.url) ? esc(r.url) : '#') + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
         (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
           : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + escJs(r.latest) + '\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
       '</span>';
@@ -1740,32 +1748,60 @@ async function toggleMaint() {
   } finally { maintBusy = false; }
 }
 
+// Per-scope UNSAVED picks (review nit 2026-10-24): switching tags →
+// sensors → tags before pressing Save used to silently re-seed from the
+// last-saved SETTINGS.alert_filter, discarding the operator's picks. The
+// draft is seeded once from SETTINGS (entries matching sensor ids go to the
+// sensors scope, entries matching known tags to the tags scope), survives
+// scope switches, and resets after a successful save.
+let scopeDraft = null;
+function scopeDraftFor(scope) {
+  if (!scopeDraft) {
+    scopeDraft = { tags: new Set(), sensors: new Set() };
+    const tags = new Set(SENSORS.flatMap(s => s.tags || []));
+    const ids = new Set(SENSORS.map(s => s.id));
+    (SETTINGS.alert_filter || []).forEach(v => {
+      if (ids.has(v)) scopeDraft.sensors.add(v);
+      else if (tags.has(v)) scopeDraft.tags.add(v);
+    });
+  }
+  return scopeDraft[scope] || new Set();
+}
+
 function renderScopeOptions(selected) {
   const scope = $('f-scope').value;
   const box = $('scope-options');
-  if (!selected) selected = SETTINGS.alert_filter || [];
+  // No explicit `selected` → render from the draft (the only path that
+  // keeps unsaved picks across scope switches).
+  const sel = selected ? new Set(selected) : scopeDraftFor(scope);
   if (scope === 'all') { box.innerHTML = '<span class="text-[11px] text-slate-500 font-mono">all sensors trigger alerts</span>'; return; }
-  const items = scope === 'tags' ? [...new Set(SENSORS.flatMap(s => s.tags || []))] : SENSORS.map(s => s.id + '||' + s.name);
+  // Structured {val,label}: the old id+'||'+name composite truncated any
+  // sensor name containing '||' (a VALID name — review nit).
+  const items = scope === 'tags'
+    ? [...new Set(SENSORS.flatMap(s => s.tags || []))].map(t => ({ val: t, label: t }))
+    : SENSORS.map(s => ({ val: s.id, label: s.name }));
   if (!items.length) { box.innerHTML = '<span class="text-[11px] text-slate-500 font-mono">none available</span>'; return; }
-  box.innerHTML = items.map(v => {
-    const val = scope === 'tags' ? v : v.split('||')[0];
-    const label = scope === 'tags' ? v : v.split('||')[1];
-    const on = selected.includes(val);
-    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(val) + '" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(label) + '</button>';
+  // data-sel is the selection's source of truth: reading it back from the
+  // Tailwind on-class meant any restyle of bg-ok/15 would silently save an
+  // EMPTY alert_filter (review nit).
+  box.innerHTML = items.map(o => {
+    const on = sel.has(o.val);
+    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(o.val) + '" data-sel="' + (on ? '1' : '0') + '" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(o.label) + '</button>';
   }).join('');
 }
 
 function toggleScopeItem(btn) {
-  const cur = selectedFilterItems();
+  const scope = $('f-scope').value;
+  const d = scopeDraftFor(scope);
   const v = btn.dataset.val;
-  const next = cur.includes(v) ? cur.filter(x => x !== v) : cur.concat(v);
-  renderScopeOptions(next);
+  if (d.has(v)) d.delete(v); else d.add(v);
+  renderScopeOptions();
 }
 
 function selectedFilterItems() {
   const scope = $('f-scope').value;
   if (scope === 'all') return [];
-  return [...document.querySelectorAll('#scope-options [data-val]')].filter(b => b.classList.contains('bg-ok/15')).map(b => b.dataset.val);
+  return [...document.querySelectorAll('#scope-options [data-val]')].filter(b => b.dataset.sel === '1').map(b => b.dataset.val);
 }
 
 function setMsg(text, kind, target) {
@@ -1884,6 +1920,7 @@ async function saveAlerts() {
   try {
     const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
     SETTINGS = r;
+    scopeDraft = null; // saved — re-seed the draft from the server on next open
     renderProviderList(r.providers || []);
     setMsg('alerts saved', 'ok', 'alerts');
   } catch (e) { setMsg(e.message, 'bad', 'alerts'); }
