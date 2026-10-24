@@ -780,7 +780,8 @@ function typeLabel(s) {
 
 function httpStatusBadge(s) {
   if (s.type !== 'http' || s.state === 'paused' || s.http_status == null) return '';
-  const code = s.http_status;
+  const code = Number.isInteger(s.http_status) ? s.http_status : null; // defensive: server type is *int
+  if (code === null) return '';
   const cls = code >= 200 && code < 300 ? 'bg-ok/10 text-ok border-ok/30'
             : code >= 300 && code < 400 ? 'bg-warn/10 text-warn border-warn/30'
             : 'bg-bad/10 text-bad border-bad/30';
@@ -1055,7 +1056,7 @@ function renderTable(list) {
       '<td class="py-2 px-3.5 text-right font-semibold ' + (st && st.rtt_last != null ? 'text-slate-100' : 'text-slate-500') + '"><span class="mr-1">' + badge + '</span>' + rtt + cert + '</td>' +
       '<td class="py-2 px-3.5 text-right text-jit">' + jit + '</td>' +
       '<td class="py-2 px-3.5 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-semibold' : 'text-slate-400') + '">' + loss + '</td>' +
-      '<td class="py-2 px-3.5 text-right ' + (st && st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') + '">' + up24 + '</td>' +
+      <td class="text-right ${st ? (st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') : 'text-slate-500'}">${up24}</td>
       '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
         '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
@@ -1189,7 +1190,13 @@ async function echoPing(id, btn) {
     let msg = r.lost ? 'no reply from host'
       : (r.http_status != null ? 'pulse: HTTP ' + r.http_status + ' · ' + fmtRtt(r.rtt_ms) : 'pulse: ' + fmtRtt(r.rtt_ms));
     toast(msg, r.lost ? 'bad' : 'ok');
-  } catch (e) { toast('pulse failed: ' + e.message, 'bad'); }
+  } catch (e) {
+    toast('pulse failed: ' + e.message, 'bad');
+    // Re-enable on failure too — with the old code a single failed pulse
+    // left the button permanently dead in views that only re-render on
+    // data change (review 2026-10-24).
+    if (btn) btn.disabled = false;
+  }
   echoBusy = false;
 }
 
@@ -1813,7 +1820,7 @@ function renderProviderList(providers) {
     row.className = 'border border-surface-800 rounded-lg px-3 py-2 bg-surface-950/50';
     row.innerHTML = `
       <div class="flex items-center justify-between mb-1.5">
-        <span class="text-[12px] font-semibold text-slate-200 flex items-center gap-1.5">${meta.icon} ${meta.name}</span>
+        <span class="text-[12px] font-semibold text-slate-200 flex items-center gap-1.5">${meta.icon} ${esc(meta.name)}</span>
         <button type="button" onclick="toggleProvider('${p.kind}')" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
           ${p.enabled ? 'Enabled' : 'Disabled'}
         </button>
