@@ -1198,10 +1198,26 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	}
 
 	var probes, events int64
-	// One transaction (the SetSensorTags house pattern): probes, events,
-	// alert_state, and the status reset commit atomically, so a failure
-	// mid-clear can't leave the DB half-wiped. The old code ran four
-	// autocommit statements and ignored the last two errors.
+	var err error
+	// The two LARGE deletes run batched (the purgeOld idiom, review
+	// 2026-10-24): one DELETE of a long-lived sensor's rows held the WAL
+	// write lock for its whole duration, stalling probe INSERTs and (via
+	// syncSensors' deliberate under-lock fresh reads) every probe loop up
+	// to the 15s busy_timeout. Batching caps each statement at a few ms.
+	// Partial completion is harmless here — the target is a WIPE, so a
+	// retry just deletes the remainder — so atomicity of these two is NOT
+	// worth the lock hold. The small state-consistency steps below stay
+	// atomic: alert_state removal and the status reset either all commit
+	// or none (the old code ran everything autocommit and ignored the last
+	// two errors — that is the half-cleared bug the tx still fixes).
+	if probes, err = deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+		respondInternal(w, "clear probes "+id, err)
+		return
+	}
+	if events, err = deleteRowsBatched(r.Context(), s.db, "events", "sensor_id = ?", []any{id}); err != nil {
+		respondInternal(w, "clear events "+id, err)
+		return
+	}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "clear history begin "+id, err)
@@ -1209,18 +1225,6 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
-	if res, err := tx.ExecContext(r.Context(), "DELETE FROM probes WHERE sensor_id = ?", id); err != nil {
-		respondInternal(w, "clear probes "+id, err)
-		return
-	} else {
-		probes, _ = res.RowsAffected()
-	}
-	if res, err := tx.ExecContext(r.Context(), "DELETE FROM events WHERE sensor_id = ?", id); err != nil {
-		respondInternal(w, "clear events "+id, err)
-		return
-	} else {
-		events, _ = res.RowsAffected()
-	}
 	if _, err := tx.ExecContext(r.Context(), "DELETE FROM alert_state WHERE sensor_id = ?", id); err != nil {
 		respondInternal(w, "clear alert_state "+id, err)
 		return
@@ -1249,6 +1253,37 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	})
 }
 
+// deleteRowsBatched deletes a table's rows (optionally filtered) in
+// purgeBatchSize chunks — the purgeOld idiom (probe.go): each statement is
+// its own autocommit delete of a bounded row set, so the WAL write lock is
+// held for milliseconds per statement instead of for a whole-million-row
+// sweep (probe INSERTs and syncSensors' under-lock reads stay responsive
+// up to, but not through, the 15s busy_timeout). Returns the total rows
+// deleted. The table/where strings are fixed call-site literals, never
+// user input.
+func deleteRowsBatched(ctx context.Context, db *DB, table, where string, args []any) (int64, error) {
+	w := ""
+	if where != "" {
+		w = " WHERE " + where
+	}
+	q := "DELETE FROM " + table + " WHERE id IN (SELECT id FROM " + table + w + " LIMIT ?)"
+	var total int64
+	for {
+		res, err := db.ExecContext(ctx, q, append(append([]any{}, args...), purgeBatchSize)...)
+		if err != nil {
+			return total, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if n < purgeBatchSize {
+			return total, nil
+		}
+	}
+}
+
 // handleClearAllHistory is the bulk version of handleSensorClearHistory:
 // every sensor's probes/events/alert_state are wiped and statuses reset,
 // so the whole fleet rebuilds its windows from the next probe tick.
@@ -1258,8 +1293,20 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var probes, events int64
-	// One transaction (the SetSensorTags house pattern): see
-	// handleSensorClearHistory for why.
+	// Batched large deletes + atomic small steps: see
+	// handleSensorClearHistory for the reasoning (review 2026-10-24). At
+	// 100 sensors @ 5s the probes table holds ~1.7M rows — this wipe was
+	// the worst single-statement write lock holder in the app, exactly the
+	// class purgeOld was rewritten for.
+	var err error
+	if probes, err = deleteRowsBatched(r.Context(), s.db, "probes", "", nil); err != nil {
+		respondInternal(w, "clear all probes", err)
+		return
+	}
+	if events, err = deleteRowsBatched(r.Context(), s.db, "events", "", nil); err != nil {
+		respondInternal(w, "clear all events", err)
+		return
+	}
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "clear all history begin", err)
@@ -1267,18 +1314,6 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
 
-	if res, err := tx.ExecContext(r.Context(), "DELETE FROM probes"); err != nil {
-		respondInternal(w, "clear all probes", err)
-		return
-	} else {
-		probes, _ = res.RowsAffected()
-	}
-	if res, err := tx.ExecContext(r.Context(), "DELETE FROM events"); err != nil {
-		respondInternal(w, "clear all events", err)
-		return
-	} else {
-		events, _ = res.RowsAffected()
-	}
 	if _, err := tx.ExecContext(r.Context(), "DELETE FROM alert_state"); err != nil {
 		respondInternal(w, "clear all alert_state", err)
 		return

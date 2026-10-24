@@ -126,13 +126,20 @@ func TestClearAllHistoryResetsProbeState(t *testing.T) {
 	}
 }
 
-// TestClearHistoryAtomicOnFailure locks the transaction half of the finding-
-// 11 fix: the four clear statements must commit atomically. The DB here is
-// deliberately missing the events and alert_state tables, so the clear fails
-// mid-transaction — the handler must return 500 AND roll back, leaving the
-// probes row and the status untouched. The old autocommit code deleted the
-// probes row first, silently ignored the rest, and returned 200. Fails on
-// the old code.
+// TestClearHistoryAtomicOnFailure pins the clear-history failure contract
+// as of the review-2026-10-24 batching fix. The DB is deliberately missing
+// the events and alert_state tables, so the clear fails mid-way — the
+// handler must return 500 and the SMALL state-consistency steps (status
+// reset, alert_state) must NOT have run: they still commit atomically as
+// one transaction AFTER the large deletes. The probes/events deletes
+// themselves are batched autocommits (bounded WAL write-lock hold) and are
+// therefore already committed when events fails — acceptable BY DESIGN
+// because the operation is a WIPE: a retry deletes the remainder, so
+// partial completion converges instead of half-clearing. (Pre-batching,
+// this test pinned full rollback of the probes delete; pre-fix-11 code
+// silently ignored the errors and returned 200 — the original bug.)
+// The status-untouched assertion below is what still fails if someone
+// re-splits the small steps back into autocommit-with-ignored-errors.
 func TestClearHistoryAtomicOnFailure(t *testing.T) {
 	db, err := NewDB(filepath.Join(t.TempDir(), "clr3.db"))
 	if err != nil {
@@ -161,13 +168,15 @@ func TestClearHistoryAtomicOnFailure(t *testing.T) {
 		t.Fatalf("clear with missing events table: %d, want 500 (mid-transaction failure), body %s", w.Code, w.Body.String())
 	}
 
-	// Rolled back: the probes row and the status are untouched.
+	// The batched probes wipe is autocommitted BEFORE the events step runs
+	// (bounded write lock); a retry of the DELETE endpoint converges the
+	// rest. What must NOT have happened: the small atomic tail.
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "clr3").Scan(&n); err != nil {
 		t.Fatalf("count probes: %v", err)
 	}
-	if n != 1 {
-		t.Errorf("probe rows = %d, want 1 (the failed clear must roll back the probes delete)", n)
+	if n != 0 {
+		t.Errorf("probe rows = %d, want 0 (batched large deletes commit ahead of the atomic small steps by design — retry converges)", n)
 	}
 	var status string
 	if err := db.QueryRow("SELECT status FROM sensors WHERE id = ?", "clr3").Scan(&status); err != nil {

@@ -377,6 +377,14 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		configs[i].tags = tagMap[configs[i].id]
 	}
 
+	// Lock-across-I/O bound (review 2026-10-24): the reads below run under
+	// pw.mu deliberately (see the fresh-state comment), and pw.mu is the
+	// hot lock sensorLoops touch twice per iteration BEFORE their ctx.Done
+	// select. A stalled read here therefore stalls every loop (and healthz
+	// ActiveCount) up to the 15s busy_timeout — so NOTHING that can hold
+	// the SQLite write lock for seconds may exist: purgeOld batches
+	// (purgeBatchSize) and both clear-history handlers batch too. Keep any
+	// future bulk write batched or this window reopens.
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
 
