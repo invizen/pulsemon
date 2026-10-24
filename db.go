@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -463,6 +464,56 @@ func (db *DB) SetMaintenanceMode(on bool, ids []string, snapJSON string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+	return applyMaintenanceTx(tx, on, ids, snapJSON)
+}
+
+// EnterMaintenanceWithFreshSnapshot enters maintenance mode with the
+// active-sensor snapshot computed INSIDE the pause transaction itself
+// (review nit 2026-10-24). The handler used to read ActiveSensorIDs before
+// the settings tx and apply that pre-tx list afterwards: a sensor activated
+// (or created) between the read and the pause escaped the snapshot and kept
+// probing under a mode that reads as ON until the next maintenance cycle.
+// One transaction now: SELECT active ids → pause them → write snapshot +
+// mode flag. Returns the ids actually paused (the handler feeds them to the
+// SetPaused in-memory fast path). The handler's earlier read survives only
+// as a UX pre-check (400 "no active sensors"); this read is authoritative.
+func (db *DB) EnterMaintenanceWithFreshSnapshot() ([]string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+	rows, err := tx.Query("SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	snap, err := json.Marshal(ids)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyMaintenanceTx(tx, true, ids, string(snap)); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// applyMaintenanceTx is the body of both maintenance transitions, running
+// on the caller's tx and committing it on success.
+func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) error {
 
 	state := "paused"
 	modeVal := "1"
