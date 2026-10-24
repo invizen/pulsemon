@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"path/filepath"
@@ -49,7 +50,7 @@ func BenchmarkPurgeOld(b *testing.B) {
 
 	pw := &ProbeWorker{db: db}
 	b.ResetTimer()
-	pw.purgeOld() // one representative purge of the full ~1M-row table
+	pw.purgeOld(context.Background()) // one representative purge of the full ~1M-row table
 	b.StopTimer()
 
 	var young int

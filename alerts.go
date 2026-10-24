@@ -12,12 +12,25 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+// alertPanicRecovered guards the fire-and-forget alert paths (review
+// 2026-10-24): before this, NO alert goroutine had a recover — a panic in
+// one malformed payload crashed the entire monitor, and a panic inside a
+// gate consumer killed that sensor's alerting PERMANENTLY (the FIFO's 8
+// slots eventually fill and block alertMu for every sensor). A guarded
+// panic logs with a stack and sacrifices the one delivery, not monitoring.
+func alertPanicRecovered(label string) {
+	if r := recover(); r != nil {
+		log.Printf("ALERT PANIC recovered (%s): %v\n%s", label, r, debug.Stack())
+	}
+}
 
 // Alerting: the alert gate, storm coalescing, provider routing and
 // delivery, retries, and the card builders for status-change alerts.
@@ -78,7 +91,14 @@ func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time
 	for {
 		select {
 		case job := <-ch:
-			job()
+			// Per-job recover (review 2026-10-24): a panicking delivery
+			// used to crash the monitor AND take this sensor's alerting
+			// down with it (consumer dies → FIFO fills → alertMu blocks
+			// for every sensor). Sacrifice the job, keep the loop alive.
+			func() {
+				defer alertPanicRecovered("alert-gate " + id)
+				job()
+			}()
 			// Drain-then-Reset (the canonical safe pattern): the timer
 			// may have fired while job() was running; a Reset without
 			// draining the fired value would leave a stale ready in
@@ -571,6 +591,7 @@ func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
 	pw.alertWG.Add(1)
 	go func() {
 		defer pw.alertWG.Done()
+		defer alertPanicRecovered("storm-flush")
 		select {
 		case <-time.After(due):
 			pw.flushStorm()
@@ -630,6 +651,7 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 		wg.Add(1)
 		go func(p providerMeta, url string) {
 			defer wg.Done()
+			defer alertPanicRecovered("deliver-" + p.Kind)
 			var ok bool
 			switch p.Kind {
 			case "google_chat":
@@ -759,6 +781,7 @@ func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state stri
 		wg.Add(1)
 		go func(p providerMeta, url string) {
 			defer wg.Done()
+			defer alertPanicRecovered("deliver-" + p.Kind)
 			if pw.deliverOne(p, url, name, target, oldState, state, rttMs, reAlert) {
 				delivered.Store(true)
 			}
@@ -904,6 +927,7 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 	pw.alertWG.Add(1)
 	go func() {
 		defer pw.alertWG.Done()
+		defer alertPanicRecovered("launch-alert")
 		fn()
 	}()
 }

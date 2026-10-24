@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"strings"
@@ -102,7 +103,7 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 	young := seed(1 * time.Hour)       // well inside the window -> must be KEPT
 
 	pw := &ProbeWorker{db: db}
-	pw.purgeOld()
+	pw.purgeOld(context.Background())
 
 	present := map[string]bool{}
 	rows, err := db.Query("SELECT ts FROM probes")
@@ -191,7 +192,7 @@ func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
 	}
 
 	pw := &ProbeWorker{db: db}
-	pw.purgeOld()
+	pw.purgeOld(context.Background())
 
 	var nA, nB int
 	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = 'a'").Scan(&nA); err != nil {

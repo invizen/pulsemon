@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"math/rand"
 	"sort"
 	"testing"
@@ -58,7 +59,7 @@ func TestFix_TS_PurgeDeletesOnlyOldRowsIncludingLegacyFormat(t *testing.T) {
 	// legacy variable-width rows written by older versions
 	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, old.UTC().Format(time.RFC3339Nano))
 	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, young.UTC().Format(time.RFC3339Nano))
-	pw.purgeOld()
+	pw.purgeOld(context.Background())
 	var n int
 	db.QueryRow(`SELECT COUNT(*) FROM probes`).Scan(&n)
 	if n != 2 {

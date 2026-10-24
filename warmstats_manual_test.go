@@ -10,6 +10,7 @@ package main
 // these tests pin the flag AND the counter exclusion on the warm path.
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -50,7 +51,7 @@ func TestWarmStatsCarriesManualFlag(t *testing.T) {
 	}
 
 	pw := &ProbeWorker{db: db, statsCache: make(map[string]*probeSeries)}
-	pw.warmStats()
+	pw.warmStats(context.Background())
 	series, ok := pw.statsCache[id]
 	if !ok {
 		t.Fatalf("warmStats did not load sensor %q", id)

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"math"
 	"sort"
@@ -81,8 +82,11 @@ type probeSeries struct {
 // fresh process (deploy/restart) serves populated cards immediately instead of
 // blanking them until each sensor re-accumulates a window. Runs once, before
 // probing starts.
-func (pw *ProbeWorker) warmStats() {
-	ids, err := pw.db.Query("SELECT id FROM sensors WHERE state = 'active'")
+func (pw *ProbeWorker) warmStats(ctx context.Context) {
+	// ctx (review nit 2026-10-24): the warm UNION query on a large DB is
+	// the first thing Run does; a shutdown landing during it must be able
+	// to abort the load instead of serving from a half-warmed process.
+	ids, err := pw.db.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active'")
 	if err != nil {
 		log.Printf("stats warm: failed to list sensors: %v", err)
 		return
@@ -150,7 +154,7 @@ func (pw *ProbeWorker) warmStats() {
 		// derivation as scheduled probes for up to 24h after every
 		// restart — the exact class the 2026-10-23 manual-exclusion
 		// batch closed on the live and DB paths (review 2026-10-24).
-		rows, err := pw.db.Query(
+		rows, err := pw.db.QueryContext(ctx,
 			`SELECT sensor_id, ts, rtt_ms, manual FROM (
 				SELECT sensor_id, ts, rtt_ms, manual,
 				       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
@@ -190,6 +194,10 @@ func (pw *ProbeWorker) warmStats() {
 		}
 	}
 	for i := 0; i < len(idList); i += inQueryChunk {
+		if ctx.Err() != nil {
+			log.Printf("stats warm: aborted after %d probes (shutdown)", built)
+			return
+		}
 		end := i + inQueryChunk
 		if end > len(idList) {
 			end = len(idList)
@@ -239,6 +247,16 @@ func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
 		// Sensor isn't in the cache yet (added after warm-up). Create it.
 		s = &probeSeries{}
 		pw.statsCache[id] = s
+	}
+	// Monotonic ts clamp (review 2026-10-24): probeEntry.ts is captured
+	// OUTSIDE statsMu (each path stamps the time before calling in), so a
+	// manual pulse and a scheduled tick racing can append out of order by
+	// milliseconds and break the ts-monotonic invariant the in24Start
+	// cutoff walks depend on. Clamping to the newest stored ts costs one
+	// comparison per append and restores the invariant; equality is fine
+	// for the cutoff walks.
+	if n := len(s.data); n > 0 && e.ts < s.data[n-1].ts {
+		e.ts = s.data[n-1].ts
 	}
 	s.append(e)
 }

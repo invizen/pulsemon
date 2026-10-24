@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -88,7 +89,7 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	// suffices. With UNION the 30 recent probes (in both branches) land once;
 	// with UNION ALL they'd land twice -> duplicate ts in the series.
 	pw := &ProbeWorker{db: db, statsCache: make(map[string]*probeSeries)}
-	pw.warmStats()
+	pw.warmStats(context.Background())
 	series, ok := pw.statsCache[id]
 	if !ok {
 		t.Fatalf("warmStats did not load sensor %q into statsCache", id)
@@ -216,7 +217,7 @@ func TestWarmStatsCursorDrains(t *testing.T) {
 
 	base := db.Stats().OpenConnections
 	pw := &ProbeWorker{db: db, statsCache: make(map[string]*probeSeries)}
-	pw.warmStats()
+	pw.warmStats(context.Background())
 	if len(pw.statsCache) != 600 {
 		t.Fatalf("statsCache has %d sensors, want 600 (all active)", len(pw.statsCache))
 	}

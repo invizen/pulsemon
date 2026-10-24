@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -94,7 +95,7 @@ func TestInQueryChunking(t *testing.T) {
 	// right RTT. A chunking bug (dropped partial chunk, wrong partition) leaves
 	// a sensor's series empty (GetStats nil) or with the wrong RTT.
 	pw := NewProbeWorker(db)
-	pw.warmStats()
+	pw.warmStats(context.Background())
 	bad := 0
 	for i := 0; i < n; i += 97 {
 		st := pw.GetStats(allIDs[i])

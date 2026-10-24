@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -437,6 +438,14 @@ func (e *Engine) readRaw() {
 		// the raw transport SENTS, which is the per-process random value.
 		if !isEcho || em.ID != int(rawEchoID) {
 			continue // not ours
+		}
+		// Payload magic (nit 2026-10-24): a raw socket sees EVERY echo
+		// reply on the host; the 16-bit ID match alone leaves a 1/65536
+		// crosstalk window with any other process that happens to use the
+		// same echo ID. The fixed probePayload marker closes it: a reply
+		// that does not carry our payload prefix is never ours.
+		if !bytes.HasPrefix(em.Data, probePayload) {
+			continue
 		}
 		if src == nil {
 			continue

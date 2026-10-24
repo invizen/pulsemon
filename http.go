@@ -507,6 +507,13 @@ func certNotAfterFromErr(err error) *time.Time {
 // makes an unresolvable name a loss row, not a wedged tick. The port
 // override below predates that change and stays.
 func validURL(t string) bool {
+	// Length bound (review 2026-10-24, same as validTarget): the URL
+	// target is echoed on every poll and into every alert body. 2048 is
+	// the de-facto practical URL ceiling; the hostname inside is bounded
+	// at 253 by the FQDN check below.
+	if t == "" || len(t) > 2048 {
+		return false
+	}
 	u, err := url.Parse(t)
 	if err != nil {
 		return false
@@ -516,7 +523,7 @@ func validURL(t string) bool {
 		return false
 	}
 	host := u.Hostname() // strips the port, keeps IPv6 brackets off
-	if host == "" {
+	if host == "" || len(host) > 253 {
 		return false
 	}
 	// A dotted host, a bracketed/IPv6 host, a host with an EXPLICIT port,

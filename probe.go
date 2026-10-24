@@ -311,7 +311,7 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	// run before syncSensors spawns the loops: warmStats replaces each
 	// sensor's cached series wholesale, so running it after probing started
 	// wiped any probe recorded during the warm window.
-	pw.warmStats()
+	pw.warmStats(ctx)
 	pw.syncSensors(ctx) // immediate first pass
 	for {
 		select {
@@ -334,7 +334,7 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 			// in-flight pass can never leave the install on old config.
 			pw.syncSensors(ctx)
 		case <-retention.C:
-			pw.purgeOld()
+			pw.purgeOld(ctx)
 		}
 	}
 }
@@ -374,6 +374,12 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		log.Printf("ProbeWorker: sensor query ended early: %v", err)
 		partial = true
 	}
+	// Close the cursor NOW (nit 2026-10-24): an exhausted-but-open Rows
+	// still holds its pooled connection until the top-level defer runs at
+	// FUNCTION return — which is after the pw.mu section below. Closing on
+	// the happy path releases the connection before the lock window (the
+	// defer above remains the error-path safety net; Close is idempotent).
+	rows.Close()
 
 	// ONE batched tag query after the loop — never a per-sensor query inside
 	// rows.Next(): the outer iteration holds a pooled connection, and nested
@@ -440,6 +446,14 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 				cfg = c.sensorConfig
 			}
 			if !found {
+				// Row vanished between the config read and this
+				// under-lock read. We are inside the NO-LOOP branch, and
+				// the vanished-sensor stop pass only sweeps ids present
+				// in pw.loops — so a ProbeState created earlier in THIS
+				// pass (or left by an earlier one) would be orphaned
+				// forever (nit 2026-10-24). Remove it; a future re-create
+				// of the sensor rebuilds state cleanly on the next pass.
+				delete(pw.sensors, c.id)
 				continue
 			}
 			// First spawn vs RESPAWN (see the spawnedIDs field): a
@@ -804,6 +818,12 @@ func (pw *ProbeWorker) safeProbe(ctx context.Context, c sensorConfig) {
 // code documented that tradeoff in its own doc string).
 const pingNowTimeout = time.Second
 
+// dbWriteTimeout bounds a single probe-record write (review 2026-10-24):
+// SQLite's busy_timeout is 15s — longer than the shutdown drain budget —
+// so probe-path writes carry their own smaller cap instead of parking on
+// a stalled writer for the full busy_timeout.
+const dbWriteTimeout = 8 * time.Second
+
 // errPulseCoolingDown is returned by PingNow when a manual pulse arrives
 // before the per-sensor cooldown elapses; the handler maps it to 429.
 var errPulseCoolingDown = errors.New("pulse too soon")
@@ -875,7 +895,14 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		rttVal = o.rttMs
 	}
 	ts := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, ?, ?, ?, 1)",
+	// Bounded write (review 2026-10-24): a bare Exec can sit on the
+	// 15s busy_timeout — longer than the ~10s shutdown drain budget —
+	// and using the REQUEST ctx would wrongly discard a completed probe
+	// when the browser closes the tab. A fresh capped context bounds the
+	// write without inheriting either problem.
+	writeCtx, cancelWrite := context.WithTimeout(context.Background(), dbWriteTimeout)
+	defer cancelWrite()
+	if _, err := pw.db.ExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, ?, ?, ?, 1)",
 		id, fmtTS(ts), rttVal, o.ip, o.httpCode); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
@@ -949,7 +976,16 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 }
 
 func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
-	o := probeTarget(ctx, c.probeType, c.target, time.Duration(c.timeoutMS)*time.Millisecond)
+	// timeout_ms<=0 fallback for a legacy zeroed row (review 2026-10-24):
+	// the API's create default is 1000ms and PingNow falls back to the
+	// same value (pingNowTimeout). Without this, a zeroed row reads 100%
+	// loss on EVERY scheduled tick while Pulse Now on the same sensor
+	// works — the two probe paths disagreed on one bad row.
+	timeout := time.Duration(c.timeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = pingNowTimeout
+	}
+	o := probeTarget(ctx, c.probeType, c.target, timeout)
 	// If the probe was cancelled in flight (stop, sensor removed or
 	// reconfigured), drop the result: writing it would record a probe for a
 	// sensor that no longer exists (FK violation) or for a config that was
@@ -968,7 +1004,11 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 
 	now := time.Now().UTC()
-	if _, err := pw.db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, fmtTS(now), rttVal, o.ip, o.httpCode); err != nil {
+	// Bounded write (review 2026-10-24): the probe ctx is correct here —
+	// it is already cancelled-and-checked above (a cancelled probe drops
+	// its result), and it lets shutdown interrupt a write parked on the
+	// 15s busy_timeout instead of outrunning the drain budget.
+	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, fmtTS(now), rttVal, o.ip, o.httpCode); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -1110,7 +1150,11 @@ const purgeBatchSize = 5000
 // bounded batches of purgeBatchSize rows, so the write lock is held only for
 // one batch (a few ms) and released between batches. A sensor whose rows are
 // all inside the window costs one cheap empty round trip.
-func (pw *ProbeWorker) purgeOld() {
+// purgeOld deletes rows older than the retention window. ctx (review
+// nit 2026-10-24) lets shutdown stop the sweep between batches: the old
+// context-free loop could run minutes of DELETEs uninterruptibly on a
+// large retention backlog, past the shutdown drain budget.
+func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 	cutoff := fmtTS(time.Now().Add(-24 * time.Hour))
 	ids, err := pw.db.SensorIDs()
 	if err != nil {
@@ -1121,7 +1165,15 @@ func (pw *ProbeWorker) purgeOld() {
 		total := int64(0)
 		for _, id := range ids {
 			for {
-				res, err := pw.db.Exec(`DELETE FROM `+table+` WHERE id IN (
+				select {
+				case <-ctx.Done():
+					if total > 0 {
+						log.Printf("retention: purge of %s stopped by shutdown after %d rows", table, total)
+					}
+					return
+				default:
+				}
+				res, err := pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
 					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
 				if err != nil {
 					log.Printf("retention: failed to purge %s for sensor %s: %v", table, id, err)
@@ -1195,6 +1247,14 @@ func validSingleLabel(t string) bool {
 // and then failing DNS every tick.
 func validTarget(t string) bool {
 	if t == "" {
+		return false
+	}
+	// Length bound (review 2026-10-24): names cap at 60 and tags at 30,
+	// but target had NO cap — a 1 MiB body-cap string was accepted, then
+	// echoed on every poll response and into every alert body. 253 is the
+	// RFC 1035 max for a fully-qualified domain name (labels are already
+	// ≤63 each; targetRe alone did not bound the TOTAL).
+	if len(t) > 253 {
 		return false
 	}
 	if ip := net.ParseIP(t); ip != nil {

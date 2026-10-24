@@ -8,6 +8,7 @@ package main
 // warmed snapshot forward (append keeps the 24h counters coherent).
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 	"time"
@@ -46,7 +47,7 @@ func TestWarmStatsKeepsLiveTail(t *testing.T) {
 	live.append(probeEntry{ts: liveTs, rtt: 4.2, manual: true})
 	pw.statsCache[id] = live
 
-	pw.warmStats()
+	pw.warmStats(context.Background())
 
 	series := pw.statsCache[id]
 	if series == nil {
