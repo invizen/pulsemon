@@ -46,13 +46,20 @@ func TestFix_FirstUserConcurrentSingleAdmin(t *testing.T) {
 	}
 	wg.Wait()
 
-	var ok, conflict, unauthorized int
+	var ok, conflict, unauthorized, throttled int
 	for i, c := range codes {
 		switch c {
 		case http.StatusOK:
 			ok++
 		case http.StatusConflict:
 			conflict++
+		case http.StatusTooManyRequests:
+			// The setup path is per-IP throttled (review 2026-10-24):
+			// N simultaneous KDF-paying attempts from one address can
+			// exceed the window, so a latecomer may be refused BEFORE
+			// bcrypt. Same single-admin invariant — still a rejection,
+			// just an earlier door.
+			throttled++
 		case http.StatusUnauthorized:
 			// Latecomer: the winner's commit has already flipped
 			// Enabled() (user_count > 0), so the auth gate rejects

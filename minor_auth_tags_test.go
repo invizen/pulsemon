@@ -14,6 +14,7 @@ package main
 //       session-only tier. Now admin-gated like DELETE /api/history.
 
 import (
+	"errors"
 	"net/http"
 	"net/http/cookiejar"
 	"testing"
@@ -28,7 +29,10 @@ func TestSetupModeRejectsBeforeBcrypt(t *testing.T) {
 	// With a user present, setup mode is guaranteed to lose the in-tx
 	// race — the pre-check must return the same errBootstrapped verdict
 	// WITHOUT hashing, and must not add the account.
-	if err := a.AddUserMode("second", "another-pw-2", true); err != errBootstrapped {
+	// errBootstrappedEarly (setup throttle, review 2026-10-24) WRAPS
+	// errBootstrapped so the handler can refund a never-paid KDF attempt;
+	// the verdict identity is errors.Is, not ==.
+	if err := a.AddUserMode("second", "another-pw-2", true); !errors.Is(err, errBootstrapped) {
 		t.Fatalf("setup-mode with existing user: err = %v, want errBootstrapped", err)
 	}
 	if n, err := a.db.UserCount(); err != nil || n != 1 {

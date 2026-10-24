@@ -367,6 +367,12 @@ var (
 	// maps it to 409 — the install is no longer fresh, the account
 	// already exists.
 	errBootstrapped = fmt.Errorf("an account already exists — this install is set up")
+	// errBootstrappedEarly wraps errBootstrapped for the pre-bcrypt count
+	// check: the caller paid NO KDF cost, so the setup throttle refunds the
+	// attempt (a claimed install must not lockout-accumulate the operator's
+	// IP for ordinary traffic). errors.Is(errBootstrapped) stays true so
+	// the 409 mapping is unchanged.
+	errBootstrappedEarly = fmt.Errorf("%w (pre-check)", errBootstrapped)
 	// errLastUser: RemoveUser refuses to delete the final account (use
 	// auth-off for that). A sentinel, not an inline fmt.Errorf, so the
 	// HTTP handler can errors.Is it to a 400 while every other db
@@ -435,7 +441,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 		// the tx (a pre-check alone cannot close the race); a failed
 		// count just falls through to it.
 		if n, err := a.db.UserCount(); err == nil && n > 0 {
-			return errBootstrapped
+			return errBootstrappedEarly
 		}
 	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
@@ -888,6 +894,26 @@ func (a *AuthState) loginSuccess(ip string) {
 	delete(a.loginThrottle.lockout, ip)
 }
 
+// refundAttempt releases ONE counted admission (the timestamp
+// beginAttempt appended) when the caller discovers — BEFORE paying the
+// bcrypt KDF — that the check needn't run: the setup-mode bootstrap lost
+// the single-shot race (errBootstrappedEarly) or failed cheap validation.
+// Without refunds, ordinary traffic against a CLAIMED install would
+// accumulate toward the setup bucket's lockout while costing the server
+// nothing — throttling is for KDF cost, and no cost was paid. Best-effort:
+// it pops the most recent entry, which under concurrency may refund a
+// different same-IP attempt; the failure direction is at most one extra
+// admitted free attempt, never a false lockout. Caller must only refund
+// admissions beginAttempt ACCEPTED (returned ok).
+func (a *AuthState) refundAttempt(ip string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	f := a.loginThrottle.fails[ip]
+	if len(f) > 0 {
+		a.loginThrottle.fails[ip] = f[:len(f)-1]
+	}
+}
+
 // sweepThrottle drops throttle entries that can no longer affect a decision:
 // no unexpired lockout and no failure within the rolling window. It is called
 // opportunistically from beginAttempt once the maps grow past a threshold,
@@ -1234,11 +1260,24 @@ func (s *Server) requireAdmin(h http.HandlerFunc) http.HandlerFunc {
 func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		// requireAuth wraps this route (see routes()).
+		// requireAuth wraps this route (see routes()). The FULL roster
+		// (every username/created_at/is_admin) is admin-facing data — the
+		// users panel that consumes it is admin-gated, and the client
+		// hiding the panel was never a server gate (review 2026-10-24).
+		// A non-admin session sees only its own row.
 		users, err := s.db.ListUsers()
 		if err != nil {
 			respondInternal(w, "list users", err)
 			return
+		}
+		if caller := s.sessionFrom(r); !s.auth.IsAdmin(caller) {
+			mine := make([]authUser, 0, 1)
+			for _, u := range users {
+				if u.Username == caller {
+					mine = append(mine, u)
+				}
+			}
+			users = mine
 		}
 		respondWithJSON(w, http.StatusOK, users)
 	case http.MethodPost:
@@ -1282,7 +1321,37 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusForbidden, "admin only")
 			return
 		}
+		// Throttle the setup path (review 2026-10-24): an unauthenticated
+		// setup POST pays a bcrypt KDF on every admitted request, so an
+		// install left unclaimed was an unlimited-KDF-CPU endpoint for any
+		// LAN host. Same bucket machinery as login, on a dedicated
+		// "setup|ip" key so it neither locks the operator's LOGIN bucket
+		// nor is diluted by it. Attempts that never reached the KDF are
+		// refunded below; a successful bootstrap clears the bucket.
+		var setupKey string
+		if setup {
+			setupKey = "setup|" + throttleKey(s.auth.ClientIP(r))
+			if ok, wait := s.auth.beginAttempt(setupKey); !ok {
+				secs := int((wait + time.Second - 1) / time.Second)
+				if secs < 1 {
+					secs = 1
+				}
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+				respondWithError(w, http.StatusTooManyRequests, "too many setup attempts — try again in a few minutes")
+				return
+			}
+		}
 		if err := s.auth.AddUserMode(req.Username, req.Password, setup); err != nil {
+			if setup {
+				// Refund exactly the no-KDF-cost rejections: cheap
+				// validation and the early bootstrap pre-check both run
+				// BEFORE bcrypt. (The in-tx bootstrap race loss DID pay
+				// the KDF — it is deliberately not refunded.)
+				if errors.Is(err, errBootstrappedEarly) || errors.Is(err, errUsernameInvalid) ||
+					errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
+					s.auth.refundAttempt(setupKey)
+				}
+			}
 			// Only the duplicate-account and validation cases are client
 			// errors; any other failure (db, KDF) is a 500 with the detail
 			// logged. Validation sentinels (incl. the 72-byte bcrypt limit)
@@ -1300,6 +1369,9 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			}
 			respondInternal(w, "add user", err)
 			return
+		}
+		if setup {
+			s.auth.loginSuccess(setupKey) // bootstrap done; clear the bucket
 		}
 		respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
 	default:
