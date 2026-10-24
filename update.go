@@ -270,6 +270,7 @@ func runUpdate(args []string) int {
 	watchdog := false
 	wdPrev, wdDst := "", ""
 	wdTimeout := 30 * time.Second
+	wdOldPid := 0
 	version := "latest"
 	for i := 0; i < len(args); i++ {
 		a := args[i]
@@ -283,7 +284,7 @@ func runUpdate(args []string) int {
 		case "watchdog", "--watchdog":
 			// The detached post-restart guardian (I2) — see runWatchdog.
 			watchdog = true
-		case "--prev", "--dst", "--timeout":
+		case "--prev", "--dst", "--timeout", "--old-pid":
 			if i+1 >= len(args) {
 				uErr(a + " requires a value")
 				return 1
@@ -294,6 +295,13 @@ func runUpdate(args []string) int {
 				wdPrev = args[i]
 			case "--dst":
 				wdDst = args[i]
+			case "--old-pid":
+				n, perr := strconv.Atoi(args[i])
+				if perr != nil {
+					uErr("invalid --old-pid: " + args[i])
+					return 1
+				}
+				wdOldPid = n
 			case "--timeout":
 				d, perr := time.ParseDuration(args[i])
 				if perr != nil || d <= 0 {
@@ -304,7 +312,7 @@ func runUpdate(args []string) int {
 			}
 		case "-h", "--help":
 			fmt.Println("usage: pulsemon update [check|rollback|watchdog|<version>] [--restart]")
-			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--timeout 30s]")
+			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--timeout 30s] [--old-pid PID]")
 			return 0
 		default:
 			version = a
@@ -312,7 +320,7 @@ func runUpdate(args []string) int {
 	}
 
 	if watchdog {
-		return runWatchdog(wdPrev, wdDst, wdTimeout)
+		return runWatchdog(wdPrev, wdDst, wdTimeout, wdOldPid)
 	}
 
 	exe, err := runningExecutable()
@@ -434,18 +442,39 @@ func runUpdate(args []string) int {
 //
 // Exit codes: 0 = the new binary is healthy, or a rollback was performed
 // successfully; 1 = the rollback itself failed (the box needs a human).
-func runWatchdog(prev, dst string, timeout time.Duration) int {
+func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 	if prev == "" || dst == "" {
 		uErr("watchdog: --prev and --dst are required")
 		return 1
 	}
-	// Take the cross-process update lock: the rollback rename must not
-	// race a concurrent update's install (the spawn-side lock was released
-	// by the server's death, so this is the watchdog's own acquisition).
-	lockFile, err := acquireUpdateLock()
-	if err != nil {
-		uErr("watchdog: update lock: " + err.Error())
+	// Guard order (review 2026-10-24). The spawning server holds the update
+	// flock until its own death (the restart we are guarding), and its
+	// healthz answers with a VALID payload while it is still up. So the
+	// old order — lock once, then poll — failed both ways: the single
+	// LOCK_NB acquisition hit EWOULDBLOCK while the server was alive and
+	// the watchdog exited 1 instantly (no guardian at all, silently:
+	// detachSpawn nils stdio), and any fix that kept polling while the old
+	// process lived would misread the OLD server as a healthy restart.
+	// Therefore: wait for the old PID to exit, THEN acquire the lock (with
+	// retries bounded to lockRetryBudget), THEN poll healthz.
+	if oldPid > 0 && !waitForProcessExit(oldPid, wdOldProcTimeout) {
+		uErr("watchdog: old server process " + strconv.Itoa(oldPid) +
+			" still alive after " + wdOldProcTimeout.String() + "; exiting without touching the binary (its health is not the new one's)")
 		return 1
+	}
+	lockDeadline := time.Now().Add(lockRetryBudget)
+	var lockFile *os.File
+	for {
+		var err error
+		lockFile, err = acquireUpdateLock()
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, errUpdateLockHeld) || !time.Now().Before(lockDeadline) {
+			uErr("watchdog: update lock: " + err.Error())
+			return 1
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
 	defer lockFile.Close()
 
@@ -474,13 +503,38 @@ func runWatchdog(prev, dst string, timeout time.Duration) int {
 	return 0
 }
 
+// wdOldProcTimeout bounds the watchdog's wait for the SPAWNING server
+// process to exit (systemd stop drains up to ~6s; 20s is generous headroom).
+// lockRetryBudget bounds the wait for the update flock to be released by
+// that dying server. Both are vars so tests can shrink them.
+var (
+	wdOldProcTimeout = 20 * time.Second
+	lockRetryBudget  = 10 * time.Second
+)
+
+// waitForProcessExit reports whether pid exited within timeout.
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if processGone(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // spawnUpdateWatchdog detaches `pulsemon update --watchdog ...` (I2) so the
 // API's auto-restart path keeps a guardian after this process dies. The
 // watchdog polls healthz and rolls back to <exe>.prev if the new binary
-// never comes up.
+// never comes up. --old-pid is us: the watchdog must not lock-acquire or
+// health-poll until THIS process is gone (review 2026-10-24).
 func spawnUpdateWatchdog(exe string) error {
 	cmd := exec.Command(exe, "update", "watchdog",
-		"--prev", exe+".prev", "--dst", exe, "--timeout", "30s")
+		"--prev", exe+".prev", "--dst", exe, "--timeout", "30s",
+		"--old-pid", strconv.Itoa(os.Getpid()))
 	return detachSpawn(cmd)
 }
 

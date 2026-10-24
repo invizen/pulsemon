@@ -3,9 +3,20 @@
 package main
 
 import (
+	"errors"
 	"os/exec"
 	"syscall"
 )
+
+// processGone reports whether pid no longer exists. Signal 0 does no harm;
+// ESRCH means the process is gone, EPERM means it exists but is not ours.
+func processGone(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, syscall.ESRCH)
+}
 
 // detachSpawn starts cmd in its own session with no controlling terminal
 // and no stdio, so it survives the caller's death (the I2 watchdog: the

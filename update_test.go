@@ -871,7 +871,7 @@ func TestWatchdogRestoresPrevOnUnhealthy(t *testing.T) {
 	performRestart = func(string) error { return nil }
 	defer func() { detectRestart, performRestart = oD, oP }()
 
-	code := runWatchdog(prev, dst, 2*time.Second)
+	code := runWatchdog(prev, dst, 2*time.Second, 0)
 	if code != 0 {
 		t.Fatalf("runWatchdog exit = %d, want 0 (rollback succeeded)", code)
 	}
@@ -906,7 +906,7 @@ func TestWatchdogNoopWhenHealthy(t *testing.T) {
 	detectRestart = func() string { return "" }
 	defer func() { detectRestart = oD }()
 
-	code := runWatchdog(prev, dst, 3*time.Second)
+	code := runWatchdog(prev, dst, 3*time.Second, 0)
 	if code != 0 {
 		t.Fatalf("runWatchdog exit = %d, want 0 (healthy)", code)
 	}
