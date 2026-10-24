@@ -358,3 +358,24 @@ func TestHotReloadCert(t *testing.T) {
 		t.Fatal("repair did not take effect — the old pair is still served")
 	}
 }
+
+// TestStormSummaryMarkdownEscapesAsterisks (2026-10-24 review n2):
+// stormSummaryMarkdown wraps each line in *…*, and cardFor uses
+// *Sensor*-style emphasis. * is legal in sensor names (validSensorName
+// only blocks quotes/angles/backticks/controls) and in URL paths, so a
+// raw * in the data renders as a literal asterisk in Google Chat /
+// Discord. The data must be backslash-escaped; the emphasis markers
+// (format string, not data) stay intact.
+func TestStormSummaryMarkdownEscapesAsterisks(t *testing.T) {
+	entries := []stormEntry{
+		{id: "a", name: "nas*01", target: "https://nas.lan/x*y", oldState: "up", state: "error"},
+	}
+	md := stormSummaryMarkdown(entries)
+	want := "*nas\\*01: up → error (https://nas.lan/x\\*y)*"
+	if !strings.Contains(md, want) {
+		t.Fatalf("markdown line not escaped:\n%s\nwant line %q", md, want)
+	}
+	if !strings.Contains(md, "*pulsemon: alert storm — 1 sensors changed state (coalesced to limit alert noise)*") {
+		t.Fatalf("header emphasis lost: %q", md)
+	}
+}

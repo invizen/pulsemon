@@ -392,7 +392,6 @@ func telegramHasURL(db *DB) bool {
 	return db.GetSetting("telegram_url") != "" && db.GetSetting("telegram_chat_id") != ""
 }
 
-// activeProviders returns every provider currently receiving alerts.
 // activeProviders returns the enabled, URL-configured providers. The
 // second return value reports whether the DB read itself succeeded
 // GetSetting maps a read error to "", so a
@@ -709,7 +708,12 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*\n", len(entries)))
 	for _, e := range entries {
-		b.WriteString("*" + stormSummaryLine(e) + "*\n")
+		// Escape * in the DATA: names and URL paths may legally contain
+		// it, and a raw * inside the *…* emphasis renders as a literal
+		// asterisk in Google Chat / Discord (2026-10-24 review n2). The
+		// emphasis markers themselves come from the format strings, not
+		// the data, so they are untouched.
+		b.WriteString("*" + strings.ReplaceAll(stormSummaryLine(e), "*", "\\*") + "*\n")
 	}
 	return b.String()
 }

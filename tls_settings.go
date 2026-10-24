@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -39,19 +40,58 @@ type tlsInfo struct {
 
 // tlsPayload computes the TLS status for the settings payload. It reads
 // the files (if present) so the dashboard can show subject/expiry even
-// though the running listener was started before the last upload.
+// though the running listener was started before the last upload. The
+// parse is memoized on (path, mtime, size) — see tlsCertCached — so a
+// settings GET on the 5s cycle doesn't re-read and re-parse the cert
+// file every time (2026-10-24 review n3).
 func (s *Server) tlsPayload() tlsInfo {
 	c := loadListenerCfg(s.db)
 	info := tlsInfo{Port: c.httpsPort, HTTPAddr: listenAddr()}
 	if c.certPath != "" {
 		info.Enabled = true
 		info.Source = c.source
-		if cert, _ := tlsX509Cert(c.certPath); cert != nil {
+		if cert, ok := s.tlsCertCached(c.certPath); ok {
 			info.Subject = cert.Subject.CommonName
 			info.Expiry = cert.NotAfter.Format("2006-01-02")
 		}
 	}
 	return info
+}
+
+// tlsCertMemo caches the parsed cert for tlsPayload, keyed on
+// (path, mtime, size). Zero value = empty cache.
+type tlsCertMemo struct {
+	mu      sync.Mutex
+	path    string
+	modTime time.Time
+	size    int64
+	cert    *x509.Certificate
+}
+
+// tlsCertCached returns the parsed cert for path, re-parsing only when
+// the file's mtime or size changed. An upload rewrites the file (new
+// mtime) → next call re-parses; a repeated settings GET with an
+// untouched file → cache hit. Read/parse failures are NOT cached: the
+// file may be mid-write, and the next call retries.
+func (s *Server) tlsCertCached(path string) (*x509.Certificate, bool) {
+	s.tlsCert.mu.Lock()
+	defer s.tlsCert.mu.Unlock()
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, false
+	}
+	if s.tlsCert.path == path && s.tlsCert.modTime.Equal(fi.ModTime()) && s.tlsCert.size == fi.Size() {
+		return s.tlsCert.cert, true
+	}
+	cert, err := tlsX509Cert(path)
+	if err != nil {
+		return nil, false
+	}
+	s.tlsCert.path = path
+	s.tlsCert.modTime = fi.ModTime()
+	s.tlsCert.size = fi.Size()
+	s.tlsCert.cert = cert
+	return cert, true
 }
 
 // tlsX509Cert parses one PEM cert file.

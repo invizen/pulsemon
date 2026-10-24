@@ -171,6 +171,9 @@ type Server struct {
 	// host or host:port entries). Empty = no Host check (LAN-trust default).
 	// Enforced only on the setup-mode bootstrap POST — see authGate.
 	allowedHosts []string
+	// tlsCert memoizes the parsed cert for tlsPayload (2026-10-24
+	// review n3); see tlsCertCached in tls_settings.go.
+	tlsCert tlsCertMemo
 }
 
 func NewServer(db *DB, pw *ProbeWorker) *Server {
