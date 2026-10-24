@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // isContainer reports whether we are the entrypoint of a container
@@ -173,14 +175,21 @@ func runRestartCommand() dispatchKind {
 }
 
 // restartSystemdService tries the user session first, then system-wide.
+// Bounded per attempt (review nit 2026-10-24): systemctl restart can block
+// (job queuing, a unit stuck in activating) and the update path's other
+// external calls are all bounded — an unbounded Run here could hang the
+// CLI/server past its own budgets. 60s is generous for a normal restart
+// and still finite.
 func restartSystemdService() error {
 	var last error
 	for _, args := range [][]string{{"--user", "restart", "pulsemon"}, {"restart", "pulsemon"}} {
-		if err := exec.Command(systemctlPath(), args...).Run(); err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		err := exec.CommandContext(ctx, systemctlPath(), args...).Run()
+		cancel()
+		if err == nil {
 			return nil
-		} else {
-			last = err
 		}
+		last = err
 	}
 	return last
 }

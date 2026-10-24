@@ -99,6 +99,25 @@ func smtpAddr(v string) (string, error) {
 	return a.Address, nil
 }
 
+// smtpEnvelopeAddr normalizes a STORED address for the SMTP envelope at
+// SEND time (review 2026-10-24). Parseable values — including legacy
+// display-name forms stored before smtpAddr existed — collapse to the
+// bare address; unparseable values pass through raw for the pre-validator
+// 501 behavior. But NEVER with control characters: net/smtp writes the
+// envelope verbatim, so a stored value containing CR/LF (written by an
+// older build before save-time CRLF rejection, or migrated in) would
+// INJECT SMTP commands into the session. Save-time validation cannot be
+// assumed for values that predate it — the sender is the last gate.
+func smtpEnvelopeAddr(raw string) (string, error) {
+	if strings.ContainsAny(raw, "\r\n\x00") {
+		return "", fmt.Errorf("stored address %q contains control characters — re-save it", raw)
+	}
+	if a, err := mail.ParseAddress(raw); err == nil {
+		return a.Address, nil
+	}
+	return raw, nil
+}
+
 // smtpDial establishes sendSMTP's TCP connection. It defaults to dialChecked
 // (webhook.go): the rebind-safe, blocklist-enforcing dial the webhook
 // providers use. Tests override it to reach an in-process server on loopback.
@@ -243,14 +262,18 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	// stored before the validator existed (e.g. a display name), so an
 	// upgrade doesn't break a working config. An unparseable value is
 	// passed through raw — it will 501 at the server, which is exactly the
-	// pre-validator behavior.
-	from := cfg.From
-	if a, err := mail.ParseAddress(cfg.From); err == nil {
-		from = a.Address
+	// pre-validator behavior — UNLESS it carries control characters:
+	// net/smtp writes the envelope verbatim, so a stored pre-validator
+	// value containing CRLF (written before save-time rejection existed,
+	// or by an older DB) would INJECT SMTP commands into the session at
+	// send time (review 2026-10-24). Reject loudly instead.
+	from, err := smtpEnvelopeAddr(cfg.From)
+	if err != nil {
+		return fmt.Errorf("smtp from address: %w", err)
 	}
-	to := cfg.To
-	if a, err := mail.ParseAddress(cfg.To); err == nil {
-		to = a.Address
+	to, err := smtpEnvelopeAddr(cfg.To)
+	if err != nil {
+		return fmt.Errorf("smtp to address: %w", err)
 	}
 	if err := c.Mail(from); err != nil {
 		return fmt.Errorf("smtp MAIL FROM: %w", err)

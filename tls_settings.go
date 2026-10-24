@@ -284,11 +284,19 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		// Crash safety (minimum-acceptable variant
 		// of the spec's F2): both temps are fsynced BEFORE close and the
 		// directory is fsynced after the renames, so a crash loses at most
-		// the window between the two renames (microseconds) — the old
-		// pair stays loadable on either side of it. The spec's preferred
-		// generation-dir+symlink design was not used because the existing
-		// install test pins the flat-file rename contract (a directory at
-		// the key target must fail the install and leave the old pair).
+		// the window between the two renames (microseconds). CORRECTION
+		// (review 2026-10-24): the earlier text claimed the old pair
+		// "stays loadable on either side" of that window — FALSE. The key
+		// rename OVERWRITES the old key, so inside the window (and after a
+		// crash inside it, or a cert-rename failure) the on-disk pair is
+		// NEW key + OLD cert: mismatched and not loadable; the next boot
+		// fails the pair check. Recovery is a re-install of the
+		// certificate — loud in the failure log below, and the mismatch
+		// cannot silently serve a wrong pair (LoadX509KeyPair refuses it).
+		// The spec's preferred generation-dir+symlink design was not used
+		// because the existing install test pins the flat-file rename
+		// contract (a directory at the key target must fail the install
+		// and leave the old pair).
 		tmpCert, err := os.CreateTemp(dir, ".cert.pem.tmp*")
 		if err != nil {
 			respondInternal(w, "temp cert", err)
@@ -329,6 +337,11 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 			if err := os.Rename(certName, certPath); err != nil {
+				// The key rename already landed: the on-disk pair is now
+				// NEW key + OLD cert — mismatched. Say so loudly; the
+				// operator must re-install the certificate (see the
+				// crash-safety note above).
+				log.Printf("TLS: certificate install FAILED after the key was swapped — cert %s and key %s are now a MISMATCHED pair; re-install the certificate: %v", certPath, keyPath, err)
 				return err
 			}
 			// F18: make the two renames durable (best effort — some

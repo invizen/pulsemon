@@ -2001,12 +2001,34 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "begin settings update", err)
 		return
 	}
-	defer tx.Rollback() // no-op after Commit
+	defer tx.Rollback() // no-op after Commit succeeds
+	// Pin the write lock BEFORE anything reads (review 2026-10-24): a
+	// SQLite deferred transaction takes a read snapshot on its first
+	// SELECT (the smtp tls_mode guard below), and upgrading that to a
+	// write AFTER another writer committed fails fast with
+	// SQLITE_BUSY_SNAPSHOT (517) — busy_timeout does not retry it. That
+	// turned a normal concurrent-PUT collision into a spurious 500 and
+	// made the guard's read see a snapshot that can go stale. A zero-row
+	// UPDATE acquires the write lock immediately (busy_timeout applies
+	// to the ACQUIRE), so the two PUTs serialize and the guard reads the
+	// committed state — wait-then-400 instead of 500.
+	if _, err := tx.ExecContext(r.Context(), "UPDATE settings SET value = value WHERE setting_key = ?", "\x00pulsemon-txlock"); err != nil {
+		respondInternal(w, "lock settings", err)
+		return
+	}
 	for i, prov := range req.Providers {
 		if err := applyProviderUpdateInTx(tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
-			// Validation errors are unreachable after the pass above
-			// (same request data, same stored snapshot); a 500 covers
-			// write failures.
+			if errors.Is(err, errSMTPNoneWithCreds) {
+				// Reachable now (in-tx re-check): a concurrent admin PUT
+				// committed between this request's pre-flight validation
+				// and its write tx, so the EFFECTIVE state this save would
+				// complete violates the rule. 400; deferred rollback leaves
+				// the store untouched.
+				respondWithError(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			// Other validation errors stay unreachable after the pass
+			// above; a 500 covers write failures.
 			respondInternal(w, "apply provider "+prov.Kind, err)
 			return
 		}
@@ -2254,7 +2276,7 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 			return storedExtra[k]
 		}
 		if eff("tls_mode") == "none" && (cred("username") != "" || cred("password") != "") {
-			return fmt.Errorf("smtp tls_mode=none cannot use credentials (clear username/password)")
+			return errSMTPNoneWithCreds
 		}
 	}
 	return nil
@@ -2273,6 +2295,51 @@ func (s *Server) storedProviderExtra(kind string) map[string]string {
 		m[k] = s.db.GetSetting(kind + "_" + k)
 	}
 	return m
+}
+
+// errSMTPNoneWithCreds: the tls_mode=none-with-credentials rejection. A
+// sentinel (not an inline error) so the settings PUT can map it to 400
+// even when it surfaces from the IN-TX re-check.
+var errSMTPNoneWithCreds = errors.New("smtp tls_mode=none cannot use credentials (clear username/password)")
+
+// guardSMTPNoCredsOverTLSInTx re-applies the tls_mode=none + credentials
+// rule against the LIVE in-tx settings snapshot (review 2026-10-24, found
+// independently by two review streams): the handler's pre-flight guard
+// evaluated the EFFECTIVE state against a PRE-BeginTx read, so two
+// concurrent admin PUTs — one setting tls_mode=none, one storing
+// credentials — each passed against the pre-other-commit snapshot and
+// JOINTLY committed none+credentials (the runtime send guard still
+// refuses to send, so the failure is broken config, not a plaintext
+// leak). SQLite serializes write transactions, so the later committer's
+// in-tx read sees the earlier write and takes the 400 with the store
+// untouched. Mask semantics mirror the write path below: a masked
+// incoming password means "keep stored", i.e. credential PRESENT.
+func guardSMTPNoCredsOverTLSInTx(tx *sql.Tx, incoming map[string]string) error {
+	stored := func(k string) string {
+		var v string
+		_ = tx.QueryRow("SELECT value FROM settings WHERE setting_key = ?", "smtp_"+k).Scan(&v)
+		return v
+	}
+	effTLS := strings.TrimSpace(incoming["tls_mode"])
+	if _, ok := incoming["tls_mode"]; !ok {
+		effTLS = strings.TrimSpace(stored("tls_mode"))
+	}
+	if effTLS != "none" {
+		return nil
+	}
+	credPresent := func(k string) bool {
+		if v, ok := incoming[k]; ok {
+			if k == "password" && v == "••••••••" { // mask = keep stored
+				return stored("password") != ""
+			}
+			return v != ""
+		}
+		return stored(k) != ""
+	}
+	if credPresent("username") || credPresent("password") {
+		return errSMTPNoneWithCreds
+	}
+	return nil
 }
 
 // applyProviderUpdate persists one provider's URL / enabled flag in its own
@@ -2310,6 +2377,15 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 	// validateProviderUpdate with DNS), never under the write lock.
 	if err := validateProviderUpdateNoDNS(kind, url, enabled, extra, storedExtra); err != nil {
 		return err
+	}
+	if kind == "smtp" {
+		// In-tx effective-state re-check (TOCTOU, review 2026-10-24): the
+		// handler's guard ran on a pre-BeginTx snapshot; this one sees the
+		// serialized write state, so two racing admin PUTs can no longer
+		// jointly commit tls_mode=none over credentials.
+		if err := guardSMTPNoCredsOverTLSInTx(tx, extra); err != nil {
+			return err
+		}
 	}
 	if url != nil {
 		u := strings.TrimSpace(*url)

@@ -213,7 +213,12 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	res := updateResponse{Status: "restarting", Running: Version, Target: rel.TagName, Bus: d}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(res)
+	// A failed encode leaves the client with an empty 202 body while the
+	// restart proceeds regardless — irreversible from their side, so at
+	// least make it visible in the log (review nit 2026-10-24).
+	if err := json.NewEncoder(w).Encode(res); err != nil {
+		log.Printf("update: 202 response encode/flush failed before restart (client sees an empty body; restart proceeds): %v", err)
+	}
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}

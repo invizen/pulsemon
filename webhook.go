@@ -322,8 +322,14 @@ func validateWebhookURL(raw string) error {
 //   - 64:ff9b::/96 (RFC 6052) — NAT64 well-known prefix: an IPv6 literal
 //     that TUNNELS an IPv4 destination (e.g. 64:ff9b::7f00:1 == 127.0.0.1).
 //     Without this, an attacker writes the loopback address in IPv6 dress.
-//   - 2002::/16 (RFC 4380) — Teredo: the same tunneling trick with an
-//     embedded IPv4 address in bits 32-63.
+//   - 2002::/16 (RFC 3056) — 6to4: an IPv4 destination embedded in bits
+//     16-47 (e.g. 2002:7f00:0001:: == 127.0.0.1).
+//   - 2001::/32 (RFC 4380) — Teredo: the same tunneling trick one level
+//     deeper. The server keeps the client's mapped IPv4 in the INVITED
+//     peer field, so a Teredo literal can relay toward an internal
+//     address; a public-internet-only sender must not reach it. (The
+//     pre-review list labeled 2002::/16 as Teredo and left Teredo itself
+//     unblocked — corrected with this review, 2026-10-24.)
 //   - 240.0.0.0/4 — Class E (reserved) through 255.255.255.255 (limited
 //     broadcast, which lands in this block). Never a valid destination.
 //
@@ -343,7 +349,8 @@ var blockedSubnets = []blockedRange{
 	{cidr: mustCIDR("198.18.0.0/15")},
 	{cidr: mustCIDR("100.64.0.0/10"), cgnat: true},
 	{cidr: mustCIDR("64:ff9b::/96")},
-	{cidr: mustCIDR("2002::/16")},
+	{cidr: mustCIDR("2002::/16")}, // 6to4
+	{cidr: mustCIDR("2001::/32")}, // Teredo (RFC 4380) — was labeled but never blocked
 	{cidr: mustCIDR("240.0.0.0/4")},
 }
 
@@ -385,8 +392,9 @@ func checkWebhookIP(ip net.IP, host string) error {
 	}
 	// Reserved-for-testing (198.18/15), carrier-NAT (100.64/10 — skipped
 	// under the PULSEMON_ALLOW_CGNAT opt-out, where it is the tailnet),
-	// NAT64 (64:ff9b::/96), Teredo (2002::/16) and Class E/broadcast
-	// (240/4) ranges: never a valid destination (see blockedSubnets).
+	// NAT64 (64:ff9b::/96), 6to4 (2002::/16), Teredo (2001::/32) and Class
+	// E/broadcast (240/4) ranges: never a valid destination (see
+	// blockedSubnets).
 	for _, n := range blockedSubnets {
 		if n.cgnat && allowCGNAT {
 			continue
