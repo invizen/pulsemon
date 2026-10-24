@@ -59,15 +59,19 @@ func TestUpdateAPIBadGatewayBodiesRedacted(t *testing.T) {
 	t.Cleanup(dead.Close)
 	withReleaseBase(t, dead.URL)
 
-	d := newTestDB(t)
-	mux := NewServer(d, NewProbeWorker(d)).Mux() // auth off => admin tier open (by design)
+	// Auth ENABLED: since the 2026-10-24 review (M1) the update endpoint
+	// 403s while auth is off, so an auth-off server would never reach the
+	// 502 body this test is asserting on. handleUpdate is called directly
+	// (like the rest of the update tests) so the mux's session check is
+	// not the thing under test here.
+	srv := updateServer(t)
 
-	rr := httptest.NewRecorder()
-	mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/update", strings.NewReader("")))
-	if rr.Code != http.StatusBadGateway {
-		t.Fatalf("dead upstream: code = %d, want 502 (body %q)", rr.Code, rr.Body.String())
+	rec := httptest.NewRecorder()
+	srv.handleUpdate(rec, httptest.NewRequest("POST", "/api/update", strings.NewReader("")))
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("dead upstream: code = %d, want 502 (body %q)", rec.Code, rec.Body.String())
 	}
-	body := rr.Body.String()
+	body := rec.Body.String()
 	if strings.Contains(body, "127.0.0.1") || strings.Contains(body, ":") && strings.Contains(body, dead.URL[7:]) {
 		t.Fatalf("502 body leaks upstream address detail: %q", body)
 	}

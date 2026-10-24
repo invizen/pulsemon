@@ -519,6 +519,20 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 	}
 	done := make(chan bool, 1)
 	pw.enqueueAlert(id, func() {
+		// Guarantee a `done` value even if the delivery panics: the
+		// consumer's per-job recover swallows the panic (sacrifice the job,
+		// keep the loop alive), but a skipped `done <-` would park this
+		// caller on `<-done` forever — leaking the goroutine and its
+		// alertWG count, so DrainAlerts burns the full backstop at every
+		// shutdown (2026-10-24 review m1). The buffer-1 channel makes the
+		// defer exact: the normal send fills it and the defer is a no-op;
+		// on panic the defer is the sole writer.
+		defer func() {
+			select {
+			case done <- false:
+			default:
+			}
+		}()
 		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
 	})
 	return <-done

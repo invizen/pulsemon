@@ -135,6 +135,13 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | Per sensor | Interval, timeout, loss %, error-after, tags |
 | CLI | `pulsemon auth-user add <user> <pass>` — create a dashboard account (the FIRST account is what turns authentication on). `pulsemon auth-user remove <user>` — delete an account (the last one is refused; use the dashboard's "Disable Authentication" for that). `pulsemon auth-user list` — list accounts. Auth is opt-in; with no accounts the dashboard is open, as before. |
 
+**Credentials in sensor targets:** the sensor API returns each sensor's
+`target` verbatim (the UI needs it for editing), so a target stored as
+`https://user:pass@host/health` is readable by anyone who can read the
+sensor list. Webhook URLs are masked; targets are not. If a target must
+carry credentials, keep authentication enabled. The full list of accepted
+security trade-offs lives in [docs/DEFERRED.md](docs/DEFERRED.md).
+
 ### Behind a reverse proxy
 
 When pulsemon sits behind Caddy, Traefik, nginx, or similar:

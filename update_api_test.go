@@ -56,8 +56,8 @@ func setupUpdateHarness(t *testing.T, container bool) *updateHarness {
 }
 
 // updateServer builds a Server with authentication ENABLED (one account):
-// the recommended production shape for the update endpoint (the endpoint
-// itself does not require it - see docs/DEFERRED.md).
+// the required shape for the update endpoint (it is 403 while auth is
+// disabled — TestUpdateRefusedWhenAuthDisabled).
 func updateServer(t *testing.T) *Server {
 	t.Helper()
 	db := newTestDB(t)
@@ -271,5 +271,28 @@ func TestUpdateMethodNotAllowed(t *testing.T) {
 	srv.handleUpdate(rec, httptest.NewRequest("GET", "/api/update", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("code = %d, want 405", rec.Code)
+	}
+}
+
+// TestUpdateRefusedWhenAuthDisabled pins the 2026-10-24 review (M1) fix: on
+// an install where the operator disabled authentication (bootstrapped, zero
+// users), POST /api/update must be 403. The self-update path downloads a
+// binary, overwrites the running one, and restarts the service, so it is not
+// part of the "auth off = fully open" surface: any LAN host could otherwise
+// trigger a restart loop, and a compromised upstream release would
+// auto-install on every auth-off box. Setup mode (never bootstrapped) is
+// already 403 at the auth gate; the CLI (`pulsemon update`) remains the
+// operator path in both states.
+func TestUpdateRefusedWhenAuthDisabled(t *testing.T) {
+	db := newTestDB(t)
+	// Bootstrapped with zero users = "auth disabled by the operator"
+	// (distinct from fresh-install setup mode, which the gate blocks).
+	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(db, NewProbeWorker(db))
+	rec := postUpdate(t, srv, "")
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("code = %d, want 403: %s", rec.Code, rec.Body.String())
 	}
 }

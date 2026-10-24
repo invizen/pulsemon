@@ -61,9 +61,12 @@ var isContainerInstall = func() bool {
 // Contract mirrors the CLI, with HTTP-shaped outcomes:
 //
 //	method not POST          -> 405
+//	container install        -> 200 {status:"container", command} — a
+//	read-only hint (no lock, no network, no swap), so it is served even
+//	while auth is disabled
+//	auth disabled            -> 403 (self-update requires an account)
 //	update already running   -> 409
 //	bad version pin          -> 400
-//	container install        -> 200 {status:"container", command}
 //	not a newer release      -> 200 {status:"up-to-date"}
 //	no platform asset        -> 409
 //	download/verify failed   -> 502 (nothing installed)
@@ -78,10 +81,36 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "use POST /api/update")
 		return
 	}
-	// NOTE: handleUpdate deliberately has no "auth must be enabled" gate. A
-	// review (M4c) proposed refusing the swap+restart on auth-off installs;
-	// the owner decided to defer that (docs/DEFERRED.md), so on an auth-off
-	// dashboard anyone who can reach the port can trigger an update.
+	// Container installs can never self-update (the image owns the binary),
+	// so the answer is a static hint — no lock, no network, no swap. It is
+	// deliberately served even while auth is disabled: it has none of the
+	// side effects the auth gate below protects against.
+	if isContainerInstall() {
+		cmd := os.Getenv("PULSEMON_UPDATE_CMD")
+		if cmd == "" {
+			cmd = containerUpdateCommand
+		}
+		respondWithJSON(w, http.StatusOK, updateResponse{
+			Status:  "container",
+			Running: Version,
+			Command: cmd,
+		})
+		return
+	}
+	// The self-update path is NOT part of the "auth off = fully open"
+	// surface: it downloads a binary, overwrites the running one, and
+	// restarts the service. On an auth-disabled install any LAN host
+	// could otherwise trigger a restart loop — and a compromised upstream
+	// release would auto-install on every auth-off box (2026-10-24 review
+	// M1; the earlier deferral in docs/DEFERRED.md is lifted). Setup mode
+	// (never bootstrapped) never reaches here: the auth gate 403s
+	// everything outside the bootstrap surface. The CLI
+	// (`pulsemon update`) remains the operator path in both states.
+	if !s.auth.Enabled() {
+		respondWithError(w, http.StatusForbidden,
+			"self-update requires an account: create one in Settings, or run `pulsemon update`")
+		return
+	}
 	if !updateMu.TryLock() {
 		respondWithError(w, http.StatusConflict, "an update is already in progress")
 		return
@@ -125,19 +154,6 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "invalid version: expected a release tag like v0.3.13")
 			return
 		}
-	}
-
-	if isContainerInstall() {
-		cmd := os.Getenv("PULSEMON_UPDATE_CMD")
-		if cmd == "" {
-			cmd = containerUpdateCommand
-		}
-		respondWithJSON(w, http.StatusOK, updateResponse{
-			Status:  "container",
-			Running: Version,
-			Command: cmd,
-		})
-		return
 	}
 
 	client := &http.Client{Timeout: 30 * time.Second}

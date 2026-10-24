@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-// --- M4: self-update rollback (the auth-off 403 was deferred, see docs/DEFERRED.md) ---------------------------
+// --- M4: self-update rollback (the auth-off 403 is enforced in update_api.go, 2026-10-24 review M1) ---------------------------
 
 func fixWriteFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	t.Helper()
