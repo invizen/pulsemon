@@ -1885,13 +1885,13 @@ function renderProviderList(providers) {
     row.innerHTML = `
       <div class="flex items-center justify-between mb-1.5">
         <span class="text-[12px] font-semibold text-slate-200 flex items-center gap-1.5">${meta.icon} ${esc(meta.name)}</span>
-        <button type="button" onclick="toggleProvider('${p.kind}')" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
+        <button type="button" onclick="toggleProvider('${escJs(p.kind)}')" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
           ${p.enabled ? 'Enabled' : 'Disabled'}
         </button>
       </div>
       <div class="flex items-center gap-2">
-        <input id="prov-url-${p.kind}" type="text" placeholder="${urlPlaceholder}" value="${esc(urlVal)}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
-        <button type="button" onclick="testWebhook('${p.kind}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
+        <input id="prov-url-${esc(p.kind)}" type="text" placeholder="${urlPlaceholder}" value="${esc(urlVal)}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
+        <button type="button" onclick="testWebhook('${escJs(p.kind)}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
       </div>
       ${extraRow}`;
     box.appendChild(row);
@@ -1922,10 +1922,12 @@ async function saveAlerts() {
     realert_min: +$('f-realert').value
   };
   body.providers = (SETTINGS.providers || []).filter(p => {
-    const input = $('prov-url-' + p.kind);
+    // id is rendered esc()'d (see renderProviders) — read back the same
+    // transform so the lookup stays symmetric for any kind value.
+    const input = $('prov-url-' + esc(p.kind));
     return input && input.value.trim() !== '';
   }).map(p => {
-    const pb = { kind: p.kind, url: $('prov-url-' + p.kind).value.trim() };
+    const pb = { kind: p.kind, url: $('prov-url-' + esc(p.kind)).value.trim() };
     if (p.kind === 'telegram') {
       const ci = $('prov-chatid-telegram');
       pb.extra = { chat_id: ci ? ci.value.trim() : '' };
