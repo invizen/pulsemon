@@ -112,8 +112,35 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 // text never leaks to the client. 4xx validation messages are user-facing
 // and keep their specific text via respondWithError.
 func respondInternal(w http.ResponseWriter, what string, err error) {
-	log.Printf("API: %s: %v", what, err)
+	log.Printf("API: %s: %v", logSafe(what), err)
 	respondWithError(w, http.StatusInternalServerError, "internal error")
+}
+
+// logSafe bounds and de-controls a value before it lands in a log line.
+// Several 'what' strings concatenate request-supplied ids/tags (e.g.
+// "delete tag "+tag); SQL is parameterized everywhere, but the LOG is a
+// sink of its own: CR/LF forges a fake entry, other control characters
+// corrupt terminals and shippers, and an unbounded value lets any session
+// write arbitrarily long log lines (review 2026-10-24 nit). Sanitizing
+// HERE covers every current and future call site in one place.
+func logSafe(s string) string {
+	const max = 120
+	mapped := strings.Map(func(c rune) rune {
+		if c < 0x20 || c == 0x7f {
+			return ' '
+		}
+		return c
+	}, s)
+	if !utf8.ValidString(mapped) {
+		mapped = strings.ToValidUTF8(mapped, "?")
+	}
+	if utf8.RuneCountInString(mapped) > max {
+		// Truncate by RUNES: a byte slice could split a multi-byte
+		// character and re-introduce the very invalid UTF-8 we removed.
+		r := []rune(mapped)
+		return string(r[:max]) + "…"
+	}
+	return mapped
 }
 
 // requestBodyErr maps the MaxBytesReader limit (authGate bounds every body
@@ -369,8 +396,8 @@ func (s *Server) authGate() http.Handler {
 			// SAME token once the cookie ages past half the TTL: at
 			// most one Set-Cookie per ~15 days of activity, never per
 			// 5s poll.
-			if s.auth.CookieRenewalDue(c.Value) {
-				s.setAuthCookie(w, r, c.Value)
+			if due, pinSecure := s.auth.CookieRenewalDue(c.Value); due {
+				s.setAuthCookie(w, r, c.Value, pinSecure)
 			}
 			s.mux.ServeHTTP(w, r)
 			return
@@ -1542,7 +1569,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 				// A skipped id is safe (the rows.Err() check below 500s a
 				// mid-stream failure), but log it like the other per-row
 				// scans.
-				log.Printf("API: skipping corrupt sensor_tags row for tag %s: %v", tag, err)
+				log.Printf("API: skipping corrupt sensor_tags row for tag %s: %v", logSafe(tag), err)
 			} else {
 				tagged = append(tagged, id)
 			}
@@ -2022,18 +2049,21 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				// Nothing to write.
 				log.Printf("API: maintenance mode already ON (snapshot preserved)")
 			} else {
-				// Entering maintenance (off→on): the snapshot ids were
-				// computed and validated above, before the settings tx
-				// committed.
+				// Entering maintenance (off→on): the snapshot is read
+				// INSIDE the pause transaction (review nit 2026-10-24) —
+				// the read above is only the 400 pre-check; a sensor
+				// activated between that read and this transaction used to
+				// escape the pause and keep probing under mode=ON.
 				//
 				// Atomic: pause + snapshot + mode flag in ONE transaction
 				// so a crash can't leave sensors paused without the mode
-				// flag (or vice versa). See SetMaintenanceMode in db.go.
-				snapJSON, _ := json.Marshal(maintIDs)
-				if err := s.db.SetMaintenanceMode(true, maintIDs, string(snapJSON)); err != nil {
+				// flag (or vice versa). See EnterMaintenanceWithFreshSnapshot in db.go.
+				ids, err := s.db.EnterMaintenanceWithFreshSnapshot()
+				if err != nil {
 					respondInternal(w, "enter maintenance mode", err)
 					return
 				}
+				maintIDs = ids
 				// Flip the in-memory pause flag immediately — the same
 				// SetPaused fast path the single-sensor PATCH uses. Without
 				// this the sensor loops keep probing until the next 5s
