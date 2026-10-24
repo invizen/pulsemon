@@ -63,7 +63,24 @@ func (t *winDgram) run(e *Engine) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		t.readDgram(e)
+		// Supervisor loop (review 2026-10-24), mirroring the Linux dgram
+		// reader and the raw reader: readDgram returns on done (clean) or
+		// an unexpected Recvfrom error (WSAENOBUFS, a driver-raised
+		// WSAECONNRESET, ...). An unsupervised exit would turn EVERY later
+		// probe into a silent false loss — sensors all read down, healthz
+		// still reports unprivileged-datagram — until process restart.
+		// Come back after the shared restart delay unless we are closing;
+		// Engine.Close closes done BEFORE stop() and wg.Wait(), so a
+		// shutdown-stopped reader exits on the done case.
+		for {
+			t.readDgram(e)
+			select {
+			case <-e.done:
+				return
+			case <-time.After(readerRestartDelay):
+				log.Printf("pulsemon: icmp reader (win dgram) restarted after an unexpected stop")
+			}
+		}
 	}()
 }
 
