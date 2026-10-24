@@ -711,8 +711,9 @@ async function doLogin(username, password) {
     $('auth-err').classList.add('hidden');
     $('auth-username').value = '';
     $('auth-password').value = '';
-    await refresh();
-    await refreshAdminState();
+    // Arm the 5s pollers (idempotent; refresh()/refreshAdminState() run
+    // inside it) — without this the post-login dashboard never updates.
+    startPolling();
     return true;
   } catch (e) {
     const err = $('auth-err');
@@ -2005,7 +2006,14 @@ document.addEventListener('keydown', e => {
   if (ok) startPolling();
 })();
 
+let _pollStarted = false;
 function startPolling() {
+  // Idempotent: boot() arms it for already-authenticated page loads and
+  // doLogin() arms it after a successful login (review 2026-10-24: the
+  // login path used to never call startPolling, leaving every
+  // auth-enabled dashboard a frozen snapshot until a manual reload).
+  if (_pollStarted) return;
+  _pollStarted = true;
   refresh();
   refreshAdminState();
   // Gate the 5s pollers on tab visibility: a hidden tab's polls are pure
