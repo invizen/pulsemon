@@ -926,6 +926,7 @@ function render() {
       '<span class="ml-auto text-slate-500 text-[11px]">' + t + '</span></li>';
   }).join('') : '<li class="px-4 py-3 text-slate-500">no recent state transitions</li>';
   layoutSparklines();
+  rearmDeleteConfirm();
 }
 
 function layoutSparklines() {
@@ -969,7 +970,7 @@ function cardHtml(s) {
 
   return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-2.5 pb-1 flex flex-col gap-2 transition hover:shadow-lg hover:shadow-black/20 ' + (paused ? 'opacity-70' : '') + '">' +
     '<div class="flex items-start justify-between gap-2">' +
-      '<div class="flex items-start gap-2 min-w-0 cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' +
+      '<div class="flex items-start gap-2 min-w-0 cursor-pointer" onclick="openInspector(\'' + escJs(s.id) + '\')">' +
         '<i class="ph-bold ' + m.icon + ' text-[16px] shrink-0 mt-px ' + (m.label === 'PAUSED' ? 'text-slate-500' : m.label === 'UP' ? 'text-ok' : m.label === 'WARN' ? 'text-warn' : 'text-bad') + '"></i>' +
         '<div class="min-w-0">' +
           '<div class="flex items-center gap-1.5 min-w-0">' +
@@ -996,7 +997,7 @@ function cardHtml(s) {
       '</div>' +
       '<div>' +
         '<div class="text-[10px] text-slate-500 uppercase">Loss</div>' +
-        '<div class="text-[14px] font-bold mt-0.5 ' + (!paused && st && st.loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div>' +
+        '<div class="text-[14px] font-bold mt-0.5 ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn' : 'text-slate-300') + '">' + loss + '</div>' +
       '</div>' +
     '</div>' +
 
@@ -1014,12 +1015,12 @@ function cardHtml(s) {
     '</div>' +
 
     '<div class="flex items-end justify-between mt-auto pt-1.5 border-t border-surface-800/60">' +
-      '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
+      '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
       '<div class="flex items-center gap-0.5">' +
-        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
-        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
-        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
-        '<button onclick="confirmInlineDelete(\'' + s.id + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
+        '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
+        '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
+        '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
+        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
       '</div>' +
     '</div>' +
   '</div>';
@@ -1055,26 +1056,31 @@ function renderTable(list) {
 
     return '<tr class="hover:bg-surface-850/50 transition-colors">' +
       '<td class="py-2 px-3.5"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2 h-2 rounded-full ' + m.dot + '"></span>' + m.label + '</span></td>' +
-      '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + s.id + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
+      '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + escJs(s.id) + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
       '<td class="url-mono py-2 px-3.5 text-slate-500 text-[12px] hidden md:table-cell max-w-[200px] truncate">' + esc(s.target) + '</td>' +
       '<td class="py-2 px-3.5">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-1.5 py-0.2 rounded text-[11px] bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-600">—</span>') + '</td>' +
       '<td class="py-2 px-3.5 text-right font-semibold ' + (st && st.rtt_last != null ? 'text-slate-100' : 'text-slate-500') + '"><span class="mr-1">' + badge + '</span>' + rtt + cert + '</td>' +
       '<td class="py-2 px-3.5 text-right text-jit">' + jit + '</td>' +
       '<td class="py-2 px-3.5 text-right ' + (!paused && st && st.hour_loss_pct > 0 ? 'text-warn font-semibold' : 'text-slate-400') + '">' + loss + '</td>' +
-      <td class="text-right ${st ? (st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') : 'text-slate-500'}">${up24}</td>
+      '<td class="py-2 px-3.5 text-right ' + (st && st.total ? (st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') : 'text-slate-500') + '">' + up24 + '</td>' +
       '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
-        '<button onclick="echoPing(\'' + s.id + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
-        '<button onclick="togglePause(\'' + s.id + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
-        '<button onclick="openSensorModal(\'' + s.id + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
-        '<button onclick="cloneSensor(\'' + s.id + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="confirmInlineDelete(\'' + s.id + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad"><i class="ph-bold ph-trash"></i></button>' +
+        '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
+        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' +
       '</div></td></tr>';
   }).join('');
 }
 
 document.addEventListener('input', e => {
-  if (e.target.id === 'q') searchQ = e.target.value.trim().toLowerCase();
+  // Search box only (review 2026-10-24): the old version re-rendered the
+  // WHOLE dashboard on any keystroke in ANY field — including the
+  // settings-modal inputs, whose typed characters were re-rendered
+  // underneath the user by the 5s poll loop.
+  if (e.target.id !== 'q') return;
+  searchQ = e.target.value.trim().toLowerCase();
   render();
 });
 
@@ -1094,27 +1100,49 @@ function setViewMode(m) {
 }
 
 // ---------- Inline Confirmation Handlers (replaces blocking confirm()) ----------
+// The delete-confirm is armed by SENSOR ID, not by a captured button
+// reference (review 2026-10-24): the 5s poll re-renders the grid/table from
+// innerHTML, which used to wipe an armed "CONFIRM?" button mid-delete — the
+// two-click confirm silently reset under the user's cursor. pendingDeleteId
+// survives the re-render and re-arms the freshly-built button.
+let pendingDeleteId = null;
+let pendingDeleteTimer = null;
+function armDeleteConfirm(btn) {
+  if (btn.dataset.confirming === "true") return;
+  btn.dataset.confirming = "true";
+  btn.innerHTML = '<span class="text-bad text-[10px] font-bold font-mono px-1">CONFIRM?</span>';
+  btn.classList.add('bg-bad/10', 'border', 'border-bad/30');
+}
+function clearPendingDelete() {
+  pendingDeleteId = null;
+  if (pendingDeleteTimer) { clearTimeout(pendingDeleteTimer); pendingDeleteTimer = null; }
+}
 function confirmInlineDelete(id, name, btn) {
-  if (btn.dataset.confirming === "true") {
+  if (pendingDeleteId === id) {   // second click → delete
+    clearPendingDelete();
     deleteSensor(id, name);
     return;
   }
-  btn.dataset.confirming = "true";
-  const origHtml = btn.innerHTML;
-  btn.innerHTML = '<span class="text-bad text-[10px] font-bold font-mono px-1">CONFIRM?</span>';
-  btn.classList.add('bg-bad/10', 'border', 'border-bad/30');
-
-  const timeout = setTimeout(() => reset(), 3000);
-  const reset = () => {
-    clearTimeout(timeout);
-    btn.dataset.confirming = "false";
-    btn.innerHTML = origHtml;
-    btn.classList.remove('bg-bad/10', 'border', 'border-bad/30');
-    document.removeEventListener('click', outside);
-  };
-  const outside = e => { if (!btn.contains(e.target)) reset(); };
-  setTimeout(() => document.addEventListener('click', outside), 20);
+  pendingDeleteId = id;
+  armDeleteConfirm(btn);
+  if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
+  pendingDeleteTimer = setTimeout(clearPendingDelete, 4000);
 }
+// Re-arm after every render() so the armed state is visible across the poll.
+function rearmDeleteConfirm() {
+  if (!pendingDeleteId) return;
+  const btn = document.querySelector('[data-del="' + pendingDeleteId + '"]');
+  if (btn) armDeleteConfirm(btn); else clearPendingDelete();
+}
+// Click anywhere outside the armed button disarms (re-render-safe: keyed on
+// the id, and bubbling order is onclick handler first, then this listener).
+document.addEventListener('click', e => {
+  if (!pendingDeleteId) return;
+  const t = e.target.closest && e.target.closest('[data-del]');
+  if (t && t.dataset.del === pendingDeleteId) return;
+  clearPendingDelete();
+  render();
+});
 
 function confirmClearActivity(btn) {
   if (!EVENTS.length) { toast('activity log is already empty', 'ok'); return; }
@@ -1488,7 +1516,7 @@ function updateOverlay(kind, title, sub) {
     '<div class="flex flex-col items-center gap-3 text-center px-6">' +
       '<i class="' + icon + ' text-4xl ' + color + '"></i>' +
       '<div class="text-[15px] font-semibold text-slate-100">' + esc(title) + '</div>' +
-      (sub ? '<div class="text-[12px] font-mono text-slate-400 max-w-[460px] leading-relaxed">' + sub + '</div>' : '') +
+      (sub ? '<div class="text-[12px] font-mono text-slate-400 max-w-[460px] leading-relaxed">' + esc(sub) + '</div>' : '') +
     '</div>';
 }
 function hideUpdateOverlay() { const ov = $('update-overlay'); if (ov) ov.remove(); }
