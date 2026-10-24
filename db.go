@@ -547,6 +547,20 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 	if _, err := conn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
 		return err
 	}
+	// A panic inside fn must not hand a conn with an OPEN transaction back
+	// to the pool: net/http recovers panics per-connection, the deferred
+	// conn.Close() still runs, and the next BEGIN IMMEDIATE on that pooled
+	// conn fails "cannot start a transaction within a transaction" —
+	// writes wedged until restart (review 2026-10-24, same failure mode the
+	// ctx-canceled comment above defends against, via a different route).
+	// Registered AFTER the conn.Close defer so it runs BEFORE it (LIFO);
+	// the panic is re-raised for the HTTP layer to log.
+	defer func() {
+		if r := recover(); r != nil {
+			_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+			panic(r)
+		}
+	}()
 	if err := fn(conn); err != nil {
 		// Rollback on a fresh context: cleanup must reach the driver even
 		// when the caller's ctx is already canceled (client disconnect) —
@@ -558,8 +572,18 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
 		return err
 	}
-	_, err = conn.ExecContext(ctx, "COMMIT")
-	return err
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		// Same hazard the rollback above defends against, COMMIT-side
+		// (review 2026-10-24): a ctx canceled at the driver skips the
+		// statement, and SQLITE_BUSY after busy_timeout leaves the
+		// transaction ACTIVE (SQLite semantics) — the conn would go back
+		// to the pool holding the write lock with database/sql unaware.
+		// Roll back on a fresh context (a no-op if the commit actually
+		// landed) before the deferred conn.Close() releases the conn.
+		_, _ = conn.ExecContext(context.Background(), "ROLLBACK")
+		return err
+	}
+	return nil
 }
 
 // migrateLegacyAuthToken converts a pre-accounts auth_token setting into the
