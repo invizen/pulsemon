@@ -404,6 +404,18 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
+	if setupMode {
+		// Cheap pre-check BEFORE paying bcrypt: setup mode is
+		// single-shot, so with any account already present this request
+		// is guaranteed to lose the in-tx bootstrap check below. Without
+		// it, unauthenticated setup mode is an unlimited bcrypt-CPU
+		// endpoint (review 2026-10-24). The authoritative check stays in
+		// the tx (a pre-check alone cannot close the race); a failed
+		// count just falls through to it.
+		if n, err := a.db.UserCount(); err == nil && n > 0 {
+			return errBootstrapped
+		}
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
 	if err != nil {
 		return err
@@ -729,13 +741,29 @@ func (a *AuthState) trustedIP(p net.IP) bool {
 //     rotation), so per-address keying handed it 2^64 separate budgets.
 //
 // An unparseable string is returned as-is.
+// cgnetRange is 100.64.0.0/10 (RFC 6598). Addresses from this space can
+// only reach the socket over an overlay (Tailscale/Headscale): every one of
+// them is an individually assigned, individually trusted peer — exactly
+// like RFC1918 space — so the login throttle buckets it PER-IP. (/24
+// bucketing there collaterally locked up to 256 tailnet devices behind one
+// peer's bad guesses; review 2026-10-24.) A public-internet attacker never
+// presents a 100.64/x source address: carrier NAT is invisible past the
+// carrier's public egress.
+var cgnetRange = func() *net.IPNet {
+	_, n, err := net.ParseCIDR("100.64.0.0/10")
+	if err != nil {
+		panic(err) // unreachable: literal
+	}
+	return n
+}()
+
 func throttleKey(ip string) string {
 	p := net.ParseIP(ip)
 	if p == nil {
 		return ip
 	}
 	if v4 := p.To4(); v4 != nil {
-		if v4.IsPrivate() || v4.IsLoopback() {
+		if v4.IsPrivate() || v4.IsLoopback() || cgnetRange.Contains(v4) {
 			return v4.String()
 		}
 		return fmt.Sprintf("%d.%d.%d.0", v4[0], v4[1], v4[2])

@@ -1509,6 +1509,15 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, s.db.AllTags())
 		return
 	case http.MethodDelete:
+		// Destructive and fleet-wide: strips the tag from EVERY sensor
+		// and respawns every affected probe loop. Admin-only for
+		// consistency with DELETE /api/history (review 2026-10-24) —
+		// per-sensor edits stay operator-scoped; all-sensors rewrites
+		// are admin surface.
+		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
+			respondWithError(w, http.StatusForbidden, "admin only")
+			return
+		}
 		tag := r.URL.Query().Get("tag")
 		if tag == "" {
 			respondWithError(w, http.StatusBadRequest, "tag query parameter is required")
