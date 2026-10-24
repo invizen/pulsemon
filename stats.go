@@ -145,14 +145,19 @@ func (pw *ProbeWorker) warmStats() {
 			args = append(args, id)
 		}
 		args = append(args, fmtTS(cutoff))
+		// manual MUST be selected: warmed Pulse-Now rows default to
+		// manual=false otherwise and re-enter the aggregates + status
+		// derivation as scheduled probes for up to 24h after every
+		// restart — the exact class the 2026-10-23 manual-exclusion
+		// batch closed on the live and DB paths (review 2026-10-24).
 		rows, err := pw.db.Query(
-			`SELECT sensor_id, ts, rtt_ms FROM (
-				SELECT sensor_id, ts, rtt_ms,
+			`SELECT sensor_id, ts, rtt_ms, manual FROM (
+				SELECT sensor_id, ts, rtt_ms, manual,
 				       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
 				FROM probes WHERE sensor_id IN (`+strings.Join(q, ",")+`)
 			) WHERE rn <= 60
 			UNION
-			SELECT sensor_id, ts, rtt_ms FROM probes
+			SELECT sensor_id, ts, rtt_ms, manual FROM probes
 			WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
 			ORDER BY sensor_id, ts`, args...)
 		if err != nil {
@@ -164,7 +169,8 @@ func (pw *ProbeWorker) warmStats() {
 			var sid string
 			var ts time.Time
 			var rtt *float64
-			if err := rows.Scan(&sid, &ts, &rtt); err != nil {
+			var mRaw int
+			if err := rows.Scan(&sid, &ts, &rtt, &mRaw); err != nil {
 				continue
 			}
 			a, ok := byID[sid]
@@ -172,7 +178,7 @@ func (pw *ProbeWorker) warmStats() {
 				a = &acc{series: &probeSeries{}}
 				byID[sid] = a
 			}
-			e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN())}
+			e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN()), manual: mRaw == 1}
 			if rtt != nil {
 				e.rtt = float32(*rtt)
 			}
