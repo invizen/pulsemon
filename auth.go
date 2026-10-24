@@ -126,10 +126,24 @@ type authSession struct {
 	// (CookieRenewalDue), keeping an active user's cookie ahead of its
 	// browser-side expiry.
 	cookieIssued time.Time
+	// cookieSecure pins the Secure decision made when the session was
+	// minted (review nit 2026-10-24): renewals re-issue the cookie on a
+	// LATER request, whose HTTPS-ness may differ (a TLS-terminating proxy
+	// that misses X-Forwarded-Proto on one hop used to re-issue the same
+	// token WITHOUT Secure — downgrading the very protection the login
+	// applied). A Secure-minted session stays Secure through every
+	// renewal; the pin only ever ratchets UP (a non-secure mint plus an
+	// https renewal still sets Secure for that response).
+	cookieSecure bool
 }
 
 type AuthState struct {
 	db *DB
+
+	// nextSweepSessions rate-limits the session-map GC (see
+	// sweepExpiredSessions / CreateSession; review nit 2026-10-24).
+	// Guarded by a.mu.
+	nextSweepSessions time.Time
 
 	// userCountFn is the count source Enabled() reads through. Defaults to
 	// db.UserCount; a test may substitute a counting stub to prove the cache
@@ -169,6 +183,14 @@ type AuthState struct {
 		sync.Mutex
 		fails   map[string][]time.Time
 		lockout map[string]time.Time
+		// nextSweep rate-limits the O(n) map GC (review 2026-10-24 nit):
+		// once a multi-IP spray pushes the map past the threshold, every
+		// entry is in-window so the sweep deletes nothing — running it per
+		// call made login O(n) and serialized all logins on an ever-
+		// growing full walk (O(n^2) total). At most one sweep per
+		// throttleSweepInterval now; memory is bounded by
+		// throttleHardCap below.
+		nextSweep time.Time
 	}
 
 	// trustedProxies: CIDRs of immediate TCP peers whose X-Forwarded-For is
@@ -570,7 +592,7 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 
 // CreateSession validates the credentials and returns a new opaque session
 // token tied to the user.
-func (a *AuthState) CreateSession(username, password string) (string, bool) {
+func (a *AuthState) CreateSession(username, password string, cookieSecure bool) (string, bool) {
 	user, ok := a.VerifyUser(username, password)
 	if !ok {
 		return "", false
@@ -594,11 +616,15 @@ func (a *AuthState) CreateSession(username, password string) (string, bool) {
 	}
 	// Opportunistic GC: see sweepExpiredSessions. Bounded O(n) work, run
 	// only once the map is large enough that abandoned sessions are the
-	// likely cause (mirrors sweepThrottle for the login-throttle maps).
-	if len(a.sessions) > 64 {
+	// likely cause (mirrors sweepThrottle for the login-throttle maps) —
+	// and rate-limited to once per sweep interval for the same reason the
+	// throttle GC is (review nit): past the threshold a full walk per
+	// login is O(n^2) for a fleet of shared-credential devices.
+	if len(a.sessions) > 64 && now.After(a.nextSweepSessions) {
 		a.sweepExpiredSessions(now)
+		a.nextSweepSessions = now.Add(throttleSweepInterval)
 	}
-	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), cookieIssued: now}
+	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), cookieIssued: now, cookieSecure: cookieSecure}
 	a.mu.Unlock()
 	return tok, true
 }
@@ -781,6 +807,14 @@ func (a *AuthState) ensureThrottleMaps() {
 	}
 }
 
+// Throttle GC tuning (review 2026-10-24 nit). Vars, not consts, so tests
+// can exercise the cap paths without 100k-entry seeding.
+var (
+	throttleSweepThreshold = 1024
+	throttleSweepInterval  = 30 * time.Second
+	throttleHardCap        = 1 << 17
+)
+
 // beginAttempt atomically decides whether ip may run a credential check
 // NOW, and if so records the attempt in the SAME critical section — before
 // the caller runs bcrypt. Counting first is what closes the concurrency
@@ -800,10 +834,24 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
-	// Opportunistic GC: see sweepThrottle. Bounded O(n) work, run only once
-	// the map is large enough that a multi-IP spray is the likely cause.
-	if len(a.loginThrottle.fails) > 1024 {
+	// Opportunistic GC: see sweepThrottle. Rate-limited (review nit): a
+	// spray keeps every entry in-window, so the sweep prunes nothing while
+	// costing a full walk per login; it only needs to run often enough to
+	// reclaim entries AS the window ages, not per call.
+	if len(a.loginThrottle.fails) > throttleSweepThreshold && !now.Before(a.loginThrottle.nextSweep) {
 		a.sweepThrottle(now)
+		a.loginThrottle.nextSweep = now.Add(throttleSweepInterval)
+		// Spray-proof memory bound: if a sweep still leaves the map huge
+		// (every entry fresh — a wide one-shot spray), drop ALL throttle
+		// state. This fail-OPENS the per-IP lockout only for an attacker
+		// already spread across >100k distinct sources, where per-IP
+		// lockout buys nothing anyway and unbounded map growth (plus the
+		// O(n) walks) would degrade monitoring and logins for everyone.
+		// Chosen bound: 131072 entries ≈ tens of MB worst case.
+		if len(a.loginThrottle.fails) > throttleHardCap {
+			a.loginThrottle.fails = map[string][]time.Time{}
+			a.loginThrottle.lockout = map[string]time.Time{}
+		}
 	}
 	if until, ok := a.loginThrottle.lockout[ip]; ok {
 		if now.Before(until) {
@@ -929,22 +977,22 @@ func (a *AuthState) SessionUser(tok string) (string, bool) {
 // behavior). The gate calls this after ValidSession and re-issues the
 // SAME token (no rotation) when it returns true — at most one Set-Cookie
 // per half-TTL of activity, never per request.
-func (a *AuthState) CookieRenewalDue(tok string) bool {
+func (a *AuthState) CookieRenewalDue(tok string) (bool, bool) {
 	if tok == "" {
-		return false
+		return false, false
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]
 	if !ok || !time.Now().Before(s.expiry) {
-		return false
+		return false, false
 	}
 	if time.Since(s.cookieIssued) < authSessionTTL/2 {
-		return false
+		return false, s.cookieSecure
 	}
 	s.cookieIssued = time.Now()
 	a.sessions[tok] = s
-	return true
+	return true, s.cookieSecure
 }
 
 // DropSession removes one session (logout).
@@ -1121,7 +1169,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, ok := s.auth.CreateSession(req.Username, req.Password)
+	tok, ok := s.auth.CreateSession(req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
 		// Constant-time-ish delay on rejection: equalizes response time across
 		// the unknown-user / wrong-password paths (closes the timing oracle)
@@ -1132,7 +1180,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.loginSuccess(key)
-	s.setAuthCookie(w, r, tok)
+	s.setAuthCookie(w, r, tok, false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
 }
 
@@ -1144,7 +1192,7 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(authSessionName); err == nil {
 		s.auth.DropSession(c.Value)
 	}
-	s.setAuthCookie(w, r, "")
+	s.setAuthCookie(w, r, "", false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false, Bootstrapped: s.auth.Bootstrapped()})
 }
 
@@ -1403,7 +1451,7 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "disable auth", err)
 		return
 	}
-	s.setAuthCookie(w, r, "")
+	s.setAuthCookie(w, r, "", false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: false, Authed: false, Bootstrapped: true})
 }
 
@@ -1415,7 +1463,11 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 // TLS-terminating reverse proxy (see cookieSecure) — so a proxied install
 // never hands the session token to a plaintext hop. On a direct plain-HTTP
 // LAN install it is omitted so the dashboard keeps working.
-func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string) {
+// pinSecure carries the session's mint-time Secure decision through
+// renewals (see authSession.cookieSecure); callers that are not renewing
+// an existing session pass false and the attribute is computed from this
+// request alone.
+func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string, pinSecure bool) {
 	expires := time.Now().Add(authSessionTTL)
 	maxAge := int(authSessionTTL.Seconds())
 	if value == "" {
@@ -1437,7 +1489,7 @@ func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value str
 		Domain:   "",
 		Expires:  expires,
 		MaxAge:   maxAge,
-		Secure:   s.cookieSecure(r),
+		Secure:   pinSecure || s.cookieSecure(r),
 		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	})

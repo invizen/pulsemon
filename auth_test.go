@@ -152,10 +152,10 @@ func TestAuthSessions(t *testing.T) {
 	if err := a.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.CreateSession("admin", "wrongpw123"); ok {
+	if _, ok := a.CreateSession("admin", "wrongpw123", false); ok {
 		t.Fatal("CreateSession must reject a bad password")
 	}
-	sess, ok := a.CreateSession("admin", "secretpw")
+	sess, ok := a.CreateSession("admin", "secretpw", false)
 	if !ok || sess == "" {
 		t.Fatal("CreateSession failed for valid credentials")
 	}
@@ -229,7 +229,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	sess, ok := srv.auth.CreateSession("admin", "secretpw")
+	sess, ok := srv.auth.CreateSession("admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -246,7 +246,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 
 	// A live session still slides: a hit moves expiry back to now+TTL.
 	// Backdate it an hour first so the slide is measurable.
-	sess2, ok := srv.auth.CreateSession("admin", "secretpw")
+	sess2, ok := srv.auth.CreateSession("admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -1068,7 +1068,7 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	const n = 70
 	toks := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		tok, ok := a.CreateSession("admin", "secretpw")
+		tok, ok := a.CreateSession("admin", "secretpw", false)
 		if !ok {
 			t.Fatal("create session")
 		}
@@ -1087,8 +1087,14 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	}
 	a.mu.Unlock()
 
-	// The next CreateSession crosses the threshold and must sweep.
-	fresh, ok := a.CreateSession("admin", "secretpw")
+	// The next CreateSession crosses the threshold and must sweep. The
+	// sweep is rate-limited now (review nit 2026-10-24: a full walk on
+	// every past-threshold create was O(n^2)); the fill loop above already
+	// consumed this window's sweep, so open it again to observe eviction.
+	a.mu.Lock()
+	a.nextSweepSessions = time.Time{}
+	a.mu.Unlock()
+	fresh, ok := a.CreateSession("admin", "secretpw", false)
 	if !ok {
 		t.Fatal("create session after sweep")
 	}

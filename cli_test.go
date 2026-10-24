@@ -167,7 +167,7 @@ func TestAuthUserAdd(t *testing.T) {
 		"bob":   "stdin-secret-2",
 		"carol": "argv-secret-3",
 	} {
-		if _, ok := a.CreateSession(user, pass); !ok {
+		if _, ok := a.CreateSession(user, pass, false); !ok {
 			t.Errorf("login %s with its added password failed — the stored password is wrong", user)
 		}
 	}
