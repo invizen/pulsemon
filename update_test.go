@@ -209,7 +209,7 @@ func TestInstallBinarySuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := installBinary(src, dst); err != nil {
+	if err := installBinary(src, dst, ""); err != nil {
 		t.Fatalf("installBinary: %v", err)
 	}
 	got, err := os.ReadFile(dst)
@@ -258,7 +258,7 @@ func TestInstallBinaryBadSource(t *testing.T) {
 	}
 	src := filepath.Join(dir, "does-not-exist")
 
-	err := installBinary(src, dst)
+	err := installBinary(src, dst, "")
 	if err == nil {
 		t.Fatal("installBinary with missing source: want error, got nil")
 	}

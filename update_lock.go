@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sync"
 )
 
 // errUpdateLockHeld is the stable sentinel for "another process is updating
@@ -31,10 +33,20 @@ var errUpdateLockHeld = errors.New("update already in progress (another process 
 // process is running) we fall back to os.TempDir(), which is always
 // writable, so a resolution hiccup degrades to a weaker-but-present lock
 // rather than a hard update failure.
+var lockFallbackOnce sync.Once
+
 func updateLockPath() string {
 	exe, err := runningExecutable()
 	if err != nil || exe == "" {
-		return filepath.Join(os.TempDir(), ".update.lock")
+		path := filepath.Join(os.TempDir(), ".update.lock")
+		// The fallback only means anything if the CLI and the server
+		// resolve the SAME TMPDIR — with systemd each unit can get a
+		// private /tmp, in which case CLI↔server mutual exclusion is
+		// silently gone. Say it loudly, once (review 2026-10-24).
+		lockFallbackOnce.Do(func() {
+			log.Printf("WARNING: update lock fell back to %s (running binary not locatable): CLI and server must share this TMPDIR for the lock to guard anything", path)
+		})
+		return path
 	}
 	return filepath.Join(filepath.Dir(exe), ".update.lock")
 }

@@ -28,7 +28,7 @@ func TestFix_M4_InstallKeepsPrev(t *testing.T) {
 	src1 := filepath.Join(dir, "new1")
 	fixWriteFile(t, src1, newBytes, 0o755)
 
-	if err := installBinary(src1, exe); err != nil {
+	if err := installBinary(src1, exe, ""); err != nil {
 		t.Fatal(err)
 	}
 	if b, _ := os.ReadFile(exe); !bytes.Equal(b, newBytes) {
@@ -48,7 +48,7 @@ func TestFix_M4_InstallKeepsPrev(t *testing.T) {
 	src2 := filepath.Join(dir, "new2")
 	newerBytes := []byte("NEWER-BINARY")
 	fixWriteFile(t, src2, newerBytes, 0o755)
-	if err := installBinary(src2, exe); err != nil {
+	if err := installBinary(src2, exe, ""); err != nil {
 		t.Fatalf("second install (stale .prev present): %v", err)
 	}
 	if b, _ := os.ReadFile(prev); !bytes.Equal(b, newBytes) {
@@ -68,7 +68,7 @@ func TestFix_M4_RollbackRestores(t *testing.T) {
 	src := filepath.Join(dir, "new")
 	fixWriteFile(t, src, newBytes, 0o755)
 
-	if err := installBinary(src, exe); err != nil {
+	if err := installBinary(src, exe, ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := rollbackBinary(exe); err != nil {

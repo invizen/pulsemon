@@ -423,7 +423,7 @@ func runUpdate(args []string) int {
 	}
 	uInfo("sha256:  " + digest + " ✓")
 
-	if err := installBinary(tmp, exe); err != nil {
+	if err := installBinary(tmp, exe, digest); err != nil {
 		uErr("install: " + err.Error())
 		return 1
 	}
@@ -526,6 +526,27 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 	}
 }
 
+// watchdogTimeout is the health-poll budget for the restart watchdog,
+// overridable via PULSEMON_WATCHDOG_TIMEOUT (Go duration, clamped to
+// 5s..5m, invalid values warn and keep the 30s default). The hardcoded 30s
+// (review open question 2026-10-24) can roll back a WORKING update on an
+// install whose startup work — InitSchema, warmStats — legitimately takes
+// longer on a very large DB; the operator can widen the window without a
+// code change.
+func watchdogTimeout() time.Duration {
+	const def = 30 * time.Second
+	v := os.Getenv("PULSEMON_WATCHDOG_TIMEOUT")
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d < 5*time.Second || d > 5*time.Minute {
+		uWarn("ignoring invalid PULSEMON_WATCHDOG_TIMEOUT " + strconv.Quote(v) + " (want a Go duration between 5s and 5m0s) — using " + def.String())
+		return def
+	}
+	return d
+}
+
 // spawnUpdateWatchdog detaches `pulsemon update --watchdog ...` (I2) so the
 // API's auto-restart path keeps a guardian after this process dies. The
 // watchdog polls healthz and rolls back to <exe>.prev if the new binary
@@ -533,7 +554,7 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 // health-poll until THIS process is gone (review 2026-10-24).
 func spawnUpdateWatchdog(exe string) error {
 	cmd := exec.Command(exe, "update", "watchdog",
-		"--prev", exe+".prev", "--dst", exe, "--timeout", "30s",
+		"--prev", exe+".prev", "--dst", exe, "--timeout", watchdogTimeout().String(),
 		"--old-pid", strconv.Itoa(os.Getpid()))
 	return detachSpawn(cmd)
 }
@@ -872,7 +893,7 @@ func fileSHA256(path string) (string, error) {
 // Before the swap the current binary is kept at <dst>.prev (M4 rollback
 // artifact): the rename atomically replaces any stale .prev and preserves
 // the original's mode and ownership.
-func installBinary(src, dst string) error {
+func installBinary(src, dst, wantSHA string) error {
 	// Preserve the original binary's ownership (a root-installed binary
 	// must stay root-owned after a root update). The rename replaces dst's
 	// inode with one owned by the executing user, so restore the recorded
@@ -901,9 +922,21 @@ func installBinary(src, dst string) error {
 	}
 	defer srcFile.Close()
 
-	if _, err := io.Copy(tmp, srcFile); err != nil {
+	// Hash while staging (review 2026-10-24): verifying the src PATH and
+	// then re-reading it leaves a window where the temp file can be
+	// swapped between verify and install. Hashing the exact bytes being
+	// staged closes it — a drifted source fails here, BEFORE dst is
+	// touched, and what passes is by construction what gets installed.
+	h := sha256.New()
+	if _, err := io.Copy(io.MultiWriter(tmp, h), srcFile); err != nil {
 		tmp.Close()
 		return err
+	}
+	if wantSHA != "" {
+		if got := hex.EncodeToString(h.Sum(nil)); got != wantSHA {
+			tmp.Close()
+			return fmt.Errorf("install refused: staged binary hash drifted from the verified download (expected %s, staged %s)", wantSHA, got)
+		}
 	}
 	if err := tmp.Chmod(0755); err != nil {
 		tmp.Close()

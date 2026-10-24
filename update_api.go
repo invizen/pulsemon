@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"strings"
@@ -142,7 +143,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	rel, err := fetchRelease(client, version)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "fetch release: "+err.Error())
+		// Upstream failure detail (URL/DNS/proxy) stays in the log
+		// (review 2026-10-24, same class as update_check.go:80).
+		log.Printf("update: fetch release: %v", err)
+		respondWithError(w, http.StatusBadGateway, "could not reach GitHub releases; try again later")
 		return
 	}
 	// Same ordering rule as the CLI: a pin that is not newer than the
@@ -164,14 +168,18 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	tmp, err := downloadAsset(client, sel.assetURL)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "download: "+err.Error())
+		log.Printf("update: download: %v", err)
+		respondWithError(w, http.StatusBadGateway, "binary download failed; try again later")
 		return
 	}
 	defer os.Remove(tmp)
 
 	digest, err := verifyDownloadedAsset(client, sel, tmp)
 	if err != nil {
-		respondWithError(w, http.StatusBadGateway, "refusing to update: "+err.Error())
+		// Intentionally NOT redacted: this text is a SHA-256 mismatch /
+		// missing-sidecar verdict — actionable, operator-facing, and
+		// carries no upstream detail (review triage 2026-10-24).
+		respondWithError(w, http.StatusBadGateway, "refusing to update: "+err.Error()) // redaction-ok: actionable SHA verdict
 		return
 	}
 
@@ -180,7 +188,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "cannot locate running binary", err)
 		return
 	}
-	if err := installBinary(tmp, exe); err != nil {
+	if err := installBinary(tmp, exe, digest); err != nil {
 		respondInternal(w, "install", err)
 		return
 	}

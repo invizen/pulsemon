@@ -39,7 +39,7 @@ func TestInstallBinaryRootOwnedPreserved(t *testing.T) {
 	if err := os.Chown(dst, 0, 0); err != nil {
 		t.Skip("cannot chown dst to root; run as root or with CAP_CHOWN to exercise the root-owned path")
 	}
-	if err := installBinary(src, dst); err != nil {
+	if err := installBinary(src, dst, ""); err != nil {
 		t.Fatalf("installBinary: %v", err)
 	}
 	after, err := os.Stat(dst)
@@ -70,7 +70,7 @@ func TestInstallBinaryNoFDLeak(t *testing.T) {
 
 	before := fdCount(t)
 	for i := 0; i < 50; i++ {
-		if err := installBinary(src, dst); err != nil {
+		if err := installBinary(src, dst, ""); err != nil {
 			t.Fatalf("install %d: %v", i, err)
 		}
 	}

@@ -13,7 +13,11 @@ import (
 // g3 guard: no handler may answer a 500 with the raw error text (driver SQL,
 // filesystem paths). respondInternal logs the detail and returns a generic body.
 func TestFix_g3_NoRawErrorTextInInternalErrors(t *testing.T) {
-	re := regexp.MustCompile(`StatusInternalServerError,\s*("[^"]*"\s*\+\s*)?err\.Error\(\)`)
+	// 502/503 joined the 500 class (review 2026-10-24): upstream-failure
+	// bodies leak resolver/proxy/URL detail exactly like SQL text does.
+	// A deliberate, reviewed exception carries a `redaction-ok:` marker
+	// on the same line.
+	re := regexp.MustCompile(`Status(InternalServerError|BadGateway|ServiceUnavailable),\s*("[^"]*"\s*\+\s*)?err\.Error\(\)`)
 	files, _ := filepath.Glob("*.go")
 	for _, f := range files {
 		if strings.HasSuffix(f, "_test.go") {
@@ -24,8 +28,11 @@ func TestFix_g3_NoRawErrorTextInInternalErrors(t *testing.T) {
 			t.Fatal(err)
 		}
 		for i, line := range strings.Split(string(b), "\n") {
+			if strings.Contains(line, "redaction-ok:") {
+				continue
+			}
 			if re.MatchString(line) {
-				t.Errorf("%s:%d returns err.Error() in a 500: %s", f, i+1, strings.TrimSpace(line))
+				t.Errorf("%s:%d returns err.Error() in a 5xx: %s", f, i+1, strings.TrimSpace(line))
 			}
 		}
 	}
