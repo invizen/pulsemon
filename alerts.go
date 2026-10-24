@@ -558,7 +558,19 @@ func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
 	if due < 0 {
 		due = 0
 	}
+	// Track the flush in alertWG from ARM time (review 2026-10-24): the
+	// arming caller is an alert path that already holds a launchAlert
+	// count (sendWebhook runs inside launchAlert), so this Add can never
+	// be the "Add called concurrently with Wait" case at counter 0 — an
+	// untracked flush whose launchAlert Add landed after DrainAlerts'
+	// Wait began was the sole instance and threw a fatal on shutdown.
+	// DrainAlerts now JOINS a pending flush; the goroutine exits promptly
+	// on stopCtx, so shutdown is not delayed (the queued summary still
+	// drops on shutdown — StopAlerts has already aborted the network by
+	// then, so there is nothing to deliver; unchanged, documented).
+	pw.alertWG.Add(1)
 	go func() {
+		defer pw.alertWG.Done()
 		select {
 		case <-time.After(due):
 			pw.flushStorm()
