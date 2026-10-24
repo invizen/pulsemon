@@ -283,24 +283,8 @@ func (db *DB) InitSchema() error {
 	// AND no users exist yet, it becomes the "admin" account (the hash is
 	// already bcrypt, so it verifies exactly as before). The row is then
 	// cleared either way — the users table is the source of truth.
-	if db.GetSetting("auth_token") != "" {
-		if n, err := db.UserCount(); err == nil && n == 0 {
-			if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at)
-				VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), ?)`,
-				tsNow()); err != nil {
-				log.Println("WARNING: legacy auth_token migration to users table failed:", err)
-			} else {
-				// This install has been set up — mark it so the gate doesn't
-				// treat a later auth-off state as a fresh install.
-				if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
-					log.Println("WARNING: failed to set auth_bootstrapped flag:", err)
-				}
-				log.Println("Migrated legacy auth token to the 'admin' user; set a new password in Settings")
-			}
-		}
-		if err := db.SetSetting("auth_token", ""); err != nil {
-			return err
-		}
+	if err := migrateLegacyAuthToken(db); err != nil {
+		return err
 	}
 	// One-time migration: the users table gained is_admin (the account
 	// panel — add/remove user, disable auth — is admin-gated; the first
@@ -578,7 +562,46 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 	return err
 }
 
-// DeleteTag removes a tag from every sensor; returns how many sensors lost it.
+// migrateLegacyAuthToken converts a pre-accounts auth_token setting into the
+// "admin" user (the stored hash is already bcrypt, so it verifies exactly as
+// before) and then clears the setting — the users table is the source of
+// truth. The token is destroyed ONLY on a confirmed outcome (users already
+// exist, or the INSERT committed): on a UserCount error or an INSERT failure
+// the token stays in place and the migration retries next boot. Clearing it
+// unconditionally (review 2026-10-24) destroyed the operator's only
+// credential on a failed migration and left zero users + no
+// auth_bootstrapped flag — which the setup gate reads as a FRESH install,
+// downgrading the dashboard to unauthenticated setup mode.
+func migrateLegacyAuthToken(db *DB) error {
+	if db.GetSetting("auth_token") == "" {
+		return nil
+	}
+	n, err := db.UserCount()
+	if err != nil {
+		log.Printf("WARNING: legacy auth_token migration deferred (user count failed: %v); token kept, retried next start", err)
+		return nil
+	}
+	if n == 0 {
+		if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at)
+			VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), ?)`,
+			tsNow()); err != nil {
+			log.Printf("WARNING: legacy auth_token migration to users table failed: %v; token kept, retried next start", err)
+			return nil
+		}
+		// This install has been set up — mark it so the gate doesn't
+		// treat a later auth-off state as a fresh install.
+		if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+			log.Println("WARNING: failed to set auth_bootstrapped flag:", err)
+		}
+		log.Println("Migrated legacy auth token to the 'admin' user; set a new password in Settings")
+	}
+	if err := db.SetSetting("auth_token", ""); err != nil {
+		return err
+	}
+	return nil
+}
+
+// DeleteTag removes one tag from every sensor; returns how many sensors lost it.
 func (db *DB) DeleteTag(tag string) (int64, error) {
 	res, err := db.Exec("DELETE FROM sensor_tags WHERE tag = ?", tag)
 	if err != nil {
