@@ -1920,8 +1920,25 @@ function renderGraph(el, data) {
   const x = i => padL + (i / Math.max(pts.length - 1, 1)) * (W - padL - padR);
   const y = v => padT + (1 - v / top) * (H - padT - padB);
 
-  const path = pts.map((p, i) => p.avg == null ? '' : (i === 0 ? 'M' : 'L') + x(i).toFixed(1) + ' ' + (p.avg != null ? y(p.avg).toFixed(1) : y(0).toFixed(1))).join(' ');
-  const area = path ? path + ' L' + x(pts.length - 1).toFixed(1) + ' ' + (H - padB) + ' L' + x(0).toFixed(1) + ' ' + (H - padB) + ' Z' : '';
+  // One subpath per CONTIGUOUS run of non-null buckets (review 2026-10-24):
+  // AVG(rtt_ms) is NULL for an all-lost bucket (it survives the Total>0
+  // filter), and the old single-path builder emitted 'L' when pts[0].avg was
+  // null — SVG discards everything before the first moveto, so the whole
+  // graph rendered NOTHING exactly at outage onset, the moment an operator
+  // opens the inspector. Gaps also used to be bridged as if service had
+  // continued. Multiple M…L subpaths in one d are valid SVG.
+  const runs = [];
+  let cur = null;
+  pts.forEach((p, i) => {
+    if (p.avg == null) { cur = null; return; }
+    const pt = x(i).toFixed(1) + ' ' + y(p.avg).toFixed(1);
+    if (cur) { cur.d += ' L' + pt; cur.last = i; }
+    else { cur = { first: i, last: i, d: 'M' + pt }; runs.push(cur); }
+  });
+  const path = runs.map(r => r.d).join(' ');
+  const area = runs.filter(r => r.last > r.first)
+    .map(r => r.d + ' L' + x(r.last).toFixed(1) + ' ' + (H - padB) + ' L' + x(r.first).toFixed(1) + ' ' + (H - padB) + ' Z')
+    .join(' ');
 
   const axis = [0, 0.5, 1].map(f => {
     const v = Math.round(top * f), yy = y(v).toFixed(1);
