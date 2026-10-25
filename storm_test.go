@@ -254,6 +254,69 @@ func TestStormFlushDropsRecovered(t *testing.T) {
 	})
 }
 
+// TestStormFlushUsesInMemoryStatus (2026-10-24 review): flushStorm filters
+// recovered sensors by their CURRENT status. During a real storm the sensors
+// are actively probed, so the in-memory lastStatus is the freshest source —
+// reading it (currentStatus) avoids one SQLite round-trip per queued entry
+// and beats a DB row a tick behind. A sensor that is 'up' in memory but
+// still 'error' in the DB must be DROPPED; one that is 'error' in both must
+// be KEPT.
+func TestStormFlushUsesInMemoryStatus(t *testing.T) {
+	withStormBudget(t, 0, 500*time.Millisecond, func() {
+		withPlainTransport(t, func() {
+			pw, db, getBodies, cleanup := newStormTestWorker(t)
+			defer cleanup()
+			// Both a0 and a1 are 'error' in the DB (the storm that queued
+			// them). a0 has since recovered IN MEMORY (lastStatus 'up');
+			// a1 is still down in memory too.
+			insertStormSensor(t, db, "a0")
+			insertStormSensor(t, db, "a1")
+			if _, err := db.Exec(`UPDATE sensors SET status = 'error' WHERE id IN ('a0','a1')`); err != nil {
+				t.Fatalf("set a0/a1 error: %v", err)
+			}
+			pw.mu.Lock()
+			pw.sensors["a0"] = &ProbeState{id: "a0", lastStatus: "up"}    // recovered in memory
+			pw.sensors["a1"] = &ProbeState{id: "a1", lastStatus: "error"} // still down
+			pw.mu.Unlock()
+			pw.stormMu.Lock()
+			pw.stormQueue = append(pw.stormQueue,
+				stormEntry{id: "a0", name: "a0", target: "127.0.0.1", oldState: "up", state: "error"},
+				stormEntry{id: "a1", name: "a1", target: "127.0.0.1", oldState: "up", state: "error"},
+			)
+			pw.stormMu.Unlock()
+			pw.flushStorm()
+			// a1 is kept, so a summary is delivered; poll for it.
+			var bodies []string
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				bodies = getBodies()
+				done := false
+				for _, b := range bodies {
+					if strings.Contains(b, "alert storm") {
+						done = true
+					}
+				}
+				if done || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			var s string
+			for _, b := range bodies {
+				if strings.Contains(b, "alert storm") {
+					s = b
+				}
+			}
+			if !strings.Contains(s, "a1") {
+				t.Errorf("summary must keep a1 (still down):\n%s", s)
+			}
+			if strings.Contains(s, "a0") {
+				t.Errorf("summary must drop a0 (recovered in memory):\n%s", s)
+			}
+		})
+	})
+}
+
 // --- m10: TLS cert hot reload ---
 
 // writeTestCertPEM writes a fresh self-signed ECDSA pair to (certPath,

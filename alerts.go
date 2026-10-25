@@ -658,10 +658,13 @@ func (pw *ProbeWorker) flushStorm() {
 	// Drop entries that recovered before the flush: a summary line for a
 	// sensor that is back up would contradict the recovery alert it raced.
 	// A vanished sensor (deleted mid-storm) is kept — the operator should
-	// still see it in the storm that took it down.
+	// still see it in the storm that took it down. Read the status via
+	// currentStatus (in-memory first): during a storm the sensors are
+	// actively probed, so lastStatus is the freshest source and reading it
+	// avoids one SQLite round-trip per queued entry (2026-10-24 review).
 	still := q[:0]
 	for _, e := range q {
-		if s, err := pw.db.SensorStatus(e.id); err == nil && s == "up" {
+		if s, err := pw.currentStatus(e.id); err == nil && s == "up" {
 			continue
 		}
 		still = append(still, e)
