@@ -1762,12 +1762,23 @@ type EventView struct {
 
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
-		res, err := s.db.ExecContext(r.Context(), "DELETE FROM events")
+		// Fleet-wide data wipe — admin-only, exactly like DELETE
+		// /api/history (requireAdmin). A regular (lower-trust) account
+		// must not be able to erase the audit/event log (review
+		// 2026-10-24). The GET branch below stays open to any session:
+		// the event feed is dashboard data, not an admin surface.
+		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
+			respondWithError(w, http.StatusForbidden, "admin only")
+			return
+		}
+		// Batched (purgeOld idiom): a single unbatched DELETE FROM events
+		// held the WAL write lock across the whole table, stalling probe
+		// INSERTs and every probe loop up to the 15s busy_timeout.
+		n, err := deleteRowsBatched(r.Context(), s.db, "events", "", nil)
 		if err != nil {
 			respondInternal(w, "delete events", err)
 			return
 		}
-		n, _ := res.RowsAffected()
 		respondWithJSON(w, http.StatusOK, map[string]interface{}{"status": "cleared", "events_deleted": n})
 		return
 	}

@@ -71,6 +71,7 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 		{http.MethodPost, "/api/settings/tls", `{}`},
 		{http.MethodDelete, "/api/settings/tls", ""},
 		{http.MethodDelete, "/api/history", ""},
+		{http.MethodDelete, "/api/events", ""},
 	}
 	for _, c := range cases {
 		code := requestStatus(t, helper, c.method, httpSrv.URL+c.path, c.body)
@@ -89,6 +90,9 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 	}
 	if code := requestStatus(t, admin, http.MethodDelete, httpSrv.URL+"/api/history", ""); code != http.StatusOK {
 		t.Errorf("DELETE /api/history (admin): got %d, want 200", code)
+	}
+	if code := requestStatus(t, admin, http.MethodDelete, httpSrv.URL+"/api/events", ""); code != http.StatusOK {
+		t.Errorf("DELETE /api/events (admin): got %d, want 200", code)
 	}
 	_ = setupUpdateHarness(t, true)
 	if code := requestStatus(t, admin, http.MethodPost, httpSrv.URL+"/api/update", ""); code != http.StatusOK {
