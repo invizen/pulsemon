@@ -43,6 +43,24 @@ func testCertWithCN(t *testing.T, cn string) string {
 	return string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
 }
 
+// padPEM pads a PEM string with trailing newlines to exactly targetLen bytes.
+// The PEM parser (tlsX509Cert) reads the first CERTIFICATE block and ignores
+// trailing data, so padding is safe. It lets a test hold the (path, mtime,
+// size) memo key's size constant across two different certs — the two random
+// certs otherwise differ in ECDSA signature length by a byte or two, which
+// made TestTlsPayloadMemoizesOnMtime flaky in CI (2026-10-25).
+func padPEM(t *testing.T, pem string, targetLen int) []byte {
+	t.Helper()
+	if len(pem) > targetLen {
+		t.Fatalf("PEM is %d bytes, exceeds target %d (padding cannot shrink)", len(pem), targetLen)
+	}
+	b := []byte(pem)
+	for len(b) < targetLen {
+		b = append(b, '\n')
+	}
+	return b
+}
+
 func TestTlsPayloadMemoizesOnMtime(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "pulsemon.db")
 	t.Setenv("PULSEMON_DB", dbPath)
@@ -61,7 +79,18 @@ func TestTlsPayloadMemoizesOnMtime(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(certPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(certPath, []byte(testCertWithCN(t, "alpha.lan")), 0o600); err != nil {
+
+	// Two different certs, padded to a common size so the (path, mtime, size)
+	// memo key's size is identical for both — this isolates the mtime
+	// dimension. (The raw certs differ in ECDSA signature length by a byte or
+	// two, which used to make this test flaky in CI.)
+	alphaPEM := testCertWithCN(t, "alpha.lan")
+	bravoPEM := testCertWithCN(t, "bravo.lan")
+	targetLen := len(alphaPEM)
+	if len(bravoPEM) > targetLen {
+		targetLen = len(bravoPEM)
+	}
+	if err := os.WriteFile(certPath, padPEM(t, alphaPEM, targetLen), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(keyPath, []byte("test-key"), 0o600); err != nil {
@@ -77,10 +106,10 @@ func TestTlsPayloadMemoizesOnMtime(t *testing.T) {
 		t.Fatalf("initial payload subject = %q, want alpha.lan", info.Subject)
 	}
 
-	// Swap in a different cert but restore the original mtime: a
-	// memoized reader must keep serving the cached cert — the mtime is
-	// the invalidation key, and a real upload would set a new one.
-	if err := os.WriteFile(certPath, []byte(testCertWithCN(t, "bravo.lan")), 0o600); err != nil {
+	// Swap in the other cert (same size) and restore the original mtime:
+	// unchanged mtime+size ⇒ the cached cert is served (a real upload sets a
+	// new mtime AND size).
+	if err := os.WriteFile(certPath, padPEM(t, bravoPEM, targetLen), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(certPath, origMTime, origMTime); err != nil {
