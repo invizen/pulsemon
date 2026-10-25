@@ -1003,6 +1003,16 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 // calls StopAlerts first, so any delivery stuck in a network blip is
 // aborted at its next read (stopCtx) instead of holding this drain for the
 // client's full 10s timeout — the timeout here is a backstop only.
+//
+// The waiter goroutine below is intentionally untracked: sync.WaitGroup has
+// no cancellable Wait, so it lingers past a timeout until alertWG drains.
+// That is bounded and harmless — after StopAlerts cancels stopCtx (and with
+// the non-blocking enqueue, no enqueue blocks forever), in-flight deliveries
+// abort at their next read and alertWG hits zero promptly. In production the
+// process exits right after this returns, so a lingering waiter is moot; in
+// tests it is a short-lived bounded goroutine (Go tests do not fail on it).
+// There is no clean way to avoid it without redesigning the delivery
+// tracking (2026-10-24 review finding #9).
 func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
