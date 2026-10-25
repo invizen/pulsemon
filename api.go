@@ -1600,6 +1600,17 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
+		// One Restart per tagged sensor is deliberate, not an oversight.
+		// Each Restart does a NON-BLOCKING send on the buffered-1 syncReq,
+		// so the N signals coalesce into a single syncSensors pass: this
+		// loop is fast (map ops, no I/O) and completes before Run can
+		// consume the buffer. Even if Run wakes mid-loop, the extra pass is
+		// ONE idempotent full-fleet reconciliation (the buffer drains once
+		// per syncSensors cycle, so it's bounded to ~1, not N) and the
+		// final state is correct. A RestartMany batch (one lock + one
+		// signal) would save at most that one rare extra pass for a rare
+		// operation (tag delete) — not worth the added surface
+		// (2026-10-24 review finding #10).
 		for _, id := range tagged {
 			s.probeWorker.Restart(id)
 		}
