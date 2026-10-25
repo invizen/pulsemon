@@ -296,3 +296,36 @@ func TestUpdateRefusedWhenAuthDisabled(t *testing.T) {
 		t.Fatalf("code = %d, want 403: %s", rec.Code, rec.Body.String())
 	}
 }
+
+// TestUpdateAllowedWhenAuthDisabledAndOptIn pins the opt-in that lifts the
+// M1 403: on an operator-disabled (auth-off) install, setting
+// allow_unauth_update re-opens POST /api/update without an account — for
+// trusted-LAN boxes that deliberately run without authentication. The gate
+// is passed (the request reaches the version check and answers up-to-date)
+// rather than the M1 403, and nothing is installed.
+func TestUpdateAllowedWhenAuthDisabledAndOptIn(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSetting("allow_unauth_update", "1"); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(db, NewProbeWorker(db))
+	h := setupUpdateHarness(t, false) // native install → reaches the auth gate
+	base, _ := serveRelease(t, "v1.0.0", "")
+	oldBase, oldVer := releaseBase, Version
+	releaseBase, Version = base, "v9.9.9"
+	t.Cleanup(func() { releaseBase, Version = oldBase, oldVer })
+
+	rec := postUpdate(t, srv, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (gate passed, up-to-date): %s", rec.Code, rec.Body.String())
+	}
+	if res := decodeUpdate(t, rec); res.Status != "up-to-date" {
+		t.Fatalf("res = %+v, want up-to-date", res)
+	}
+	if got, _ := os.ReadFile(h.exePath); string(got) != "old binary" {
+		t.Fatalf("binary was swapped on an up-to-date check: %q", got)
+	}
+}

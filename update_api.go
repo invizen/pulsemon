@@ -64,7 +64,7 @@ var isContainerInstall = func() bool {
 //	container install        -> 200 {status:"container", command} — a
 //	read-only hint (no lock, no network, no swap), so it is served even
 //	while auth is disabled
-//	auth disabled            -> 403 (self-update requires an account)
+//	auth disabled, no opt-in   -> 403 (self-update requires an account)
 //	update already running   -> 409
 //	bad version pin          -> 400
 //	not a newer release      -> 200 {status:"up-to-date"}
@@ -98,17 +98,24 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// The self-update path is NOT part of the "auth off = fully open"
-	// surface: it downloads a binary, overwrites the running one, and
-	// restarts the service. On an auth-disabled install any LAN host
-	// could otherwise trigger a restart loop — and a compromised upstream
-	// release would auto-install on every auth-off box (2026-10-24 review
-	// M1; the earlier deferral in docs/DEFERRED.md is lifted). Setup mode
-	// (never bootstrapped) never reaches here: the auth gate 403s
-	// everything outside the bootstrap surface. The CLI
-	// (`pulsemon update`) remains the operator path in both states.
-	if !s.auth.Enabled() {
+	// surface by DEFAULT: it downloads a binary, overwrites the running
+	// one, and restarts the service. On an auth-disabled install any LAN
+	// host could otherwise trigger a restart loop — and a compromised
+	// upstream release would auto-install on every auth-off box
+	// (2026-10-24 review M1; the earlier deferral in docs/DEFERRED.md is
+	// lifted).
+	//
+	// Opt-in: an operator on a trusted LAN who runs auth-off can set
+	// allow_unauth_update (Settings → Authentication) to re-allow the
+	// in-dashboard Update button without an account. The risk — any LAN
+	// host can trigger a restart, and a compromised release auto-installs
+	// — is the operator's to accept. Setup mode (never bootstrapped)
+	// never reaches here: the auth gate 403s everything outside the
+	// bootstrap surface. The CLI (`pulsemon update`) remains the operator
+	// path in all states.
+	if !s.auth.Enabled() && s.db.GetSetting("allow_unauth_update") != "1" {
 		respondWithError(w, http.StatusForbidden,
-			"self-update requires an account: create one in Settings, or run `pulsemon update`")
+			"self-update requires an account: create one in Settings, enable \"Allow self-update without authentication\" in Settings, or run `pulsemon update`")
 		return
 	}
 	if !updateMu.TryLock() {

@@ -1889,15 +1889,16 @@ func (s *Server) settingsPayload() map[string]interface{} {
 		chatSource = "env"
 	}
 	return map[string]interface{}{
-		"webhook_url":        webhookMasked(chatURL),
-		"webhook_configured": chatURL != "",
-		"source":             chatSource,
-		"providers":          s.probeWorker.providerStatuses(),
-		"alert_scope":        scope,
-		"alert_filter":       filter,
-		"realert_min":        realert,
-		"maintenance_mode":   s.db.GetSetting("maintenance_mode") == "1",
-		"tls":                s.tlsPayload(),
+		"webhook_url":         webhookMasked(chatURL),
+		"webhook_configured":  chatURL != "",
+		"source":              chatSource,
+		"providers":           s.probeWorker.providerStatuses(),
+		"alert_scope":         scope,
+		"alert_filter":        filter,
+		"realert_min":         realert,
+		"maintenance_mode":    s.db.GetSetting("maintenance_mode") == "1",
+		"allow_unauth_update": s.db.GetSetting("allow_unauth_update") == "1",
+		"tls":                 s.tlsPayload(),
 	}
 }
 
@@ -1926,6 +1927,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		AlertFilter *[]string `json:"alert_filter"` // nil = keep; else set
 		RealertMin  *int      `json:"realert_min"`  // nil = keep; 0 = alert once only
 		MaintMode   *bool     `json:"maintenance_mode"`
+		AllowUnauth *bool     `json:"allow_unauth_update"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
@@ -2090,6 +2092,16 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		filterJSON, _ := json.Marshal(*req.AlertFilter)
 		if err := setSettingInTx(tx, "alert_filter", string(filterJSON)); err != nil {
 			respondInternal(w, "save setting alert_filter", err)
+			return
+		}
+	}
+	if req.AllowUnauth != nil {
+		val := "0"
+		if *req.AllowUnauth {
+			val = "1"
+		}
+		if err := setSettingInTx(tx, "allow_unauth_update", val); err != nil {
+			respondInternal(w, "save setting allow_unauth_update", err)
 			return
 		}
 	}

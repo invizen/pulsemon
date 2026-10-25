@@ -437,6 +437,17 @@
             To re-enable it, create an account on the host:
             <code class="block mt-1.5 px-2 py-1.5 rounded bg-surface-950 border border-surface-800 text-[11px] text-slate-300">pulsemon auth-user add &lt;username&gt;</code>
           </div>
+          <!-- Opt-in: allow the in-dashboard self-update button while auth is
+               off (trusted-LAN installs). No-op while auth is on. -->
+          <div class="mt-2.5 flex items-center justify-between gap-3 border border-surface-800 rounded-lg px-2.5 py-2 bg-surface-900/60">
+            <div>
+              <span class="text-[12px] text-slate-200 font-semibold">Allow self-update without an account</span>
+              <span class="block text-[10px] text-slate-500">Only applies while authentication is off. Any LAN host can trigger an update while enabled.</span>
+            </div>
+            <button type="button" id="unauth-update-btn" onclick="toggleUnauthUpdate()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 text-[11px] font-mono shrink-0 transition">
+              <span id="unauth-update-txt">Off</span>
+            </button>
+          </div>
         </div>
 
         <div id="auth-enabled-box" class="hidden space-y-2.5">
@@ -1631,6 +1642,7 @@ async function renderAuthPanel() {
       : 'Protect dashboard with secure credential gate.';
     $('auth-create-first-btn').classList.toggle('hidden', wasDisabled);
     $('auth-disabled-note').classList.toggle('hidden', !wasDisabled);
+    setUnauthUpdateUI(SETTINGS.allow_unauth_update === true);
   }
 }
 
@@ -1774,6 +1786,33 @@ async function toggleMaint() {
     setMaintUI(SETTINGS.maintenance_mode === true);
     setMsg('failed: ' + e.message, 'bad');
   } finally { maintBusy = false; }
+}
+
+// allow_unauth_update: opt-in to the in-dashboard self-update button on
+// auth-off (trusted-LAN) installs. Only meaningful while auth is off —
+// the row lives in the auth-off panel, so this is a no-op when auth is on.
+function setUnauthUpdateUI(on) {
+  const btn = $('unauth-update-btn'), txt = $('unauth-update-txt');
+  if (!btn) return;
+  txt.textContent = on ? 'On' : 'Off';
+  btn.className = 'px-2.5 py-1 rounded-lg border text-[11px] font-mono shrink-0 transition ' +
+    (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-300');
+}
+let unauthBusy = false;
+async function toggleUnauthUpdate() {
+  if (unauthBusy) return;
+  const next = !(SETTINGS.allow_unauth_update === true);
+  unauthBusy = true;
+  setUnauthUpdateUI(next);
+  try {
+    const r = await api('/api/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ allow_unauth_update: next }) });
+    SETTINGS = r;
+    setUnauthUpdateUI(!!r.allow_unauth_update);
+    setMsg(next ? 'Self-update without an account allowed' : 'Self-update without an account disabled', 'ok');
+  } catch (e) {
+    setUnauthUpdateUI(SETTINGS.allow_unauth_update === true);
+    setMsg('failed: ' + e.message, 'bad');
+  } finally { unauthBusy = false; }
 }
 
 // Per-scope UNSAVED picks (review nit 2026-10-24): switching tags →
