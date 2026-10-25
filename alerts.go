@@ -745,12 +745,13 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*\n", len(entries)))
 	for _, e := range entries {
-		// Escape * in the DATA: names and URL paths may legally contain
-		// it, and a raw * inside the *…* emphasis renders as a literal
-		// asterisk in Google Chat / Discord (2026-10-24 review n2). The
+		// Escape the emphasis chars in the DATA: names and URL paths may
+		// legally contain * _ ~ `, and a raw one inside the *…* emphasis
+		// renders as literal formatting (italic/strikethrough/code) in
+		// Google Chat / Discord (2026-10-24 review n2 + markdown). The
 		// emphasis markers themselves come from the format strings, not
 		// the data, so they are untouched.
-		b.WriteString("*" + strings.ReplaceAll(stormSummaryLine(e, true), "*", "\\*") + "*\n")
+		b.WriteString("*" + mdEscape(stormSummaryLine(e, true)) + "*\n")
 	}
 	return b.String()
 }
@@ -1095,8 +1096,24 @@ func discordMentionSafe(s string) string {
 	return s
 }
 
+// mdEscape backslash-escapes the Markdown emphasis characters that can appear
+// in sensor names and targets — * _ ~ ` — so Discord and Google Chat render
+// them verbatim instead of as bold/italic/strikethrough/code. The emphasis
+// markers in the card and summary format strings come from the code, not the
+// data, so they are untouched (2026-10-24 review: a sensor named
+// db_primary_01 would otherwise render with "primary" italicized). Applied
+// ONLY to the Markdown (google_chat/discord) builders — the Telegram (HTML)
+// and SMTP (plain) paths carry the data verbatim.
+func mdEscape(s string) string {
+	for _, c := range []string{"*", "_", "~", "`"} {
+		s = strings.ReplaceAll(s, c, "\\"+c)
+	}
+	return s
+}
+
 func cardFor(oldState, state, name, target string, rttMs float64) string {
 	target = alertTarget(target)
+	name, target = mdEscape(name), mdEscape(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1112,6 +1129,7 @@ func cardFor(oldState, state, name, target string, rttMs float64) string {
 
 func cardForRe(state, name, target string, rttMs float64) string {
 	target = alertTarget(target)
+	name, target = mdEscape(name), mdEscape(target)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1128,7 +1146,7 @@ func cardForRe(state, name, target string, rttMs float64) string {
 // content. Same information, Discord-flavored. name/target are sanitized
 // first: credentials stripped (F22) and mention tokens neutralized (F23).
 func discordCard(oldState, state, name, target string, rttMs float64) string {
-	name, target = discordMentionSafe(name), discordMentionSafe(alertTarget(target))
+	name, target = mdEscape(discordMentionSafe(name)), mdEscape(discordMentionSafe(alertTarget(target)))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1142,7 +1160,7 @@ func discordCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func discordCardRe(state, name, target string, rttMs float64) string {
-	name, target = discordMentionSafe(name), discordMentionSafe(alertTarget(target))
+	name, target = mdEscape(discordMentionSafe(name)), mdEscape(discordMentionSafe(alertTarget(target)))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"

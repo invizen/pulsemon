@@ -407,3 +407,42 @@ func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
 		t.Errorf("SMTP plain summary must carry the sensor name verbatim: %q", p)
 	}
 }
+
+// TestMarkdownEscapesEmphasisChars (2026-10-24 review): sensor names and
+// targets may legally contain * _ ~ (underscores and tildes are common in
+// hostnames, service names, and URL paths), and a raw one in the Discord /
+// Google Chat Markdown renders as italic/strikethrough — db_primary_01 would
+// show "primary" in italics with the underscores stripped. The Markdown
+// builders must backslash-escape the data; the Telegram (HTML) and SMTP
+// (plain) paths must carry it verbatim.
+func TestMarkdownEscapesEmphasisChars(t *testing.T) {
+	name := "db_primary_01"
+	target := "https://nas.lan/api_v1/health~check"
+	entries := []stormEntry{{id: "a", name: name, target: target, oldState: "up", state: "error"}}
+
+	// Google Chat card + re-alert (cardFor / cardForRe).
+	if gc := cardFor("up", "error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") || !strings.Contains(gc, "api\\_v1/health\\~check") {
+		t.Errorf("google_chat card must escape _ and ~ in name/target: %q", gc)
+	}
+	if gc := cardForRe("error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") {
+		t.Errorf("google_chat re-alert card must escape underscores: %q", gc)
+	}
+	// Discord card + re-alert (discordCard / discordCardRe).
+	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") {
+		t.Errorf("discord card must escape underscores in the name: %q", dc)
+	}
+	if dc := discordCardRe("error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") {
+		t.Errorf("discord re-alert card must escape underscores: %q", dc)
+	}
+	// Storm summary (Markdown).
+	if md := stormSummaryMarkdown(entries); !strings.Contains(md, "db\\_primary\\_01") {
+		t.Errorf("storm markdown must escape underscores in the name: %q", md)
+	}
+	// The non-Markdown paths must NOT carry backslash escapes.
+	if p := stormSummaryPlain(entries); strings.Contains(p, "\\") {
+		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
+	}
+	if h := stormSummaryHTML(entries); strings.Contains(h, "\\") {
+		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
+	}
+}
