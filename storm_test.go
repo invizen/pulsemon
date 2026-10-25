@@ -379,3 +379,31 @@ func TestStormSummaryMarkdownEscapesAsterisks(t *testing.T) {
 		t.Fatalf("header emphasis lost: %q", md)
 	}
 }
+
+// TestStormSummaryMentionNeutralizationScopedToMarkdown (2026-10-24 review):
+// discordMentionSafe injects an invisible \u200b into @everyone/@here to
+// defuse Discord mass-mentions. That neutralization belongs ONLY to the
+// Discord/Google Chat Markdown path — the Telegram (HTML) and SMTP (plain)
+// summaries must carry the sensor name verbatim, or the invisible char
+// corrupts email copy-paste and renders as tofu in non-UTF-8 readers.
+func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
+	entries := []stormEntry{
+		{id: "a", name: "@everyone", target: "10.0.0.1", oldState: "up", state: "error"},
+	}
+	const zwsp = "\u200b"
+	// Markdown (Discord/Google Chat): the mention IS neutralized.
+	if md := stormSummaryMarkdown(entries); !strings.Contains(md, zwsp) {
+		t.Errorf("markdown summary must neutralize the mention (want %q present): %q", zwsp, md)
+	}
+	// Plain (SMTP) and HTML (Telegram): the mention is NOT neutralized.
+	if p := stormSummaryPlain(entries); strings.Contains(p, zwsp) {
+		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
+	}
+	if h := stormSummaryHTML(entries); strings.Contains(h, zwsp) {
+		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
+	}
+	// The plain summary carries the sensor name verbatim.
+	if p := stormSummaryPlain(entries); !strings.Contains(p, "@everyone") {
+		t.Errorf("SMTP plain summary must carry the sensor name verbatim: %q", p)
+	}
+}

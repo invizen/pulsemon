@@ -724,10 +724,18 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 }
 
 // stormSummaryLine renders one entry as a readable transition, with the
-// same hygiene as the per-sensor cards: credentials stripped (F22),
-// mention tokens neutralized (F23).
-func stormSummaryLine(e stormEntry) string {
-	name := discordMentionSafe(e.name)
+// same hygiene as the per-sensor cards: credentials stripped (F22). Mention
+// tokens are neutralized ONLY when escapeMentions is true — that is the
+// Discord/Google Chat Markdown path, where a raw @everyone/@here in a sensor
+// name would fire a mass mention. The Telegram (HTML) and SMTP (plain) paths
+// pass false: discordMentionSafe injects an invisible \u200b, which is
+// pointless there and corrupts copy-paste in email clients / renders as tofu
+// in non-UTF-8 readers (2026-10-24 review).
+func stormSummaryLine(e stormEntry, escapeMentions bool) string {
+	name := e.name
+	if escapeMentions {
+		name = discordMentionSafe(name)
+	}
 	target := alertTarget(e.target)
 	return fmt.Sprintf("%s: %s → %s (%s)", name, e.oldState, e.state, target)
 }
@@ -742,7 +750,7 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 		// asterisk in Google Chat / Discord (2026-10-24 review n2). The
 		// emphasis markers themselves come from the format strings, not
 		// the data, so they are untouched.
-		b.WriteString("*" + strings.ReplaceAll(stormSummaryLine(e), "*", "\\*") + "*\n")
+		b.WriteString("*" + strings.ReplaceAll(stormSummaryLine(e, true), "*", "\\*") + "*\n")
 	}
 	return b.String()
 }
@@ -752,7 +760,7 @@ func stormSummaryHTML(entries []stormEntry) string {
 	var b strings.Builder
 	b.WriteString(html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))))
 	for _, e := range entries {
-		b.WriteString(html.EscapeString(stormSummaryLine(e)) + "\n")
+		b.WriteString(html.EscapeString(stormSummaryLine(e, false)) + "\n")
 	}
 	return b.String()
 }
@@ -762,7 +770,7 @@ func stormSummaryPlain(entries []stormEntry) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))
 	for _, e := range entries {
-		b.WriteString(stormSummaryLine(e) + "\n")
+		b.WriteString(stormSummaryLine(e, false) + "\n")
 	}
 	return b.String()
 }
