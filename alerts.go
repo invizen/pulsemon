@@ -950,6 +950,12 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		return false, redactErr(err).Error()
 	}
 	defer resp.Body.Close()
+	// Drain (capped) before close so the shared client's per-host pool can
+	// reuse the TLS connection for the next request to this endpoint —
+	// closing an unread body marks the conn non-reusable (same idiom as
+	// postJSON). TestWebhook is a cold, operator-initiated path, so this is
+	// a minor efficiency/consistency win, not a hot-path fix.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
 		return false, "endpoint redirected (refused to follow — possible misconfiguration)"
 	}
