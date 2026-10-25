@@ -1291,6 +1291,16 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // up to, but not through, the 15s busy_timeout). Returns the total rows
 // deleted. The table/where strings are fixed call-site literals, never
 // user input.
+//
+// The `id IN (SELECT id …)` shape is optimal as written (review 2026-10-24,
+// verified by EXPLAIN QUERY PLAN): both probes.id and events.id are
+// INTEGER PRIMARY KEY — i.e. rowid aliases — so the outer delete already
+// seeks by rowid (SEARCH … USING INTEGER PRIMARY KEY (rowid=?)) and the
+// sensor_id-filtered subquery is a covering-index seek
+// (SEARCH … USING COVERING INDEX idx_*_sensor_ts (sensor_id=?)), NOT a
+// PK-B-tree or full-table scan. Rewriting it as `rowid IN (SELECT rowid …)`
+// is a byte-identical no-op (id IS rowid here), so the `id` form is kept
+// for clarity.
 func deleteRowsBatched(ctx context.Context, db *DB, table, where string, args []any) (int64, error) {
 	w := ""
 	if where != "" {
