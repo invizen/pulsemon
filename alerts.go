@@ -44,15 +44,24 @@ func alertPanicRecovered(label string) {
 var alertGateIdle = 10 * time.Minute
 
 // enqueueAlert queues job on the sensor's alert FIFO, creating the gate
-// and its consumer on first use. The SEND happens
-// under alertMu: the consumer's idle-exit
-// check runs under the same lock, so it can never observe an empty queue
-// and exit while a send is in flight — that window would orphan the job
-// in the buffer with no reader (a silently dropped alert). Holding the
-// lock across the send is safe: the 8-slot buffer bounds any wait, the
+// and its consumer on first use. It reports false (and drops the job) when
+// the sensor's 8-slot buffer is full, instead of blocking.
+//
+// The map read, the gate creation, and the send are ONE critical section
+// under alertMu: the consumer's idle-exit check runs under the same lock,
+// so it can never observe an empty queue and exit while a send is in
+// flight — that window would orphan the job in the buffer with no reader
+// (a silently dropped alert). The send is a NON-BLOCKING select, not a
+// blocking one: holding alertMu across a blocking send (the old behavior)
+// meant a full buffer parked the caller under the GLOBAL lock, stalling
+// every other sensor's enqueue AND every idle consumer's exit check behind
+// one stuck sensor for up to ~5 minutes (8 pending jobs × ~42s of
+// webhook/SMTP I/O each) during provider degradation. Dropping when full
+// bounds that stall at zero; the dropped alert is reported to the caller,
+// which schedules a 1-minute-later retry once the queue drains. The
 // consumer drains WITHOUT holding alertMu (job() is alert delivery —
 // webhook/SMTP I/O), and no job takes alertMu, so there is no deadlock.
-func (pw *ProbeWorker) enqueueAlert(id string, job func()) {
+func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 	pw.alertMu.Lock()
 	defer pw.alertMu.Unlock()
 	ch, ok := pw.alertOrderGates[id]
@@ -69,7 +78,13 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) {
 		// invisible there.
 		go pw.alertGateConsumer(id, ch, alertGateIdle)
 	}
-	ch <- job
+	select {
+	case ch <- job:
+		return true
+	default:
+		log.Printf("alert: sensor %s alert queue full (8 pending); dropping alert", id)
+		return false
+	}
 }
 
 // alertGateConsumer drains one sensor's alert FIFO and exits after
@@ -517,7 +532,7 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		return true
 	}
 	done := make(chan bool, 1)
-	pw.enqueueAlert(id, func() {
+	if !pw.enqueueAlert(id, func() {
 		// Guarantee a `done` value even if the delivery panics: the
 		// consumer's per-job recover swallows the panic (sacrifice the job,
 		// keep the loop alive), but a skipped `done <-` would park this
@@ -533,8 +548,22 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 			}
 		}()
 		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
-	})
-	return <-done
+	}) {
+		// The sensor's FIFO was full (provider degradation): the alert was
+		// dropped, not delivered. Report false so the caller schedules its
+		// 1-minute-later retry (scheduleAlertRetry) once the queue drains.
+		return false
+	}
+	select {
+	case ok := <-done:
+		return ok
+	case <-pw.stopCtx.Done():
+		// Shutdown began before the FIFO reached this job. Abort the wait
+		// so this caller (tracked in alertWG via launchAlert) releases its
+		// count and DrainAlerts can finish, instead of parking on `<-done`
+		// for the full backstop.
+		return false
+	}
 }
 
 // stormEntry is one alert suppressed by the storm budget, pending the
