@@ -175,3 +175,64 @@ func TestFix_g8_CloneNameTruncatesByRunes(t *testing.T) {
 			rr.Code, got.Name, utf8.RuneCountInString(got.Name), utf8.RuneCountInString(want), rr.Body.String())
 	}
 }
+
+// TestCloneClampsLegacyParams pins the 2026-10-28 review n5 fix: a clone is
+// a NEW write, so it must honor the CURRENT new-write floors/caps
+// (minIntervalS, the timeout/loss/down/spike ranges, and the timeout <=
+// interval*1000 cross-field rule) rather than copy the source verbatim. A
+// legacy row can hold out-of-range values (those floors were added after the
+// row existed and are deliberately not migrated — see minIntervalS), so a
+// verbatim copy let an operator multiply a legacy 1s sensor indefinitely via
+// clone. The seeds go in via a direct INSERT (the API would reject them); the
+// clone must come back clamped into range.
+func TestCloneClampsLegacyParams(t *testing.T) {
+	d := newTestDB(t)
+	mux := NewServer(d, NewProbeWorker(d)).Mux()
+	seed := func(id string, intervalS, timeoutMS, lossWarn, downAfter, spikeMult int) {
+		if _, err := d.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+			VALUES (?, ?, '10.0.0.1', 'icmp', ?, ?, ?, ?, ?, 'paused', 'up', 'x')`,
+			id, id, intervalS, timeoutMS, lossWarn, downAfter, spikeMult); err != nil {
+			t.Fatal(err)
+		}
+	}
+	clone := func(id string) Sensor {
+		var got Sensor
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest("POST", "/api/sensors/"+id+"/clone", nil))
+		if rr.Code != http.StatusCreated {
+			t.Fatalf("clone %s => %d, want 201 (%s)", id, rr.Code, rr.Body.String())
+		}
+		if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+			t.Fatal(err)
+		}
+		return got
+	}
+
+	// All five params out of range: interval below the 5s floor, zeroed
+	// loss_warn/down_after, spike_mult 15 above its cap -> clamped to the
+	// nearest valid value. timeout 1000 stays (1000 <= 5*1000).
+	seed("legacy-low", 1, 1000, 0, 0, 15)
+	got := clone("legacy-low")
+	if got.IntervalS != 5 || got.TimeoutMS != 1000 || got.LossWarn != 1 || got.DownAfter != 1 || got.SpikeMult != 10 {
+		t.Errorf("legacy-low clone = interval %d / timeout %d / loss %d / down %d / spike %d, want 5 / 1000 / 1 / 1 / 10",
+			got.IntervalS, got.TimeoutMS, got.LossWarn, got.DownAfter, got.SpikeMult)
+	}
+
+	// Cross-field: timeout 60000 clamps to the 30000 cap, then the
+	// timeout <= interval*1000 rule (5*1000 = 5000) clamps it to 5000.
+	seed("legacy-cross", 5, 60000, 50, 5, 5)
+	got = clone("legacy-cross")
+	if got.IntervalS != 5 || got.TimeoutMS != 5000 || got.LossWarn != 50 || got.DownAfter != 5 || got.SpikeMult != 5 {
+		t.Errorf("legacy-cross clone = interval %d / timeout %d / loss %d / down %d / spike %d, want 5 / 5000 / 50 / 5 / 5 (cross-field)",
+			got.IntervalS, got.TimeoutMS, got.LossWarn, got.DownAfter, got.SpikeMult)
+	}
+
+	// Control: an in-range source is copied unchanged (the clamp must not
+	// perturb valid values).
+	seed("normal", 60, 1000, 25, 2, 5)
+	got = clone("normal")
+	if got.IntervalS != 60 || got.TimeoutMS != 1000 || got.LossWarn != 25 || got.DownAfter != 2 || got.SpikeMult != 5 {
+		t.Errorf("normal clone = interval %d / timeout %d / loss %d / down %d / spike %d, want 60 / 1000 / 25 / 2 / 5 (unchanged)",
+			got.IntervalS, got.TimeoutMS, got.LossWarn, got.DownAfter, got.SpikeMult)
+	}
+}

@@ -1425,6 +1425,52 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	}
 	src.Tags = s.db.SensorTags(id)
 
+	// The clone is a NEW write, so it must honor the CURRENT new-write
+	// floors/caps — the same ones the create and PATCH paths enforce
+	// (minIntervalS, the timeout/loss/down/spike ranges, and the
+	// timeout <= interval*1000 cross-field rule) — NOT copy the source's
+	// values verbatim. A legacy row can hold out-of-range values: those
+	// floors were added after the row existed and are deliberately not
+	// migrated (see minIntervalS — "a legacy 1s sensor keeps running until
+	// the operator edits it"). Copying verbatim let an operator multiply a
+	// legacy 1s sensor (or any out-of-range param) indefinitely via clone,
+	// bypassing the API floor (2026-10-28 review n5). Clamp each copied
+	// numeric into its valid range; the clone starts PAUSED, so the operator
+	// reviews the normalized values before resuming it.
+	if src.IntervalS < minIntervalS {
+		src.IntervalS = minIntervalS
+	} else if src.IntervalS > 3600 {
+		src.IntervalS = 3600
+	}
+	if src.TimeoutMS < 100 {
+		src.TimeoutMS = 100
+	} else if src.TimeoutMS > 30000 {
+		src.TimeoutMS = 30000
+	}
+	if src.LossWarn < 1 {
+		src.LossWarn = 1
+	} else if src.LossWarn > 100 {
+		src.LossWarn = 100
+	}
+	if src.DownAfter < 1 {
+		src.DownAfter = 1
+	} else if src.DownAfter > 100 {
+		src.DownAfter = 100
+	}
+	if src.SpikeMult < 2 {
+		src.SpikeMult = 2
+	} else if src.SpikeMult > 10 {
+		src.SpikeMult = 10
+	}
+	// Cross-field, AFTER the interval/timeout clamps above: a probe timeout
+	// longer than the interval means two probes can never complete
+	// back-to-back (the create path rejects it). If the source carried such
+	// a pair (legacy, pre-validation), clamp the timeout down to keep the
+	// clone valid.
+	if src.TimeoutMS > src.IntervalS*1000 {
+		src.TimeoutMS = src.IntervalS * 1000
+	}
+
 	// Pick the first free name and insert it. The existing clone names are
 	// fetched in ONE query and the first free suffix is picked in memory
 	// (the old loop ran up to 100 sequential SELECT COUNT(*) round-trips
