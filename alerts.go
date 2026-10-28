@@ -101,6 +101,17 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 // entry is gone (Remove) or points at a newer channel (a quiet sensor's
 // gate was recycled and re-created), the consumer just exits without
 // touching the map.
+//
+// The idle timer is local to this goroutine — no other goroutine touches
+// it (enqueueAlert only pushes to ch and holds alertMu) — so the
+// Stop/drain/Reset sequence in the job branch is sequential, not racy, and
+// is the complete canonical drain-then-Reset pattern: a Reset without first
+// draining a fired value would leave a stale ready in idle.C that a later
+// select reads as a spurious idle-fire. The ONLY exit is the return in the
+// <-idle.C branch, which is entered only after the timer has fired AND its
+// value been read (that is how the select got there) — so no fired-but-
+// unread timer is left behind at exit, and a defer idle.Stop() would be a
+// guaranteed no-op (2026-10-28 review n7: no timer leak, no missing defer).
 func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time.Duration) {
 	idle := time.NewTimer(idleDur)
 	for {
