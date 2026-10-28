@@ -254,6 +254,95 @@ func TestStormFlushDropsRecovered(t *testing.T) {
 	})
 }
 
+// TestStormPartialRecoveryAlwaysAdmitted (2026-10-28 review): a partial
+// recovery (error -> warning) is a recovery — recoveryTitle already renders
+// it as a "partial recovery" card — so it bypasses the storm budget exactly
+// like error -> up. Pre-fix it counted against the non-recovery budget and,
+// over budget, was coalesced into the storm summary: good news delayed a
+// full window, and a sensor that went up -> error -> warning inside the
+// window left TWO conflicting lines in the summary.
+func TestStormPartialRecoveryAlwaysAdmitted(t *testing.T) {
+	withStormBudget(t, 0, time.Hour, func() {
+		withPlainTransport(t, func() { // loopback httptest vs the SSRF blocklist
+			pw, db, getBodies, cleanup := newStormTestWorker(t)
+			defer cleanup()
+			insertStormSensor(t, db, "p0")
+			pw.launchAlert(func() { pw.sendAlert("p0", "p0", "127.0.0.1", "error", "warning", 0) })
+			pw.DrainAlerts(5 * time.Second)
+			bodies := getBodies()
+			if len(bodies) != 1 {
+				t.Fatalf("partial recovery at budget 0: deliveries = %d, want 1 (individual)", len(bodies))
+			}
+			for _, b := range bodies {
+				if strings.Contains(b, "alert storm") {
+					t.Fatal("partial recovery must never be coalesced into a storm summary")
+				}
+				if !strings.Contains(b, "partial recovery") {
+					t.Errorf("card must read as a partial recovery: %q", b)
+				}
+			}
+		})
+	})
+}
+
+// TestStormFlushDedupesPerSensor (2026-10-28 review): a sensor that flapped
+// twice inside one storm window (up -> error, then warning -> error) leaves
+// TWO entries in the queue. The summary must carry only the LATEST
+// transition per sensor — the older line is stale by definition — with the
+// header counting sensors, not transitions.
+func TestStormFlushDedupesPerSensor(t *testing.T) {
+	withStormBudget(t, 0, 500*time.Millisecond, func() {
+		withPlainTransport(t, func() {
+			pw, db, getBodies, cleanup := newStormTestWorker(t)
+			defer cleanup()
+			insertStormSensor(t, db, "f0")
+			if _, err := db.Exec(`UPDATE sensors SET status = 'error' WHERE id = 'f0'`); err != nil {
+				t.Fatalf("set f0 error: %v", err)
+			}
+			pw.mu.Lock()
+			pw.sensors["f0"] = &ProbeState{id: "f0", lastStatus: "error"}
+			pw.mu.Unlock()
+			pw.stormMu.Lock()
+			pw.stormQueue = append(pw.stormQueue,
+				stormEntry{id: "f0", name: "f0", target: "127.0.0.1", oldState: "up", state: "error"},
+				stormEntry{id: "f0", name: "f0", target: "127.0.0.1", oldState: "warning", state: "error"},
+			)
+			pw.stormMu.Unlock()
+			pw.flushStorm()
+			var bodies []string
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				bodies = getBodies()
+				done := false
+				for _, b := range bodies {
+					if strings.Contains(b, "alert storm") {
+						done = true
+					}
+				}
+				if done || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			var s string
+			for _, b := range bodies {
+				if strings.Contains(b, "alert storm") {
+					s = b
+				}
+			}
+			if !strings.Contains(s, "f0: warning → error") {
+				t.Errorf("summary must keep the latest transition:\\n%s", s)
+			}
+			if strings.Contains(s, "f0: up → error") {
+				t.Errorf("summary must drop the superseded transition:\\n%s", s)
+			}
+			if !strings.Contains(s, "1 sensors changed state") {
+				t.Errorf("header must count 1 sensor, not 2 transitions:\\n%s", s)
+			}
+		})
+	})
+}
+
 // TestStormFlushUsesInMemoryStatus (2026-10-24 review): flushStorm filters
 // recovered sensors by their CURRENT status. During a real storm the sensors
 // are actively probed, so the in-memory lastStatus is the freshest source —

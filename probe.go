@@ -257,10 +257,11 @@ type ProbeWorker struct {
 	// excess alerts are NOT delivered individually — they are queued and
 	// emitted as ONE coalesced "storm summary" alert when the window
 	// elapses, instead of N parallel bursts that trip provider 429s and
-	// the retry schedule into a storm of their own. Recoveries
-	// (state == "up") are ALWAYS admitted: the operator must hear a
-	// recovery even mid-storm, and a storm of recoveries is far less
-	// noisy than a storm of failures. Guarded by stormMu.
+	// the retry schedule into a storm of their own. Recoveries — full
+	// (state == "up") AND partial (error -> warning) — are ALWAYS
+	// admitted: the operator must hear a recovery even mid-storm, and a
+	// storm of recoveries is far less noisy than a storm of failures.
+	// Guarded by stormMu.
 	stormMu          sync.Mutex
 	stormWindowStart time.Time
 	stormCount       int

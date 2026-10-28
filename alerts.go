@@ -588,7 +588,11 @@ var (
 // stormAdmit reports whether this alert may be delivered individually.
 // See the stormMu field comment for the design.
 func (pw *ProbeWorker) stormAdmit(id, name, target, oldState, state string, rttMs float64) bool {
-	if state == "up" {
+	// A partial recovery (error -> warning) is a recovery: recoveryTitle
+	// already renders it as a "partial recovery" card, so coalescing it
+	// into a storm summary would delay good news and burn budget meant for
+	// down alerts.
+	if state == "up" || (oldState == "error" && state == "warning") {
 		return true
 	}
 	pw.stormMu.Lock()
@@ -655,6 +659,19 @@ func (pw *ProbeWorker) flushStorm() {
 	if len(q) == 0 {
 		return
 	}
+	// Dedupe by sensor first: a sensor that flapped more than once inside
+	// the window (up -> error, then warning -> error) leaves one queue
+	// entry per transition. Only the latest transition per sensor is
+	// actionable — the older line is stale by definition — so keep the
+	// latest entry, in first-seen order for stable summaries.
+	latest := make(map[string]stormEntry, len(q))
+	order := make([]string, 0, len(q))
+	for _, e := range q {
+		if _, seen := latest[e.id]; !seen {
+			order = append(order, e.id)
+		}
+		latest[e.id] = e
+	}
 	// Drop entries that recovered before the flush: a summary line for a
 	// sensor that is back up would contradict the recovery alert it raced.
 	// A vanished sensor (deleted mid-storm) is kept — the operator should
@@ -663,11 +680,11 @@ func (pw *ProbeWorker) flushStorm() {
 	// actively probed, so lastStatus is the freshest source and reading it
 	// avoids one SQLite round-trip per queued entry (2026-10-24 review).
 	still := q[:0]
-	for _, e := range q {
-		if s, err := pw.currentStatus(e.id); err == nil && s == "up" {
+	for _, id := range order {
+		if s, err := pw.currentStatus(id); err == nil && s == "up" {
 			continue
 		}
-		still = append(still, e)
+		still = append(still, latest[id])
 	}
 	if len(still) == 0 {
 		return
