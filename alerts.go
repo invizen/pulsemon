@@ -814,7 +814,13 @@ func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
 	}
 	var dests []dest
 	for _, p := range providers {
-		url, err := pw.db.GetSettingErr(p.Kind + "_url")
+		// p.URLField, NOT p.Kind + "_url": SMTP's value lives in
+		// "smtp_host" (see providerList), and a "smtp_url" lookup
+		// returns "" for every real SMTP config — silently skipping
+		// email in both the per-sensor delivery and the storm summary,
+		// with sendWebhookDeliver reporting "delivered" (no dests) for
+		// an alert nothing was sent in.
+		url, err := pw.db.GetSettingErr(p.URLField)
 		if err != nil {
 			return nil, false
 		}

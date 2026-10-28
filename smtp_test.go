@@ -404,6 +404,137 @@ func TestSendSMTPEndToEnd(t *testing.T) {
 	}
 }
 
+// TestResolveDestinationsIncludesSMTP (2026-10-28 review): resolveDestinations
+// used to look up p.Kind + "_url" — for SMTP that is "smtp_url", a key
+// NOTHING writes (the host lives in smtp_host, per providerList's URLField).
+// An enabled, fully-configured SMTP provider therefore resolved to NO
+// destinations: email was silently skipped in both sendWebhookDeliver and the
+// storm summary, and sendWebhookDeliver reported the alert "delivered"
+// (len(dests) == 0) with nothing sent. The lookup must use p.URLField.
+func TestResolveDestinationsIncludesSMTP(t *testing.T) {
+	db := newTestDB(t)
+	_ = db.SetSetting("smtp_enabled", "1")
+	_ = db.SetSetting("smtp_host", "10.0.0.25")
+	_ = db.SetSetting("smtp_from", "pulsemon@test.local")
+	_ = db.SetSetting("smtp_to", "ops@test.local")
+	pw := NewProbeWorker(db)
+	dests, ok := pw.resolveDestinations()
+	if !ok {
+		t.Fatal("resolveDestinations: ok=false with a readable DB")
+	}
+	if len(dests) != 1 {
+		t.Fatalf("dests = %d, want 1 (the configured SMTP provider)", len(dests))
+	}
+	if dests[0].p.Kind != "smtp" || dests[0].url != "10.0.0.25" {
+		t.Fatalf("dest = {%s %q}, want smtp with url = the smtp_host value", dests[0].p.Kind, dests[0].url)
+	}
+}
+
+// TestSendWebhookDeliverReachesSMTP (2026-10-28 review): with SMTP as the ONLY
+// configured provider, a status alert must actually reach the mail server.
+// Pre-fix this reported "delivered" (empty dest list) and sent nothing — the
+// silent-drop half of the resolveDestinations smtp_url bug. Drives the real
+// production path: sendAlert → sendWebhook → stormAdmit → alertGate FIFO →
+// sendWebhookDeliver → resolveDestinations → deliverOne → sendSMTP.
+func TestSendWebhookDeliverReachesSMTP(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	addr := ln.Addr().String()
+	host, portStr, _ := net.SplitHostPort(addr)
+
+	var mu sync.Mutex
+	var body string
+	done := make(chan struct{})
+
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			close(done)
+			return
+		}
+		defer conn.Close()
+		r := bufio.NewReader(conn)
+		w := func(s string) { fmt.Fprint(conn, s) }
+		w("220 test ESMTP\r\n")
+		dataMode := false
+		var dataLines []string
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				mu.Lock()
+				body = strings.Join(dataLines, "\n")
+				mu.Unlock()
+				close(done)
+				return
+			}
+			trimmed := strings.TrimRight(line, "\r\n")
+			upper := strings.ToUpper(trimmed)
+			switch {
+			case strings.HasPrefix(upper, "EHLO"), strings.HasPrefix(upper, "HELO"):
+				w("250-test\r\n250 OK\r\n")
+			case strings.HasPrefix(upper, "MAIL"):
+				w("250 OK\r\n")
+			case strings.HasPrefix(upper, "RCPT"):
+				w("250 OK\r\n")
+			case strings.HasPrefix(upper, "DATA"):
+				w("354 go ahead\r\n")
+				dataMode = true
+			case dataMode:
+				if trimmed == "." {
+					dataMode = false
+					mu.Lock()
+					body = strings.Join(dataLines, "\n")
+					mu.Unlock()
+					w("250 OK\r\n")
+					close(done)
+				} else {
+					dataLines = append(dataLines, trimmed)
+				}
+			case strings.HasPrefix(upper, "QUIT"):
+				w("221 bye\r\n")
+				return
+			default:
+				w("250 OK\r\n")
+			}
+		}
+	}()
+	t.Cleanup(func() { ln.Close() })
+
+	db := newTestDB(t)
+	_ = db.SetSetting("smtp_enabled", "1")
+	_ = db.SetSetting("smtp_host", host)
+	_ = db.SetSetting("smtp_port", portStr)
+	_ = db.SetSetting("smtp_from", "pulsemon@test.local")
+	_ = db.SetSetting("smtp_to", "ops@test.local")
+	_ = db.SetSetting("smtp_tls_mode", "none")
+	pw := NewProbeWorker(db)
+	t.Cleanup(pw.StopAlerts)
+
+	// The production dial (smtpDial = dialChecked) refuses loopback by
+	// design — this test needs a plain dialer to reach the in-process
+	// server on 127.0.0.1.
+	origDial := smtpDial
+	smtpDial = func(ctx context.Context, network, daddr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, daddr)
+	}
+	t.Cleanup(func() { smtpDial = origDial })
+
+	pw.launchAlert(func() { pw.sendAlert("s1", "s1", "127.0.0.1", "up", "error", 0) })
+	pw.DrainAlerts(10 * time.Second)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out: the mail server never received the alert")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(body, "pulsemon: error") {
+		t.Fatalf("mail server did not receive the alert body:\\n%s", body)
+	}
+}
+
 // TestSendSMTPRefusesLoopbackEndToEnd pins the dial-time blocklist on the
 // SMTP path: a stored host that is a reserved address must be refused at dial
 // time — the same guarantee the webhook path proves in
