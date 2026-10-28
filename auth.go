@@ -905,12 +905,28 @@ func (a *AuthState) loginSuccess(ip string) {
 // different same-IP attempt; the failure direction is at most one extra
 // admitted free attempt, never a false lockout. Caller must only refund
 // admissions beginAttempt ACCEPTED (returned ok).
+//
+// When a refund brings the count back UNDER loginFailMax it also clears any
+// lockout (2026-10-28 review n6): beginAttempt sets the 5-minute lockout the
+// instant the in-window count reaches loginFailMax, so a burst of
+// >loginFailMax no-KDF-cost requests that are all subsequently refunded
+// (browser double-submits, scripts hitting errBootstrappedEarly / invalid
+// usernames) would otherwise leave the IP locked out for the full lockout
+// despite paying zero KDF cost. The lockout is only ever set with
+// >= loginFailMax entries present, so dropping back under the threshold
+// means the IP no longer has enough real (KDF-cost) failures to justify it.
+// A genuine attacker who pays the KDF for loginFailMax failures never gets
+// those refunded, so their lockout is preserved.
 func (a *AuthState) refundAttempt(ip string) {
 	a.loginThrottle.Lock()
 	defer a.loginThrottle.Unlock()
 	f := a.loginThrottle.fails[ip]
 	if len(f) > 0 {
-		a.loginThrottle.fails[ip] = f[:len(f)-1]
+		f = f[:len(f)-1]
+		a.loginThrottle.fails[ip] = f
+		if len(f) < loginFailMax {
+			delete(a.loginThrottle.lockout, ip)
+		}
 	}
 }
 

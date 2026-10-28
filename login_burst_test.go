@@ -111,3 +111,56 @@ func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 		}
 	}
 }
+
+// TestRefundAttemptClearsStaleLockout (2026-10-28 review n6): beginAttempt
+// sets a 5-minute lockout the instant the in-window failure count reaches
+// loginFailMax. If a burst of >loginFailMax no-KDF-cost requests are all
+// admitted (beginAttempt) and then all refunded before the KDF runs (browser
+// double-submits, scripts hitting errBootstrappedEarly / invalid usernames),
+// the refunds drain fails[ip] back under loginFailMax — but the lockout set
+// by the over-budget admission was never cleared, so the IP sat locked out
+// for the full lockout despite paying zero KDF cost. refundAttempt must clear
+// the now-unjustified lockout the moment a refund drops the count under
+// loginFailMax. Unit-level (not HTTP) so the begin/refund ordering is
+// deterministic instead of a coin flip on real concurrency.
+func TestRefundAttemptClearsStaleLockout(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	key := "setup|10.9.9.9"
+	// Admit loginFailMax no-KDF-cost attempts (all refunded below).
+	for i := 0; i < loginFailMax; i++ {
+		if ok, _ := a.beginAttempt(key); !ok {
+			t.Fatalf("admission %d: beginAttempt = false, want true (under the limit)", i)
+		}
+	}
+	// An over-budget (loginFailMax+1)th admission sets the lockout — the race
+	// window: it arrives while the first loginFailMax are between
+	// beginAttempt and refundAttempt.
+	if ok, _ := a.beginAttempt(key); ok {
+		t.Fatalf("over-budget admission: beginAttempt = true, want false (>= %d in-window -> lockout)", loginFailMax)
+	}
+	a.loginThrottle.Lock()
+	_, locked := a.loginThrottle.lockout[key]
+	a.loginThrottle.Unlock()
+	if !locked {
+		t.Fatal("over-budget admission did not set the lockout")
+	}
+	// Refund all loginFailMax admissions (they paid no KDF cost). The lockout
+	// must clear once the count drops back under loginFailMax.
+	for i := 0; i < loginFailMax; i++ {
+		a.refundAttempt(key)
+	}
+	a.loginThrottle.Lock()
+	_, stillLocked := a.loginThrottle.lockout[key]
+	n := len(a.loginThrottle.fails[key])
+	a.loginThrottle.Unlock()
+	if stillLocked {
+		t.Errorf("after refunding all %d no-KDF-cost admissions the lockout is still set — a harmless burst locked the IP for %s", loginFailMax, loginLockout)
+	}
+	if n != 0 {
+		t.Errorf("after %d refunds, fails[%s] = %d entries, want 0", loginFailMax, key, n)
+	}
+	// A fresh sequential attempt is admitted again (no 429).
+	if ok, _ := a.beginAttempt(key); !ok {
+		t.Error("post-refund admission: beginAttempt = false, want true (the lockout should be cleared)")
+	}
+}
