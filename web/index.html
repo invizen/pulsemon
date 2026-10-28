@@ -172,7 +172,7 @@
       <button onclick="openSettings()" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i class="ph-bold ph-gear text-[19px]"></i>
       </button>
-      <button onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
+      <button id="new-sensor-btn" onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
         <i class="ph-bold ph-plus text-[15px]"></i> <span class="hidden sm:inline">New Sensor</span><span class="sm:hidden">New</span>
       </button>
     </div>
@@ -259,7 +259,7 @@
     <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-[32px]"></i></div>
     <h3 class="text-[15px] font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
     <p class="text-[13px] text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
-    <button onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
+    <button id="empty-add-btn" onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
       <i class="ph-bold ph-plus"></i> Add your first sensor
     </button>
   </div>
@@ -655,14 +655,16 @@ syncThemeIcon();
 // ---------- Authentication Flow ----------
 let authState = null;
 // meIsAdmin gates the admin-only UI surface (alerts, maintenance mode,
-// TLS, self-update). Server-side, requireAdmin 403s the same routes for
-// non-admin sessions; the UI just hides the controls a regular account
-// can't use. Default true: with auth off the dashboard is fully open,
-// so everything stays visible.
+// TLS, self-update, and every SENSOR MUTATION control: new/edit/clone/
+// delete/pause + clear history). Server-side, requireAdmin 403s the same
+// routes for non-admin sessions (review 2026-10-28: non-admins are
+// viewers + Pulse Now operators); the UI just hides the controls a
+// regular account can't use. Default true: with auth off the dashboard
+// is fully open, so everything stays visible.
 let meIsAdmin = true;
 function applyAdminVisibility() {
   const hide = !meIsAdmin;
-  for (const id of ['alerts-btn', 'tls-panel', 'maint-row']) {
+  for (const id of ['alerts-btn', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', hide);
   }
@@ -679,6 +681,11 @@ async function refreshAdminState() {
     meIsAdmin = !!(me && me.is_admin);
   } catch { meIsAdmin = true; }
   applyAdminVisibility();
+  // Re-render: the per-sensor mutation buttons (edit/clone/delete/pause)
+  // are built in cardHtml()/renderTable() from meIsAdmin, so the grid
+  // must redraw once the admin state is known — the initial render ran
+  // before this fetch resolved.
+  render();
 }
 
 function showAuthGate() {
@@ -1027,12 +1034,15 @@ function cardHtml(s) {
 
     '<div class="flex items-end justify-between mt-auto pt-1.5 border-t border-surface-800/60">' +
       '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
-      '<div class="flex items-center gap-0.5">' +
+      // Mutation cluster (pause/edit/clone/delete) is admin-only — the
+      // server 403s these for non-admin sessions (requireAdmin); the UI
+      // just hides what a regular account can't use. Pulse Now stays.
+      (meIsAdmin ? '<div class="flex items-center gap-0.5">' +
         '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
         '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
         '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
         '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
-      '</div>' +
+      '</div>' : '') +
     '</div>' +
   '</div>';
 }
@@ -1077,10 +1087,12 @@ function renderTable(list) {
       '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
         '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        // Admin-only mutation cluster (mirrors cardHtml); non-admins keep Pulse Now.
+        (meIsAdmin ?
         '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
         '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
         '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' +
+        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' : '') +
       '</div></td></tr>';
   }).join('');
 }

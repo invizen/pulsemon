@@ -445,13 +445,25 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
 	s.mux.HandleFunc("GET /api/update-check", s.handleUpdateCheck)
 	s.mux.HandleFunc("POST /api/update", s.requireAdmin(s.handleUpdate))
-	s.mux.HandleFunc("/api/sensors", s.handleSensors)
-	s.mux.HandleFunc("/api/sensors/{id}", s.handleSensorByID)
+	// Sensor routes: reads and Pulse Now are open to EVERY authenticated
+	// session (non-admins are viewers + manual-pulse operators); every
+	// sensor MUTATION — create, edit (incl. pause/resume + target
+	// repoint), delete, clone, per-sensor history wipe — is admin-only
+	// (review 2026-10-28: a lower-trust account must not administer
+	// sensors or erase per-sensor events rows, which the requireAdmin-
+	// gated DELETE /api/events exists to protect). requireAdmin stands
+	// down with the auth gate, so the "auth off = fully open" contract
+	// is unchanged.
+	s.mux.HandleFunc("GET /api/sensors", s.handleSensors)
+	s.mux.HandleFunc("POST /api/sensors", s.requireAdmin(s.handleSensors))
+	s.mux.HandleFunc("GET /api/sensors/{id}", s.handleSensorByID)
+	s.mux.HandleFunc("PATCH /api/sensors/{id}", s.requireAdmin(s.handleSensorByID))
+	s.mux.HandleFunc("DELETE /api/sensors/{id}", s.requireAdmin(s.handleSensorByID))
 	s.mux.HandleFunc("POST /api/sensors/{id}/ping", s.handleSensorPing)
-	s.mux.HandleFunc("POST /api/sensors/{id}/clone", s.handleSensorClone)
+	s.mux.HandleFunc("POST /api/sensors/{id}/clone", s.requireAdmin(s.handleSensorClone))
 	s.mux.HandleFunc("GET /api/sensors/{id}/history", s.handleSensorHistory)
 	s.mux.HandleFunc("GET /api/sensors/{id}/graph", s.handleSensorGraph)
-	s.mux.HandleFunc("DELETE /api/sensors/{id}/history", s.handleSensorClearHistory)
+	s.mux.HandleFunc("DELETE /api/sensors/{id}/history", s.requireAdmin(s.handleSensorClearHistory))
 	s.mux.HandleFunc("DELETE /api/history", s.requireAdmin(s.handleClearAllHistory))
 	s.mux.HandleFunc("/api/tags", s.handleTags)
 	s.mux.HandleFunc("/api/events", s.handleEvents)

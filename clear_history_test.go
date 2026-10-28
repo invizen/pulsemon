@@ -147,6 +147,13 @@ func TestClearHistoryAtomicOnFailure(t *testing.T) {
 	}
 	defer db.Close()
 	// NO InitSchema: only the tables the clear can succeed on exist.
+	// The users table IS created (empty): with zero accounts the auth
+	// gate stands down, so this test exercises the clear-history
+	// contract, not the admin gate (a missing users table makes
+	// auth.Enabled() fail-closed and the route 401s before the handler).
+	if _, err := db.Exec(`CREATE TABLE users (username TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0)`); err != nil {
+		t.Fatalf("create users: %v", err)
+	}
 	if _, err := db.Exec(`CREATE TABLE sensors (id TEXT PRIMARY KEY, name TEXT, status TEXT)`); err != nil {
 		t.Fatalf("create sensors: %v", err)
 	}

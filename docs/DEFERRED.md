@@ -37,6 +37,20 @@ keep authentication enabled.
 
 ## Lifted
 
+### Non-admin sensor mutations (lifted 2026-10-28)
+The per-sensor mutation routes (`POST /api/sensors`, `PATCH`/`DELETE
+/api/sensors/{id}`, `POST /api/sensors/{id}/clone`,
+`DELETE /api/sensors/{id}/history`) were `requireAuth`-only during the
+v0.3.21 admin-gate work (commit f3eddbf), so a regular (lower-trust)
+account could create/edit/delete sensors — including wiping per-sensor
+`events` rows one sensor at a time, the same audit log the
+`requireAdmin`-gated `DELETE /api/events` exists to protect — and
+repoint sensors at arbitrary internal targets. The 2026-10-28 review
+lifted the deferral: every sensor mutation is now `requireAdmin`
+(`Server.routes`, api.go); non-admin sessions keep all sensor reads
+and Pulse Now (`POST /api/sensors/{id}/ping`) — the viewer +
+manual-pulse role model. Pinned by `TestNonAdminCannotMutateSensors`.
+
 ### M4c — self-update while auth is off (lifted 2026-10-24)
 `POST /api/update` used to run on auth-off installs (any LAN host could
 trigger a download + binary swap + service restart; a compromised
