@@ -1499,7 +1499,7 @@ func TestNonAdminCannotManageUsers(t *testing.T) {
 	var st struct {
 		Enabled bool `json:"enabled"`
 	}
-	json.NewDecoder(resp.Body).Decode(&st)
+	jsonDecode(t, resp, &st)
 	resp.Body.Close()
 	if !st.Enabled {
 		t.Error("auth was disabled by a non-admin")

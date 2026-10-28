@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,7 +119,7 @@ func TestRequestBodyBounded(t *testing.T) {
 	var out struct {
 		Error string `json:"error"`
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	jsonDecode(t, resp, &out)
 	if resp.StatusCode != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized body: got %d, want 413", resp.StatusCode)
 	}
@@ -167,7 +166,7 @@ func TestEventsQueryCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	var sensors []Sensor
-	json.NewDecoder(resp.Body).Decode(&sensors)
+	jsonDecode(t, resp, &sensors)
 	resp.Body.Close()
 	if len(sensors) != 1 {
 		t.Fatalf("want 1 sensor, got %d", len(sensors))
@@ -189,7 +188,7 @@ func TestEventsQueryCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	var events []EventView
-	json.NewDecoder(resp.Body).Decode(&events)
+	jsonDecode(t, resp, &events)
 	resp.Body.Close()
 	if len(events) != 500 {
 		t.Fatalf("events?n=10000: got %d events, want 500 (cap)", len(events))
@@ -201,7 +200,7 @@ func TestEventsQueryCapped(t *testing.T) {
 		t.Fatal(err)
 	}
 	var small []EventView
-	json.NewDecoder(resp.Body).Decode(&small)
+	jsonDecode(t, resp, &small)
 	resp.Body.Close()
 	if len(small) != 10 {
 		t.Fatalf("events?n=10: got %d events, want 10", len(small))
@@ -237,7 +236,7 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	jsonDecode(t, resp, &out)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("unknown kind: got %d, want 400", resp.StatusCode)
@@ -253,7 +252,7 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	jsonDecode(t, resp, &out)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty body: got %d, want 400", resp.StatusCode)
@@ -265,7 +264,7 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	jsonDecode(t, resp, &out)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("malformed JSON: got %d, want 400", resp.StatusCode)
@@ -283,7 +282,7 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = json.NewDecoder(resp.Body).Decode(&out)
+	jsonDecode(t, resp, &out)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("known kind, no URL: got %d, want 200", resp.StatusCode)

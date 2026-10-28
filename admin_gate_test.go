@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -123,7 +122,7 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 	var st struct {
 		Enabled bool `json:"enabled"`
 	}
-	json.NewDecoder(resp.Body).Decode(&st)
+	jsonDecode(t, resp, &st)
 	resp.Body.Close()
 	if !st.Enabled {
 		t.Error("auth was disabled by a non-admin")
@@ -180,7 +179,7 @@ func TestNonAdminCannotMutateSensors(t *testing.T) {
 		t.Fatal(err)
 	}
 	var created map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&created)
+	jsonDecode(t, resp, &created)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {
 		t.Fatalf("admin POST /api/sensors: %d, want 201", resp.StatusCode)
