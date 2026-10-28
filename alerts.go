@@ -743,21 +743,17 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	}
 }
 
-// stormSummaryLine renders one entry as a readable transition, with the
-// same hygiene as the per-sensor cards: credentials stripped (F22). Mention
-// tokens are neutralized ONLY when escapeMentions is true — that is the
-// Discord/Google Chat Markdown path, where a raw @everyone/@here in a sensor
-// name would fire a mass mention. The Telegram (HTML) and SMTP (plain) paths
-// pass false: discordMentionSafe injects an invisible \u200b, which is
-// pointless there and corrupts copy-paste in email clients / renders as tofu
-// in non-UTF-8 readers (2026-10-24 review).
-func stormSummaryLine(e stormEntry, escapeMentions bool) string {
-	name := e.name
-	if escapeMentions {
-		name = discordMentionSafe(name)
-	}
-	target := alertTarget(e.target)
-	return fmt.Sprintf("%s: %s → %s (%s)", name, e.oldState, e.state, target)
+// stormSummaryLine renders one entry as a readable transition for the
+// non-Markdown summary paths (Telegram HTML, SMTP plain), with the same
+// hygiene as the per-sensor cards: credentials stripped (F22). Mention
+// tokens are NOT neutralized here: those paths carry the name verbatim, and
+// the invisible \u200b discordMentionSafe injects is pointless there and
+// corrupts copy-paste in email clients / renders as tofu in non-UTF-8
+// readers (2026-10-24 review). The Markdown path (stormSummaryMarkdown)
+// builds its own line so it can escape the name without escaping the URL
+// target (2026-10-28 review n4).
+func stormSummaryLine(e stormEntry) string {
+	return fmt.Sprintf("%s: %s → %s (%s)", e.name, e.oldState, e.state, alertTarget(e.target))
 }
 
 // stormSummaryMarkdown renders the summary for google_chat / discord.
@@ -765,13 +761,14 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 	var b strings.Builder
 	b.WriteString(fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*\n", len(entries)))
 	for _, e := range entries {
-		// Escape the emphasis chars in the DATA: names and URL paths may
-		// legally contain * _ ~ `, and a raw one inside the *…* emphasis
-		// renders as literal formatting (italic/strikethrough/code) in
-		// Google Chat / Discord (2026-10-24 review n2 + markdown). The
-		// emphasis markers themselves come from the format strings, not
-		// the data, so they are untouched.
-		b.WriteString("*" + mdEscape(stormSummaryLine(e, true)) + "*\n")
+		// Escape the emphasis chars in the NAME only (free text — a name like
+		// db_primary_01 would otherwise render "primary" in italics, and a
+		// raw * in the name renders as literal formatting), with mention
+		// tokens neutralized (2026-10-24 review n2 + markdown). The TARGET is
+		// a URL/hostname and stays VERBATIM: mdEscape would inject backslashes
+		// into _ and ~ in the path and break the clickable link (2026-10-28
+		// review n4). The emphasis markers come from the format string.
+		b.WriteString("*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + alertTarget(e.target) + ")*\n")
 	}
 	return b.String()
 }
@@ -781,7 +778,7 @@ func stormSummaryHTML(entries []stormEntry) string {
 	var b strings.Builder
 	b.WriteString(html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))))
 	for _, e := range entries {
-		b.WriteString(html.EscapeString(stormSummaryLine(e, false)) + "\n")
+		b.WriteString(html.EscapeString(stormSummaryLine(e)) + "\n")
 	}
 	return b.String()
 }
@@ -791,7 +788,7 @@ func stormSummaryPlain(entries []stormEntry) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))
 	for _, e := range entries {
-		b.WriteString(stormSummaryLine(e, false) + "\n")
+		b.WriteString(stormSummaryLine(e) + "\n")
 	}
 	return b.String()
 }
@@ -1122,24 +1119,32 @@ func alertTarget(target string) string {
 // discordMentionSafe neutralizes Discord mention tokens in free text
 // a sensor named "@everyone" (or a target path
 // containing the token) would fire a mass mention to the whole channel
-// when the card posts. A zero-width space after the @ breaks the token
-// for Discord's mention parser while staying invisible in the rendered
-// card. Belt-and-braces with the payload's allowed_mentions.parse = []:
+// when the card posts. A zero-width space inserted right AFTER the @
+// breaks the token for Discord's mention parser while keeping the @
+// visible in the rendered card (the old code replaced the @ entirely,
+// so "@everyone" rendered as "‌everyone" with no @ — 2026-10-28 review
+// n4). Belt-and-braces with the payload's allowed_mentions.parse = []:
 // this covers clients/imports that ignore allowed_mentions.
 func discordMentionSafe(s string) string {
-	s = strings.ReplaceAll(s, "@everyone", "\u200beveryone")
-	s = strings.ReplaceAll(s, "@here", "\u200bhere")
+	s = strings.ReplaceAll(s, "@everyone", "@\u200beveryone")
+	s = strings.ReplaceAll(s, "@here", "@\u200bhere")
 	return s
 }
 
-// mdEscape backslash-escapes the Markdown emphasis characters that can appear
-// in sensor names and targets — * _ ~ ` — so Discord and Google Chat render
-// them verbatim instead of as bold/italic/strikethrough/code. The emphasis
-// markers in the card and summary format strings come from the code, not the
-// data, so they are untouched (2026-10-24 review: a sensor named
-// db_primary_01 would otherwise render with "primary" italicized). Applied
-// ONLY to the Markdown (google_chat/discord) builders — the Telegram (HTML)
-// and SMTP (plain) paths carry the data verbatim.
+// mdEscape backslash-escapes the Markdown emphasis characters — * _ ~ ` — so
+// Discord and Google Chat render them verbatim instead of as
+// bold/italic/strikethrough/code (2026-10-24 review: a sensor named
+// db_primary_01 would otherwise render with "primary" italicized).
+//
+// Applied to SENSOR NAMES ONLY, never to targets: a target is a URL/hostname
+// whose path may legally contain _ and ~, and backslash-escaping those
+// injects visible backslashes into the URL and breaks the clickable link
+// (2026-10-28 review n4). The URL host carries no emphasis chars, and the
+// intra-path _ / ~ do not trigger emphasis inside an auto-linked URL token
+// on either platform, so a verbatim target is both safe and clickable.
+//
+// Applied ONLY to the Markdown (google_chat/discord) builders — the Telegram
+// (HTML) and SMTP (plain) paths carry the data verbatim.
 func mdEscape(s string) string {
 	for _, c := range []string{"*", "_", "~", "`"} {
 		s = strings.ReplaceAll(s, c, "\\"+c)
@@ -1149,7 +1154,9 @@ func mdEscape(s string) string {
 
 func cardFor(oldState, state, name, target string, rttMs float64) string {
 	target = alertTarget(target)
-	name, target = mdEscape(name), mdEscape(target)
+	// Escape the name (free text) only; the target is a URL/hostname and stays
+	// verbatim so it renders and auto-links cleanly (2026-10-28 review n4).
+	name = mdEscape(name)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1165,7 +1172,7 @@ func cardFor(oldState, state, name, target string, rttMs float64) string {
 
 func cardForRe(state, name, target string, rttMs float64) string {
 	target = alertTarget(target)
-	name, target = mdEscape(name), mdEscape(target)
+	name = mdEscape(name)
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1182,7 +1189,11 @@ func cardForRe(state, name, target string, rttMs float64) string {
 // content. Same information, Discord-flavored. name/target are sanitized
 // first: credentials stripped (F22) and mention tokens neutralized (F23).
 func discordCard(oldState, state, name, target string, rttMs float64) string {
-	name, target = mdEscape(discordMentionSafe(name)), mdEscape(discordMentionSafe(alertTarget(target)))
+	// Name: mention-neutralized + emphasis-escaped (free text). Target:
+	// mention-neutralized + credentials stripped, but VERBATIM (no mdEscape)
+	// so the URL renders and auto-links cleanly (2026-10-28 review n4).
+	name = mdEscape(discordMentionSafe(name))
+	target = discordMentionSafe(alertTarget(target))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"
@@ -1196,7 +1207,8 @@ func discordCard(oldState, state, name, target string, rttMs float64) string {
 }
 
 func discordCardRe(state, name, target string, rttMs float64) string {
-	name, target = mdEscape(discordMentionSafe(name)), mdEscape(discordMentionSafe(alertTarget(target)))
+	name = mdEscape(discordMentionSafe(name))
+	target = discordMentionSafe(alertTarget(target))
 	icon := statusIcon(state)
 	if icon == "" {
 		icon = "✅"

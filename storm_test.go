@@ -511,21 +511,24 @@ func TestHotReloadCert(t *testing.T) {
 	}
 }
 
-// TestStormSummaryMarkdownEscapesAsterisks (2026-10-24 review n2):
-// stormSummaryMarkdown wraps each line in *…*, and cardFor uses
-// *Sensor*-style emphasis. * is legal in sensor names (validSensorName
-// only blocks quotes/angles/backticks/controls) and in URL paths, so a
-// raw * in the data renders as a literal asterisk in Google Chat /
-// Discord. The data must be backslash-escaped; the emphasis markers
-// (format string, not data) stay intact.
+// TestStormSummaryMarkdownEscapesAsterisks (2026-10-24 review n2, refined
+// 2026-10-28 review n4): stormSummaryMarkdown wraps each line in *…*. * is
+// legal in sensor names (validSensorName only blocks quotes/angles/backticks/
+// controls), so a raw * in a NAME renders as literal formatting in Google
+// Chat / Discord — the name must be backslash-escaped. The target, however,
+// is a URL and stays VERBATIM (escaping its * / _ / ~ broke clickable links,
+// n4); a * inside an auto-linked URL token is not emphasis on either
+// platform, so the verbatim target is safe. The emphasis markers (format
+// string, not data) stay intact.
 func TestStormSummaryMarkdownEscapesAsterisks(t *testing.T) {
 	entries := []stormEntry{
 		{id: "a", name: "nas*01", target: "https://nas.lan/x*y", oldState: "up", state: "error"},
 	}
 	md := stormSummaryMarkdown(entries)
-	want := "*nas\\*01: up → error (https://nas.lan/x\\*y)*"
+	// Name's * is escaped; the URL target's * is verbatim (clickable).
+	want := "*nas\\*01: up → error (https://nas.lan/x*y)*"
 	if !strings.Contains(md, want) {
-		t.Fatalf("markdown line not escaped:\n%s\nwant line %q", md, want)
+		t.Fatalf("markdown line wrong (name escaped, target verbatim):\n%s\nwant line %q", md, want)
 	}
 	if !strings.Contains(md, "*pulsemon: alert storm — 1 sensors changed state (coalesced to limit alert noise)*") {
 		t.Fatalf("header emphasis lost: %q", md)
@@ -560,35 +563,39 @@ func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
 	}
 }
 
-// TestMarkdownEscapesEmphasisChars (2026-10-24 review): sensor names and
-// targets may legally contain * _ ~ (underscores and tildes are common in
-// hostnames, service names, and URL paths), and a raw one in the Discord /
-// Google Chat Markdown renders as italic/strikethrough — db_primary_01 would
-// show "primary" in italics with the underscores stripped. The Markdown
-// builders must backslash-escape the data; the Telegram (HTML) and SMTP
-// (plain) paths must carry it verbatim.
+// TestMarkdownEscapesEmphasisChars (2026-10-24 review, refined 2026-10-28
+// n4): sensor names may legally contain * _ ~ (underscores are common in
+// service names), and a raw one in the Discord / Google Chat Markdown
+// renders as italic/strikethrough — db_primary_01 would show "primary" in
+// italics with the underscores stripped. So the NAME must be
+// backslash-escaped in every Markdown builder. The TARGET, however, is a
+// URL/hostname whose path may contain _ and ~; it must stay VERBATIM
+// (no backslashes) so it renders and auto-links cleanly — escaping those
+// chars injected visible backslashes into the URL and broke the link (n4).
+// The Telegram (HTML) and SMTP (plain) paths carry both verbatim.
 func TestMarkdownEscapesEmphasisChars(t *testing.T) {
 	name := "db_primary_01"
 	target := "https://nas.lan/api_v1/health~check"
 	entries := []stormEntry{{id: "a", name: name, target: target, oldState: "up", state: "error"}}
 
-	// Google Chat card + re-alert (cardFor / cardForRe).
-	if gc := cardFor("up", "error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") || !strings.Contains(gc, "api\\_v1/health\\~check") {
-		t.Errorf("google_chat card must escape _ and ~ in name/target: %q", gc)
+	// Google Chat card + re-alert (cardFor / cardForRe): name escaped,
+	// target verbatim.
+	if gc := cardFor("up", "error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") || !strings.Contains(gc, "api_v1/health~check") || strings.Contains(gc, "api\\_v1") || strings.Contains(gc, "health\\~check") {
+		t.Errorf("google_chat card must escape the name's _ but keep the target verbatim: %q", gc)
 	}
-	if gc := cardForRe("error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") {
-		t.Errorf("google_chat re-alert card must escape underscores: %q", gc)
+	if gc := cardForRe("error", name, target, 0); !strings.Contains(gc, "db\\_primary\\_01") || !strings.Contains(gc, "api_v1/health~check") {
+		t.Errorf("google_chat re-alert card must escape the name's _ but keep the target verbatim: %q", gc)
 	}
 	// Discord card + re-alert (discordCard / discordCardRe).
-	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") {
-		t.Errorf("discord card must escape underscores in the name: %q", dc)
+	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") || !strings.Contains(dc, "api_v1/health~check") {
+		t.Errorf("discord card must escape the name's _ but keep the target verbatim: %q", dc)
 	}
-	if dc := discordCardRe("error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") {
-		t.Errorf("discord re-alert card must escape underscores: %q", dc)
+	if dc := discordCardRe("error", name, target, 0); !strings.Contains(dc, "db\\_primary\\_01") || !strings.Contains(dc, "api_v1/health~check") {
+		t.Errorf("discord re-alert card must escape the name's _ but keep the target verbatim: %q", dc)
 	}
 	// Storm summary (Markdown).
-	if md := stormSummaryMarkdown(entries); !strings.Contains(md, "db\\_primary\\_01") {
-		t.Errorf("storm markdown must escape underscores in the name: %q", md)
+	if md := stormSummaryMarkdown(entries); !strings.Contains(md, "db\\_primary\\_01") || !strings.Contains(md, "api_v1/health~check") {
+		t.Errorf("storm markdown must escape the name's _ but keep the target verbatim: %q", md)
 	}
 	// The non-Markdown paths must NOT carry backslash escapes.
 	if p := stormSummaryPlain(entries); strings.Contains(p, "\\") {
@@ -596,5 +603,24 @@ func TestMarkdownEscapesEmphasisChars(t *testing.T) {
 	}
 	if h := stormSummaryHTML(entries); strings.Contains(h, "\\") {
 		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
+	}
+}
+
+// TestDiscordMentionSafeKeepsAtSign (2026-10-28 review n4): the
+// neutralization inserts a zero-width space AFTER the @ (breaking Discord's
+// mention token) while KEEPING the @ visible. The old code replaced the @
+// entirely, so a sensor named "@everyone" rendered as "‌everyone" (no @) in
+// the card.
+func TestDiscordMentionSafeKeepsAtSign(t *testing.T) {
+	const zwsp = "\u200b"
+	if got := discordMentionSafe("@everyone"); got != "@"+zwsp+"everyone" {
+		t.Errorf("discordMentionSafe(@everyone) = %q, want %q (keep the @, ZWSP after it)", got, "@"+zwsp+"everyone")
+	}
+	if got := discordMentionSafe("@here"); got != "@"+zwsp+"here" {
+		t.Errorf("discordMentionSafe(@here) = %q, want %q", got, "@"+zwsp+"here")
+	}
+	// Non-mention text is untouched.
+	if got := discordMentionSafe("db_primary_01"); got != "db_primary_01" {
+		t.Errorf("discordMentionSafe must not touch non-mention text: %q", got)
 	}
 }
