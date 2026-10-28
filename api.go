@@ -465,6 +465,24 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/sensors/{id}/graph", s.handleSensorGraph)
 	s.mux.HandleFunc("DELETE /api/sensors/{id}/history", s.requireAdmin(s.handleSensorClearHistory))
 	s.mux.HandleFunc("DELETE /api/history", s.requireAdmin(s.handleClearAllHistory))
+	// /api/tags and /api/events intentionally use BARE (method-less)
+	// patterns, unlike the rest of the table (2026-10-28 review n9 —
+	// dismissed as non-bug; do not "fix" to method-prefixed). The
+	// method-less `/` catch-all below (handleStatic) matches EVERY path,
+	// so a method-prefixed pattern like `GET /api/tags` would NOT earn
+	// ServeMux's canonical 405 + Allow for an unregistered method (e.g.
+	// POST /api/tags): the `/` catch-all wins the match and handleStatic
+	// returns a plain HTML 404. Converting would REGRESS the handler's
+	// JSON 405 into an HTML 404 and gain none of the 405+Allow the
+	// pattern is supposed to provide — the catch-all suppresses it
+	// (verified empirically against a `/`-catch-all mux). The handler
+	// switches on r.Method and returns a JSON 405 for unregistered
+	// methods, which is the correct behavior under this architecture.
+	// The inline admin check on each DELETE branch is also behaviorally
+	// identical to a route-level requireAdmin (both stand down when auth
+	// is off, and authGate already 401s a sessionless /api/ request
+	// before the mux, so the missing-session case is unobservable) — no
+	// benefit to moving it to the route.
 	s.mux.HandleFunc("/api/tags", s.handleTags)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
 	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
