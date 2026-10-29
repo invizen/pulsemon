@@ -383,11 +383,13 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 // drainBodyCap bounds how much of a response body probeHTTP will read so
 // the transport can reuse the keep-alive connection. An UNREAD body makes
 // net/http discard the connection — which would defeat the whole point of
-// the shared client (one TCP+TLS handshake per host, not one per probe).
-// 1MB is far above any real health endpoint's response; anything larger is
-// discarded after the cap so a huge page costs one bounded read, not a
-// full download.
-const drainBodyCap = 1 << 20
+// the shared client (one TCP handshake per host, not one per probe). 64KB
+// is far above any real health endpoint's response (a JSON status is bytes;
+// even a small HTML page is under this); a body larger than the cap is
+// closed unread, so a huge page costs one bounded read, not a full
+// download — and the connection is simply not reused (the next probe pays
+// one handshake, the same as the pre-keep-alive behavior).
+const drainBodyCap = 64 << 10
 
 // httpProbeResult is one HTTP probe: the round-trip time, whether it counts
 // as a loss (no response OR status outside 200-299), the HTTP status code
@@ -502,10 +504,17 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 
 	// Capture the server's presented certs and their expiry for the
 	// card's note, then close the body. We only need the status line and
-	// the cert; draining (capped) before close lets the transport reuse
-	// the keep-alive connection instead of discarding it after an unread
-	// body. The cert itself was already verified per-handshake in
-	// probeDialTLS (every hop, not just the final one).
+	// the cert. Draining (capped) before close lets the transport REUSE a
+	// keep-alive connection — but only when that connection will actually
+	// be kept. probeHTTP forces a fresh TLS handshake per HTTPS probe
+	// (req.Close = true, for cert freshness, M5), and net/http builds each
+	// redirect hop as a fresh request with Close = false, so the final
+	// hop's resp.Request.Close is the exact "will this conn be discarded"
+	// signal: drain only when it is false. Skipping the drain on a conn
+	// that is closed anyway saves up to drainBodyCap of download on every
+	// probe of a heavy HTTPS UI (Proxmox, Nextcloud). The cert itself was
+	// already verified per-handshake in probeDialTLS (every hop, not just
+	// the final one).
 	var presented []*x509.Certificate
 	var certExp *time.Time
 	if resp.TLS != nil {
@@ -515,7 +524,9 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		na := presented[0].NotAfter
 		certExp = &na
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
+	if resp.Request == nil || !resp.Request.Close {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
+	}
 	resp.Body.Close()
 
 	// A redirect chain that ENDS on plain HTTP after the configured target

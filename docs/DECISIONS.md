@@ -116,6 +116,39 @@ policy. The failing leaf rides back on the typed `certVerifyError` so
 `certNotAfterFromErr` keeps the card's expiry note alive on a failed
 verify.
 
+## probe-body-drain (http.go `probeHTTP`, 2026-10-29)
+
+**Contract:** `probeHTTP` drains the response body ONLY to let the
+transport reuse a keep-alive connection, and only up to `drainBodyCap`
+(64 KB). The drain runs only when the final connection is kept —
+`!resp.Request.Close`.
+
+**Why the `!resp.Request.Close` condition:** an unread body makes
+`net/http` discard the connection, so the drain exists purely to enable
+reuse. But an HTTPS probe forces a fresh TLS handshake per probe
+(`req.Close = true`, cert freshness — see `probe-tls-verify`), so its
+connection is discarded anyway and the drain was pure waste: a 5s HTTPS
+sensor on a heavy UI (Proxmox, Nextcloud) pulled ~1 MB plus a full TLS
+handshake every 5s. `resp.Request.Close` is the exact "will this conn be
+kept" signal: `true` for HTTPS (fresh handshake), `false` for plain HTTP
+and for redirect hops (net/http builds each hop as a fresh request that
+does NOT copy `Close`), so an `http → https` redirect still drains only
+its kept hops. The reviewer's `scheme == "http"` guard would have missed
+that the FINAL hop's scheme, not the target's, is what decides reuse.
+
+**Why 64 KB, not 1 MB:** far above any real health endpoint (a JSON
+status is bytes; even a small HTML page is under this). A body over the
+cap is closed unread — the connection is simply not reused (next probe
+pays one handshake, the pre-keep-alive behavior) instead of downloading
+the whole page.
+
+**Test:** `TestProbeHTTPDrainsOnlyReusableConnections` (Linux-only; an
+`SO_SNDBUF`-bounded listener makes the server's written-bytes counter
+track the client's reads, not an autotuned multi-MB socket buffer).
+Serves a 1 MB body and asserts the fixed probe writes far less than
+512 KB. Fails on the pre-fix code (writes the full 1 MB on both the
+HTTPS and HTTP subtests).
+
 ## probe-redirect-guard (http.go `redirectTargetAllowed`)
 
 **Contract:** same-host hops pass; cross-host hops are refused if ANY
