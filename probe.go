@@ -662,8 +662,8 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 
 	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
 	// ERROR re-checks on the fast-retry cadence (capped at the configured
-	// interval, 10s floor — no ping-storm) until a probe brings it back
-	// to up, then reverts to the configured interval.
+	// interval — never faster than the user's pace) until a probe brings
+	// it back to up, then reverts to the configured interval.
 	timer := time.NewTimer(phase)
 	defer timer.Stop()
 	var nextDelay time.Duration
@@ -704,13 +704,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 			// alerts) — a paused sensor is not being watched.
 			nextDelay = interval
 		} else if fast {
-			nextDelay = errorRetryInterval
-			if nextDelay > interval {
-				nextDelay = interval // never faster than the user's pace
-			}
-			if nextDelay < 10*time.Second {
-				nextDelay = 10 * time.Second // floor: no ping-storm loops
-			}
+			nextDelay = min(errorRetryInterval, interval) // never faster than the user's pace
 		} else {
 			nextDelay = interval
 		}
@@ -1075,9 +1069,9 @@ func (pw *ProbeWorker) rememberStatus(id, status string) {
 // errorRetryInterval is the probe cadence for a sensor while its status is
 // ERROR: re-check every 30s until a probe brings it back to up, then revert
 // to the sensor's configured interval. It is capped at the configured
-// interval (a sensor polling faster than 30s already re-checks at least as
-// often) and floored at 10s, so the fast path is never faster than the
-// normal one and a total-outage scenario is bounded to ~2x normal load.
+// interval, so the fast path is never faster than the user's pace and a
+// total outage adds no load beyond the normal probe rate for sub-30s
+// sensors (longer-interval sensors re-check at 30s — the only increase).
 const errorRetryInterval = 30 * time.Second
 
 // purgeBatchSize caps the rows deleted per statement in purgeOld. Each batch

@@ -215,6 +215,24 @@ moving it to the route.
 method-less pattern matches the same path. A top-level `/` static
 catch-all suppresses it for every method-prefixed route.
 
+## fast-retry floor removed (probe.go `sensorLoop`, 2026-10-29)
+
+**Contract:** an ERROR sensor re-checks every `min(30s, interval)` —
+never faster than the user's pace, never slower.
+
+**Why the old 10s floor went:** it made 5–9s sensors re-check *less*
+often while down (5s sensor → 10s cadence), slowing recovery detection
+and contradicting the fast-retry contract. It protected no load bound:
+the `min(30s, interval)` cap ALONE guarantees the fast path is never
+faster than the user's pace, so a total outage adds no load beyond the
+normal probe rate for sub-30s sensors (longer-interval sensors re-check
+at 30s — the only increase, by design). The floor only ever affected
+sub-10s intervals, where `min()` already returns `interval`. All write
+paths enforce `minIntervalS = 5` (POST/PUT validation, clone clamp), so
+a legacy sub-5s row (DB surgery) in error re-checks at its own normal
+pace — not a ping storm. Pinned by
+`TestSensorLoopFastRetryMatchesInterval`.
+
 ## deriveStatus window (status.go)
 
 **Contract:** window loss% is computed over the newest `statusWindow`
