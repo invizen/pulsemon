@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -508,6 +509,112 @@ func TestHotReloadCert(t *testing.T) {
 	}
 	if sameCert(c4, c2) {
 		t.Fatal("repair did not take effect — the old pair is still served")
+	}
+}
+
+// logWriter is an io.Writer that hands each non-empty line to a callback.
+type logWriter struct {
+	add func(string)
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	for _, line := range strings.Split(string(p), "\n") {
+		if line != "" {
+			w.add(line)
+		}
+	}
+	return len(p), nil
+}
+
+// TestHotReloadCertNoRespinWhileBroken (2026-10-29 review): a failed reload
+// must NOT re-parse + re-log on every handshake for as long as the files stay
+// broken. Pre-fix the failure branch left certMT/keyMT unset, so every
+// handshake saw the changed mtime, re-ran tls.LoadX509KeyPair, and logged — a
+// log-spam + CPU cost on a busy TLS server. The fix records the (broken)
+// mtimes on failure, so the reload is retried only when a file's mtime changes
+// again. Each failed reload logs exactly one line, so the log count is a
+// direct count of re-parse attempts.
+func TestHotReloadCertNoRespinWhileBroken(t *testing.T) {
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "cert.pem")
+	keyPath := filepath.Join(dir, "key.pem")
+	writeTestCertPEM(t, certPath, keyPath)
+
+	get := hotReloadCert(certPath, keyPath)
+	if _, err := get(nil); err != nil {
+		t.Fatalf("initial load: %v", err)
+	}
+
+	// Capture log output (mutex-guarded: safe if any goroutine logs).
+	var (
+		lcMu    sync.Mutex
+		lcLines []string
+	)
+	lcWriter := &logWriter{add: func(line string) {
+		lcMu.Lock()
+		lcLines = append(lcLines, line)
+		lcMu.Unlock()
+	}}
+	oldOut := log.Writer()
+	log.SetOutput(lcWriter)
+	defer log.SetOutput(oldOut)
+	failLines := func() int {
+		lcMu.Lock()
+		defer lcMu.Unlock()
+		n := 0
+		for _, line := range lcLines {
+			if strings.Contains(line, "tls: cert reload from") {
+				n++
+			}
+		}
+		return n
+	}
+	clearLines := func() {
+		lcMu.Lock()
+		lcLines = nil
+		lcMu.Unlock()
+	}
+
+	// Corrupt the cert and bump its mtime so the reload is triggered.
+	if err := os.WriteFile(certPath, []byte("garbage"), 0o600); err != nil {
+		t.Fatalf("corrupt cert: %v", err)
+	}
+	if err := os.Chtimes(certPath, time.Time{}, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("chtime: %v", err)
+	}
+
+	// First broken handshake: reload attempted, fails, keeps the last good
+	// pair, logs exactly ONCE.
+	if _, err := get(nil); err != nil {
+		t.Fatalf("broken reload must keep the last good pair: %v", err)
+	}
+	if n := failLines(); n != 1 {
+		t.Fatalf("first broken handshake logged %d reload-failure lines, want 1", n)
+	}
+	clearLines()
+
+	// Repeated handshakes, files STILL broken (same mtime): no re-parse, no
+	// re-log. Pre-fix each of these logged again.
+	for i := 0; i < 5; i++ {
+		if _, err := get(nil); err != nil {
+			t.Fatalf("broken handshake %d must keep the last good pair: %v", i, err)
+		}
+	}
+	if n := failLines(); n != 0 {
+		t.Fatalf("5 unchanged-broken handshakes logged %d reload-failure lines, want 0 (no respin while the files are unchanged)", n)
+	}
+
+	// Repair (new pair, bumped mtime): the reload is retried and succeeds —
+	// no failure log.
+	writeTestCertPEM(t, certPath, keyPath)
+	if err := os.Chtimes(certPath, time.Time{}, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatalf("chtime: %v", err)
+	}
+	if _, err := get(nil); err != nil {
+		t.Fatalf("repair reload: %v", err)
+	}
+	if n := failLines(); n != 0 {
+		t.Fatalf("repair handshake logged %d reload-failure lines, want 0 (reload succeeded)", n)
 	}
 }
 

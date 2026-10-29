@@ -344,8 +344,10 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 // hotReloadCert returns a tls.Config.GetCertificate that serves the pair at
 // (certPath, keyPath), re-loading it whenever either file's mtime changes.
 // A failed reload (half-written file, transient mismatch) keeps the LAST
-// GOOD pair instead of failing every handshake — the next handshake retries
-// the reload. The initial load failure surfaces as a handshake error (the
+// GOOD pair instead of failing every handshake, and records the (broken)
+// mtimes so it is NOT re-parsed + re-logged on every handshake for as long
+// as the files stay broken — the reload is retried only when a file's mtime
+// changes again. The initial load failure surfaces as a handshake error (the
 // pair was already validated by tlsKeyPairOK before serve starts, so this
 // only bites on a genuinely broken file at runtime).
 func hotReloadCert(certPath, keyPath string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
@@ -371,6 +373,11 @@ func hotReloadCert(certPath, keyPath string) func(*tls.ClientHelloInfo) (*tls.Ce
 		pair, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
 			if cached != nil {
+				// Record the (broken) mtimes so the next handshakes take the
+				// fast cached path instead of re-parsing + re-logging on every
+				// handshake for as long as the files stay broken. The reload is
+				// retried only when a file's mtime changes again.
+				certMT, keyMT = cMT, kMT
 				log.Printf("tls: cert reload from %s/%s failed (%v) — keeping the previous pair", certPath, keyPath, err)
 				return cached, nil
 			}

@@ -300,6 +300,28 @@ a healthy sensor to the top of the list. The inspector's own loss readout
 keeps `loss_pct` on purpose: it is the raw 60-probe history view ("N / M
 dropped" over what you actually see), and manual rows belong there.
 
+## tls-cert-hot-reload (main.go `hotReloadCert`, 2026-10-29)
+
+**Contract:** the TLS listener's `GetCertificate` serves the pair at
+(certPath, keyPath), re-loading it only when a file's mtime changes. A
+failed reload (half-written file, transient mismatch) keeps the LAST GOOD
+pair AND records the (broken) mtimes, so it is not re-parsed + re-logged
+on every handshake for as long as the files stay broken — the reload is
+retried only when a file's mtime changes again.
+
+**Why record the mtimes on failure:** the pre-fix failure branch returned
+the cached pair without updating `certMT`/`keyMT`, so every subsequent
+handshake saw the changed mtime, skipped the cached fast path, re-ran
+`tls.LoadX509KeyPair` (failing), and logged — a log-spam + parse cost on
+every handshake of a busy TLS server, for the whole time the files stayed
+broken. Recording the mtimes makes the broken state a no-op fast path
+until the operator (or a cron) writes the files again. The initial-load
+failure path is unchanged (no good pair to fall back to → handshake
+error), and a repaired file (new mtime) retriggers the reload as before.
+Pinned by `TestHotReloadCertNoRespinWhileBroken` (counts the reload-failure
+log lines: 1 on the first broken handshake, 0 on 5 unchanged-broken
+handshakes, 0 on the successful repair).
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)
