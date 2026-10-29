@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -288,6 +289,163 @@ func TestProbeHTTPSelfSignedExpiredRejected(t *testing.T) {
 	}
 	if r.CertExpiry == nil {
 		t.Fatal("CertExpiry = nil, want the expired cert's NotAfter")
+	}
+}
+
+// TestProbeHTTPUntrustedCertSendsNoRequest: an untrusted cert must abort
+// the handshake BEFORE any request bytes are written. The pre-fix design
+// (InsecureSkipVerify + post-Do verifyHTTPCert) sent the full request —
+// including an Authorization: Basic header derived from a user:pass@
+// target's userinfo (docs/DEFERRED.md documents such targets) — to the
+// unverified peer before rejecting it; an ARP/DNS spoofer on the LAN
+// collected the credentials while the probe "correctly" read lost. This
+// test fails on that code: the server's handler runs (request received)
+// before the post-hoc verify rejects.
+func TestProbeHTTPUntrustedCertSendsNoRequest(t *testing.T) {
+	var gotRequests int32
+	cert, _ := testTLSChain(t, time.Now().Add(48*time.Hour)) // untrusted CA
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&gotRequests, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+	if !r.Lost {
+		t.Fatalf("untrusted-CA cert marked up, want loss")
+	}
+	if n := atomic.LoadInt32(&gotRequests); n != 0 {
+		t.Fatalf("server received %d request(s) despite failed verification — request sent before cert check", n)
+	}
+	// The card's expiry note survives the handshake abort: the failing
+	// leaf's NotAfter rides back on the typed certVerifyError.
+	if r.CertExpiry == nil {
+		t.Error("CertExpiry = nil, want the failing cert's NotAfter (card expiry note)")
+	}
+}
+
+// TestProbeHTTPRedirectHopUntrustedCertSendsNoRequest: verification is
+// per-handshake, so a redirect HOP to an untrusted https target is refused
+// at the hop's handshake — its handler never runs. The pre-fix post-hoc
+// check judged only the FINAL hop's cert, so a bad intermediate hop was
+// never verified at all (the request to it was written regardless).
+func TestProbeHTTPRedirectHopUntrustedCertSendsNoRequest(t *testing.T) {
+	var hopRequests int32
+	cert, _ := testTLSChain(t, time.Now().Add(48*time.Hour))
+
+	hop := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hopRequests, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	hop.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	hop.StartTLS()
+	defer hop.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, hop.URL, http.StatusFound) // 302 → untrusted https hop
+	}))
+	defer srv.Close()
+
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+	if !r.Lost {
+		t.Fatalf("redirect to untrusted https hop marked up, want loss")
+	}
+	if n := atomic.LoadInt32(&hopRequests); n != 0 {
+		t.Fatalf("untrusted https hop received %d request(s) — hop cert not verified before the request", n)
+	}
+}
+
+// TestProbeHTTPIPMismatchSelfSignedRejected: an IP-literal target is
+// verified against the URL's host, not whatever the handshake SNI carried
+// (empty for IP literals — see TestVerifyConnectionServerNameBlanksIPLiterals):
+// a self-signed cert for 10.9.9.9 presented on 127.0.0.1 must be rejected.
+// This is the case the VerifyConnection-based fix would have gotten wrong
+// (empty ServerName → no host to verify against).
+func TestProbeHTTPIPMismatchSelfSignedRejected(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkixName("pulsemon test self-signed"),
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(48 * time.Hour),
+		IPAddresses:           []net.IP{net.ParseIP("10.9.9.9")},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("self-signed cert: %v", err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	r := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+	if !r.Lost {
+		t.Fatalf("self-signed cert for a DIFFERENT IP accepted on 127.0.0.1, want loss")
+	}
+}
+
+// TestVerifyConnectionServerNameBlanksIPLiterals: documents the stdlib
+// behavior that rules out the "obvious" fix for verify-before-write —
+// tls.Config.VerifyConnection judging cs.ServerName. On this Go version
+// the CLIENT's ConnectionState.ServerName is the SNI name, and
+// hostnameInSNI (crypto/tls, RFC 6066 §3) blanks IP literals: an
+// https://IP handshake reports ServerName "" (hostnames report the name).
+// So a VerifyConnection-based verifyHTTPCert(presented, cs.ServerName)
+// would reject EVERY https://IP target. That is why probeDialTLS verifies
+// at dial time against the dial address's host instead. Verified on the
+// toolchain's Go (go.mod: go 1.26); if a future Go populates cs.ServerName
+// for IP literals, this test fails — re-evaluate the simpler hook then.
+func TestVerifyConnectionServerNameBlanksIPLiterals(t *testing.T) {
+	var mu sync.Mutex
+	var names []string
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+				VerifyConnection: func(cs tls.ConnectionState) error {
+					mu.Lock()
+					names = append(names, cs.ServerName)
+					mu.Unlock()
+					return nil
+				},
+			},
+		},
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.StartTLS()
+	defer srv.Close()
+
+	resp, err := client.Get(srv.URL) // https://127.0.0.1:PORT
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(names) != 1 {
+		t.Fatalf("VerifyConnection called %d times, want 1", len(names))
+	}
+	if names[0] != "" {
+		t.Errorf("client cs.ServerName for IP-literal URL = %q, want \"\" (the premise that blocks the VerifyConnection approach)", names[0])
 	}
 }
 

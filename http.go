@@ -60,13 +60,20 @@ const maxHTTPRedirects = 5
 // real destination — the common case for a web UI behind a redirect — is
 // judged on where it ends up, not the redirect itself.
 //
-// TLS: the transport sets InsecureSkipVerify so the handshake always
-// succeeds and the server's presented certificates are handed back instead
-// of being rejected at the TLS layer. probeHTTP then verifies them itself
-// via verifyHTTPCert, which accepts a cert when it is trusted by the system
-// roots OR genuinely self-signed with a hostname and validity matching the
-// target. That is how self-signed homelab web UIs become monitorable without
-// accepting every certificate.
+// TLS: the probe client verifies the server certificate DURING the
+// handshake, before any request bytes are written — see probeDialTLS.
+// The policy is unchanged from the old InsecureSkipVerify + post-Do design:
+// a cert is accepted when it is trusted by the system roots OR genuinely
+// self-signed with a hostname and validity matching the target. What moved
+// is WHEN it runs: the old design verified after httpClient.Do returned,
+// by which point the full request had already been sent to whoever answered
+// the handshake — including an Authorization: Basic header derived from a
+// target's user:pass@ userinfo (docs/DEFERRED.md documents such targets),
+// so an ARP/DNS spoofer on the LAN collected the credentials while the
+// probe "correctly" read lost. The same held for every redirect hop, which
+// the post-hoc check never even verified (it judged only the final hop's
+// cert). Self-signed homelab web UIs stay monitorable; "allow self-signed"
+// does not become "allow anything".
 //
 // Redirect guard: a monitored public host can 302 the probe anywhere,
 // including cloud metadata (169.254.169.254) or loopback services — the
@@ -92,10 +99,12 @@ const maxHTTPRedirects = 5
 //
 // Known limitation (stated, not hidden): hostname resolution here has a
 // TOCTOU window that the webhook path closes by pinning its dial to the
-// checked IPs. The probe client cannot pin without a per-probe
-// DialContext, and the attacker would already need sensor-create rights
-// (or LAN access before any user exists). This raises the bar
-// substantially, which is the point.
+// checked IPs. probeDialTLS now owns the probe client's dial, but it does
+// NOT pin to checked IPs: the initial target is the operator's own
+// configured sensor (admin privilege by design), and redirect hops are
+// already vetted by redirectTargetAllowed before their dial. A rebinding
+// attacker would need DNS control on the LAN — the same threat that the
+// cert verification itself is defending against.
 //
 // Security-review note (deliberate, do NOT "fix" by blocking private ranges):
 // Allowing RFC1918/ULA cross-host redirect hops is INTENTIONAL, not an
@@ -158,6 +167,67 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 	return nil
 }
 
+// probeTLSHandshakeTimeout caps the TLS handshake inside probeDialTLS. The
+// transport's TLSHandshakeTimeout does not apply to a custom
+// DialTLSContext (it only governs the transport's own addTLS path), so the
+// handshake gets its own cap — the same 10s the old transport config used —
+// on top of the probe's context deadline.
+const probeTLSHandshakeTimeout = 10 * time.Second
+
+// probeDialTLS is the probe client's DialTLSContext: it dials, completes
+// the TLS handshake, and verifies the presented certificate BEFORE the
+// connection is handed to the transport — so a cert that is neither
+// system-trusted nor a valid self-signed match for the target aborts the
+// handshake with ZERO request bytes written. That is the whole point of
+// moving verification out of probeHTTP's post-Do path: the old order sent
+// the full request (incl. an Authorization: Basic header derived from a
+// user:pass@ target's userinfo) before the cert was judged.
+//
+// Why a dial-time hook and not tls.Config.VerifyConnection (the natural
+// spot): on Go 1.26 the client's ConnectionState.ServerName is the SNI
+// name, and hostnameInSNI (crypto/tls, RFC 6066 §3) blanks IP literals —
+// cs.ServerName is "" for EVERY https://IP target, so
+// verifyHTTPCert(presented, cs.ServerName) would reject all of them
+// (pinned by TestVerifyConnectionServerNameBlanksIPLiterals). The dial
+// address carries the host the URL asked for, IP literals included, so
+// verifying here judges each hop against exactly the host the old post-Do
+// check used (resp.Request.URL.Hostname()).
+//
+// InsecureSkipVerify stays on so the stdlib chain check never rejects
+// first; verifyHTTPCert is the sole cert policy, unchanged. The returned
+// *tls.Conn (required — the transport type-asserts to extract tlsState,
+// which becomes resp.TLS and the card's cert-expiry source) is already
+// handshaken; the transport's follow-up HandshakeContext is a no-op.
+//
+// A custom DialTLSContext bypasses the transport's proxy handling for
+// HTTPS — probes are LAN targets dialed directly, the same posture as the
+// webhook path's dialChecked.
+func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	hsCtx, cancel := context.WithTimeout(ctx, probeTLSHandshakeTimeout)
+	defer cancel()
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	// Verify BEFORE the transport writes any request bytes. The failing
+	// leaf rides back on the typed certVerifyError so certNotAfterFromErr
+	// can surface its expiry on the card.
+	if err := verifyHTTPCert(tlsConn.ConnectionState().PeerCertificates, host); err != nil {
+		tlsConn.Close()
+		return nil, err
+	}
+	return tlsConn, nil
+}
+
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -196,14 +266,36 @@ var httpClient = &http.Client{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       10 * time.Minute,
-		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
-		TLSClientConfig:       &tls.Config{InsecureSkipVerify: true},
+		// TLS is owned by probeDialTLS (dial + handshake + verify
+		// before any request bytes): TLSClientConfig is deliberately
+		// nil — the transport's own TLS path, and its InsecureSkipVerify,
+		// are not used. TLSHandshakeTimeout is likewise moot (it only
+		// governs the transport's addTLS); probeDialTLS caps the
+		// handshake itself.
+		DialTLSContext: probeDialTLS,
 	},
 }
 
-// verifyHTTPCert validates the certificate(s) the server presented after a
-// successful (skip-verify) handshake. It accepts the cert when EITHER
+// certVerifyError is a TLS verification failure carrying the leaf
+// certificate that failed. verifyHTTPCert now runs inside probeDialTLS
+// (before the request is written), where probeHTTP cannot reach
+// resp.TLS.PeerCertificates — so the leaf rides back on the error, and
+// certNotAfterFromErr extracts its NotAfter to keep the card's expiry
+// note alive on a failed verify.
+type certVerifyError struct {
+	leaf *x509.Certificate
+	err  error
+}
+
+func (e *certVerifyError) Error() string { return "pulsemon: " + e.err.Error() }
+
+func (e *certVerifyError) Unwrap() error { return e.err }
+
+// verifyHTTPCert validates the certificate(s) the server presented during
+// a skip-verify handshake (probeDialTLS runs it before the connection is
+// handed to the transport, so a rejection writes zero request bytes). It
+// accepts the cert when EITHER
 // (a) it is trusted by the system roots, or
 // (b) it is genuinely self-signed (issuer == subject) AND its hostname and
 // validity hold for host. Everything else — a cert from an untrusted CA, an
@@ -289,7 +381,10 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 			return nil
 		}
 	}
-	return errors.New("pulsemon: TLS certificate is not trusted and is not a self-signed cert matching the target")
+	return &certVerifyError{
+		leaf: leaf,
+		err:  errors.New("TLS certificate is not trusted and is not a self-signed cert matching the target"),
+	}
 }
 
 // drainBodyCap bounds how much of a response body probeHTTP will read so
@@ -343,10 +438,8 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	host := ""
 	origScheme := ""
 	if u, err := url.Parse(target); err == nil {
-		host = u.Hostname()
 		origScheme = strings.ToLower(u.Scheme)
 	}
 
@@ -404,19 +497,22 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		rtt = time.Since(connAt)
 	}
 	if err != nil {
-		// A transport-level failure: timeout, connection refused, DNS, or a
-		// malformed TLS handshake. With InsecureSkipVerify the handshake
-		// itself always completes and the peer's certs ride back on resp, so
-		// a certificate problem no longer surfaces here — it is caught by
-		// verifyHTTPCert below. certNotAfterFromErr stays as a safety net
-		// for the rare handshake error that does carry a cert.
+		// A transport-level failure: timeout, connection refused, DNS, or
+		// a TLS handshake aborted by probeDialTLS's verify (a cert that is
+		// neither system-trusted nor a valid self-signed match for this
+		// hop's host). Verification runs during the handshake, so a bad
+		// cert is a dial error here — no request bytes were written.
+		// certNotAfterFromErr extracts the failing leaf's expiry from the
+		// typed certVerifyError so the card still shows it.
 		return httpProbeResult{Elapsed: rtt, Lost: true, IP: resolved, CertExpiry: certNotAfterFromErr(err), Err: err}
 	}
 
-	// Capture the server's presented certs and their expiry, then close the
-	// body. We only need the status line and the cert; draining (capped)
-	// before close lets the transport reuse the keep-alive connection
-	// instead of discarding it after an unread body.
+	// Capture the server's presented certs and their expiry for the
+	// card's note, then close the body. We only need the status line and
+	// the cert; draining (capped) before close lets the transport reuse
+	// the keep-alive connection instead of discarding it after an unread
+	// body. The cert itself was already verified per-handshake in
+	// probeDialTLS (every hop, not just the final one).
 	var presented []*x509.Certificate
 	var certExp *time.Time
 	if resp.TLS != nil {
@@ -428,23 +524,6 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
 	resp.Body.Close()
-
-	// Now that the handshake has returned the peer's certificates, verify
-	// them ourselves. This is where "allow self-signed" lives: a cert
-	// trusted by the system roots OR a genuine self-signed cert matching the
-	// target's host is accepted; anything else is a loss.
-	//
-	// After a redirect, resp.TLS belongs to the FINAL hop, so the cert must
-	// be verified against the FINAL request's host — not the original
-	// target (a 302 to the LAN UI with a valid self-signed cert for that
-	// host was a false down when checked against the original host).
-	verifyHost := host
-	if resp.Request != nil && resp.Request.URL != nil {
-		verifyHost = resp.Request.URL.Hostname()
-	}
-	if vErr := verifyHTTPCert(presented, verifyHost); vErr != nil {
-		return httpProbeResult{Elapsed: rtt, Lost: true, IP: resolved, CertExpiry: certExp, Err: vErr}
-	}
 
 	// A redirect chain that ENDS on plain HTTP after the configured target
 	// was HTTPS is a loss: the TLS endpoint is what
@@ -481,11 +560,17 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 
 // certNotAfterFromErr walks a failed handshake's error chain for the
 // server's leaf certificate and returns its NotAfter, or nil. Covers the
-// two shapes net/http surfaces: tls.CertificateVerificationError carrying
-// the full unverified chain (leaf first), and x509.UnknownAuthorityError
-// carrying only the leaf. Plain transport errors (timeout, refused) return
-// nil.
+// shapes probe failures surface: certVerifyError (our own policy, now the
+// normal verify-failure path — probeDialTLS rejects during the handshake),
+// tls.CertificateVerificationError carrying the full unverified chain
+// (leaf first), and x509.UnknownAuthorityError carrying only the leaf.
+// Plain transport errors (timeout, refused) return nil.
 func certNotAfterFromErr(err error) *time.Time {
+	var cvErr *certVerifyError
+	if errors.As(err, &cvErr) && cvErr.leaf != nil {
+		na := cvErr.leaf.NotAfter
+		return &na
+	}
 	var certErr *tls.CertificateVerificationError
 	if errors.As(err, &certErr) && len(certErr.UnverifiedCertificates) > 0 {
 		na := certErr.UnverifiedCertificates[0].NotAfter
