@@ -53,9 +53,22 @@ import (
 const (
 	authSessionName = "pulsemon_session"
 	authSessionTTL  = 30 * 24 * time.Hour
-	bcryptCost      = bcrypt.DefaultCost
-	minPasswordLen  = 8
-	maxUsernameLen  = 32
+	// authSessionMaxAge is the ABSOLUTE lifetime of a session, counted from
+	// login time (authSession.created), independent of activity. authSessionTTL
+	// is a sliding inactivity window: ValidSession and SessionUser move expiry
+	// forward on every live hit, so with the TTL alone a continuously-active
+	// session — an open dashboard tab polling every few seconds, or a stolen
+	// cookie used periodically — would never lapse. The max-age cap bounds the
+	// total time any session can stay valid: after authSessionMaxAge from login
+	// the session is rejected and deleted even if it has been active the whole
+	// time, forcing a re-login. Set to the same 30 days as authSessionTTL, so
+	// an idle session (which lapses after TTL of inactivity) and a maximally
+	// active session both last at most 30 days from login; only activity in
+	// between extends an idle session up to that cap.
+	authSessionMaxAge = 30 * 24 * time.Hour
+	bcryptCost        = bcrypt.DefaultCost
+	minPasswordLen    = 8
+	maxUsernameLen    = 32
 
 	// Login throttling (see AuthState.loginThrottle). An internet-reachable
 	// install must not be a free online password-cracking target against the
@@ -116,6 +129,13 @@ var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcf
 type authSession struct {
 	user   string
 	expiry time.Time
+	// created is the login time, kept for the absolute authSessionMaxAge cap.
+	// Unlike expiry — which ValidSession and SessionUser slide forward on every
+	// live hit — created is fixed at login and never moved, so it bounds the
+	// total lifetime of a continuously-active session. The sliding TTL alone
+	// can't do that: activity keeps pushing expiry out, so without this field
+	// an always-open tab (or a periodically-used stolen cookie) never lapses.
+	created time.Time
 	// cookieIssued is when the browser cookie for this session was last
 	// (re)issued. The cookie carries a fixed Max-Age=authSessionTTL set at
 	// login, so without re-issuance the browser deletes it exactly TTL
@@ -630,12 +650,13 @@ func (a *AuthState) CreateSession(username, password string, cookieSecure bool) 
 		a.sweepExpiredSessions(now)
 		a.nextSweepSessions = now.Add(throttleSweepInterval)
 	}
-	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), cookieIssued: now, cookieSecure: cookieSecure}
+	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), created: now, cookieIssued: now, cookieSecure: cookieSecure}
 	a.mu.Unlock()
 	return tok, true
 }
 
-// sweepExpiredSessions evicts sessions whose TTL has lapsed. Expired
+// sweepExpiredSessions evicts sessions whose sliding TTL has lapsed or that
+// have passed their absolute authSessionMaxAge cap from login. Expired
 // entries are already rejected — and individually deleted — by
 // ValidSession/SessionUser when their token is presented; this sweep
 // covers the rest: abandoned sessions whose cookie was discarded and
@@ -645,7 +666,13 @@ func (a *AuthState) CreateSession(username, password string, cookieSecure bool) 
 // no ticker — mirrors sweepThrottle). Caller must hold a.mu.
 func (a *AuthState) sweepExpiredSessions(now time.Time) {
 	for tok, s := range a.sessions {
-		if now.After(s.expiry) {
+		// Evict on the lapsed sliding TTL OR on the absolute authSessionMaxAge
+		// cap from login. A continuously-active session's sliding expiry is
+		// still in the future at max-age, so the TTL test alone would let it
+		// linger here until its (slid) expiry lapses; the cap test reclaims it
+		// now. (Both paths already reject the token on presentation — this is
+		// memory hygiene for sessions that won't be presented again.)
+		if now.After(s.expiry) || now.After(s.created.Add(authSessionMaxAge)) {
 			delete(a.sessions, tok)
 		}
 	}
@@ -958,19 +985,21 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 }
 
 // ValidSession validates a session token: a live hit slides its expiry
-// forward; an unknown OR expired token is rejected AND deleted — the
-// returned value is the expiry test, never just a map hit. The owner's
-// account is re-checked against the users table (TTL-cached, see
-// userOKTTL) so a user deleted out-of-band (CLI `auth-user remove`) is
-// rejected within the window even though the in-memory map can't know
-// about it.
+// forward; an unknown, expired, OR past-max-age token is rejected AND
+// deleted — the returned value is the validity test, never just a map hit.
+// The absolute authSessionMaxAge cap (measured from login time, not
+// activity) is enforced here too, so a continuously-active session cannot
+// be slid indefinitely — see authSessionMaxAge. The owner's account is
+// re-checked against the users table (TTL-cached, see userOKTTL) so a user
+// deleted out-of-band (CLI `auth-user remove`) is rejected within the window
+// even though the in-memory map can't know about it.
 func (a *AuthState) ValidSession(tok string) bool {
 	if tok == "" {
 		return false
 	}
 	a.mu.Lock()
 	s, ok := a.sessions[tok]
-	if ok && time.Now().Before(s.expiry) && a.userExistsCached(s.user) {
+	if ok && time.Now().Before(s.expiry) && a.sessionWithinMaxAge(s) && a.userExistsCached(s.user) {
 		s.expiry = time.Now().Add(authSessionTTL)
 		a.sessions[tok] = s
 	} else {
@@ -981,6 +1010,17 @@ func (a *AuthState) ValidSession(tok string) bool {
 	return ok
 }
 
+// sessionWithinMaxAge reports whether the session is still within the
+// absolute authSessionMaxAge cap from its login time (s.created). Unlike
+// s.expiry — which ValidSession and SessionUser slide forward on every live
+// hit — created is fixed at login, so this is what bounds the total lifetime
+// of a continuously-active session. A session past the cap is rejected and
+// deleted by the caller even if its sliding expiry is still in the future.
+// Caller must hold a.mu.
+func (a *AuthState) sessionWithinMaxAge(s authSession) bool {
+	return time.Since(s.created) <= authSessionMaxAge
+}
+
 // SessionUser returns the username a live session belongs to, validating
 // the expiry (and deleting the entry if it has lapsed) so the result is
 // safe to use as an authorization check on its own. Like ValidSession it
@@ -989,12 +1029,15 @@ func (a *AuthState) ValidSession(tok string) bool {
 // and like ValidSession it slides the expiry on a
 // live hit: this is the validation path for
 // the gate-exempt /api/auth/status, so without the slide a
-// status-poll-only client would never extend its session.
+// status-poll-only client would never extend its session. It also enforces
+// the absolute authSessionMaxAge cap, so a status-poll-only client (the
+// dashboard's /api/auth/status poll every few seconds) cannot be the thing
+// that slides a session past its login-time max age.
 func (a *AuthState) SessionUser(tok string) (string, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]
-	if !ok || !time.Now().Before(s.expiry) {
+	if !ok || !time.Now().Before(s.expiry) || !a.sessionWithinMaxAge(s) {
 		delete(a.sessions, tok)
 		return "", false
 	}

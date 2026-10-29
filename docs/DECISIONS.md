@@ -322,6 +322,28 @@ Pinned by `TestHotReloadCertNoRespinWhileBroken` (counts the reload-failure
 log lines: 1 on the first broken handshake, 0 on 5 unchanged-broken
 handshakes, 0 on the successful repair).
 
+## session-absolute-max-age (auth.go, 2026-10-29)
+
+**Contract:** a session's 30-day `authSessionTTL` is a SLIDING inactivity
+window — `ValidSession` and `SessionUser` move `expiry` forward on every
+live hit. `authSessionMaxAge` (30 days) is the ABSOLUTE cap counted from
+login time (`authSession.created`, set once at mint, never slid). A session
+past the cap is rejected and deleted on presentation even if its sliding
+expiry is still in the future, and `sweepExpiredSessions` reclaims it too.
+
+**Why the cap:** with the sliding TTL alone, a continuously-active session
+never lapses — an open dashboard tab polls `/api/auth/status` every few
+seconds (the `SessionUser` path) and each poll slides `expiry` out by 30
+days, so an open tab, or a stolen cookie used periodically, stayed valid
+indefinitely. The cap bounds total session lifetime at 30 days from login
+for both idle and maximally-active sessions; only activity in between
+extends an idle session up to that cap. The cap must be enforced on BOTH
+`ValidSession` and `SessionUser` — `SessionUser` is the gate-exempt
+`/api/auth/status` path, so fixing only `ValidSession` would let a
+status-poll-only client slide forever. Pinned by `TestSessionAbsoluteMaxAge`
+(29-day-old active session still valid; 31-day-old active session rejected
++ deleted by both paths; fresh session unaffected).
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)

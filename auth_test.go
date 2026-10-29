@@ -283,6 +283,86 @@ func TestExpiredSessionRejected(t *testing.T) {
 	}
 }
 
+// TestSessionAbsoluteMaxAge: the 30-day sliding expiry must NOT let a
+// session live forever. authSessionMaxAge caps the total lifetime from LOGIN
+// time (s.created), independent of activity — so a continuously-active
+// session (an open dashboard tab polling every few seconds, or a stolen
+// cookie used periodically, whose sliding expiry ValidSession/SessionUser
+// keep pushing out) is rejected and deleted once authSessionMaxAge elapses
+// from login, even though its sliding expiry is still far in the future. The
+// sliding TTL alone cannot do this; the cap is the absolute bound.
+//
+// Like TestExpiredSessionRejected this backdates the stored fields directly
+// (no 30-day wait): an "active" session is one whose sliding expiry is in the
+// future but whose login time (created) is past the cap.
+func TestSessionAbsoluteMaxAge(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if err := a.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	// activeWithLoginAgo mints a real session, then backdates its LOGIN time
+	// by createdAgo while keeping its sliding expiry in the future (now+TTL) —
+	// the exact state a continuously-active session reaches createdAgo after
+	// login.
+	activeWithLoginAgo := func(createdAgo time.Duration) string {
+		tok, ok := a.CreateSession("admin", "secretpw", false)
+		if !ok {
+			t.Fatal("CreateSession failed")
+		}
+		a.mu.Lock()
+		s := a.sessions[tok]
+		s.created = time.Now().Add(-createdAgo)
+		s.expiry = time.Now().Add(authSessionTTL) // actively slid: far in the future
+		a.sessions[tok] = s
+		a.mu.Unlock()
+		return tok
+	}
+
+	// 1. Within the cap: an active session still validates (and slides).
+	within := activeWithLoginAgo(29 * 24 * time.Hour)
+	if !a.ValidSession(within) {
+		t.Fatal("a session within the max-age cap must stay valid")
+	}
+
+	// 2. Past the cap: an ACTIVE session (future sliding expiry) is rejected
+	//    AND deleted once authSessionMaxAge elapses from login.
+	past := activeWithLoginAgo(31 * 24 * time.Hour)
+	if a.ValidSession(past) {
+		t.Fatal("ValidSession accepted a session past its absolute max-age")
+	}
+	a.mu.Lock()
+	_, stillValid := a.sessions[past]
+	a.mu.Unlock()
+	if stillValid {
+		t.Fatal("a past-max-age session entry must be deleted on rejection")
+	}
+
+	// 3. The cap must hold on SessionUser too (the gate-exempt
+	//    /api/auth/status path) — not just ValidSession — otherwise a
+	//    status-poll-only client would slide its session forever.
+	past2 := activeWithLoginAgo(31 * 24 * time.Hour)
+	if _, ok := a.SessionUser(past2); ok {
+		t.Fatal("SessionUser accepted a session past its absolute max-age")
+	}
+	a.mu.Lock()
+	_, stillValid2 := a.sessions[past2]
+	a.mu.Unlock()
+	if stillValid2 {
+		t.Fatal("SessionUser must delete a past-max-age session on rejection")
+	}
+
+	// 4. A just-logged-in session is unaffected by the cap.
+	fresh, ok := a.CreateSession("admin", "secretpw", false)
+	if !ok {
+		t.Fatal("CreateSession failed")
+	}
+	if !a.ValidSession(fresh) {
+		t.Fatal("a just-logged-in session must be valid")
+	}
+}
+
 // TestAuthEnabledCacheServesFromCache proves the core claim: Enabled() stops
 // issuing the per-request COUNT(*). userCountFn is a per-instance seam that
 // counts how many times the underlying count source is actually read. Once
