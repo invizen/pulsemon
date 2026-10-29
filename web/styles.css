@@ -1,0 +1,55 @@
+:root {
+      color-scheme: dark;
+      --s950: 7 9 14; --s900: 11 15 23; --s850: 16 22 34; --s800: 22 31 48; --s700: 34 47 71; --s600: 51 68 102;
+      --okc: 16 185 129; --warnc: 245 158 11; --badc: 244 63 94; --jitc: 129 140 248;
+      --ok-solid: #10b981; --bad-solid: #f43f5e; --g-grid: #161f30; --g-text: #64748b;
+    }
+    .light {
+      color-scheme: light;
+      --s950: 238 241 245; --s900: 255 255 255; --s850: 234 238 245; --s800: 210 216 228; --s700: 186 195 209; --s600: 160 172 190;
+      --okc: 5 150 105; --warnc: 217 119 6; --badc: 225 29 72; --jitc: 99 102 241;
+      --ok-solid: #059669; --bad-solid: #e11d48; --g-grid: #d7dee8; --g-text: #64748b;
+    }
+    .light .text-slate-100 { color: #1e293b; }
+    .light .text-slate-200 { color: #334155; }
+    .light .text-slate-300 { color: #475569; }
+    .light .text-slate-400 { color: #475569; }
+    .light .text-slate-500 { color: #56637a; }
+    .light .text-slate-600 { color: #8494a8; }
+    .light .text-slate-700 { color: #cbd5e1; }
+    .light .text-white { color: #0f172a; }
+    .light .hover\:text-white:hover { color: #0f172a; }
+    select, option { color-scheme: dark; background-color: #0b0f17; color: #f1f5f9; }
+    .light select, .light option { color-scheme: light; background-color: #fff; color: #1e293b; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    /* ── Global +1px text scale (tune the +1px here; set to +0px to revert) ── */
+    .text-\[10px\] { font-size: 11px !important; }
+    .text-\[11px\] { font-size: 12px !important; }
+    .text-\[12px\] { font-size: 13px !important; }
+    .text-\[13px\] { font-size: 14px !important; }
+    .text-\[14px\] { font-size: 15px !important; }
+    .text-\[15px\] { font-size: 16px !important; }
+    .text-\[16px\] { font-size: 17px !important; }
+    .text-\[17px\] { font-size: 18px !important; }
+    .text-\[18px\] { font-size: 19px !important; }
+    .text-\[19px\] { font-size: 20px !important; }
+    .text-\[20px\] { font-size: 21px !important; }
+    .text-\[32px\] { font-size: 33px !important; }
+    ::-webkit-scrollbar-track { background: #0b0f17; }
+    ::-webkit-scrollbar-thumb { background: #222f47; border-radius: 3px; }
+    .light ::-webkit-scrollbar-track { background: #eef1f5; }
+    .light ::-webkit-scrollbar-thumb { background: #b9c5d6; border-radius: 3px; }
+    .glow-ok { box-shadow: 0 0 10px rgba(16, 185, 129, 0.45); }
+    .glow-warn { box-shadow: 0 0 10px rgba(245, 158, 11, 0.45); }
+    .glow-bad { box-shadow: 0 0 10px rgba(244, 63, 94, 0.55); }
+    .light .glow-ok { box-shadow: 0 0 8px rgba(5, 150, 105, 0.35); }
+    .light .glow-warn { box-shadow: 0 0 8px rgba(217, 119, 6, 0.35); }
+    .light .glow-bad { box-shadow: 0 0 8px rgba(225, 29, 72, 0.4); }
+    .spark-bar { transition: height 0.2s ease, background-color 0.2s ease; }
+    .modal-backdrop { animation: fadein 0.12s ease; }
+    @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+    /* Thin JetBrains Mono '/' at weight 400 can fail to rasterize on high-DPI
+       displays, so "https://" reads as "https:". Heavier weight + a small letter
+       gap + antialiasing keeps both slashes visible. Named class (not inline) so a
+       future UI rewrite can't silently drop it -- restores f95386a, lost in v0.2.0. */
+    .url-mono { font-weight: 600; letter-spacing: .03em; -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }

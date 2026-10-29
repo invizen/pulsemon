@@ -268,7 +268,17 @@ func (s *Server) authGate() http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "no-referrer")
-		w.Header().Set("Content-Security-Policy", "frame-ancestors 'none'")
+		// Strict CSP: the dashboard is fully self-contained (go:embed web/*, no
+		// CDN), so 'self' is the whole story. script-src and style-src are
+		// 'self' with NO 'unsafe-inline' and no hashes — the theme, app, and
+		// custom CSS all live in files (web/theme.js, web/app.js, web/styles.css,
+		// web/vendor/tailwind.css), so an injected inline <script>/<style> is
+		// refused. That is defence in depth on top of the esc()/escJs() escaping:
+		// if one interpolation were ever missed, a reflected payload has no
+		// script/style source to run from. object-src/base-uri/form-action are
+		// locked down; frame-ancestors 'none' keeps the clickjacking guard.
+		w.Header().Set("Content-Security-Policy",
+			"default-src 'self'; script-src 'self'; style-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
 		// Sensitive JSON payloads (/api/settings, /api/auth/status, sensor
 		// data) must not be cached by browsers or intermediate proxies:
 		// no-store on every /api/ response. Static assets set their own

@@ -373,6 +373,54 @@ there). The 60s throttle bounds the abuse without that friction. Pinned by
 `?refresh=1` is ignored — no new upstream hit; a `?refresh=1` after the
 interval forces a fresh fetch).
 
+## precompiled-tailwind-strict-csp (web/, api.go, 2026-10-29)
+
+**Contract:** the dashboard is fully self-contained and ships **zero** inline
+`<script>`/`<style>`. Tailwind is PRECOMPILED to a static stylesheet
+(`web/vendor/tailwind.css`, ~30 KB) at build time by the Tailwind CLI
+(`make css`, pinned `tailwindcss@3.4.17`), replacing the ~407 KB Play CDN
+in-browser JIT that used to be vendored as `web/vendor/tailwind.js` and
+generated CSS on every page load. The theme, app, and custom CSS live in
+files — `web/theme.js`, `web/app.js`, `web/styles.css` — so the CSP in
+`api.go` (`authGate`) can be strict with **no** `'unsafe-inline'` and **no**
+hashes:
+
+```
+default-src 'self'; script-src 'self'; style-src 'self';
+object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+```
+
+**Why precompile:** the Play CDN JIT is explicitly not recommended for
+production — it runs a ~400 KB compiler in the browser and regenerates CSS on
+every load. Precompiling removes that client-side cost and, because the
+output is a static same-origin file, makes a `'self'`-only CSP practical
+(the JIT's inline `tailwind.config` script was one of the two inline blocks
+that forced hashes/`unsafe-inline`).
+
+**Why the strict CSP:** the escaping (`esc`/`escJs`) is consistent, but a CSP
+is defence in depth for the one interpolation that's ever missed. With
+`script-src 'self'; style-src 'self'` and no inline source, a reflected
+payload has no `<script>`/`<style>` it can run from. `object-src 'none'`,
+`base-uri 'none'`, and `form-action 'self'` are locked down;
+`frame-ancestors 'none'` keeps the clickjacking guard. Every asset is local
+(`go:embed web/*`, no CDN, no `data:` URIs), so `'self'` is the whole story.
+
+**Regeneration:** `make css` runs the Tailwind CLI against
+`web/tailwind.input.css` (config `web/tailwind.config.js`, which mirrors the
+old inline theme extension — CSS-variable colors so the `.light` theme swap
+keeps working — and safelists the ok/warn/bad status utilities composed in
+`app.js`). The compiled `web/vendor/tailwind.css` is COMMITTED so the Go
+build works without a Node toolchain; regenerate it after adding/renaming a
+Tailwind class. `content` paths use `path.resolve(__dirname, …)` so they
+resolve to `web/` regardless of the CLI's working directory.
+
+**Pinned by:** `TestFix_g1_SecurityHeaders` (asserts the exact CSP string)
+and `TestFix_csp_NoInlineScriptsOrStyles` (asserts the served `index.html`
+has no inline `<script>`/`<style>` and references the external files — a
+re-inlined block, which the CSP would silently refuse to run, fails the test).
+Sabotage-verified: injecting an inline `<script>` before `</body>` makes
+`TestFix_csp_NoInlineScriptsOrStyles` fail.
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)
