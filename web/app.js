@@ -18,6 +18,49 @@ function toggleTheme() {
 
 let viewMode = localStorage.getItem('pulsemon_view') || 'cards';
 const $ = id => document.getElementById(id);
+
+// ---------- CSP-safe click dispatch (replaces inline onclick) ----------
+// Finding 10's strict CSP (script-src 'self', no 'unsafe-inline') blocks
+// inline onclick="..." attributes — which is exactly what the dashboard
+// generated for every control, so none of them fired. Each control now
+// carries data-act + data-args and this single delegated listener dispatches
+// the click. data-args is a JSON array of the handler's arguments; handlers
+// in ACT_NEEDS_EL also receive the clicked element (the old
+// `onclick="fn(x, this)"` pattern). Every ACT target is a top-level function
+// declaration (hoisted), so the map can reference them here.
+function dataArgs(...vals) {
+  return 'data-args="' + JSON.stringify(vals).replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '"';
+}
+const ACT_NEEDS_EL = new Set(['confirmClearActivity', 'confirmRemoveTLSCert', 'confirmDisableAuth', 'confirmClearHistory', 'echoPing', 'confirmInlineDelete']);
+const ACT = {
+  openSettings, toggleTheme, openAlerts, openSensorModal, setViewMode,
+  confirmClearActivity, closeModal, closeSettings, toggleMaint, checkUpdate,
+  applyTLSCert, confirmRemoveTLSCert, openFirstAccountDialog, toggleUnauthUpdate,
+  addAuthUser, openChangePasswordDialog, logoutAuth, confirmDisableAuth,
+  closeAlerts, saveAlerts, hideAccModal, submitAccountModal, closeInspector,
+  setGraphRange, confirmClearHistory, setTag, openInspector, echoPing,
+  togglePause, cloneSensor, confirmInlineDelete, removeFormTag, startUpdate,
+  undismissUpdate, dismissUpdate, copyCmd, removeAuthUser, toggleScopeItem,
+  toggleProvider, testWebhook
+};
+document.addEventListener('click', e => {
+  const el = e.target.closest ? e.target.closest('[data-act]') : null;
+  if (!el) return;
+  const act = el.dataset.act;
+  let args = [];
+  try { args = JSON.parse(el.dataset.args || '[]'); } catch (_) { args = []; }
+  const fn = ACT[act];
+  if (typeof fn !== 'function') { console.error('unknown data-act:', act); return; }
+  if (ACT_NEEDS_EL.has(act)) args = args.concat([el]);
+  fn.apply(null, args);
+});
+// Handlers that previously existed only as inline one-liners:
+function hideAccModal() { const m = $('acc-modal'); if (m) m.classList.add('hidden'); }
+function setGraphRange(range) { graphRange = range; loadInspector(); }
+function copyCmd(cmd) { navigator.clipboard.writeText(cmd).then(() => setMsg('command copied', 'ok')).catch(() => setMsg('copy failed', 'bad')); }
+function undismissUpdate(running, latest) { localStorage.removeItem('pulsemon_update_dismissed'); renderUpdateUI({ running: running, latest: latest, available: true }); }
+function dismissUpdate(running, latest) { localStorage.setItem('pulsemon_update_dismissed', latest); renderUpdateUI({ running: running, latest: latest, available: false }); }
+
 syncThemeIcon();
 
 // ---------- Authentication Flow ----------
@@ -238,7 +281,7 @@ function sparklineBars(hour, spikeMult) {
     const h = Math.min(100, Math.max(12, (v / maxVal) * 100));
     let cls = 'bg-ok/80';
     if (v > 200) cls = 'bg-bad'; else if (spikeAt > 0 && v >= spikeAt) cls = 'bg-warn';
-    return '<div class="spark-bar flex-1 rounded-sm ' + cls + '" style="height:' + h + '%" title="' + fmtRtt(v) + '"></div>';
+    return '<div class="spark-bar flex-1 rounded-sm ' + cls + '" data-h="' + h + '%" title="' + fmtRtt(v) + '"></div>';
   }).join('');
 }
 
@@ -256,10 +299,10 @@ function render() {
   const off = 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800';
   $('tag-chips').innerHTML = tags.map(t => {
     if (t === 'ALL') {
-      return '<button onclick="setTag(\'ALL\')" class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
+      return '<button data-act="setTag" ' + dataArgs('ALL') + ' class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
         (activeTags.size === 0 ? on : off) + '">ALL</button>';
     }
-    return '<button onclick="setTag(\'' + escJs(t) + '\')" class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
+    return '<button data-act="setTag" ' + dataArgs(t) + ' class="px-2.5 py-1 rounded-md whitespace-nowrap transition ' +
       (activeTags.has(t) ? on : off) + '">' + esc(t) + '</button>';
   }).join('');
 
@@ -316,6 +359,9 @@ function render() {
 }
 
 function layoutSparklines() {
+  // CSP-safe: bar heights live in data-h (no inline style attribute, which the
+  // strict Content-Security-Policy blocks). Apply them via the style property.
+  document.querySelectorAll('[data-h]').forEach(b => { b.style.height = b.dataset.h; });
   // Round each bar to a whole number of PHYSICAL (device) pixels so the browser
   // rasterizes every bar identically. A fractional CSS width (e.g. 4.14px) is
   // invisible on a 1x screen but, on fractionally-scaled high-DPI displays
@@ -356,7 +402,7 @@ function cardHtml(s) {
 
   return '<div class="bg-surface-900 border ' + border + ' rounded-xl p-2.5 pb-1 flex flex-col gap-2 transition hover:shadow-lg hover:shadow-black/20 ' + (paused ? 'opacity-70' : '') + '">' +
     '<div class="flex items-start justify-between gap-2">' +
-      '<div class="flex items-start gap-2 min-w-0 cursor-pointer" onclick="openInspector(\'' + escJs(s.id) + '\')">' +
+      '<div class="flex items-start gap-2 min-w-0 cursor-pointer" data-act="openInspector" ' + dataArgs(s.id) + '>' +
         '<i class="ph-bold ' + m.icon + ' text-[16px] shrink-0 mt-px ' + (m.label === 'PAUSED' ? 'text-slate-500' : m.label === 'UP' ? 'text-ok' : m.label === 'WARN' ? 'text-warn' : 'text-bad') + '"></i>' +
         '<div class="min-w-0">' +
           '<div class="flex items-center gap-1.5 min-w-0">' +
@@ -401,15 +447,15 @@ function cardHtml(s) {
     '</div>' +
 
     '<div class="flex items-end justify-between mt-auto pt-1.5 border-t border-surface-800/60">' +
-      '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
+      '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
       // Mutation cluster (pause/edit/clone/delete) is admin-only — the
       // server 403s these for non-admin sessions (requireAdmin); the UI
       // just hides what a regular account can't use. Pulse Now stays.
       (meIsAdmin ? '<div class="flex items-center gap-0.5">' +
-        '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
-        '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
-        '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
-        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
+        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
+        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
+        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
+        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
       '</div>' : '') +
     '</div>' +
   '</div>';
@@ -426,7 +472,7 @@ function miniSpark(recent) {
     const h = Math.min(18, Math.max(3, (v / maxVal) * 18));
     let cls = 'bg-ok/70';
     if (v > 200) cls = 'bg-bad'; else if (v >= 100) cls = 'bg-warn';
-    return '<div class="w-[2.5px] rounded-sm ' + cls + '" style="height:' + h + 'px" title="' + fmtRtt(v) + '"></div>';
+    return '<div class="w-[2.5px] rounded-sm ' + cls + '" data-h="' + h + 'px" title="' + fmtRtt(v) + '"></div>';
   }).join('');
 }
 
@@ -445,7 +491,7 @@ function renderTable(list) {
 
     return '<tr class="hover:bg-surface-850/50 transition-colors">' +
       '<td class="py-2 px-3.5"><span class="inline-flex items-center gap-1.5 ' + m.cls.split(' ')[0] + ' font-semibold"><span class="w-2 h-2 rounded-full ' + m.dot + '"></span>' + m.label + '</span></td>' +
-      '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" onclick="openInspector(\'' + escJs(s.id) + '\')">' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
+      '<td class="py-2 px-3.5 font-semibold text-slate-200"><span class="hover:text-ok cursor-pointer" data-act="openInspector" ' + dataArgs(s.id) + '>' + esc(s.name) + '</span><span class="ml-1.5 px-1 py-0.2 rounded text-[10px] font-mono border ' + (s.type === 'http' ? 'bg-jit/10 border-jit/30 text-jit' : 'bg-surface-800 border-surface-700 text-slate-500') + '">' + typeLabel(s) + '</span></td>' +
       '<td class="url-mono py-2 px-3.5 text-slate-500 text-[12px] hidden md:table-cell max-w-[200px] truncate">' + esc(s.target) + '</td>' +
       '<td class="py-2 px-3.5">' + ((s.tags || []).length ? (s.tags || []).map(t => '<span class="inline-block px-1.5 py-0.2 rounded text-[11px] bg-surface-950 border border-surface-800 text-slate-400 mr-1">' + esc(t) + '</span>').join('') : '<span class="text-slate-600">—</span>') + '</td>' +
       '<td class="py-2 px-3.5 text-right font-semibold ' + (st && st.rtt_last != null ? 'text-slate-100' : 'text-slate-500') + '"><span class="mr-1">' + badge + '</span>' + rtt + cert + '</td>' +
@@ -454,13 +500,13 @@ function renderTable(list) {
       '<td class="py-2 px-3.5 text-right ' + (st && st.total ? (st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') : 'text-slate-500') + '">' + up24 + '</td>' +
       '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
-        '<button onclick="echoPing(\'' + escJs(s.id) + '\', this)" title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
         // Admin-only mutation cluster (mirrors cardHtml); non-admins keep Pulse Now.
         (meIsAdmin ?
-        '<button onclick="togglePause(\'' + escJs(s.id) + '\')" title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
-        '<button onclick="openSensorModal(\'' + escJs(s.id) + '\')" title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
-        '<button onclick="cloneSensor(\'' + escJs(s.id) + '\')" title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button onclick="confirmInlineDelete(\'' + escJs(s.id) + '\', \'' + escJs(s.name) + '\', this)" title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' : '') +
+        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
+        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' : '') +
       '</div></td></tr>';
   }).join('');
 }
@@ -670,7 +716,7 @@ function renderFormTags(selected) {
   } else {
     box.innerHTML = selected.map(t =>
       '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-[11px] font-mono text-slate-200">' +
-      esc(t) + '<button type="button" onclick="removeFormTag(\'' + escJs(t) + '\')" class="text-slate-500 hover:text-bad"><i class="ph ph-x"></i></button></span>').join('');
+      esc(t) + '<button type="button" data-act="removeFormTag" ' + dataArgs(t) + ' class="text-slate-500 hover:text-bad"><i class="ph ph-x"></i></button></span>').join('');
   }
   const pick = $('f-tagpick');
   const cur = pick.value;
@@ -812,7 +858,7 @@ async function openAlerts() {
     $('set-summary').className = 'px-2 py-0.5 rounded bg-bad/10 border border-bad/40 text-bad';
     // Informative empty-state so the section doesn't read as "the feature is gone"
     const box = $('provider-list');
-    if (box) box.innerHTML = '<div class="border border-bad/40 rounded-lg px-3 py-2 bg-bad/5 text-[12px] font-mono text-bad flex items-center gap-2"><i class="ph-bold ph-warning"></i> Could not load alert settings (<span>' + esc(e.message || 'request failed') + '</span>). <button onclick="openAlerts()" class="ml-auto underline hover:text-white">Retry</button></div>';
+    if (box) box.innerHTML = '<div class="border border-bad/40 rounded-lg px-3 py-2 bg-bad/5 text-[12px] font-mono text-bad flex items-center gap-2"><i class="ph-bold ph-warning"></i> Could not load alert settings (<span>' + esc(e.message || 'request failed') + '</span>). <button data-act="openAlerts" class="ml-auto underline hover:text-white">Retry</button></div>';
     setMsg('Failed to load alert settings: ' + (e.message || 'request failed'), 'bad', 'alerts');
   }
 }
@@ -845,13 +891,13 @@ function renderUpdateUI(r) {
     body.innerHTML =
       '<span>running <b class="text-slate-200">' + esc(r.running) + '</b> · latest <b class="text-warn">' + esc(r.latest) + '</b></span>' +
       '<span class="flex items-center gap-2">' +
-      (meIsAdmin ? '<button id="update-btn" onclick="startUpdate()" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' : '') +
+      (meIsAdmin ? '<button id="update-btn" data-act="startUpdate" title="Download and install ' + esc(r.latest) + ' now" class="px-2 py-0.5 rounded bg-ok/10 border border-ok/40 text-ok hover:bg-ok/20 text-[11px] font-semibold transition"><i class="ph-bold ph-download-simple"></i> update</button>' : '') +
       // Scheme allowlist (review nit): esc() blocks attribute breakout but
       // NOT a javascript:/data: scheme. Safe with the built-in GitHub URL,
       // but a future custom/proxied update source must not become XSS.
       '<a href="' + (/^https:\/\//i.test(r.url) ? esc(r.url) : '#') + '" target="_blank" rel="noopener" class="text-ok hover:underline">release notes</a>' +
-        (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button onclick="localStorage.removeItem(\'pulsemon_update_dismissed\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:true})" class="text-slate-400 hover:text-white">undo</button>'
-          : '<button onclick="localStorage.setItem(\'pulsemon_update_dismissed\',\'' + escJs(r.latest) + '\');renderUpdateUI({running:\'' + escJs(r.running) + '\',latest:\'' + escJs(r.latest) + '\',available:false})" class="text-slate-500 hover:text-white">dismiss</button>') +
+        (localStorage.getItem('pulsemon_update_dismissed') === r.latest ? '<button data-act="undismissUpdate" ' + dataArgs(r.running, r.latest) + ' class="text-slate-400 hover:text-white">undo</button>'
+          : '<button data-act="dismissUpdate" ' + dataArgs(r.running, r.latest) + ' class="text-slate-500 hover:text-white">dismiss</button>') +
       '</span>';
   } else {
     body.innerHTML =
@@ -946,7 +992,7 @@ function renderContainerUpdate(res) {
     '<span class="text-warn"><i class="ph-bold ph-info"></i> Docker install — the app cannot update itself</span>' +
     '<span class="flex items-center gap-2">' +
       '<code class="text-[11px] bg-surface-800 border border-surface-700 rounded px-2 py-0.5">' + esc(cmd) + '</code>' +
-      '<button onclick="navigator.clipboard.writeText(\'' + escJs(cmd) + '\').then(() => setMsg(\'command copied\', \'ok\')).catch(() => setMsg(\'copy failed\', \'bad\'))" class="text-slate-400 hover:text-white">copy</button>' +
+      '<button data-act="copyCmd" ' + dataArgs(cmd) + ' class="text-slate-400 hover:text-white">copy</button>' +
     '</span>';
 }
 
@@ -1004,7 +1050,7 @@ async function renderAuthPanel() {
       (u.username === status.user ? ' <span class="text-[10px] text-ok font-mono">(you)</span>' : '') +
       (u.is_admin ? ' <span class="text-[10px] text-amber-400 font-mono">admin</span>' : '') +
       '</span>' +
-      (meIsAdmin && u.username !== status.user ? '<button onclick="removeAuthUser(\'' + escJs(u.username) + '\')" class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>' : '') +
+      (meIsAdmin && u.username !== status.user ? '<button data-act="removeAuthUser" ' + dataArgs(u.username) + ' class="text-[11px] font-mono text-slate-500 hover:text-bad">Remove</button>' : '') +
       '</div>'
     ).join('');
   } else {
@@ -1233,7 +1279,7 @@ function renderScopeOptions(selected) {
   // EMPTY alert_filter (review nit).
   box.innerHTML = items.map(o => {
     const on = sel.has(o.val);
-    return '<button type="button" onclick="toggleScopeItem(this)" data-val="' + esc(o.val) + '" data-sel="' + (on ? '1' : '0') + '" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(o.label) + '</button>';
+    return '<button type="button" data-act="toggleScopeItem" data-val="' + esc(o.val) + '" data-sel="' + (on ? '1' : '0') + '" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ' + (on ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-950/60 border-surface-800 text-slate-400 hover:text-white') + '">' + esc(o.label) + '</button>';
   }).join('');
 }
 
@@ -1304,13 +1350,13 @@ function renderProviderList(providers) {
     row.innerHTML = `
       <div class="flex items-center justify-between mb-1.5">
         <span class="text-[12px] font-semibold text-slate-200 flex items-center gap-1.5">${meta.icon} ${esc(meta.name)}</span>
-        <button type="button" onclick="toggleProvider('${escJs(p.kind)}')" class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
+        <button type="button" data-act="toggleProvider" data-args='["${p.kind}"]' class="px-2 py-0.5 rounded text-[11px] font-mono border transition ${p.enabled ? 'bg-ok/15 border-ok/40 text-ok' : 'bg-surface-800 border-surface-700 text-slate-400'}">
           ${p.enabled ? 'Enabled' : 'Disabled'}
         </button>
       </div>
       <div class="flex items-center gap-2">
         <input id="prov-url-${esc(p.kind)}" type="text" placeholder="${urlPlaceholder}" value="${esc(urlVal)}" class="flex-1 bg-surface-950 border border-surface-800 rounded px-2 py-1 text-[12px] font-mono text-slate-200 focus:outline-none focus:border-ok/60" autocomplete="off">
-        <button type="button" onclick="testWebhook('${escJs(p.kind)}')" class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
+        <button type="button" data-act="testWebhook" data-args='["${p.kind}"]' class="px-2.5 py-1 rounded bg-jit/10 border border-jit/30 text-jit hover:bg-jit/20 text-[11px] font-semibold whitespace-nowrap">Test</button>
       </div>
       ${extraRow}`;
     box.appendChild(row);

@@ -206,7 +206,15 @@ func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	}
 	hsCtx, cancel := context.WithTimeout(ctx, probeTLSHandshakeTimeout)
 	defer cancel()
-	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	// ServerName sets the SNI. Without it the handshake sends NO SNI and
+	// SNI-dependent servers (Cloudflare-fronted hosts — most public sites)
+	// reject it with "remote error: tls: handshake failure". That is the
+	// exact v0.4.0 regression that took HTTPS sensors down: the old
+	// transport path set ServerName from the request URL automatically, but
+	// this manual dial must do it explicitly. For IP-literal hosts Go blanks
+	// the SNI (RFC 6066 §3), so this is a no-op there and verifyHTTPCert
+	// still judges the IP SAN.
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: host})
 	if err := tlsConn.HandshakeContext(hsCtx); err != nil {
 		conn.Close()
 		return nil, err

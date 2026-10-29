@@ -62,7 +62,7 @@
         <div class="flex items-center gap-2">
           <span class="font-extrabold tracking-tight text-[17px]"><span class="text-ok">pulse</span><span class="text-slate-400">mon</span></span>
           <span id="app-ver" class="text-[11px] font-mono px-1.5 py-0.5 rounded bg-surface-800 border border-surface-700 text-slate-400" title="pulsemon version">v…</span>
-          <button id="update-pill" class="hidden text-[11px] font-mono px-1.5 py-0.5 rounded bg-warn/10 border border-warn/40 text-warn hover:bg-warn/20 transition" title="Update available — see Settings" onclick="openSettings()"><i class="ph-bold ph-arrow-up"></i> <span id="update-pill-ver">update</span></button>
+          <button id="update-pill" class="hidden text-[11px] font-mono px-1.5 py-0.5 rounded bg-warn/10 border border-warn/40 text-warn hover:bg-warn/20 transition" title="Update available — see Settings" data-act="openSettings"><i class="ph-bold ph-arrow-up"></i> <span id="update-pill-ver">update</span></button>
         </div>
         <p class="text-[12px] text-slate-500 hidden sm:block">network sensor monitor</p>
       </div>
@@ -80,16 +80,16 @@
     </div>
 
     <div class="flex items-center gap-2">
-      <button onclick="toggleTheme()" id="theme-toggle" title="Toggle light/dark theme" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+      <button data-act="toggleTheme" id="theme-toggle" title="Toggle light/dark theme" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i id="theme-icon" class="ph-bold ph-sun text-[19px]"></i>
       </button>
-      <button id="alerts-btn" onclick="openAlerts()" title="Alerts" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+      <button id="alerts-btn" data-act="openAlerts" title="Alerts" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i class="ph-bold ph-bell text-[19px]"></i>
       </button>
-      <button onclick="openSettings()" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
+      <button data-act="openSettings" title="Settings" class="p-2 rounded-lg hover:bg-surface-800 text-slate-400 hover:text-white transition">
         <i class="ph-bold ph-gear text-[19px]"></i>
       </button>
-      <button id="new-sensor-btn" onclick="openSensorModal()" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
+      <button id="new-sensor-btn" data-act="openSensorModal" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-ok/10 border border-ok/30 text-ok hover:bg-ok/20 active:scale-95 transition text-[13px] font-semibold">
         <i class="ph-bold ph-plus text-[15px]"></i> <span class="hidden sm:inline">New Sensor</span><span class="sm:hidden">New</span>
       </button>
     </div>
@@ -137,10 +137,10 @@
       </div>
 
       <div class="flex items-center bg-surface-950 border border-surface-800 rounded-lg p-0.5">
-        <button onclick="setViewMode('cards')" id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800 transition">
+        <button data-act="setViewMode" data-args=\'['cards']\' id="view-cards-btn" title="Card view" class="p-1.5 rounded text-white bg-surface-800 transition">
           <i class="ph-bold ph-squares-four text-[15px]"></i>
         </button>
-        <button onclick="setViewMode('table')" id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white transition">
+        <button data-act="setViewMode" data-args=\'['table']\' id="view-table-btn" title="Dense table view" class="p-1.5 rounded text-slate-400 hover:text-white transition">
           <i class="ph-bold ph-rows text-[15px]"></i>
         </button>
       </div>
@@ -176,7 +176,7 @@
     <div class="inline-flex p-4 rounded-full bg-surface-900 border border-surface-800 text-slate-500 mb-3"><i class="ph ph-waveform-slash text-[32px]"></i></div>
     <h3 class="text-[15px] font-semibold text-slate-300" id="empty-title">No sensors match your filter</h3>
     <p class="text-[13px] text-slate-500 mt-1" id="empty-sub">Clear the search or tag filter, or add a new sensor.</p>
-    <button id="empty-add-btn" onclick="openSensorModal()" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
+    <button id="empty-add-btn" data-act="openSensorModal" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
       <i class="ph-bold ph-plus"></i> Add your first sensor
     </button>
   </div>
@@ -189,7 +189,7 @@
         <span class="text-[12px] font-bold text-slate-300 tracking-wider">ACTIVITY</span>
         <span class="text-[11px] text-slate-500 font-mono">state transitions</span>
       </div>
-      <button id="clear-activity-btn" onclick="confirmClearActivity(this)" title="Clear activity log"
+      <button id="clear-activity-btn" data-act="confirmClearActivity" title="Clear activity log"
         class="px-2 py-0.5 rounded text-[11px] font-mono text-slate-400 hover:text-bad hover:bg-surface-800 transition flex items-center gap-1">
         <i class="ph ph-trash-simple"></i> Clear
       </button>
@@ -203,7 +203,7 @@
   <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden">
     <div class="px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
       <h2 id="modal-title" class="text-[14px] font-bold text-white uppercase tracking-wider font-mono">New Sensor</h2>
-      <button onclick="closeModal()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
+      <button data-act="closeModal" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
     </div>
     <form id="sensor-form" onsubmit="submitSensor(event)" class="p-5 space-y-3.5">
       <input type="hidden" id="f-id">
@@ -260,7 +260,7 @@
       <div id="form-err" class="hidden text-[12px] text-bad font-mono"></div>
 
       <div class="flex justify-end gap-2 pt-2 border-t border-surface-800">
-        <button type="button" onclick="closeModal()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Cancel</button>
+        <button type="button" data-act="closeModal" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Cancel</button>
         <button type="submit" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Sensor</button>
       </div>
     </form>
@@ -272,7 +272,7 @@
   <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
     <div class="shrink-0 px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
       <h2 class="text-[14px] font-bold text-white flex items-center gap-2"><i class="ph-bold ph-gear text-slate-400"></i> Settings</h2>
-      <button onclick="closeSettings()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
+      <button data-act="closeSettings" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
     </div>
 
     <div class="p-5 space-y-4 overflow-y-auto min-h-0 text-[13px]">
@@ -288,7 +288,7 @@
           </span>
           <span class="block text-[11px] text-slate-500" id="maint-desc">Pause probe executions globally without deleting schedules</span>
         </div>
-        <button type="button" id="maint-btn" onclick="toggleMaint()" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-warn text-[12px] font-mono flex items-center gap-1.5 transition">
+        <button type="button" id="maint-btn" data-act="toggleMaint" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-warn text-[12px] font-mono flex items-center gap-1.5 transition">
           <i id="maint-icon" class="ph-bold ph-pause"></i> <span id="maint-btn-txt">Pause All</span>
         </button>
       </div>
@@ -299,7 +299,7 @@
           <span class="font-semibold text-slate-200 flex items-center gap-1.5">
             <i class="ph-bold ph-git-branch text-slate-400"></i> Version
           </span>
-          <button id="ver-refresh" onclick="checkUpdate(true)" title="Re-check for updates now" class="p-1 rounded text-slate-500 hover:text-white transition"><i class="ph ph-arrows-clockwise"></i></button>
+          <button id="ver-refresh" data-act="checkUpdate" data-args=\'[true]\' title="Re-check for updates now" class="p-1 rounded text-slate-500 hover:text-white transition"><i class="ph ph-arrows-clockwise"></i></button>
         </div>
         <div id="ver-body" class="mt-1.5 flex items-center justify-between text-[12px] font-mono text-slate-400">
           <span>checking…</span><span>—</span>
@@ -327,8 +327,8 @@
           </div>
         </div>
         <div class="flex gap-2 pt-1">
-          <button onclick="applyTLSCert()" class="px-3 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[11px] font-mono font-semibold">Apply Cert</button>
-          <button onclick="confirmRemoveTLSCert(this)" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[11px] font-mono">Remove Cert</button>
+          <button data-act="applyTLSCert" class="px-3 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[11px] font-mono font-semibold">Apply Cert</button>
+          <button data-act="confirmRemoveTLSCert" id="tls-remove-btn" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[11px] font-mono">Remove Cert</button>
         </div>
       </div>
 
@@ -344,7 +344,7 @@
         
         <div id="auth-off-box">
           <p id="auth-off-desc" class="text-[12px] text-slate-500 mb-2">Protect dashboard with secure credential gate.</p>
-          <button id="auth-create-first-btn" onclick="openFirstAccountDialog()" class="w-full py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">
+          <button id="auth-create-first-btn" data-act="openFirstAccountDialog" class="w-full py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-mono font-semibold">
             Create First Account
           </button>
           <!-- Operator-disabled state (auth_bootstrapped): unauthenticated
@@ -361,7 +361,7 @@
               <span class="text-[12px] text-slate-200 font-semibold">Allow self-update without an account</span>
               <span class="block text-[10px] text-slate-500">Only applies while authentication is off. Any LAN host can trigger an update while enabled.</span>
             </div>
-            <button type="button" id="unauth-update-btn" onclick="toggleUnauthUpdate()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 text-[11px] font-mono shrink-0 transition">
+            <button type="button" id="unauth-update-btn" data-act="toggleUnauthUpdate" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 text-[11px] font-mono shrink-0 transition">
               <span id="unauth-update-txt">Off</span>
             </button>
           </div>
@@ -377,15 +377,15 @@
               <input id="auth-new-username" type="text" placeholder="Username" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
               <input id="auth-new-password" type="password" placeholder="Password (8+ chars)" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
             </div>
-            <button onclick="addAuthUser()" class="px-3 py-1 rounded-md bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-200 text-[11px] font-mono">
+            <button data-act="addAuthUser" class="px-3 py-1 rounded-md bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-200 text-[11px] font-mono">
               Add User
             </button>
           </div>
 
           <div class="flex flex-wrap gap-2 pt-1">
-            <button onclick="openChangePasswordDialog()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Change Password</button>
-            <button onclick="logoutAuth()" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Sign Out</button>
-            <button id="auth-disable-btn" onclick="confirmDisableAuth(this)" class="px-2.5 py-1 rounded-lg bg-bad/10 border border-bad/30 text-bad hover:bg-bad/20 text-[11px] font-mono">Disable Auth</button>
+            <button data-act="openChangePasswordDialog" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Change Password</button>
+            <button data-act="logoutAuth" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-white text-[11px] font-mono">Sign Out</button>
+            <button id="auth-disable-btn" data-act="confirmDisableAuth" class="px-2.5 py-1 rounded-lg bg-bad/10 border border-bad/30 text-bad hover:bg-bad/20 text-[11px] font-mono">Disable Auth</button>
           </div>
         </div>
       </div>
@@ -396,7 +396,7 @@
     <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
       <span class="text-[11px] text-slate-500 font-mono">persisted in pulsemon.db</span>
       <div class="flex gap-2">
-        <button onclick="closeSettings()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
+        <button data-act="closeSettings" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
       </div>
     </div>
   </div>
@@ -407,7 +407,7 @@
   <div class="bg-surface-900 border border-surface-700/80 w-full max-w-2xl max-h-[90vh] rounded-2xl shadow-2xl overflow-hidden flex flex-col min-h-0">
     <div class="shrink-0 px-5 py-3.5 border-b border-surface-800 flex items-center justify-between bg-surface-850">
       <h2 class="text-[14px] font-bold text-white flex items-center gap-2"><i class="ph-bold ph-bell text-slate-400"></i> Alerts</h2>
-      <button onclick="closeAlerts()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
+      <button data-act="closeAlerts" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x"></i></button>
     </div>
 
     <div class="p-5 space-y-4 overflow-y-auto min-h-0 text-[13px]">
@@ -444,8 +444,8 @@
     <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
       <span class="text-[11px] text-slate-500 font-mono flex items-center gap-2"><a href="https://pulsemon.net/alerts" target="_blank" rel="noopener" class="text-ok/80 hover:text-ok hover:underline">Setup guide for each destination →</a><span class="text-slate-600">·</span>persisted in pulsemon.db</span>
       <div class="flex gap-2">
-        <button onclick="closeAlerts()" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
-        <button onclick="saveAlerts()" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Alerts</button>
+        <button data-act="closeAlerts" class="px-3 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-300 text-[12px] font-mono">Close</button>
+        <button data-act="saveAlerts" class="px-4 py-1.5 rounded-lg bg-ok/15 border border-ok/40 text-ok hover:bg-ok/25 text-[12px] font-semibold">Save Alerts</button>
       </div>
     </div>
   </div>
@@ -473,8 +473,8 @@
     </div>
     <div id="acc-err" class="hidden text-[11px] font-mono text-bad"></div>
     <div class="flex justify-end gap-2 pt-2">
-      <button onclick="$('acc-modal').classList.add('hidden')" class="px-3 py-1 rounded bg-surface-800 text-slate-300 text-[12px] font-mono">Cancel</button>
-      <button id="acc-submit-btn" onclick="submitAccountModal()" class="px-3 py-1 rounded bg-ok/15 border border-ok/40 text-ok text-[12px] font-semibold">Submit</button>
+      <button data-act="hideAccModal" class="px-3 py-1 rounded bg-surface-800 text-slate-300 text-[12px] font-mono">Cancel</button>
+      <button id="acc-submit-btn" data-act="submitAccountModal" class="px-3 py-1 rounded bg-ok/15 border border-ok/40 text-ok text-[12px] font-semibold">Submit</button>
     </div>
   </div>
 </div>
@@ -493,7 +493,7 @@
           <p id="insp-target" class="url-mono text-[12px] text-slate-500 font-mono mt-0.5"></p>
         </div>
       </div>
-      <button onclick="closeInspector()" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
+      <button data-act="closeInspector" class="text-slate-500 hover:text-white p-1 rounded"><i class="ph ph-x text-[16px]"></i></button>
     </div>
 
     <div class="p-5 space-y-4 overflow-y-auto min-h-0">
@@ -526,8 +526,8 @@
             <span id="insp-graph-up" class="text-[11px] font-mono text-slate-500"></span>
           </span>
           <div class="flex items-center gap-1">
-            <button id="grange-1h" onclick="graphRange='1h';loadInspector()" class="px-2 py-0.5 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
-            <button id="grange-24h" onclick="graphRange='24h';loadInspector()" class="px-2 py-0.5 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
+            <button id="grange-1h" data-act="setGraphRange" data-args='["1h"]' class="px-2 py-0.5 rounded text-[11px] font-mono border border-ok/40 bg-ok/10 text-ok">1h</button>
+            <button id="grange-24h" data-act="setGraphRange" data-args='["24h"]' class="px-2 py-0.5 rounded text-[11px] font-mono border border-surface-800 text-slate-400 hover:text-white">24h</button>
           </div>
         </div>
         <div id="insp-graph" class="bg-surface-950 border border-surface-800 rounded-lg p-2 overflow-hidden"></div>
@@ -537,10 +537,10 @@
     <div class="shrink-0 px-5 py-3 border-t border-surface-800 bg-surface-850 flex items-center justify-between">
       <span id="insp-interval" class="text-[11px] text-slate-500 font-mono"></span>
       <div class="flex items-center gap-2">
-        <button id="clear-hist-btn" onclick="confirmClearHistory(this)" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono transition">
+        <button id="clear-hist-btn" data-act="confirmClearHistory" class="px-3 py-1.5 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 hover:text-bad text-[12px] font-mono transition">
           <i class="ph ph-trash"></i> Clear History
         </button>
-        <button onclick="closeInspector()" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-[12px] font-mono">Close</button>
+        <button data-act="closeInspector" class="px-4 py-1.5 rounded-lg bg-surface-800 hover:bg-surface-700 text-slate-200 text-[12px] font-mono">Close</button>
       </div>
     </div>
   </div>

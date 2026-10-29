@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"math/big"
 	"net"
 	"net/http"
@@ -266,6 +267,40 @@ func TestProbeHTTPSelfSignedAccepted(t *testing.T) {
 	}
 	if diff := r.CertExpiry.Sub(notAfter); diff > time.Minute || diff < -time.Minute {
 		t.Errorf("CertExpiry = %v, want ~%v", r.CertExpiry, notAfter)
+	}
+}
+
+// TestProbeHTTPEndToEndSNIRequired: a TLS server that presents its cert ONLY
+// when the client sends the right SNI — the Cloudflare-fronted-host behavior
+// that broke v0.4.0. probeDialTLS must set ServerName so the SNI is on the
+// wire; without it the handshake fails with "remote error: tls: handshake
+// failure" and every HTTPS sensor on an SNI-dependent host reads down. The
+// target is a hostname (localhost), not an IP literal, because IP literals
+// never carry SNI (RFC 6066 §3) and so cannot exercise this path.
+func TestProbeHTTPEndToEndSNIRequired(t *testing.T) {
+	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.TLS = &tls.Config{
+		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			if hi.ServerName != "localhost" {
+				return nil, errors.New("server requires SNI=localhost, got " + hi.ServerName)
+			}
+			return &cert, nil
+		},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	url := strings.Replace(srv.URL, "127.0.0.1", "localhost", 1)
+	r := probeHTTP(context.Background(), url, 5*time.Second)
+	if r.Lost {
+		t.Fatalf("SNI-dependent host marked loss (probeDialTLS not sending SNI): %v", r.Err)
+	}
+	if r.Status == nil || *r.Status != 200 {
+		t.Fatalf("status = %v, want 200", r.Status)
 	}
 }
 

@@ -1,107 +1,63 @@
-# v0.4.0 — Self-update release signing + external-review hardening
+# v0.4.1 — HTTPS probe SNI fix + strict-CSP dashboard fix
 
-A security-hardening minor release. The headline change closes the
-self-update **authenticity** gap: release binaries are now cryptographically
-signed, so a compromised GitHub account or release pipeline can no longer
-push a malicious binary that passes the update check. The remaining nine
-commits are the 2026-10-29 external-review batch (probe security, session
-lifetime, dashboard CSP, and probe-correctness fixes). Every finding was
-verified against the real code first and is gated with `gofmt`, `go vet`
-(incl. `GOOS=windows`), and the full `-race` suite.
+A patch release that fixes two regressions introduced in v0.4.0. No new
+features; both changes are correctness fixes for behavior that broke on
+update. Gated with `gofmt`, `go vet` (incl. `GOOS=windows`), `node --check`,
+the CSP + SNI regression tests, and the full `-race` suite.
 
-## Self-update release signing (the headline)
+## HTTPS sensors failing after v0.4.0 (the headline)
 
-- **Release binaries are now signed with ed25519** (`c69c2d0`). The client
-  verifies a detached `.sig` asset against embedded trusted public keys
-  (`release_pubkeys`) **before** installing. Verification is fail-closed: a
-  missing, corrupt, mis-sized, or untrusted signature is refused. The SHA-256
-  integrity check is kept as a second, redundant layer.
-- **Why it matters:** the binary and its SHA-256 come from the *same* GitHub
-  release, so a compromised account or pipeline could previously publish a
-  trojaned binary **and** its matching SHA-256, and every client that updated
-  would run it (code execution, often with ping privileges). A signature
-  proves the publisher held the private key, which a compromised pipeline
-  does not. This was the project's highest-impact residual risk.
-- Both the CLI (`pulsemon update`) and the dashboard update button are
-  covered (they share one verification path).
-- **New maintainer commands:** `pulsemon sign genkey`, `pulsemon sign release
-  <file> <keyfile>`, and `pulsemon sign verify <file>`.
-- The Linux and Windows release pipelines now sign every binary and **fail
-  the release if a binary is unsigned**; a `.sig` asset ships alongside each
-  binary.
+- **HTTPS probes now send SNI** (`http.go`). v0.4.0's new dial-then-verify
+  TLS path (`probeDialTLS`) built the manual TLS client with
+  `InsecureSkipVerify: true` but **no `ServerName`**, so no SNI was sent.
+  SNI-dependent frontends — Cloudflare in particular — reject a SNI-less
+  handshake with `remote error: tls: handshake failure`, which put
+  Cloudflare-fronted HTTPS sensors (e.g. `invizen.com`, `pulsemon.net`) into
+  a permanent `error` state even though the host was reachable. The fix sets
+  `ServerName: host` so the correct virtual host is selected. IP-literal
+  targets are unaffected: Go blanks SNI for IPs and `verifyHTTPCert` judges
+  the IP SAN as before.
+- **Regression-locked** with `TestProbeHTTPEndToEndSNIRequired`: a TLS test
+  server whose `GetCertificate` *requires* a matching SNI and fails
+  otherwise. The probe only passes if it sends SNI. Sabotage-verified —
+  removing `ServerName` makes the test fail.
 
-## Probe security
+## Dashboard: strict CSP restored, no inline handlers
 
-- **TLS certs verified during the handshake** (`3b70288`). The probe client
-  now verifies the server cert *before* any request bytes are written (dial +
-  handshake + verify in one step), on every redirect hop. Previously the full
-  request — including an `Authorization` header auto-derived from a
-  `user:pass@` target — was sent to whoever answered the handshake before the
-  cert was judged, so an on-path spoofer could collect the credentials. Cert
-  policy is unchanged (system-trusted OR a genuine self-signed match).
-- **HTTP body drained only when the connection is reused** (`3397096`). An
-  HTTPS probe forces a fresh handshake per probe, so its connection is
-  discarded anyway — draining up to 1 MB of body was pure waste. The drain now
-  runs only when the connection is kept and is capped at 64 KB.
-
-## Access control
-
-- **Sessions have an absolute 30-day lifetime** (`0cae5bb`). The 30-day TTL
-  was a *sliding* inactivity window, so a continuously-active session (an open
-  dashboard tab, or a stolen cookie used periodically) never expired — each
-  poll slid the expiry forward by another 30 days. A session is now
-  hard-capped at 30 days from login; only activity in between extends an idle
-  session up to that cap.
-
-## Dashboard
-
-- **Strict CSP + precompiled Tailwind** (`a4725bf`). The CSP was only
-  `frame-ancestors 'none'`; it is now a strict `'self'`-only policy (no
-  `unsafe-inline`, no hashes) — the theme/app/CSS moved out of inline blocks
-  into files so the policy needs no exceptions. Tailwind is precompiled to a
-  static ~30 KB stylesheet at build time, replacing the ~400 KB in-browser JIT
-  that regenerated CSS on every page load (not recommended for production).
-
-## Probe correctness
-
-- **Fast-retry matches the sensor interval** (`e8d8ff6`). An ERROR sensor
-  re-checks every `min(30s, interval)` — the old 10s floor made 5–9s sensors
-  re-check *less* often while down, slowing recovery detection.
-- **Status window mirrors the badge** (`ffaa4d3`). Window loss% and
-  sort-by-loss now use the same 8-*scheduled*-probe window as the badge (a
-  manual "Pulse Now" no longer shrinks the denominator or floats a healthy
-  sensor to the top of a loss-sorted list).
-- **TLS cert hot-reload: no respin while broken** (`fe3ae49`). A failed cert
-  reload now records the (broken) mtimes, so a busy TLS server no longer
-  re-parses and re-logs on every handshake for as long as the files stay
-  broken.
-
-## Update check
-
-- **`?refresh=1` throttled** (`75da4b2`). A forced update-check refresh is now
-  ignored if the last fetch attempt was under 60s ago, so it can't be spammed
-  into GitHub's unauthenticated rate limit (or used to block other callers
-  behind the single-flight lock). The version check stays read-only; the
-  actual update remains admin-gated.
-
-## Docs
-
-- **`docs/DECISIONS.md`** (`0c1b1c5`). Rationale, rejected alternatives, and
-  the review-ID map for non-obvious code now live in a durable file; in-code
-  comments state the current contract only.
+- v0.4.0 shipped a strict CSP (`script-src 'self'; style-src 'self'`, no
+  `unsafe-inline`) but the dashboard still generated **inline `onclick`
+  handlers and inline `style="height:…"` sparkline bars** at runtime, which
+  the strict policy blocks — so every control was dead and sparklines
+  rendered at zero height. A stopgap (`'unsafe-inline'`) was deployed to
+  unblock; this is the proper fix that removes the need for it.
+- **Event delegation** (`web/app.js`, `web/index.html`): every inline
+  `onclick="…"` is replaced with `data-act` + `data-args` (a JSON array of
+  the handler's arguments) dispatched by a single delegated click listener.
+  Handlers that took `this` receive the clicked element. Zero inline
+  `onclick`/`onload`/`onerror` attributes remain.
+- **Sparkline heights via JS, not inline style**: bars carry `data-h` and
+  `layoutSparklines()` sets `el.style.height` from it, so no inline `style`
+  attribute is ever written.
+- **CSP re-tightened** (`api.go`): back to the strict
+  `default-src 'self'; script-src 'self'; style-src 'self'; object-src
+  'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` —
+  the stopgap `'unsafe-inline'` is gone. The security-headers test asserts
+  this exact string.
+- Verified in a real browser under the strict policy: sensors render,
+  per-sensor Edit opens a populated form (args pass through `data-args`),
+  sparkline bars have non-zero heights, and an injected inline
+  `style="…"` is confirmed blocked by the policy.
 
 ## Notes for operators
 
-- **Self-update is now authenticated.** If your install is on a release from
-  before this one, its first update to a signed release works as usual (older
-  clients only check the SHA). From this version on, an update is installed
-  only if its signature verifies against the embedded key.
-- No config changes are required. The signing public key is embedded in the
-  binary; the private signing key is the maintainer's release secret and is
-  never distributed.
+- **HTTPS sensors recover automatically** on update — no config change.
+  Cloudflare-fronted and other SNI-dependent hosts will probe normally.
+- **The dashboard is fully interactive again** under the strict CSP (edit,
+  clone, delete, pulse, tags, settings, alerts, TLS, self-update, inspector).
+- No config changes required. Self-update signing from v0.4.0 is unchanged.
 
 ## Assets
 
 - `pulsemon-linux-amd64`, `pulsemon-linux-arm64` (+ sha256 sidecars + `.sig`)
 - Windows assets added by the `windows-release.yml` workflow on tag push
-  (`pulsemon-windows-amd64.exe`, `pulsemon-setup-0.4.0.exe` + sidecars + `.sig`)
+  (`pulsemon-windows-amd64.exe`, `pulsemon-setup-0.4.1.exe` + sidecars + `.sig`)
