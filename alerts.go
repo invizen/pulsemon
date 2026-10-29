@@ -88,30 +88,23 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 }
 
 // alertGateConsumer drains one sensor's alert FIFO and exits after
-// alertGateIdle with no queued jobs.
-// The old "for job := range ch" consumer lived forever: Remove drops the
-// map entry but the channel is never closed (an in-flight sendWebhook
-// sending on a closed channel panics), so one goroutine leaked per
-// deleted sensor for the process lifetime. Idle exit replaces the leak:
-// the consumer reaps itself when the queue is empty.
+// alertGateIdle with no queued jobs. Idle exit reaps consumers of quiet
+// sensors (deleted, or simply healthy) — the channel is never closed
+// (an in-flight send on a closed channel panics), so a plain
+// `range ch` consumer would leak one goroutine per deleted sensor.
 //
-// The exit check runs under alertMu — the same lock enqueueAlert holds
-// across its send — so len(ch) == 0 under the lock means no job is
-// queued AND no send is in flight: exiting drops nothing. When the map
-// entry is gone (Remove) or points at a newer channel (a quiet sensor's
-// gate was recycled and re-created), the consumer just exits without
-// touching the map.
-//
-// The idle timer is local to this goroutine — no other goroutine touches
-// it (enqueueAlert only pushes to ch and holds alertMu) — so the
-// Stop/drain/Reset sequence in the job branch is sequential, not racy, and
-// is the complete canonical drain-then-Reset pattern: a Reset without first
-// draining a fired value would leave a stale ready in idle.C that a later
-// select reads as a spurious idle-fire. The ONLY exit is the return in the
-// <-idle.C branch, which is entered only after the timer has fired AND its
-// value been read (that is how the select got there) — so no fired-but-
-// unread timer is left behind at exit, and a defer idle.Stop() would be a
-// guaranteed no-op (2026-10-28 review n7: no timer leak, no missing defer).
+// Invariants (docs/DECISIONS.md → alert-gate): the exit check runs under
+// alertMu — the same lock enqueueAlert holds across its send — so
+// len(ch) == 0 under the lock means no job is queued AND no send is in
+// flight; exiting drops nothing. The idle timer is local to THIS
+// goroutine and idleDur arrives as a parameter — the consumer must NOT
+// read the alertGateIdle package var (tests swap it; a reader outliving
+// the restore is a data race, caught by -race). The Stop/drain/Reset
+// below is the complete canonical pattern: a Reset without draining a
+// fired value leaves a stale ready in idle.C read as a spurious
+// idle-fire, and the only exit (the <-idle.C branch) is entered only
+// after the timer fired AND its value was read, so no fired-but-unread
+// timer is left behind and a defer idle.Stop() would be a no-op.
 func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time.Duration) {
 	idle := time.NewTimer(idleDur)
 	for {

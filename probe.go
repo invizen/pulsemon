@@ -581,47 +581,16 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 }
 
 // Restart respawns a sensor's probe loop so config changes take effect
-// without a process restart: target/interval/timeout are read by the loop
-// and loss_warn/down_after by deriveStatus, all from the spawn-time config
-// copy captured in syncSensors.
+// without a process restart: cancel + delete + an IMMEDIATE syncSensors
+// signal — the respawn is the NEXT sync pass, which re-reads the row
+// under pw.mu. The DB is the source of truth; deriveStatus re-derives
+// state from probe history on the next probe.
 //
-// Deliberate: cancel + delete + SIGNAL. The respawn is the NEXT syncSensors
-// pass — now requested IMMEDIATELY via the syncReq channel (Run's select
-// runs it on the next iteration) instead of waiting out the 5s tick
-// The <=5s + staggered-phase gap the old
-// passive design left is closed (and the respawn's first tick is capped at
-// respawnFirstTickCap, so a config edit is not dark for up to a full
-// interval); the DB is still the source of
-// truth and deriveStatus re-derives state from probe history on the next
-// probe. This
-// is the documented M2 design (see api_restart_test.go), with the
-// immediate-sync extension.
-//
-// Security/concurrency-review note (deliberate, do NOT "fix" by re-spawning
-// in Restart): there is NO duplicate-loop race and NO map race. pw.loops is
-// guarded by pw.mu at every access (syncSensors, Restart, Remove,
-// ActiveCount); syncSensors runs on a SINGLE goroutine (only Run's first
-// pass + its ticker call it - API handlers call Restart/Remove, never
-// syncSensors); and an old sensorLoop's cleanup on ctx.Done() just returns
-// and never touches pw.loops, so the "old loop cleaning up while the new
-// one spawns" case has nothing to race on. A duplicate entry cannot form:
-// the spawn is guarded by `if _, ok := pw.loops[id]; !ok` under the same
-// lock that deletes it. The only real overlap (an old loop mid-doProbe when
-// a new one spawns) writes ONE shared *ProbeState at pw.sensors[id] under
-// the mutex (doProbe) - two goroutines, one object, locked. Correct.
-//
-// CRITICAL invariant a naive "re-spawn in Restart" fix breaks: every loop
-// is a CHILD of Run's ctx (see syncSensors: WithCancel(ctx)). Run's
-// shutdown path does `case <-ctx.Done(): pw.wg.Wait()` and RELIES on every
-// loop being a child of that ctx so it exits at its next select. Spawning
-// with context.WithCancel(context.Background()) (as a proposed review fix
-// did) SEVERS that: the Background-parented loop is never cancelled by
-// ctx.Done(), so Run's wg.Wait() HANGS FOREVER for any sensor that was ever
-// restarted - the process can no longer shut down or close the DB. If the
-// <=5s respawn gap is ever worth closing, the safe form is: re-read config
-// from the DB, delete pw.sensors[id] first, and spawn under the EXISTING
-// Run ctx (never Background) - keeping the mutex discipline and the
-// shutdown invariant intact.
+// Invariants (docs/DECISIONS.md → restart-respawn): the respawn must
+// stay a child of Run's ctx (a Background-parented loop makes Run's
+// wg.Wait() hang forever at shutdown), and the cancel/delete/signal
+// discipline is what makes duplicate loops impossible — do not
+// "simplify" it into a re-spawn inside this function.
 func (pw *ProbeWorker) Restart(id string) {
 	pw.mu.Lock()
 	if cancel, ok := pw.loops[id]; ok {
@@ -631,10 +600,8 @@ func (pw *ProbeWorker) Restart(id string) {
 	delete(pw.sensors, id)
 	pw.mu.Unlock()
 	// Request an IMMEDIATE sync pass: Run's select runs it on the next
-	// iteration and respawns the loop with the post-commit config, so a
-	// config edit no longer waits out the 5s tick. The spawn re-reads the row under pw.mu (see the
-	// syncSensors respawn branch), so even a sync pass that started before
-	// this commit can't respawn a stale config. Non-blocking: a request
+	// iteration and respawns with the post-commit config, so a config
+	// edit no longer waits out the 5s tick. Non-blocking: a request
 	// already queued is enough — the follow-up pass will see this change.
 	select {
 	case pw.syncReq <- struct{}{}:
@@ -681,32 +648,22 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 		interval = time.Minute // a zeroed row must not divide by zero or spin
 	}
 
-	// Stagger the first tick by a deterministic per-sensor phase (hash of the
-	// id, 0 .. interval). Without this, every sensor added at the same time —
-	// or every sensor sharing an interval — fires on the same wall-clock second,
-	// producing a write thundering-herd against SQLite. Spreading the phases
-	// turns N simultaneous writes into N writes spread across the interval.
+	// Stagger the first tick by a deterministic per-sensor phase so
+	// sensors added together don't fire on the same wall-clock second
+	// (a write thundering-herd against SQLite) — see staggerPhase and
+	// docs/DECISIONS.md → stagger.
 	//
-	// RESPAWN exception (resumed, set by syncSensors via spawnedIDs): the
-	// operator just resumed this sensor (pause >5s, maintenance-mode end)
-	// or edited its config (Restart), so a full phase here would leave it
-	// dark for up to a whole interval — an hour on an hourly sensor, with
-	// no data, no status, and no alerts in between. Cap the first tick at
-	// respawnFirstTickCap; see that constant for the anti-herd tradeoff.
+	// RESPAWN exception (resumed, set by syncSensors via spawnedIDs):
+	// cap the first tick at respawnFirstTickCap (see that constant).
 	phase := staggerPhase(c.id, interval)
 	if resumed && phase > respawnFirstTickCap {
 		phase = respawnFirstTickCap
 	}
 
 	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
-	// ERROR is re-checked on the fast-retry cadence (errorRetryInterval,
-	// capped at the configured interval so it is never FASTER than normal —
-	// a 15s-interval sensor keeps its 15s during error, a 60s sensor
-	// re-checks every 30s) until a probe brings it back to up, then reverts
-	// to the configured interval. The 10s floor makes a ping-storm
-	// impossible: even if every sensor errors at once, total load is at
-	// most 2x the normal load, and each sensor keeps its staggered phase
-	// (no re-synchronization into a burst).
+	// ERROR re-checks on the fast-retry cadence (capped at the configured
+	// interval, 10s floor — no ping-storm) until a probe brings it back
+	// to up, then reverts to the configured interval.
 	timer := time.NewTimer(phase)
 	defer timer.Stop()
 	var nextDelay time.Duration
@@ -793,9 +750,9 @@ func staggerPhase(id string, interval time.Duration) time.Duration {
 // pause, maintenance-mode end, config-edit Restart; see spawnedIDs). A
 // full stagger here would leave a resumed sensor dark for up to a whole
 // interval (an hour on an hourly sensor). Capping at 1s keeps the
-// anti-herd property in the one case that matters — a maintenance-mode
-// end with N sensors respawning together lands N probes across ~1s, not
-// the same wall-clock instant — while bounding the resume/edit delay.
+// anti-herd property in the one case that matters — N sensors respawning
+// together land across ~1s, not the same instant — while bounding the
+// resume/edit delay (docs/DECISIONS.md → stagger).
 const respawnFirstTickCap = time.Second
 
 // safeProbe runs one probe and contains a panic: one bad probe must not take
