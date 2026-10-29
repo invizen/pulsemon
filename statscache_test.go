@@ -470,6 +470,51 @@ func TestManualPulseExcludedFromAggregates(t *testing.T) {
 	}
 }
 
+// TestStatusWindowMirrorsDeriveStatusWithManualPulse locks the finding-5 fix
+// (2026-10-29): the status window is the last statusWindow SCHEDULED probes
+// (skipping manual), mirroring recentFromCache / deriveStatus EXACTLY — not
+// "the last statusWindow raw entries with manual skipped", which shrinks the
+// window below statusWindow after a Pulse Now and reads a different number
+// than the badge. Scenario: a LOST manual pulse is the newest entry, and the
+// 7th-newest scheduled probe is a loss.
+//
+//   - fixed (8 scheduled):  S1..S8, one loss  -> 1/8  = 12.5%
+//   - pre-fix (8 raw-skip): manual+S1..S7, skip manual -> 1/7 = 14.3%
+//
+// Fails on the pre-fix code (14.3% != 12.5%).
+func TestStatusWindowMirrorsDeriveStatusWithManualPulse(t *testing.T) {
+	pw := &ProbeWorker{
+		sensors:    make(map[string]*ProbeState),
+		loops:      make(map[string]context.CancelFunc),
+		statsCache: make(map[string]*probeSeries),
+	}
+	// 10 scheduled probes, 5s apart, newest at now-60. i=0 is the newest
+	// scheduled (S1); i=6 is S7 — the loss.
+	for i := 0; i < 10; i++ {
+		rtt := float32(10)
+		if i == 6 {
+			rtt = float32(math.NaN()) // S7 = a loss
+		}
+		pw.recordProbe("sw", probeEntry{ts: testNowUnix - 60 - int64(i)*5, rtt: rtt})
+	}
+	// A LOST manual pulse at the anchor: the newest entry overall.
+	pw.recordProbe("sw", probeEntry{ts: testNowUnix, rtt: float32(math.NaN()), manual: true})
+
+	got := pw.statsFor("sw", testNowUnix)
+	if got == nil {
+		t.Fatal("statsFor: nil, want stats")
+	}
+	// The status window is the 8 newest SCHEDULED probes (S1..S8); S7 is the
+	// loss -> 1/8 = 12.5%. The pre-fix code read the last 8 RAW entries
+	// (manual + S1..S7), skipped the manual, and got 1/7 = 14.3%.
+	if got.StatusLostCount != 1 {
+		t.Errorf("StatusLostCount = %d, want 1", got.StatusLostCount)
+	}
+	if got.StatusLossPct != 100.0/8 {
+		t.Errorf("StatusLossPct = %v, want %v (1/8, the 8-scheduled window the badge uses; 14.3%% is the shrunken 1/7 pre-fix window)", got.StatusLossPct, 100.0/8)
+	}
+}
+
 // TestSeriesEviction locks the retention rule: the series holds exactly the
 // union of the last 60 probes and the 24h window.
 func TestSeriesEviction(t *testing.T) {

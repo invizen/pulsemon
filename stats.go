@@ -439,17 +439,18 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 	// so a manual loss in an otherwise healthy window must not read as
 	// loss%.
 	st.StatusWindowSize = statusWindow
-	sw := entries
-	if len(sw) > statusWindow {
-		sw = sw[len(sw)-statusWindow:]
-	}
+	// Walk back collecting statusWindow SCHEDULED probes (skipping manual),
+	// mirroring recentFromCache / deriveStatus EXACTLY. Not "last statusWindow
+	// raw entries then skip manual" — that shrinks the window below
+	// statusWindow after a Pulse Now, so the inspector number would come from
+	// a different window than the badge.
 	swTotal, swLost := 0, 0
-	for _, e := range sw {
-		if e.manual {
+	for i := len(entries) - 1; i >= 0 && swTotal < statusWindow; i-- {
+		if entries[i].manual {
 			continue
 		}
 		swTotal++
-		if isLost(e.rtt) {
+		if isLost(entries[i].rtt) {
 			swLost++
 		}
 	}

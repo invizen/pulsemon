@@ -241,6 +241,32 @@ the inspector number agree. The read fetches `max(statusWindow,
 down_after)` rows; the extra rows feed only the consecutive-loss test,
 never the loss% math.
 
+## status-window manual handling (stats.go `computeSensorStats`)
+
+**Contract:** `status_loss_pct` is the loss over the newest 8 SCHEDULED
+probes — the walk collects 8 non-manual entries by scanning back from the
+newest (skipping manual), which is byte-for-byte what `recentFromCache` /
+`deriveStatus` do. The inspector therefore shows the exact number the
+badge came from.
+
+**Why not "last 8 raw entries, then skip manual" (the pre-2026-10-29
+code):** a Pulse Now inside the last 8 raw entries shrinks the scheduled
+denominator below 8 (7, 6, …), so the inspector read a *different* window
+than the badge — e.g. a loss at the 7th-scheduled position plus a newest
+manual pulse read 1/7 = 14.3% in the inspector but 1/8 = 12.5% on the
+badge. The differential test's SQL reference
+(`WHERE manual = 0 ORDER BY ts DESC LIMIT 8`) already encoded the correct
+8-scheduled window, which is why the in-memory path was the odd one out.
+Pinned by `TestStatusWindowMirrorsDeriveStatusWithManualPulse`.
+
+**Sort-by-loss (web/index.html):** the list's "sort by loss" now orders on
+`hour_loss_pct` (past-hour, manual-excluded) — the same value the
+grid/table loss column displays — instead of the raw 60-probe `loss_pct`,
+which counts manual rows. A lost *diagnostic* pulse could otherwise float
+a healthy sensor to the top of the list. The inspector's own loss readout
+keeps `loss_pct` on purpose: it is the raw 60-probe history view ("N / M
+dropped" over what you actually see), and manual rows belong there.
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)

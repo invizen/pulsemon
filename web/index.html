@@ -906,7 +906,7 @@ function render() {
     const rb = b.stats ? (b.stats.rtt_last != null ? b.stats.rtt_last : 99999) : 99999;
     if (sort === 'rtt-desc') return rb - ra;
     if (sort === 'rtt-asc') return ra - rb;
-    if (sort === 'loss') return (b.stats && b.stats.loss_pct || 0) - (a.stats && a.stats.loss_pct || 0);
+    if (sort === 'loss') return (b.stats && b.stats.hour_loss_pct || 0) - (a.stats && a.stats.hour_loss_pct || 0);
     return 0;
   });
 
