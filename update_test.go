@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -43,27 +45,61 @@ func tempLeakAfter(before map[string]bool) []string {
 	return leaked
 }
 
+// signFixture signs bin with a fresh ed25519 test key, points the embedded
+// trusted-key set (releasePubkeys) at that key for the test's duration
+// (restored in t.Cleanup), and returns the hex signature. Inline fixtures that
+// build their own release (rather than using serveRelease) use this to satisfy
+// the fail-closed authenticity gate in verifyDownloadedAsset.
+func signFixture(t *testing.T, bin []byte) string {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate test signing key: %v", err)
+	}
+	oldPubkeys := releasePubkeys
+	releasePubkeys = []byte(hex.EncodeToString(pub) + "\n")
+	t.Cleanup(func() { releasePubkeys = oldPubkeys })
+	return hex.EncodeToString(ed25519.Sign(priv, bin))
+}
+
 // serveRelease spins up a fake GitHub releases API that hands out one asset.
 // digest is the advertised sha256 (with or without the "sha256:" prefix); when
 // it's empty the asset carries no digest, forcing the sidecar path. It returns
 // the releases base URL (to point releaseBase at — fetchRelease appends
 // "/latest") and the real sha256 of the served binary bytes.
+//
+// Every fixture is SIGNED: the payload is signed with a fresh ed25519 test key
+// and the embedded trusted-key set (releasePubkeys) is pointed at that key for
+// the test's duration. This satisfies the fail-closed authenticity gate in
+// verifyDownloadedAsset so the tests exercise the update flow (sidecar
+// resolution, user-agent, mismatch, install) now that a release without a valid
+// .sig is refused. Tests that specifically want the UNSIGNED-refusal behavior
+// use the dedicated sig tests in update_sig_test.go.
 func serveRelease(t *testing.T, tag, digest string) (string, string) {
 	t.Helper()
 	bin := []byte("fake pulsemon binary payload\n")
 	real := sha256.Sum256(bin)
 	realHex := hex.EncodeToString(real[:])
 
+	// Sign the payload (see signFixture) so the authenticity gate passes.
+	sigHex := signFixture(t, bin)
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		rel := ghRelease{
 			TagName: tag,
-			Assets: []releaseAsset{{
-				Name: targetAsset(),
-				// r.Host carries the 127.0.0.1:port of the test server.
-				BrowserDownloadURL: "http://" + r.Host + "/releases/bin",
-				Digest:             digest,
-			}},
+			Assets: []releaseAsset{
+				{
+					Name: targetAsset(),
+					// r.Host carries the 127.0.0.1:port of the test server.
+					BrowserDownloadURL: "http://" + r.Host + "/releases/bin",
+					Digest:             digest,
+				},
+				{
+					Name:               targetAsset() + ".sig",
+					BrowserDownloadURL: "http://" + r.Host + "/releases/bin.sig",
+				},
+			},
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(rel)
@@ -71,6 +107,10 @@ func serveRelease(t *testing.T, tag, digest string) (string, string) {
 	mux.HandleFunc("/releases/bin", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.Write(bin)
+	})
+	mux.HandleFunc("/releases/bin.sig", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(sigHex))
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -323,6 +363,7 @@ func captureStderr(t *testing.T, fn func() int) (int, string) {
 // deliberately advertises a wrong digest).
 func TestRunUpdateSidecarViaAPIURL(t *testing.T) {
 	bin := "sidecar-path binary payload\n"
+	sigHex := signFixture(t, []byte(bin))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
@@ -331,11 +372,14 @@ func TestRunUpdateSidecarViaAPIURL(t *testing.T) {
 			json.NewEncoder(w).Encode(ghRelease{TagName: "v9.9.9", Assets: []releaseAsset{
 				{Name: targetAsset(), URL: "http://" + r.Host + "/releases/bin"},
 				{Name: targetAsset() + ".sha256", URL: "http://" + r.Host + "/releases/sum"},
+				{Name: targetAsset() + ".sig", URL: "http://" + r.Host + "/releases/bin.sig"},
 			}})
 		case strings.HasSuffix(r.URL.Path, "/releases/sum"):
 			// Valid 64-hex but wrong on purpose: verification must fail
 			// with a MISMATCH, which proves the sidecar was found.
 			io.WriteString(w, "0000000000000000000000000000000000000000000000000000000000000000")
+		case strings.HasSuffix(r.URL.Path, "/releases/bin.sig"):
+			io.WriteString(w, sigHex)
 		default:
 			w.Header().Set("Content-Type", "application/octet-stream")
 			io.WriteString(w, bin)
@@ -372,11 +416,17 @@ func TestRunUpdateSidecarViaAPIURL(t *testing.T) {
 // exit 1 with a formatted diagnostic naming the missing sidecar asset — not
 // the old "sidecar fetch failed: HTTP 404" from a munged URL.
 func TestRunUpdateNoSidecarRefused(t *testing.T) {
+	sigHex := signFixture(t, []byte("payload\n"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
 			json.NewEncoder(w).Encode(ghRelease{TagName: "v9.9.9", Assets: []releaseAsset{
 				{Name: targetAsset(), URL: "http://" + r.Host + "/releases/bin"},
+				{Name: targetAsset() + ".sig", URL: "http://" + r.Host + "/releases/bin.sig"},
 			}})
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/releases/bin.sig") {
+			io.WriteString(w, sigHex)
 			return
 		}
 		w.Header().Set("Content-Type", "application/octet-stream")
@@ -585,6 +635,7 @@ func TestFetchReleaseSendsUserAgent(t *testing.T) {
 func TestRunUpdateSendsUserAgentOnAllRequests(t *testing.T) {
 	var mu sync.Mutex
 	seenUA := map[string]string{} // path -> User-Agent
+	sigHex := signFixture(t, []byte("binary bytes\n"))
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		seenUA[r.URL.Path] = r.Header.Get("User-Agent")
@@ -599,6 +650,7 @@ func TestRunUpdateSendsUserAgentOnAllRequests(t *testing.T) {
 				Assets: []releaseAsset{
 					{Name: targetAsset(), BrowserDownloadURL: "http://" + r.Host + "/bin"},
 					{Name: targetAsset() + ".sha256", BrowserDownloadURL: "http://" + r.Host + "/bin.sha256"},
+					{Name: targetAsset() + ".sig", BrowserDownloadURL: "http://" + r.Host + "/bin.sig"},
 				},
 			})
 		case "/bin":
@@ -608,6 +660,9 @@ func TestRunUpdateSendsUserAgentOnAllRequests(t *testing.T) {
 		case "/bin.sha256":
 			w.Header().Set("Content-Type", "text/plain")
 			w.Write([]byte("0000000000000000000000000000000000000000000000000000000000000000  pulsemon\n"))
+		case "/bin.sig":
+			w.Header().Set("Content-Type", "text/plain")
+			w.Write([]byte(sigHex))
 		default:
 			http.NotFound(w, r)
 		}
@@ -638,7 +693,7 @@ func TestRunUpdateSendsUserAgentOnAllRequests(t *testing.T) {
 			t.Errorf("request %s sent User-Agent %q, want %q", path, ua, want)
 		}
 	}
-	for _, path := range []string{"/releases/latest", "/bin", "/bin.sha256"} {
+	for _, path := range []string{"/releases/latest", "/bin", "/bin.sha256", "/bin.sig"} {
 		if _, ok := seenUA[path]; !ok {
 			t.Errorf("expected request to %s was not observed", path)
 		}
@@ -704,6 +759,7 @@ func TestRunUpdateUppercaseSidecarAccepted(t *testing.T) {
 	bin := "uppercase sidecar binary payload\n"
 	other := sha256.Sum256([]byte("some other payload\n"))
 	upperHex := strings.ToUpper(hex.EncodeToString(other[:]))
+	sigHex := signFixture(t, []byte(bin))
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -711,6 +767,7 @@ func TestRunUpdateUppercaseSidecarAccepted(t *testing.T) {
 			json.NewEncoder(w).Encode(ghRelease{TagName: "v9.9.9", Assets: []releaseAsset{
 				{Name: targetAsset(), BrowserDownloadURL: "http://" + r.Host + "/bin"},
 				{Name: targetAsset() + ".sha256", BrowserDownloadURL: "http://" + r.Host + "/bin.sha256"},
+				{Name: targetAsset() + ".sig", BrowserDownloadURL: "http://" + r.Host + "/bin.sig"},
 			}})
 		case "/bin":
 			w.Header().Set("Content-Type", "application/octet-stream")
@@ -718,6 +775,9 @@ func TestRunUpdateUppercaseSidecarAccepted(t *testing.T) {
 		case "/bin.sha256":
 			w.Header().Set("Content-Type", "text/plain")
 			io.WriteString(w, upperHex+"\n")
+		case "/bin.sig":
+			w.Header().Set("Content-Type", "text/plain")
+			io.WriteString(w, sigHex)
 		default:
 			http.NotFound(w, r)
 		}

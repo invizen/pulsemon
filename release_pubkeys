@@ -1,0 +1,17 @@
+# pulsemon release-signing public keys (ed25519, hex, one per line).
+#
+# A release binary is accepted only if its detached .sig asset verifies
+# against at least one key below. This is the authenticity root for
+# self-update: a compromised release pipeline can publish a binary and its
+# SHA-256 (both come from the same release), but it cannot sign the binary
+# without the private key, so the client refuses to install it.
+#
+# Rotation: add the new pubkey on its own line, ship a release signed by the
+# new key, then retire the old key in a LATER release (keep both until the
+# fleet is off the old key). The set — not a single key — is what makes
+# rotation a normal update instead of a full re-bootstrap.
+#
+# Generated 2026-10-29. The matching private key is the release-signing
+# secret: it lives on the trusted release host and (for the Windows CI path)
+# as the RELEASE_SIGNING_KEY secret. It is NEVER committed.
+c412b899f4c2a4a7d96bc23ca0d0d5ca2ec5fef7464e0133355a534ea50b0bbe

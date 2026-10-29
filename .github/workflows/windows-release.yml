@@ -64,6 +64,32 @@ jobs:
           "$hash  pulsemon-windows-amd64.exe" | Out-File -Encoding ascii "dist/pulsemon-windows-amd64.exe.sha256"
           Write-Host "Built dist/pulsemon-windows-amd64.exe  sha256=$hash"
 
+      - name: Sign the Windows binary (release authenticity)
+        shell: pwsh
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          # Detached ed25519 signature over the .exe, verified at update time
+          # against the embedded release_pubkeys — the authenticity root the
+          # SHA-256 (integrity) cannot provide. The raw .exe is the self-update
+          # asset (pulsemon update swaps it in place); the Inno Setup installer
+          # is a fresh-human-install path, not self-update, so it is out of scope
+          # here. The key is the SAME release-signing secret the Linux cut
+          # (release.sh) uses. The build FAILS if the secret is missing or the
+          # signature does not verify against the embedded pubkeys.
+          if (-not $env:RELEASE_SIGNING_KEY) {
+            throw "RELEASE_SIGNING_KEY secret is not set — refusing to ship an unsigned Windows release"
+          }
+          $keyfile = Join-Path $env:TEMP "pm-signing-key.hex"
+          Set-Content -Path $keyfile -Value $env:RELEASE_SIGNING_KEY -Encoding ascii -NoNewline
+          & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile
+          if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
+          # Verify against the EMBEDDED release_pubkeys (the keys a client checks).
+          & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
+          Remove-Item $keyfile -Force
+          Write-Host "Signed dist\pulsemon-windows-amd64.exe -> .sig"
+
       - name: Install pinned Inno Setup 6.7.3
         shell: pwsh
         run: |
@@ -115,6 +141,7 @@ jobs:
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",
+            "dist\pulsemon-windows-amd64.exe.sig",
             "installer\output\pulsemon-setup-$ver.exe",
             "installer\output\pulsemon-setup-$ver.exe.sha256"
           )

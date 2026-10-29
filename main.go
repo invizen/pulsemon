@@ -104,6 +104,15 @@ func dispatch(args []string) dispatchKind {
 	case "auth-user":
 		// Dashboard accounts: pulsemon auth-user add|remove|list [NAME]
 		return runAuthUser(args[2:])
+	case "sign":
+		// Release-signing maintainer tool: pulsemon sign genkey|release.
+		// Not part of the update path; run on the trusted release host.
+		switch runSignRelease(args[2:]) {
+		case 0:
+			return dExit0
+		default:
+			return dExit1
+		}
 	case "-v", "-version", "--version", "version":
 		fmt.Println("pulsemon", Version)
 		return dExit0

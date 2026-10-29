@@ -68,6 +68,37 @@ for ARCH in amd64 arm64; do
   ( cd "dist" && sha256sum "pulsemon-linux-$ARCH" > "pulsemon-linux-$ARCH.sha256" )
 done
 
+# --- 1b. sign each binary (release AUTHENTICITY) ----------------------------
+# The .sig is a detached ed25519 signature over the binary's exact bytes. At
+# update time the client verifies it against the embedded release_pubkeys —
+# the authenticity root the SHA-256 (integrity) cannot provide: a compromised
+# pipeline can publish a binary + its SHA, but not a valid signature.
+#
+# The private key is the release-signing secret, provided via
+# RELEASE_SIGNING_KEY_FILE (a file holding the 64-byte hex key, 600 perms).
+# The release FAILS if the key is missing, signing fails, or the signature
+# does not verify against the embedded release_pubkeys — an unsigned release
+# must never be published (the client refuses to install it).
+SIGN_KEY="${RELEASE_SIGNING_KEY_FILE:-$HOME/.config/pulsemon/release-signing-key.hex}"
+if [[ ! -f "$SIGN_KEY" ]]; then
+  echo "release.sh: signing key not found: $SIGN_KEY"
+  echo "  generate one:  dist/pulsemon-linux-amd64 sign genkey"
+  echo "  (set RELEASE_SIGNING_KEY_FILE to the hex private key file)"
+  exit 1
+fi
+SIGNER="dist/pulsemon-linux-amd64"   # runs natively on the amd64 release host
+for ARCH in amd64 arm64; do
+  BIN="dist/pulsemon-linux-$ARCH"
+  "$SIGNER" sign release "$BIN" "$SIGN_KEY" >/dev/null \
+    || { echo "release.sh: signing failed for $BIN"; exit 1; }
+  # Verify against the EMBEDDED release_pubkeys (the keys a client checks):
+  # catches a release cut with the wrong signing key before it ships.
+  "$SIGNER" sign verify "$BIN" >/dev/null \
+    || { echo "release.sh: signature does not verify against release_pubkeys for $BIN"; exit 1; }
+  [[ -f "$BIN.sig" ]] || { echo "release.sh: no .sig produced for $BIN"; exit 1; }
+  echo "  signed $BIN"
+done
+
 # --- 2. verify: the built binaries must satisfy the update verifier -----------
 # Re-check each binary against its own sidecar the way runUpdate/install.sh do.
 for ARCH in amd64 arm64; do
@@ -114,8 +145,10 @@ gh release create "$VERSION" \
   --notes-file RELEASE_NOTES.md \
   dist/pulsemon-linux-amd64 \
   dist/pulsemon-linux-amd64.sha256 \
+  dist/pulsemon-linux-amd64.sig \
   dist/pulsemon-linux-arm64 \
   dist/pulsemon-linux-arm64.sha256 \
+  dist/pulsemon-linux-arm64.sig \
   install.sh
 
 # --- 5. push the tag LAST -------------------------------------------------------

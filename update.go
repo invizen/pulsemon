@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
+	"embed"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -31,6 +34,33 @@ var Version = "dev"
 // releaseBase is the GitHub releases API for this repo. It is a var (not a
 // const) so tests can point runUpdate at a local httptest server.
 var releaseBase = "https://api.github.com/repos/invizen/pulsemon/releases"
+
+// release_pubkeys holds the trusted release-signing public keys (ed25519,
+// hex, one per line) — see the file header for the rotation model. A release
+// binary is accepted only if its detached .sig asset verifies against at
+// least one of these keys. This is the authenticity root for self-update:
+// the SHA-256 check proves the bytes survived the download (integrity), but
+// the signature proves the publisher held the private key (authenticity) —
+// the one thing a compromised release pipeline cannot forge.
+//
+//go:embed release_pubkeys
+var releaseKeyFS embed.FS
+
+// releasePubkeys is the embedded trusted-key set as bytes. It is a var (not
+// the FS read inline) so tests can swap in a known test key set and restore
+// it in t.Cleanup — the same var-seam idiom this file uses (releaseBase,
+// detectRestart, ...).
+var releasePubkeys = mustReadEmbeddedPubkeys()
+
+func mustReadEmbeddedPubkeys() []byte {
+	b, err := releaseKeyFS.ReadFile("release_pubkeys")
+	if err != nil {
+		// The file is embedded at build time; a read failure is a build/bundle
+		// bug, not a runtime condition, so it is loud.
+		panic("release_pubkeys: " + err.Error())
+	}
+	return b
+}
 
 // update colors — matches the house script style (update_llama.sh).
 const (
@@ -750,12 +780,13 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 	return &rel, nil
 }
 
-// releaseSelection is the (binary, digest, sidecar) triple resolved from a
-// release's asset list for the running platform.
+// releaseSelection is the (binary, digest, sidecar, signature) quad resolved
+// from a release's asset list for the running platform.
 type releaseSelection struct {
 	assetURL   string
 	sha        string
 	sidecarURL string
+	sigURL     string
 }
 
 // selectAssets picks the release assets for this platform: the binary
@@ -779,6 +810,12 @@ func selectAssets(rel *ghRelease) releaseSelection {
 				sel.sidecarURL = a.BrowserDownloadURL
 			} else {
 				sel.sidecarURL = a.URL
+			}
+		case targetAsset() + ".sig":
+			if a.BrowserDownloadURL != "" {
+				sel.sigURL = a.BrowserDownloadURL
+			} else {
+				sel.sigURL = a.URL
 			}
 		}
 	}
@@ -1063,34 +1100,40 @@ var runningExecutable = func() (string, error) {
 	return exe, nil
 }
 
-// verifyDownloadedAsset enforces the mandatory SHA-256 check on a downloaded
-// release asset. Primary source is the GitHub-computed asset digest from the
-// release API; when that is absent (pre-2025 uploads) it falls back to the
-// published sidecar asset (targetAsset()+".sha256", resolved by name in
-// selectAssets — never by string-munging the binary URL, which 404'd when
-// the URL was the API endpoint ".../assets/N"). When NEITHER exists it
-// refuses — an unverifiable binary is worse than no update (guards against
-// DNS poisoning, MITM, or a compromised release pipeline). Returns the
-// verified digest. Shared by the CLI (runUpdate) and the dashboard endpoint
-// (handleUpdate) so the verification contract lives in one place.
+// verifyDownloadedAsset enforces the mandatory authenticity + integrity
+// checks on a downloaded release asset. It runs TWO gates, in order:
 //
-// Security-review note (deliberate, do NOT
-// re-flag as a bug): this check is INTEGRITY, not AUTHENTICITY. The SHA-256
-// comes from the SAME GitHub release as the binary (API digest or .sha256
-// sidecar), so it catches corruption, DNS poisoning, and MITM — but a
-// compromised repo/release that publishes both a trojaned binary and a
-// matching checksum passes. Closing that gap requires release SIGNING:
-// sign the assets in the pipeline with a key held in a GitHub secret
-// (minisign or cosign), embed the PUBLIC key here, and verify the
-// signature before the hash. That is a longer-term project — keypair
-// generation the operator owns, a secret in the repo settings, and
-// signing steps in BOTH release flows (the Linux cut from zenai and
-// windows-release.yml) plus a migration story for already-shipped
-// binaries — and is parked as a deliberate decision, not an oversight.
-// (The companion F9 item, the unpinned `go install go-winres@latest` in
-// windows-release.yml, is fixed: pinned to v0.3.3, because that tool
-// writes the .syso resource embedded in the Windows binary.)
+//  1. AUTHENTICITY (the load-bearing one): the binary's detached ed25519
+//     signature (targetAsset()+".sig", resolved by name in selectAssets)
+//     must verify against at least one of the embedded trusted release
+//     pubkeys (release_pubkeys). This is FAIL-CLOSED — a missing .sig, an
+//     undecodable signature, or one that verifies against no trusted key is
+//     a refusal. A compromised release pipeline can publish a trojaned
+//     binary and a matching SHA-256 (both come from the same release), but
+//     it cannot sign the binary without the private key, so it cannot pass
+//     this gate.
+//
+//  2. INTEGRITY (defense in depth): the SHA-256 must match the release's
+//     published digest (GitHub API digest, or the .sha256 sidecar when that
+//     is absent — pre-2025 uploads; when NEITHER exists it refuses). A
+//     valid signature already pins the exact bytes the key holder signed, so
+//     this is a redundant integrity net; it is kept because it is cheap and
+//     catches a sig/bytes skew.
+//
+// Shared by the CLI (runUpdate) and the dashboard endpoint (handleUpdate) so
+// the verification contract lives in one place. Returns the verified digest.
 func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string) (string, error) {
+	binBytes, err := os.ReadFile(tmp)
+	if err != nil {
+		return "", fmt.Errorf("verify: %v", err)
+	}
+
+	// Gate 1: authenticity. Fail-closed — see verifyReleaseSignature.
+	if err := verifyReleaseSignature(client, sel, binBytes); err != nil {
+		return "", err
+	}
+
+	// Gate 2: integrity (defense in depth on top of the signature).
 	verifySHA := strings.TrimPrefix(sel.sha, "sha256:")
 	if verifySHA == "" {
 		if sel.sidecarURL == "" {
@@ -1102,14 +1145,218 @@ func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string
 		}
 		verifySHA = sidecar
 	}
-	got, err := fileSHA256(tmp)
-	if err != nil {
-		return "", fmt.Errorf("verify: %v", err)
-	}
+	sum := sha256.Sum256(binBytes)
+	got := hex.EncodeToString(sum[:])
 	if got != verifySHA {
 		return "", fmt.Errorf("SHA-256 MISMATCH — expected %s, got %s", verifySHA, got)
 	}
 	return got, nil
+}
+
+// parseReleasePubkeys decodes the embedded trusted release-signing pubkeys
+// (release_pubkeys: hex ed25519 pubkeys, one per line; '#' comments and
+// blank lines ignored) into ed25519 public keys.
+func parseReleasePubkeys() ([]ed25519.PublicKey, error) {
+	var keys []ed25519.PublicKey
+	for _, line := range strings.Split(string(releasePubkeys), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		b, err := hex.DecodeString(line)
+		if err != nil {
+			return nil, fmt.Errorf("release_pubkeys: bad hex key: %v", err)
+		}
+		if len(b) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("release_pubkeys: key is %d bytes, want %d", len(b), ed25519.PublicKeySize)
+		}
+		keys = append(keys, ed25519.PublicKey(b))
+	}
+	if len(keys) == 0 {
+		return nil, errors.New("release_pubkeys: no trusted keys embedded")
+	}
+	return keys, nil
+}
+
+// fetchReleaseSignature downloads the detached .sig asset for the release
+// binary and returns the decoded ed25519 signature bytes. The .sig is the
+// hex-encoded 64-byte signature (one line), produced by `pulsemon sign
+// release`. The read is capped far below any real signature to bound it.
+func fetchReleaseSignature(client *http.Client, url string) ([]byte, error) {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent())
+	req.Header.Set("Accept-Encoding", "identity")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
+	if err != nil {
+		return nil, err
+	}
+	sig, err := hex.DecodeString(strings.TrimSpace(string(body)))
+	if err != nil {
+		return nil, fmt.Errorf("malformed .sig (not hex): %v", err)
+	}
+	return sig, nil
+}
+
+// verifyReleaseSignature checks the downloaded binary's detached ed25519
+// signature against the embedded trusted pubkey set. FAIL-CLOSED: a missing
+// .sig asset, an undecodable/oversized signature, or a signature that
+// verifies against none of the trusted keys is a refusal — an unsigned or
+// foreign-signed release must never install. This is the authenticity root
+// the SHA-256 check cannot provide.
+func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes []byte) error {
+	if sel.sigURL == "" {
+		return errors.New("release has no .sig signature asset — refusing to install an unsigned release")
+	}
+	sig, err := fetchReleaseSignature(client, sel.sigURL)
+	if err != nil {
+		return fmt.Errorf("release signature: %w", err)
+	}
+	if len(sig) != ed25519.SignatureSize {
+		return fmt.Errorf("release signature is %d bytes, want %d", len(sig), ed25519.SignatureSize)
+	}
+	keys, err := parseReleasePubkeys()
+	if err != nil {
+		return err
+	}
+	for _, pub := range keys {
+		if ed25519.Verify(pub, binBytes, sig) {
+			return nil
+		}
+	}
+	return errors.New("release signature invalid — the binary is not signed by a trusted release key")
+}
+
+// runSignRelease implements the maintainer's release-signing commands:
+//
+//	pulsemon sign genkey                   -> new ed25519 keypair (stdout)
+//	pulsemon sign release <file> <keyfile> -> write <file>.sig
+//	pulsemon sign verify <file>            -> check <file>.sig vs embedded keys
+//
+// genkey prints the public key (hex, add to release_pubkeys) and the private
+// key (hex, keep as the release-signing secret). `release` signs a release
+// binary's exact bytes with the private key (a hex ed25519 private key, one
+// line, in <keyfile>) and writes a detached .sig next to it (hex, one line) —
+// the asset verifyReleaseSignature checks at update time. `verify` re-checks
+// an existing <file>.sig against the EMBEDDED release_pubkeys (the same keys
+// a client verifies with), so a release cut with the wrong key is caught
+// before it ships.
+//
+// This is a MAINTAINER tool run on the trusted release host during a cut; it
+// is not part of the update path and never runs on a client.
+func runSignRelease(args []string) int {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: pulsemon sign <genkey|release <file> <keyfile>|verify <file>>")
+		return 1
+	}
+	switch args[0] {
+	case "genkey":
+		pub, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			uErr("generate key: " + err.Error())
+			return 1
+		}
+		fmt.Println("# pulsemon release-signing keypair (ed25519).")
+		fmt.Println("# Add the PUBLIC key to release_pubkeys (one line).")
+		fmt.Println("# Keep the PRIVATE key as the release-signing secret (release host,")
+		fmt.Println("# and the RELEASE_SIGNING_KEY CI secret for the Windows build).")
+		fmt.Println("# NEVER commit the private key.")
+		fmt.Println("PUBKEY=" + hex.EncodeToString(pub))
+		fmt.Println("PRIVKEY=" + hex.EncodeToString(priv))
+		return 0
+	case "release":
+		if len(args) != 3 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon sign release <file> <keyfile>")
+			return 1
+		}
+		file, keyfile := args[1], args[2]
+		binBytes, err := os.ReadFile(file)
+		if err != nil {
+			uErr("read " + file + ": " + err.Error())
+			return 1
+		}
+		keyHex, err := os.ReadFile(keyfile)
+		if err != nil {
+			uErr("read " + keyfile + ": " + err.Error())
+			return 1
+		}
+		priv, err := hex.DecodeString(strings.TrimSpace(string(keyHex)))
+		if err != nil {
+			uErr("keyfile is not hex: " + err.Error())
+			return 1
+		}
+		if len(priv) != ed25519.PrivateKeySize {
+			uErr("keyfile is " + strconv.Itoa(len(priv)) + " bytes, want " + strconv.Itoa(ed25519.PrivateKeySize))
+			return 1
+		}
+		sig := ed25519.Sign(ed25519.PrivateKey(priv), binBytes)
+		sigPath := file + ".sig"
+		if err := os.WriteFile(sigPath, []byte(hex.EncodeToString(sig)+"\n"), 0o644); err != nil {
+			uErr("write " + sigPath + ": " + err.Error())
+			return 1
+		}
+		// Self-check: the signature we just wrote must verify against the key's
+		// public half (an ed25519 private key's last 32 bytes are its pubkey).
+		if !ed25519.Verify(ed25519.PublicKey(priv[32:]), binBytes, sig) {
+			uErr("sign self-check failed (signature did not verify)")
+			return 1
+		}
+		uInfo("signed " + file + " -> " + sigPath)
+		sum := sha256.Sum256(binBytes)
+		uInfo("sha256:  " + hex.EncodeToString(sum[:]))
+		return 0
+	case "verify":
+		if len(args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon sign verify <file>")
+			return 1
+		}
+		file := args[1]
+		binBytes, err := os.ReadFile(file)
+		if err != nil {
+			uErr("read " + file + ": " + err.Error())
+			return 1
+		}
+		sigRaw, err := os.ReadFile(file + ".sig")
+		if err != nil {
+			uErr("read " + file + ".sig: " + err.Error())
+			return 1
+		}
+		sig, err := hex.DecodeString(strings.TrimSpace(string(sigRaw)))
+		if err != nil {
+			uErr(file + ".sig is not hex: " + err.Error())
+			return 1
+		}
+		if len(sig) != ed25519.SignatureSize {
+			uErr(file + ".sig is " + strconv.Itoa(len(sig)) + " bytes, want " + strconv.Itoa(ed25519.SignatureSize))
+			return 1
+		}
+		keys, err := parseReleasePubkeys()
+		if err != nil {
+			uErr(err.Error())
+			return 1
+		}
+		for _, pub := range keys {
+			if ed25519.Verify(pub, binBytes, sig) {
+				uInfo("signature valid: " + file + " verifies against the embedded release_pubkeys")
+				return 0
+			}
+		}
+		uErr("signature INVALID: " + file + " does not verify against the embedded release_pubkeys (wrong signing key?)")
+		return 1
+	default:
+		fmt.Fprintln(os.Stderr, "usage: pulsemon sign <genkey|release <file> <keyfile>|verify <file>>")
+		return 1
+	}
 }
 
 // detectRestart and performRestart are vars (not plain funcs) so tests can

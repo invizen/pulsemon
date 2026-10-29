@@ -59,3 +59,16 @@ the deferral: the endpoint is now 403 whenever authentication is
 disabled (`handleUpdate`, update_api.go; pinned by
 `TestUpdateRefusedWhenAuthDisabled`). The CLI (`pulsemon update`)
 remains the operator path.
+
+### Self-update authenticity (lifted 2026-10-29)
+`verifyDownloadedAsset` (update.go) checked the SHA-256 only — integrity,
+not authenticity. The binary and its SHA-256 come from the same GitHub
+release, so a compromised account or pipeline publishes both and the check
+passes, leading straight to code execution on every install that updates
+(often with ping privileges). This was the documented, deliberate deferral
+and the highest-impact residual risk in the project. The 2026-10-29 review
+lifted it: a release binary is now installed only if its detached ed25519
+`.sig` asset verifies against the embedded `release_pubkeys` (fail-closed),
+with the SHA-256 kept as a redundant integrity net. Both the CLI and the
+dashboard update path go through the shared check. See `docs/DECISIONS.md`
+→ `release-signing` for the rationale, rotation, and key custody.

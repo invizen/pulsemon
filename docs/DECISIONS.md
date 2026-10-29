@@ -421,6 +421,78 @@ re-inlined block, which the CSP would silently refuse to run, fails the test).
 Sabotage-verified: injecting an inline `<script>` before `</body>` makes
 `TestFix_csp_NoInlineScriptsOrStyles` fail.
 
+## release-signing (update.go, release_pubkeys, 2026-10-29)
+
+**Contract:** a release binary is installed ONLY if its detached ed25519
+signature (`targetAsset() + ".sig"`, resolved by name in `selectAssets`)
+verifies against at least one of the embedded trusted pubkeys
+(`release_pubkeys`, `go:embed`). Verification is FAIL-CLOSED — a missing
+`.sig`, an undecodable/mis-sized signature, or one that matches no trusted
+key is a refusal. After the authenticity gate, the SHA-256 is still checked
+(GitHub digest, else the `.sha256` sidecar) as a redundant integrity net.
+Both the CLI (`runUpdate`) and the dashboard (`handleUpdate`) go through the
+shared `verifyDownloadedAsset`, so one choke point secures both paths.
+
+**Why a signature (the authenticity root):** the SHA-256 proves the bytes
+survived the download intact (integrity) but NOT who published them
+(authenticity) — the binary and its SHA-256 come from the SAME GitHub
+release, so a compromised account or pipeline publishes both and the SHA
+check passes. A detached ed25519 signature proves the publisher held the
+private key, which a compromised pipeline does not. This was the
+highest-impact residual risk in the project (a compromised release → code
+execution on every install that updates, often running with ping
+privileges) and the documented self-update authenticity deferral is now
+lifted (see `docs/DEFERRED.md` → "Self-update authenticity").
+
+**Why sign the raw bytes, not a manifest:** the signature is over the
+binary's exact bytes. A valid signature for v1 will not verify against v2's
+different bytes, so there is no replay risk, and a per-file detached `.sig`
+is simpler than a signed manifest (no second artifact to keep in sync, no
+manifest format to define).
+
+**Why keep the SHA-256 after the signature:** a valid signature already pins
+the exact bytes the key holder signed, so the SHA is redundant for
+authenticity. It is kept because it is cheap, is the operator-facing
+integrity signal (the mismatch message shows expected vs got), and catches a
+sig/bytes skew (a `.sig` asset that drifts from its binary).
+
+**Why immediate fail-closed, no soft-fail deprecation window:** the release
+pipelines (`release.sh` for Linux, `windows-release.yml` for Windows) now
+SIGN every binary and FAIL THE RELEASE if signing, or the
+verify-against-`release_pubkeys` check, fails — an unsigned release cannot be
+published. Clients verify the TARGET release, not their own running binary,
+so the rollout is self-bootstrapping: a pre-signing client (no sig check)
+installs the first signed release on a plain SHA match, and every signed
+client thereafter installs only signed releases. No client is stranded, and
+a manual rollback to a pre-signing release is an operator action (not
+self-update), so fail-closed is the correct posture with no deprecation
+window.
+
+**Rotation:** `release_pubkeys` is a SET of trusted keys, not one. To rotate:
+add the new pubkey on its own line, ship a release signed by the new key,
+then retire the old key in a LATER release (keep both until the fleet is off
+the old key). The set — not a single key — is what makes rotation a normal
+update instead of a full re-bootstrap. Pinned by
+`TestVerifyReleaseSignature_Rotation` (a sig from either of two embedded keys
+verifies).
+
+**Key custody:** the private key is the release-signing SECRET — it lives on
+the trusted release host (a 600-perm file) and, for the Windows CI path, as
+the `RELEASE_SIGNING_KEY` GitHub Actions secret. It is NEVER committed; only
+`release_pubkeys` (the pubkeys) is committed. Maintainer tools:
+`pulsemon sign genkey` (new keypair), `pulsemon sign release <file>
+<keyfile>` (write a detached `.sig`), `pulsemon sign verify <file>`
+(re-check a `.sig` against the embedded pubkeys — the release pipeline runs
+this so a release cut with the wrong key is caught before it ships).
+
+**Pinned by:** `update_sig_test.go` — `TestVerifyReleaseSignature_{Valid,
+WrongKey,MissingSig,CorruptSig,WrongLength,Rotation}`,
+`TestParseReleasePubkeys`, and the end-to-end
+`TestVerifyDownloadedAsset_{Signed,Unsigned,ForeignSig}` (an unsigned or
+foreign-signed binary with a MATCHING SHA is refused — the whole point). A
+sabotage that drops the authenticity gate makes `_Unsigned` and `_ForeignSig`
+fail.
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)
