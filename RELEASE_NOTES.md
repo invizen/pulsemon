@@ -1,97 +1,107 @@
-# v0.3.31 — External-review hardening (9 findings: 6 fixes, 1 test-hygiene, 2 annotations)
+# v0.4.0 — Self-update release signing + external-review hardening
 
-A security- and alerting-correctness point release from the 2026-10-28
-external review batch. Every finding was verified against the real code
-first; six were valid and fixed with regression tests, one was test
-hygiene, and two were adjudicated non-bugs (pinned with in-code
-annotations so future review passes don't re-flag them). Gated with
-`gofmt`, `go vet` (incl. `GOOS=windows`), and the full `-race` suite.
+A security-hardening minor release. The headline change closes the
+self-update **authenticity** gap: release binaries are now cryptographically
+signed, so a compromised GitHub account or release pipeline can no longer
+push a malicious binary that passes the update check. The remaining nine
+commits are the 2026-10-29 external-review batch (probe security, session
+lifetime, dashboard CSP, and probe-correctness fixes). Every finding was
+verified against the real code first and is gated with `gofmt`, `go vet`
+(incl. `GOOS=windows`), and the full `-race` suite.
 
-## Alerting
+## Self-update release signing (the headline)
 
-- **SMTP email alerts deliver again** (`a507e06`). `resolveDestinations`
-  looked up `smtp_url` — a settings key nothing writes (SMTP's host lives
-  in `smtp_host`) — so every enabled, configured SMTP provider resolved to
-  **zero** destinations and `sendWebhookDeliver` returned "delivered" with
-  nothing sent. Every status alert, re-alert, recovery, and storm summary
-  silently skipped email since the multi-provider split. Webhook providers
-  were unaffected; **email-only alerting was fully broken**. Now resolved
-  via the provider's real `URLField`.
-- **Storm summaries: partial recovery + per-sensor dedupe** (`6a6de8e`).
-  A sensor going up → error → warning inside one storm window produced two
-  conflicting lines (the partial recovery burned the non-recovery budget
-  and was coalesced separately). Partial recoveries now count as
-  recoveries, and `flushStorm` dedupes the queue by sensor id keeping the
-  latest transition — one line per sensor.
+- **Release binaries are now signed with ed25519** (`c69c2d0`). The client
+  verifies a detached `.sig` asset against embedded trusted public keys
+  (`release_pubkeys`) **before** installing. Verification is fail-closed: a
+  missing, corrupt, mis-sized, or untrusted signature is refused. The SHA-256
+  integrity check is kept as a second, redundant layer.
+- **Why it matters:** the binary and its SHA-256 come from the *same* GitHub
+  release, so a compromised account or pipeline could previously publish a
+  trojaned binary **and** its matching SHA-256, and every client that updated
+  would run it (code execution, often with ping privileges). A signature
+  proves the publisher held the private key, which a compromised pipeline
+  does not. This was the project's highest-impact residual risk.
+- Both the CLI (`pulsemon update`) and the dashboard update button are
+  covered (they share one verification path).
+- **New maintainer commands:** `pulsemon sign genkey`, `pulsemon sign release
+  <file> <keyfile>`, and `pulsemon sign verify <file>`.
+- The Linux and Windows release pipelines now sign every binary and **fail
+  the release if a binary is unsigned**; a `.sig` asset ships alongside each
+  binary.
+
+## Probe security
+
+- **TLS certs verified during the handshake** (`3b70288`). The probe client
+  now verifies the server cert *before* any request bytes are written (dial +
+  handshake + verify in one step), on every redirect hop. Previously the full
+  request — including an `Authorization` header auto-derived from a
+  `user:pass@` target — was sent to whoever answered the handshake before the
+  cert was judged, so an on-path spoofer could collect the credentials. Cert
+  policy is unchanged (system-trusted OR a genuine self-signed match).
+- **HTTP body drained only when the connection is reused** (`3397096`). An
+  HTTPS probe forces a fresh handshake per probe, so its connection is
+  discarded anyway — draining up to 1 MB of body was pure waste. The drain now
+  runs only when the connection is kept and is capped at 64 KB.
 
 ## Access control
 
-- **Non-admins are viewers + pulse operators** (`22c17a3`). Per-sensor
-  mutations (create, edit, delete, clone, per-sensor history wipe) were
-  open to any session — a known deferral from v0.3.21. A lower-trust
-  account could create/repoint/delete sensors and erase per-sensor
-  `events` rows. Every mutation route is `requireAdmin`; reads and "Pulse
-  Now" stay open to every authenticated session. The UI hides the
-  mutation controls (new-sensor, add, per-sensor pause/edit/clone/delete,
-  clear-history) for non-admins while keeping Pulse Now visible.
-  `requireAdmin` stands down with auth-off, so the "auth off = fully open"
-  contract is unchanged.
+- **Sessions have an absolute 30-day lifetime** (`0cae5bb`). The 30-day TTL
+  was a *sliding* inactivity window, so a continuously-active session (an open
+  dashboard tab, or a stolen cookie used periodically) never expired — each
+  poll slid the expiry forward by another 30 days. A session is now
+  hard-capped at 30 days from login; only activity in between extends an idle
+  session up to that cap.
 
-## Alert card formatting
+## Dashboard
 
-- **Markdown: names escaped, URLs verbatim** (`a8f32b8`). `mdEscape` was
-  applied to the whole card line including the target, so a URL path with
-  `_`/`~` (legal) got visible backslashes — corrupting the text and
-  breaking the clickable auto-link in Discord/Google Chat. Now the sensor
-  **name** (free text) is escaped in all five Markdown builders and the
-  **target** stays verbatim so it renders and auto-links. `discordMentionSafe`
-  also no longer drops the `@` (inserts the zero-width space *after* it).
+- **Strict CSP + precompiled Tailwind** (`a4725bf`). The CSP was only
+  `frame-ancestors 'none'`; it is now a strict `'self'`-only policy (no
+  `unsafe-inline`, no hashes) — the theme/app/CSS moved out of inline blocks
+  into files so the policy needs no exceptions. Tailwind is precompiled to a
+  static ~30 KB stylesheet at build time, replacing the ~400 KB in-browser JIT
+  that regenerated CSS on every page load (not recommended for production).
 
-## Login
+## Probe correctness
 
-- **Throttle clears a stale lockout on refund** (`557ec03`). `beginAttempt`
-  sets a 5-minute lockout at `loginFailMax` failures, but `refundAttempt`
-  only popped the counter and never cleared the lockout. A burst of
-  no-KDF-cost rejections that are all refunded (browser double-submits,
-  setup-path errors) drained the count to zero while leaving the IP locked
-  out for the full 5 min. A refund that drops the count under the threshold
-  now clears the lockout. Genuine attackers who pay the KDF cost keep
-  theirs.
+- **Fast-retry matches the sensor interval** (`e8d8ff6`). An ERROR sensor
+  re-checks every `min(30s, interval)` — the old 10s floor made 5–9s sensors
+  re-check *less* often while down, slowing recovery detection.
+- **Status window mirrors the badge** (`ffaa4d3`). Window loss% and
+  sort-by-loss now use the same 8-*scheduled*-probe window as the badge (a
+  manual "Pulse Now" no longer shrinks the denominator or floats a healthy
+  sensor to the top of a loss-sorted list).
+- **TLS cert hot-reload: no respin while broken** (`fe3ae49`). A failed cert
+  reload now records the (broken) mtimes, so a busy TLS server no longer
+  re-parses and re-logs on every handshake for as long as the files stay
+  broken.
 
-## Sensor clone
+## Update check
 
-- **Clone clamps legacy params to current floors** (`284a45e`). Cloning
-  copied the source's `interval_s`/`timeout_ms`/`loss_warn`/`down_after`/
-  `spike_mult` verbatim, so a legacy out-of-range row (e.g. a 1s sensor)
-  could be cloned into arbitrarily many new out-of-range sensors, bypassing
-  the API floor the create/PATCH paths enforce. A clone is a new write and
-  now clamps each param into its valid range (plus the `timeout ≤
-  interval*1000` cross-field rule). Clones start paused, so the operator
-  reviews the normalized values.
+- **`?refresh=1` throttled** (`75da4b2`). A forced update-check refresh is now
+  ignored if the last fetch attempt was under 60s ago, so it can't be spammed
+  into GitHub's unauthenticated rate limit (or used to block other callers
+  behind the single-flight lock). The version check stays read-only; the
+  actual update remains admin-gated.
 
-## Tests / annotations (no behavior change)
+## Docs
 
-- **Test JSON decode errors checked** (`186b085`): 11 test assertions now
-  route response-body decodes through the `jsonDecode` helper so a
-  non-JSON body can't silently zero a struct and mask a regression.
-- **Annotation closing review n7** (`9d067ab`): `alertGateConsumer`'s
-  idle-timer lifecycle documented as correct (goroutine-local timer,
-  complete drain-then-Reset, single post-fire exit) — a `defer idle.Stop()`
-  would be a no-op.
-- **Annotation closing review n9** (`4c3f2e7`): `/api/tags` and
-  `/api/events` stay bare-pattern routes on purpose — the method-less `/`
-  catch-all defeats `ServeMux`'s 405+Allow, so converting would regress the
-  handler's JSON 405 into an HTML 404 for no benefit.
+- **`docs/DECISIONS.md`** (`0c1b1c5`). Rationale, rejected alternatives, and
+  the review-ID map for non-obvious code now live in a durable file; in-code
+  comments state the current contract only.
 
 ## Notes for operators
 
-- If you alert via **email only**, you have been receiving no email
-  alerts since the multi-provider split — this release restores them.
-- The **non-admin role** is the groundwork for enterprise viewer accounts:
-  create a second (non-admin) account to get a read + Pulse-Now-only
-  session. The first/bootstrapped account is always admin.
+- **Self-update is now authenticated.** If your install is on a release from
+  before this one, its first update to a signed release works as usual (older
+  clients only check the SHA). From this version on, an update is installed
+  only if its signature verifies against the embedded key.
+- No config changes are required. The signing public key is embedded in the
+  binary; the private signing key is the maintainer's release secret and is
+  never distributed.
 
 ## Assets
 
-- `pulsemon-linux-amd64`, `pulsemon-linux-arm64` (+ sha256 sidecars)
-- Windows asset added by the `windows-release.yml` workflow on tag push
+- `pulsemon-linux-amd64`, `pulsemon-linux-arm64` (+ sha256 sidecars + `.sig`)
+- Windows assets added by the `windows-release.yml` workflow on tag push
+  (`pulsemon-windows-amd64.exe`, `pulsemon-setup-0.4.0.exe` + sidecars + `.sig`)
