@@ -344,6 +344,35 @@ status-poll-only client slide forever. Pinned by `TestSessionAbsoluteMaxAge`
 (29-day-old active session still valid; 31-day-old active session rejected
 + deleted by both paths; fresh session unaffected).
 
+## update-check-refresh-throttle (update_check.go, 2026-10-29)
+
+**Contract:** `GET /api/update-check` serves the GitHub releases lookup from
+a 30-min in-memory cache. `?refresh=1` forces a fresh lookup, but only when
+the last fetch ATTEMPT was at least `updateCheckRefreshMinInterval` (60s)
+ago; a fresher refresh is ignored and served from the cache like a normal
+poll. `updateCheckAttemptAt` records the last attempt (success OR failure),
+not just the last success, so an outage can't be used to keep forcing calls.
+
+**Why the throttle:** pre-fix, `?refresh=1` bypassed the cache unconditionally
+(both cache-hit cases were gated on `!refresh`). Any authenticated user — or
+anyone on the LAN when auth is off — could spam it: each refresh forced
+`fetchRelease` while `updateCheckMu` was held (the single-flight lock), so
+every other caller (including the 5s dashboard polls) blocked for up to the
+10s client timeout, and rapid refreshes walked straight into GitHub's 60
+req/hour unauthenticated limit. Keying the throttle on the last ATTEMPT (not
+the last success) matters: `updateCheckAt` only advances on success, so a
+60s throttle measured from it would never bind during an outage.
+
+**Why not require admin:** the version check is read-only (it only reports
+the latest release), and the actual self-update (`POST /api/update`) is
+already `requireAdmin`-gated. Requiring admin for a read-only "check now"
+would be an odd tightening and conflicts with the standing M4c posture of
+keeping the update path low-friction on auth-off installs (no admin exists
+there). The 60s throttle bounds the abuse without that friction. Pinned by
+`TestUpdateCheckRefreshThrottled` (first check fetches; an immediate
+`?refresh=1` is ignored — no new upstream hit; a `?refresh=1` after the
+interval forces a fresh fetch).
+
 ## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
 
 **Status:** single `package main` (~15k LOC production, 154 .go files)

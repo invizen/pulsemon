@@ -27,7 +27,23 @@ var (
 	updateCheckMu     sync.Mutex
 	updateCheckCached *updateCheckResult
 	updateCheckAt     time.Time
-	updateCheckTTL    = 30 * time.Minute
+	// updateCheckAttemptAt is the time of the last fetchRelease ATTEMPT
+	// (success or failure). It drives the ?refresh=1 throttle: unlike
+	// updateCheckAt (the last SUCCESS, which ages the stale entry and never
+	// advances on a failure), a failed attempt must also count, or an outage
+	// would let ?refresh=1 keep forcing GitHub calls.
+	updateCheckAttemptAt time.Time
+	updateCheckTTL       = 30 * time.Minute
+	// updateCheckRefreshMinInterval is the minimum time between two GitHub
+	// fetches forced by ?refresh=1. Without it, an authenticated user (or
+	// anyone on the LAN when auth is off) can spam the check: every ?refresh=1
+	// bypasses the 30-min cache and forces fetchRelease while updateCheckMu is
+	// held (blocking every other caller up to the 10s client timeout), and
+	// rapid refreshes walk straight into GitHub's 60 req/hour unauthenticated
+	// limit. A refresh younger than this is ignored and served from the cache
+	// like a normal poll. 60s keeps an explicit "check now" useful while
+	// bounding forced calls to one per minute.
+	updateCheckRefreshMinInterval = 60 * time.Second
 	// How long a failed check suppresses new GitHub calls. Without this,
 	// every 5s dashboard poll during an outage re-hits the API and walks
 	// into a secondary rate limit, making the failure sticky.
@@ -45,8 +61,25 @@ var (
 // outage must not blank the version pill or hammer the API. With no cached
 // result at all, a failure is a 503. Only a fresh success overwrites the
 // cached result (the stale response carries cached:true).
+//
+// ?refresh=1 forces a fresh lookup, but only when the last fetch attempt was
+// at least updateCheckRefreshMinInterval ago; a fresher refresh is ignored
+// and served from the cache like a normal poll, so the endpoint cannot be
+// used to hammer the GitHub API (and block every other caller on the
+// single-flight lock) by repeated refreshes.
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	refresh := r.URL.Query().Get("refresh") == "1"
+	// A ?refresh=1 younger than updateCheckRefreshMinInterval since the last
+	// fetch attempt is ignored and served from the cache like a normal poll:
+	// honored, it would force a fetchRelease on every click — while
+	// updateCheckMu is held (blocking every other caller up to the 10s client
+	// timeout) and straight into GitHub's 60 req/hour unauthenticated limit.
+	// The throttle keys on the last ATTEMPT (not the last success), so a
+	// failed attempt also counts and an outage can't be used to keep forcing
+	// calls.
+	if refresh && time.Since(updateCheckAttemptAt) < updateCheckRefreshMinInterval {
+		refresh = false
+	}
 
 	// mu held across the whole check: that is the single-flight —
 	// concurrent cache-miss requests queue here, and the first fetch
@@ -68,6 +101,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	updateCheckAttemptAt = time.Now()
 	client := &http.Client{Timeout: 10 * time.Second}
 	rel, err := fetchRelease(client, "latest")
 	if err != nil {

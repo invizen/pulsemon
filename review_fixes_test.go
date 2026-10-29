@@ -194,3 +194,79 @@ func TestUpdateCheckStaleOnFailure(t *testing.T) {
 		t.Fatalf("upstream hit %d times during failure suppression, want still 2", hits)
 	}
 }
+
+// TestUpdateCheckRefreshThrottled pins the ?refresh=1 throttle: a refresh
+// younger than updateCheckRefreshMinInterval since the last fetch attempt is
+// ignored and served from the cache (no new upstream hit), so the endpoint
+// can't be used to hammer the GitHub API by repeated refreshes. A refresh
+// once the interval has elapsed DOES force a fresh fetch. Pre-fix, every
+// ?refresh=1 bypassed the cache and forced a fetchRelease.
+func TestUpdateCheckRefreshThrottled(t *testing.T) {
+	var hits int
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"tag_name":"v9.9.9","html_url":"https://github.com/invizen/pulsemon/releases/tag/v9.9.9"}`))
+	}))
+	defer gh.Close()
+
+	oldBase := releaseBase
+	releaseBase = gh.URL + "/releases"
+	t.Cleanup(func() { releaseBase = oldBase })
+
+	oldCache, oldAt, oldAttempt, oldFailed := updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed
+	oldTTL, oldMinRefresh := updateCheckTTL, updateCheckRefreshMinInterval
+	t.Cleanup(func() {
+		updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed = oldCache, oldAt, oldAttempt, oldFailed
+		updateCheckTTL, updateCheckRefreshMinInterval = oldTTL, oldMinRefresh
+	})
+	updateCheckCached, updateCheckFailed = nil, false
+	updateCheckAt, updateCheckAttemptAt = time.Time{}, time.Time{}
+	updateCheckTTL = time.Hour // normal polls served from cache, not re-fetched
+	updateCheckRefreshMinInterval = 50 * time.Millisecond
+
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	get := func(refresh bool) (int, updateCheckResult) {
+		u := "/api/update-check"
+		if refresh {
+			u += "?refresh=1"
+		}
+		req := httptest.NewRequest("GET", u, nil)
+		rec := httptest.NewRecorder()
+		srv.handleUpdateCheck(rec, req)
+		var res updateCheckResult
+		_ = json.Unmarshal(rec.Body.Bytes(), &res)
+		return rec.Code, res
+	}
+
+	// 1. First check (no refresh): fetches and caches. hits=1.
+	code, res := get(false)
+	if code != 200 || res.Latest != "v9.9.9" || res.Cached {
+		t.Fatalf("first check: code=%d res=%+v", code, res)
+	}
+	if hits != 1 {
+		t.Fatalf("first check hit upstream %d times, want 1", hits)
+	}
+
+	// 2. Immediate ?refresh=1 (within the min interval): IGNORED — served from
+	//    the fresh cache, NO new upstream hit. Pre-fix this forced a fetch
+	//    (hits would become 2).
+	code, res = get(true)
+	if code != 200 || res.Cached {
+		t.Fatalf("throttled refresh: code=%d res=%+v, want 200 served from fresh cache", code, res)
+	}
+	if hits != 1 {
+		t.Fatalf("throttled refresh hit upstream %d times, want still 1 (a refresh within the min interval must be ignored)", hits)
+	}
+
+	// 3. After the min interval elapses: ?refresh=1 forces a fresh fetch.
+	time.Sleep(60 * time.Millisecond)
+	code, res = get(true)
+	if code != 200 || res.Cached {
+		t.Fatalf("post-interval refresh: code=%d res=%+v", code, res)
+	}
+	if hits != 2 {
+		t.Fatalf("post-interval refresh hit upstream %d times, want 2", hits)
+	}
+}
