@@ -1012,31 +1012,20 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	} else {
 		body = map[string]string{"text": "✅ *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
-	// Errors from net/http embed the full request URL, which carries the
-	// provider token: strip it before it reaches the browser or the log.
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(mustJSON(body)))
+	// Single transport seam with postJSON (doWebhookPost): the shared
+	// hardened client, the capped drain, and the URL redaction live there.
+	// TestWebhook is a cold, operator-initiated path — no retry.
+	code, _, err := pw.doWebhookPost(ctx, url, mustJSON(body))
 	if err != nil {
-		return false, redactErr(err).Error()
+		return false, err.Error()
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := webhookClientFor(req.URL).Do(req)
-	if err != nil {
-		return false, redactErr(err).Error()
-	}
-	defer resp.Body.Close()
-	// Drain (capped) before close so the shared client's per-host pool can
-	// reuse the TLS connection for the next request to this endpoint —
-	// closing an unread body marks the conn non-reusable (same idiom as
-	// postJSON). TestWebhook is a cold, operator-initiated path, so this is
-	// a minor efficiency/consistency win, not a hot-path fix.
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
+	if code >= 300 && code < 400 {
 		return false, "endpoint redirected (refused to follow — possible misconfiguration)"
 	}
-	if resp.StatusCode >= 300 {
-		return false, fmt.Sprintf("endpoint returned HTTP %d", resp.StatusCode)
+	if code >= 300 {
+		return false, fmt.Sprintf("endpoint returned HTTP %d", code)
 	}
-	return true, "test alert sent via " + p.Label + " (HTTP " + http.StatusText(resp.StatusCode) + ")"
+	return true, "test alert sent via " + p.Label + " (HTTP " + http.StatusText(code) + ")"
 }
 
 func mustJSON(v interface{}) []byte {
@@ -1309,6 +1298,34 @@ func (pw *ProbeWorker) retryAlert(try func() (retryable bool, retryAfter time.Du
 	}
 }
 
+// doWebhookPost performs ONE webhook POST with the shared hardened client
+// (10s timeout, no redirects, SSRF-guarded dial — webhookClientFor) and
+// returns the response status + headers. It is the single transport seam for
+// both webhook writers: postJSON (alert delivery, retried) and TestWebhook
+// (the settings test button, single-shot). The caller passes a pre-marshaled
+// body (postJSON marshals once and reuses it across retries) and owns the
+// status classification — the two callers classify differently (retry policy
+// vs UI detail string). The returned error never contains the URL (it
+// carries the provider credential).
+func (pw *ProbeWorker) doWebhookPost(ctx context.Context, url string, body []byte) (int, http.Header, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, redactErr(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := webhookClientFor(req.URL).Do(req)
+	if err != nil {
+		return 0, nil, redactErr(err)
+	}
+	defer resp.Body.Close()
+	// Drain (capped) before close so the transport can reuse the
+	// TLS connection for the next request to this endpoint:
+	// closing an unread body marks the conn non-reusable, so every
+	// alert paid a fresh handshake even to the same endpoint.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, resp.Header, nil
+}
+
 // postJSON delivers a JSON payload to a webhook with the shared hardened
 // client (10s timeout, no redirects), retrying transient failures (network
 // errors, 429, 5xx) per alertRetryDelays. The POST is bound to pw.stopCtx so
@@ -1321,27 +1338,16 @@ func (pw *ProbeWorker) retryAlert(try func() (retryable bool, retryAfter time.Du
 func (pw *ProbeWorker) postJSON(url string, payload map[string]interface{}) error {
 	body, _ := json.Marshal(payload)
 	err := pw.retryAlert(func() (bool, time.Duration, error) {
-		req, err := http.NewRequestWithContext(pw.stopCtx, http.MethodPost, url, bytes.NewReader(body))
+		code, header, err := pw.doWebhookPost(pw.stopCtx, url, body)
 		if err != nil {
-			return false, 0, redactErr(err)
+			return pw.stopCtx.Err() == nil, 0, err
 		}
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := webhookClientFor(req.URL).Do(req)
-		if err != nil {
-			return pw.stopCtx.Err() == nil, 0, redactErr(err)
-		}
-		defer resp.Body.Close()
-		// Drain (capped) before close so the transport can reuse the
-		// TLS connection for the next alert:
-		// closing an unread body marks the conn non-reusable, so every
-		// alert paid a fresh handshake even to the same endpoint.
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-		switch code := resp.StatusCode; {
+		switch {
 		case code >= 300 && code < 400:
 			return false, 0, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")
 		case code == http.StatusTooManyRequests:
 			// Honor the provider's Retry-After.
-			return true, parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()), fmt.Errorf("endpoint returned %d", code)
+			return true, parseRetryAfter(header.Get("Retry-After"), time.Now()), fmt.Errorf("endpoint returned %d", code)
 		case code >= 500:
 			return true, 0, fmt.Errorf("endpoint returned %d", code)
 		case code >= 300:
