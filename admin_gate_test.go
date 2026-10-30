@@ -60,13 +60,16 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 		t.Fatalf("helper login: %d", code)
 	}
 
-	// The mutating admin surface: every one of these is a 403 for the
+	// The mutating admin surface — plus the settings READ, whose
+	// payload carries operator PII and infrastructure metadata
+	// (review 2026-10-30): every one of these is a 403 for the
 	// non-admin session (and must NOT reach the handler — the update
 	// attempt in particular must not acquire the update lock).
 	cases := []struct {
 		method, path, body string
 	}{
 		{http.MethodPost, "/api/update", ""},
+		{http.MethodGet, "/api/settings", ""},
 		{http.MethodPut, "/api/settings", "{}"},
 		{http.MethodPost, "/api/settings/test", `{"kind":"discord"}`},
 		{http.MethodPost, "/api/settings/tls", `{}`},
@@ -82,10 +85,13 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 	}
 
 	// Admin positive controls: the same routes reach the handler.
-	// PUT settings and DELETE history are hermetic 200s; the update
-	// endpoint is pinned to the container path (no download, no
-	// install); the TLS pair is an empty body (400, missing cert/key);
-	// the TLS delete has no dashboard cert to remove (409).
+	// GET+PUT settings and DELETE history are hermetic 200s; the
+	// update endpoint is pinned to the container path (no download,
+	// no install); the TLS pair is an empty body (400, missing
+	// cert/key); the TLS delete has no dashboard cert to remove (409).
+	if code := requestStatus(t, admin, http.MethodGet, httpSrv.URL+"/api/settings", ""); code != http.StatusOK {
+		t.Errorf("GET /api/settings (admin): got %d, want 200", code)
+	}
 	if code := requestStatus(t, admin, http.MethodPut, httpSrv.URL+"/api/settings", "{}"); code != http.StatusOK {
 		t.Errorf("PUT /api/settings (admin): got %d, want 200", code)
 	}

@@ -484,7 +484,15 @@ func (s *Server) routes() {
 	// not "fix" to method-prefixed (docs/DECISIONS.md → bare-routes).
 	s.mux.HandleFunc("/api/tags", s.handleTags)
 	s.mux.HandleFunc("/api/events", s.handleEvents)
-	s.mux.HandleFunc("GET /api/settings", s.handleSettingsGet)
+	// Settings READS are admin-only too: the payload carries operator
+	// PII and infrastructure metadata (smtp_from/to/username,
+	// telegram_chat_id, webhook scheme+host, TLS cert metadata) that a
+	// lower-trust viewer account must not see — the same privilege
+	// boundary GET /api/auth/users enforces on the roster. The UI
+	// already hides the settings modal from non-admins, so nothing
+	// consumes this for them. requireAdmin stands down with the auth
+	// gate, so the "auth off = fully open" contract is unchanged.
+	s.mux.HandleFunc("GET /api/settings", s.requireAdmin(s.handleSettingsGet))
 	s.mux.HandleFunc("PUT /api/settings", s.requireAdmin(s.handleSettingsPut))
 	s.mux.HandleFunc("POST /api/settings/test", s.requireAdmin(s.handleSettingsTest))
 	s.mux.HandleFunc("POST /api/settings/tls", s.requireAdmin(s.handleTLSSettingsPut))

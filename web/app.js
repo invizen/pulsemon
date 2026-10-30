@@ -65,17 +65,19 @@ syncThemeIcon();
 
 // ---------- Authentication Flow ----------
 let authState = null;
-// meIsAdmin gates the admin-only UI surface (alerts, maintenance mode,
-// TLS, self-update, and every SENSOR MUTATION control: new/edit/clone/
-// delete/pause + clear history). Server-side, requireAdmin 403s the same
-// routes for non-admin sessions (review 2026-10-28: non-admins are
-// viewers + Pulse Now operators); the UI just hides the controls a
-// regular account can't use. Default true: with auth off the dashboard
-// is fully open, so everything stays visible.
+// meIsAdmin gates the admin-only UI surface (alerts, settings,
+// maintenance mode, TLS, self-update, and every SENSOR MUTATION control:
+// new/edit/clone/delete/pause + clear history). Server-side, requireAdmin
+// 403s the same routes for non-admin sessions (review 2026-10-28:
+// non-admins are viewers + Pulse Now operators; review 2026-10-30: the
+// settings READ is gated too, so its modal entry points — the gear, the
+// update pill, and the alerts bell — are hidden for them); the UI just
+// hides the controls a regular account can't use. Default true: with auth
+// off the dashboard is fully open, so everything stays visible.
 let meIsAdmin = true;
 function applyAdminVisibility() {
   const hide = !meIsAdmin;
-  for (const id of ['alerts-btn', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn']) {
+  for (const id of ['alerts-btn', 'settings-btn', 'update-pill', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', hide);
   }
