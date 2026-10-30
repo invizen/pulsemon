@@ -1,63 +1,87 @@
-# v0.4.1 — HTTPS probe SNI fix + strict-CSP dashboard fix
+# v0.4.2 — 2026-10-30 external-review hardening batch
 
-A patch release that fixes two regressions introduced in v0.4.0. No new
-features; both changes are correctness fixes for behavior that broke on
-update. Gated with `gofmt`, `go vet` (incl. `GOOS=windows`), `node --check`,
-the CSP + SNI regression tests, and the full `-race` suite.
+A patch release closing out the 2026-10-30 external-review batch: 8
+findings adjudicated — 6 fixed, 2 rejected and pinned (documented
+decisions, no behavior change). No new features. Gated with `gofmt`,
+`go vet` (incl. `GOOS=windows`), `node --check`, and the full `-race`
+suite on every commit.
 
-## HTTPS sensors failing after v0.4.0 (the headline)
+## Security & correctness fixes
 
-- **HTTPS probes now send SNI** (`http.go`). v0.4.0's new dial-then-verify
-  TLS path (`probeDialTLS`) built the manual TLS client with
-  `InsecureSkipVerify: true` but **no `ServerName`**, so no SNI was sent.
-  SNI-dependent frontends — Cloudflare in particular — reject a SNI-less
-  handshake with `remote error: tls: handshake failure`, which put
-  Cloudflare-fronted HTTPS sensors (e.g. `invizen.com`, `pulsemon.net`) into
-  a permanent `error` state even though the host was reachable. The fix sets
-  `ServerName: host` so the correct virtual host is selected. IP-literal
-  targets are unaffected: Go blanks SNI for IPs and `verifyHTTPCert` judges
-  the IP SAN as before.
-- **Regression-locked** with `TestProbeHTTPEndToEndSNIRequired`: a TLS test
-  server whose `GetCertificate` *requires* a matching SNI and fails
-  otherwise. The probe only passes if it sends SNI. Sabotage-verified —
-  removing `ServerName` makes the test fail.
+- **Settings read is admin-only** (`api.go`, `web/`). `GET /api/settings`
+  passed the bare session gate, so a lower-trust viewer account could read
+  the full settings payload (SMTP from/to/username, `telegram_chat_id`,
+  webhook scheme+host, TLS cert metadata, alert scope/filter) while `PUT`
+  was already admin-gated. The GET is now `requireAdmin`; the settings
+  modal entry points (gear button, update pill) are hidden from
+  non-admins so they no longer hit a 403 on open. `requireAdmin` stands
+  down on auth-off / zero-account installs, so those deployments are
+  byte-for-byte unchanged.
+- **Telegram `chat_id` resolved up front, fail-closed** (`alerts.go`).
+  The chat_id was re-read live inside the delivery goroutines via the
+  swallow-to-`""` setting getter while every provider URL was already
+  resolved error-aware — a transient DB lock at delivery time posted an
+  empty chat_id (Telegram 400), and the storm-summary path (no retry)
+  dropped the coalesced alert. `resolveDestinations` now resolves the
+  chat_id once and fails the whole send on read failure, matching the URL
+  handling.
+- **`IsAdmin` is TTL-cached, fail-closed** (`auth.go`). `IsAdmin` was the
+  only per-request auth check without a cache — every admin-gated request
+  ran an uncached SQLite point query. Both answers now cache for the
+  standard 2s user-TTL; DB errors fail closed and are never cached;
+  in-app mutations (create/remove/last-admin promotion) invalidate
+  immediately.
+- **Request context threaded into the last four ctx-less handler DB
+  calls** (`db.go`, `api.go`). `ActiveSensorIDs`,
+  `EnterMaintenanceWithFreshSnapshot`, `SetMaintenanceMode`, and
+  `DeleteTag` ignored `r.Context()`, so a client that disconnected
+  mid-request left those statements running. They now carry the request
+  context (pool-level fast-fail: a dead ctx means the statement never
+  runs), completing the context-propagation contract pinned by
+  `TestFix_HandlerDBCallsHonorRequestContext`.
+- **Markdown link-bracket escaping** (`alerts.go`). `mdEscape` escaped the
+  emphasis characters that `validSensorName` permits but not `[` `]` — and
+  the validator permits those too. A sensor named
+  `[click here](https://evil.example)` was legal input and rendered as a
+  masked hyperlink in the Discord/Google Chat cards and storm summary.
+  Brackets are now escaped (all five Markdown builders); parens stay
+  unescaped (no link syntax can form without the brackets) and targets
+  remain verbatim.
 
-## Dashboard: strict CSP restored, no inline handlers
+## Refactor
 
-- v0.4.0 shipped a strict CSP (`script-src 'self'; style-src 'self'`, no
-  `unsafe-inline`) but the dashboard still generated **inline `onclick`
-  handlers and inline `style="height:…"` sparkline bars** at runtime, which
-  the strict policy blocks — so every control was dead and sparklines
-  rendered at zero height. A stopgap (`'unsafe-inline'`) was deployed to
-  unblock; this is the proper fix that removes the need for it.
-- **Event delegation** (`web/app.js`, `web/index.html`): every inline
-  `onclick="…"` is replaced with `data-act` + `data-args` (a JSON array of
-  the handler's arguments) dispatched by a single delegated click listener.
-  Handlers that took `this` receive the clicked element. Zero inline
-  `onclick`/`onload`/`onerror` attributes remain.
-- **Sparkline heights via JS, not inline style**: bars carry `data-h` and
-  `layoutSparklines()` sets `el.style.height` from it, so no inline `style`
-  attribute is ever written.
-- **CSP re-tightened** (`api.go`): back to the strict
-  `default-src 'self'; script-src 'self'; style-src 'self'; object-src
-  'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'` —
-  the stopgap `'unsafe-inline'` is gone. The security-headers test asserts
-  this exact string.
-- Verified in a real browser under the strict policy: sensors render,
-  per-sensor Edit opens a populated form (args pass through `data-args`),
-  sparkline bars have non-zero heights, and an injected inline
-  `style="…"` is confirmed blocked by the policy.
+- **Single webhook transport seam** (`alerts.go`). `TestWebhook` (the
+  settings test button) duplicated `postJSON`'s HTTP transport
+  construction (request build, headers, capped drain, URL redaction, 3xx
+  classification), risking drift. Both now share
+  `doWebhookPost(ctx, url, body)`; behavior-preserving — same hardened
+  client, same headers, same drain, same messages, same contexts.
+
+## Pinned decisions (no behavior change)
+
+- **`GET /api/update-check` stays open to any session** (re-adjudicated).
+  Read-only, non-secret (versions already render in the header pill),
+  fixed upstream URL, 60s global `?refresh=1` throttle. The admin gate
+  belongs on `POST /api/update` (code download + execute + restart), which
+  is already admin-only. Pinned in-code, in `docs/DECISIONS.md`, and with
+  a hermetic non-admin 200 test.
+- **`shouldAlert`'s per-decision filter read is deliberate** (rejected
+  cache proposal). The default path is O(1); the loop only runs for
+  opt-in routing on a 500-capped list, on a cold path; and the
+  read-current-setting-per-decision pattern (shared with the
+  `maintenance_mode` gate) means a routing change takes effect on the next
+  transition with zero staleness. Pinned in `docs/DECISIONS.md` and
+  in-code.
 
 ## Notes for operators
 
-- **HTTPS sensors recover automatically** on update — no config change.
-  Cloudflare-fronted and other SNI-dependent hosts will probe normally.
-- **The dashboard is fully interactive again** under the strict CSP (edit,
-  clone, delete, pulse, tags, settings, alerts, TLS, self-update, inspector).
-- No config changes required. Self-update signing from v0.4.0 is unchanged.
+- No config changes required. Self-update signing (ed25519) is unchanged
+  from v0.4.0; existing clients verify v0.4.2 as usual.
+- Auth-off / zero-account installs (the current fleet) are behaviorally
+  identical to v0.4.1 — the new admin gate stands down without accounts.
 
 ## Assets
 
 - `pulsemon-linux-amd64`, `pulsemon-linux-arm64` (+ sha256 sidecars + `.sig`)
 - Windows assets added by the `windows-release.yml` workflow on tag push
-  (`pulsemon-windows-amd64.exe`, `pulsemon-setup-0.4.1.exe` + sidecars + `.sig`)
+  (`pulsemon-windows-amd64.exe`, `pulsemon-setup-0.4.2.exe` + sidecars + `.sig`)
