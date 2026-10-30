@@ -1162,10 +1162,15 @@ func discordMentionSafe(s string) string {
 	return s
 }
 
-// mdEscape backslash-escapes the Markdown emphasis characters — * _ ~ ` — so
-// Discord and Google Chat render them verbatim instead of as
-// bold/italic/strikethrough/code (2026-10-24 review: a sensor named
-// db_primary_01 would otherwise render with "primary" italicized).
+// mdEscape backslash-escapes the Markdown metacharacters that
+// validSensorName permits: the emphasis characters * _ ~ ` (2026-10-24
+// review: a sensor named db_primary_01 would otherwise render with
+// "primary" italicized) and the link brackets [ ] (2026-10-30 review #7:
+// a sensor named "[click here](https://evil.example)" is legal input and
+// would otherwise render as a masked hyperlink in the Discord/Google Chat
+// cards and storm summary). The parens are deliberately unescaped: with
+// the brackets neutralized no link syntax can form, so escaping them would
+// be noise.
 //
 // Applied to SENSOR NAMES ONLY, never to targets: a target is a URL/hostname
 // whose path may legally contain _ and ~, and backslash-escaping those
@@ -1177,7 +1182,7 @@ func discordMentionSafe(s string) string {
 // Applied ONLY to the Markdown (google_chat/discord) builders — the Telegram
 // (HTML) and SMTP (plain) paths carry the data verbatim.
 func mdEscape(s string) string {
-	for _, c := range []string{"*", "_", "~", "`"} {
+	for _, c := range []string{"*", "_", "~", "`", "[", "]"} {
 		s = strings.ReplaceAll(s, c, "\\"+c)
 	}
 	return s

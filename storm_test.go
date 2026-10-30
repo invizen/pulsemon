@@ -713,6 +713,36 @@ func TestMarkdownEscapesEmphasisChars(t *testing.T) {
 	}
 }
 
+// TestMarkdownEscapesLinkBrackets (2026-10-30 review #7): validSensorName
+// permits [ ] ( ), so a sensor named "[click here](https://evil.example)"
+// is legal input. In Discord/Google Chat Markdown, [text](url) renders as a
+// masked hyperlink — the brackets are what make it a link, so mdEscape must
+// escape them. The parens stay unescaped (no link syntax can form without
+// the brackets), and the URL in the name stays verbatim (same n4 rule).
+func TestMarkdownEscapesLinkBrackets(t *testing.T) {
+	name := "[click here](https://evil.example)"
+	target := "https://nas.lan/health"
+	entries := []stormEntry{{id: "a", name: name, target: target, oldState: "up", state: "error"}}
+
+	wantEscaped := `\[click here\](https://evil.example)`
+	if gc := cardFor("up", "error", name, target, 0); !strings.Contains(gc, wantEscaped) {
+		t.Errorf("google_chat card must escape the name's link brackets: %q", gc)
+	}
+	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, wantEscaped) {
+		t.Errorf("discord card must escape the name's link brackets: %q", dc)
+	}
+	if md := stormSummaryMarkdown(entries); !strings.Contains(md, wantEscaped) {
+		t.Errorf("storm markdown must escape the name's link brackets: %q", md)
+	}
+	// The non-Markdown paths must NOT carry backslash escapes.
+	if p := stormSummaryPlain(entries); strings.Contains(p, "\\") {
+		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
+	}
+	if h := stormSummaryHTML(entries); strings.Contains(h, "\\") {
+		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
+	}
+}
+
 // TestDiscordMentionSafeKeepsAtSign (2026-10-28 review n4): the
 // neutralization inserts a zero-width space AFTER the @ (breaking Discord's
 // mention token) while KEEPING the @ visible. The old code replaced the @
