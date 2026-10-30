@@ -715,21 +715,23 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	var delivered atomic.Bool
 	for _, d := range dests {
 		wg.Add(1)
-		go func(p providerMeta, url string) {
+		go func(d dest) {
 			defer wg.Done()
-			defer alertPanicRecovered("deliver-" + p.Kind)
+			defer alertPanicRecovered("deliver-" + d.p.Kind)
 			var ok bool
-			switch p.Kind {
+			switch d.p.Kind {
 			case "google_chat":
-				ok = pw.postJSON(url, map[string]interface{}{"text": md}) == nil
+				ok = pw.postJSON(d.url, map[string]interface{}{"text": md}) == nil
 			case "discord":
-				ok = pw.postJSON(url, map[string]interface{}{
+				ok = pw.postJSON(d.url, map[string]interface{}{
 					"content":          md,
 					"allowed_mentions": map[string]interface{}{"parse": []string{}},
 				}) == nil
 			case "telegram":
-				ok = pw.postJSON(url, map[string]interface{}{
-					"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+				// d.chatID was resolved up front in resolveDestinations
+				// (see dest) — never a live re-read here.
+				ok = pw.postJSON(d.url, map[string]interface{}{
+					"chat_id":    d.chatID,
 					"text":       stormSummaryHTML(entries),
 					"parse_mode": "HTML",
 				}) == nil
@@ -739,7 +741,7 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 			if ok {
 				delivered.Store(true)
 			}
-		}(d.p, d.url)
+		}(d)
 	}
 	wg.Wait()
 	if len(dests) > 0 && !delivered.Load() {
@@ -798,16 +800,29 @@ func stormSummaryPlain(entries []stormEntry) string {
 }
 
 // dest is one configured provider with its resolved URL (a webhook POST
-// target, or the SMTP host for the smtp kind).
+// target, or the SMTP host for the smtp kind). chatID carries the
+// Telegram chat_id, resolved in resolveDestinations with the same
+// error-awareness as the URL: the old code re-read it live in the
+// delivery goroutine via the swallow-to-"" GetSetting, so a transient
+// DB lock at delivery time posted an empty chat_id (Telegram 400) —
+// fatal on the storm-summary path, which has no retry (2026-10-30
+// review #3).
 type dest struct {
-	p   providerMeta
-	url string
+	p      providerMeta
+	url    string
+	chatID string // telegram only; "" for every other kind
 }
 
+// getSettingErr is the settings read resolveDestinations uses for the
+// provider URLs and the Telegram chat_id. A var so tests can simulate a
+// transient read failure on a specific key (same seam idiom as smtpDial);
+// production is a plain DB read.
+var getSettingErr = func(db *DB, key string) (string, error) { return db.GetSettingErr(key) }
+
 // resolveDestinations returns the active, configured providers with their
-// URLs. ok=false means the provider list is unreadable (DB error with no
-// last-known-good cache) — the caller must treat the send as FAILED, not
-// delivered.
+// URLs (and, for telegram, the chat_id). ok=false means the provider list
+// is unreadable (DB error with no last-known-good cache) — the caller must
+// treat the send as FAILED, not delivered.
 func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
 	providers, readOK := pw.activeProviders()
 	if !readOK {
@@ -821,7 +836,7 @@ func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
 		// email in both the per-sensor delivery and the storm summary,
 		// with sendWebhookDeliver reporting "delivered" (no dests) for
 		// an alert nothing was sent in.
-		url, err := pw.db.GetSettingErr(p.URLField)
+		url, err := getSettingErr(pw.db, p.URLField)
 		if err != nil {
 			return nil, false
 		}
@@ -831,7 +846,22 @@ func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
 		if url == "" {
 			continue
 		}
-		dests = append(dests, dest{p, url})
+		// Telegram's chat_id is resolved HERE, error-aware, for the same
+		// reason as the URL: a live read in the delivery goroutine maps a
+		// transient DB lock to "" and posts an empty chat_id (Telegram
+		// 400; the storm-summary path has no retry, so the alert drops).
+		// An active telegram provider passed telegramHasURL (chat_id
+		// non-empty), so "" here means "read failed or cleared
+		// mid-flight" — fail the whole send (the caller retries), never
+		// post an empty chat_id (2026-10-30 review #3).
+		var chatID string
+		if p.Kind == "telegram" {
+			chatID, err = getSettingErr(pw.db, "telegram_chat_id")
+			if err != nil || chatID == "" {
+				return nil, false
+			}
+		}
+		dests = append(dests, dest{p, url, chatID})
 	}
 	return dests, true
 }
@@ -862,20 +892,25 @@ func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state stri
 	var delivered atomic.Bool
 	for _, d := range dests {
 		wg.Add(1)
-		go func(p providerMeta, url string) {
+		go func(d dest) {
 			defer wg.Done()
-			defer alertPanicRecovered("deliver-" + p.Kind)
-			if pw.deliverOne(p, url, name, target, oldState, state, rttMs, reAlert) {
+			defer alertPanicRecovered("deliver-" + d.p.Kind)
+			if pw.deliverOne(d, name, target, oldState, state, rttMs, reAlert) {
 				delivered.Store(true)
 			}
-		}(d.p, d.url)
+		}(d)
 	}
 	wg.Wait()
 	return len(dests) == 0 || delivered.Load()
 }
 
-// deliverOne sends one alert to one provider and reports success.
-func (pw *ProbeWorker) deliverOne(p providerMeta, url, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+// deliverOne sends one alert to one provider and reports success. The dest
+// carries everything resolved up front in resolveDestinations (URL and, for
+// telegram, the chat_id) — deliverOne must not re-read settings live: a
+// transient DB lock at delivery time would otherwise degrade into a
+// half-configured payload (2026-10-30 review #3).
+func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
+	p, url := d.p, d.url
 	switch p.Kind {
 	case "google_chat":
 		card := cardFor(oldState, state, name, target, rttMs)
@@ -901,8 +936,11 @@ func (pw *ProbeWorker) deliverOne(p providerMeta, url, name, target, oldState, s
 		if reAlert {
 			card = telegramCardRe(state, name, target, rttMs)
 		}
+		// d.chatID was resolved up front in resolveDestinations (see
+		// dest): a live re-read here would map a transient DB lock to ""
+		// and Telegram would 400 the message.
 		return pw.postJSON(url, map[string]interface{}{
-			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
+			"chat_id":    d.chatID,
 			"text":       card,
 			"parse_mode": "HTML",
 		}) == nil

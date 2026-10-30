@@ -35,6 +35,27 @@ masked (`webhookMasked`).
 **Mitigation:** don't store credentials in sensor targets; if you must,
 keep authentication enabled.
 
+### Telegram alert cards do not neutralize @username mentions (2026-10-30)
+The Discord card path neutralizes `@everyone`/`@here`
+(`discordMentionSafe` + `allowed_mentions.parse = []`), but the Telegram
+card and storm-summary HTML (telegram.go, `stormSummaryHTML` in alerts.go)
+carry sensor names and targets verbatim (HTML-escaped only). In a
+Telegram GROUP, a sensor name or target path containing `@username` that
+matches a group member's Telegram username would notify that user.
+**Mitigation:** point Telegram alerts at a private bot chat (the common
+setup — mentions don't apply there), and don't name sensors after people's
+Telegram usernames when alerting to a shared group.
+**Why accepted:** `@everyone`/`@here` don't exist in Telegram (the Discord
+mass-ping vector isn't a Telegram concept); the real vector requires a
+shared group AND a name/username collision; and the zero-width-space
+neutralization used for Discord would corrupt the target URL in the card
+(copy-pasted links break) — the HTML/plain paths deliberately carry text
+verbatim (alerts.go, `stormSummaryLine` comment, 2026-10-24 review). The
+companion finding in the same review (chat_id re-read per delivery) was
+FIXED, not deferred: `resolveDestinations` now resolves the chat_id
+error-aware alongside the URL and `dest` carries it (pinned by
+`TestTelegramDeliveryFailsClosedOnChatIDReadError`).
+
 ## Lifted
 
 ### Non-admin sensor mutations (lifted 2026-10-28)

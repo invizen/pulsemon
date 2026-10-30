@@ -1,8 +1,17 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Telegram uses HTML parse mode (<b>bold</b>). The card carries the same
@@ -97,5 +106,108 @@ func TestTelegramCardEscapesMarkupInTarget(t *testing.T) {
 		if !strings.Contains(c, "<b>Sensor:</b> zenkub1") {
 			t.Fatalf("intentional card tags were damaged:\n%s", c)
 		}
+	}
+}
+
+// TestResolveDestinationsResolvesTelegramChatID (2026-10-30 review #3):
+// the chat_id is resolved up front, alongside the URL, and carried on the
+// dest — the delivery goroutines must never re-read it live.
+func TestResolveDestinationsResolvesTelegramChatID(t *testing.T) {
+	db := newTestDB(t)
+	_ = db.SetSetting("telegram_enabled", "1")
+	_ = db.SetSetting("telegram_url", "https://api.telegram.org/botTEST/sendMessage")
+	_ = db.SetSetting("telegram_chat_id", "111222")
+	pw := NewProbeWorker(db)
+	dests, ok := pw.resolveDestinations()
+	if !ok {
+		t.Fatal("resolveDestinations: ok=false with a readable DB")
+	}
+	if len(dests) != 1 {
+		t.Fatalf("dests = %d, want 1 (the configured telegram provider)", len(dests))
+	}
+	if dests[0].p.Kind != "telegram" || dests[0].chatID != "111222" {
+		t.Fatalf("dest = {%s chatID=%q}, want telegram with chatID = the configured value",
+			dests[0].p.Kind, dests[0].chatID)
+	}
+}
+
+// TestTelegramDeliveryFailsClosedOnChatIDReadError (2026-10-30 review #3):
+// a transient settings-read failure on telegram_chat_id must fail the whole
+// send (reported not-delivered, so the caller retries) — never post an
+// empty chat_id, which Telegram answers 400 and the storm-summary path
+// (no retry) would drop. Pre-fix the chat_id was re-read live in the
+// delivery goroutine via the swallow-to-"" GetSetting, so a DB lock at
+// delivery time posted {"chat_id": ""}.
+func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
+	db := newTestDB(t)
+	_ = db.SetSetting("telegram_enabled", "1")
+	var reqCount int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reqCount, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	_ = db.SetSetting("telegram_url", srv.URL)
+	_ = db.SetSetting("telegram_chat_id", "111222")
+	pw := NewProbeWorker(db)
+
+	orig := getSettingErr
+	getSettingErr = func(db *DB, key string) (string, error) {
+		if key == "telegram_chat_id" {
+			return "", errors.New("simulated transient DB lock")
+		}
+		return orig(db, key)
+	}
+	defer func() { getSettingErr = orig }()
+
+	if dests, ok := pw.resolveDestinations(); ok {
+		t.Fatalf("resolveDestinations ok=true with a failing chat_id read (dests=%v)", dests)
+	}
+	if pw.sendWebhookDeliver("s1", "s1", "10.0.0.1", "up", "error", 0, false) {
+		t.Fatal("sendWebhookDeliver reported delivered with a failing chat_id read")
+	}
+	if n := atomic.LoadInt32(&reqCount); n != 0 {
+		t.Fatalf("endpoint received %d request(s); want 0 (the send must fail before any POST)", n)
+	}
+}
+
+// TestTelegramDeliveryPostsResolvedChatID (2026-10-30 review #3): the POST
+// carries the chat_id resolved in resolveDestinations — the healthy-path
+// half of the fail-closed contract above. The cleartext client's dial-time
+// SSRF check (dialCheckedCleartext) refuses loopback by design, so the test
+// swaps in a plain dialer — the same seam idiom the SMTP delivery test uses
+// for smtpDial.
+func TestTelegramDeliveryPostsResolvedChatID(t *testing.T) {
+	transport := webhookClientCleartext.Transport.(*http.Transport)
+	origDial := transport.DialContext
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	t.Cleanup(func() { transport.DialContext = origDial })
+
+	db := newTestDB(t)
+	_ = db.SetSetting("telegram_enabled", "1")
+	var mu sync.Mutex
+	var gotChatID string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var payload map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		mu.Lock()
+		gotChatID, _ = payload["chat_id"].(string)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	_ = db.SetSetting("telegram_url", srv.URL)
+	_ = db.SetSetting("telegram_chat_id", "111222")
+	pw := NewProbeWorker(db)
+
+	if !pw.sendWebhookDeliver("s1", "s1", "10.0.0.1", "up", "error", 0, false) {
+		t.Fatal("sendWebhookDeliver reported not-delivered with a working endpoint")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if gotChatID != "111222" {
+		t.Fatalf("POST chat_id = %q, want the resolved %q", gotChatID, "111222")
 	}
 }
