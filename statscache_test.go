@@ -4,10 +4,10 @@ import (
 	"context"
 	"math"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // testNowUnix is a fixed reference time (epoch seconds) so the differential
@@ -33,7 +33,7 @@ func absF(v float64) float64 {
 // pattern, 12 losses) plus a 10-probe "old" block ~12h back (all successful).
 // This exercises every stats field: the 60-probe window (last 60 recent), the
 // 1h window (all 120 recent), the 24h window (all 130), and the sparkline.
-func seedStatsSensor(t *testing.T, db *DB, id string) {
+func seedStatsSensor(t *testing.T, db *store.Store, id string) {
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
@@ -64,7 +64,7 @@ func seedStatsSensor(t *testing.T, db *DB, id string) {
 // readSeries mirrors the in-memory warm-up: the sensor's probe history as an
 // oldest-first []probeEntry, loaded from the DB (last 60 per sensor UNION the
 // 24h window — the exact set the live series holds).
-func readSeries(t *testing.T, db *DB, id string) []probeEntry {
+func readSeries(t *testing.T, db *store.Store, id string) []probeEntry {
 	t.Helper()
 	rows, err := db.Query(`SELECT sensor_id, ts, rtt_ms FROM (
 		SELECT sensor_id, ts, rtt_ms,
@@ -101,7 +101,7 @@ func readSeries(t *testing.T, db *DB, id string) []probeEntry {
 // with the time windows anchored to testNowUnix (epoch-based, the same window
 // semantics the in-memory path uses). This is the independent computation the
 // in-memory path must reproduce field-for-field.
-func sqlStats(t *testing.T, db *DB, id string) *SensorStats {
+func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 	t.Helper()
 	var st SensorStats
 

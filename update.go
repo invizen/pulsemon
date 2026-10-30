@@ -18,11 +18,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // Version is stamped at build time:
@@ -1529,7 +1529,7 @@ func healthzTarget() string {
 //
 // db may be nil (no data dir / first run): the HTTPS port falls back to
 // defaultHTTPSPort.
-func healthzTargets(db *DB) []string {
+func healthzTargets(db *store.Store) []string {
 	host, httpPort := healthzHostPort()
 	httpsPort := defaultHTTPSPort
 	if db != nil {
@@ -1598,7 +1598,7 @@ func healthzDBPath() string {
 // the listener config (the HTTPS port). A var so tests can stub it (the
 // restart tests run where no data dir exists). nil on any failure — the
 // health check then falls back to the default HTTPS port.
-var openHealthzDB = func() *DB {
+var openHealthzDB = func() *store.Store {
 	db, err := store.NewStore(healthzDBPath())
 	if err != nil {
 		return nil
@@ -1618,13 +1618,13 @@ var openHealthzDB = func() *DB {
 // skipped because the question here is "did the new process come up and
 // answer", not "is the certificate trusted" — and a self-signed homelab
 // cert must pass too.
-func waitHealthy(db *DB) (bool, string) {
+func waitHealthy(db *store.Store) (bool, string) {
 	return waitHealthyWithTimeout(db, healthzTimeout)
 }
 
 // waitHealthyWithTimeout is the timeout-parameterized form of waitHealthy
 // (the watchdog passes its own budget — see runWatchdog).
-func waitHealthyWithTimeout(db *DB, timeout time.Duration) (bool, string) {
+func waitHealthyWithTimeout(db *store.Store, timeout time.Duration) (bool, string) {
 	targets := healthzTargets(db)
 	deadline := time.Now().Add(timeout)
 	client := &http.Client{

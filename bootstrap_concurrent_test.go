@@ -15,7 +15,7 @@ import (
 // account — the winner's AddUserMode runs COUNT + INSERT +
 // auth_bootstrapped in one BEGIN IMMEDIATE transaction, the losers see
 // user_count > 0 inside the transaction and get 409. The DB-level
-// (*DB).AddUser helper used to duplicate this invariant as a non-atomic
+// (*store.Store).AddUser helper used to duplicate this invariant as a non-atomic
 // autocommit COUNT-then-INSERT: a concurrent pair on an empty table could
 // both read n==0 and mint two "first" admins, and it never set
 // auth_bootstrapped. It had no production callers (API and CLI both go

@@ -5,12 +5,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"testing"
 	"pulsemon/internal/store"
+	"testing"
 )
 
 // sensorState reads one sensor's state column straight from the DB.
-func sensorState(t *testing.T, db *DB, id string) string {
+func sensorState(t *testing.T, db *store.Store, id string) string {
 	t.Helper()
 	var state string
 	if err := db.QueryRow("SELECT state FROM sensors WHERE id = ?", id).Scan(&state); err != nil {
@@ -40,7 +40,7 @@ func putMaintStatus(t *testing.T, srv *Server, on bool, want int) {
 	}
 }
 
-func newMaintTestDB(t *testing.T, rows []string) *DB {
+func newMaintTestDB(t *testing.T, rows []string) *store.Store {
 	t.Helper()
 	db, err := store.NewStore(filepath.Join(t.TempDir(), "maint.db"))
 	if err != nil {

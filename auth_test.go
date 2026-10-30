@@ -24,7 +24,7 @@ import (
 // tests (out-of-band writes, like the host CLI) can reopen the same store.
 var lastTestDBPath string
 
-func newTestDB(t *testing.T) *DB {
+func newTestDB(t *testing.T) *store.Store {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "auth.db")
 	lastTestDBPath = path
@@ -1463,7 +1463,7 @@ func TestPasswordOver72Bytes(t *testing.T) {
 
 // ---------- admin-flag tests (2026-10-19 external review fix) ----------
 
-func adminFlagServer(t *testing.T) (*DB, *httptest.Server) {
+func adminFlagServer(t *testing.T) (*store.Store, *httptest.Server) {
 	t.Helper()
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
@@ -1472,7 +1472,7 @@ func adminFlagServer(t *testing.T) (*DB, *httptest.Server) {
 	return db, httpSrv
 }
 
-func userByName(t *testing.T, db *DB, name string) (store.AuthUser, bool) {
+func userByName(t *testing.T, db *store.Store, name string) (store.AuthUser, bool) {
 	t.Helper()
 	users, err := db.ListUsers()
 	if err != nil {

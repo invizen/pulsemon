@@ -12,11 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"pulsemon/internal/store"
 	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
-	"pulsemon/internal/store"
 )
 
 //go:embed web/*
@@ -164,7 +164,7 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 type Server struct {
-	db          *DB
+	db          *store.Store
 	probeWorker *ProbeWorker
 	mux         *http.ServeMux
 	auth        *AuthState
@@ -177,7 +177,7 @@ type Server struct {
 	tlsCert tlsCertMemo
 }
 
-func NewServer(db *DB, pw *ProbeWorker) *Server {
+func NewServer(db *store.Store, pw *ProbeWorker) *Server {
 	s := &Server{
 		db:           db,
 		probeWorker:  pw,
@@ -1349,7 +1349,7 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // PK-B-tree or full-table scan. Rewriting it as `rowid IN (SELECT rowid …)`
 // is a byte-identical no-op (id IS rowid here), so the `id` form is kept
 // for clarity.
-func deleteRowsBatched(ctx context.Context, db *DB, table, where string, args []any) (int64, error) {
+func deleteRowsBatched(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
 	w := ""
 	if where != "" {
 		w = " WHERE " + where

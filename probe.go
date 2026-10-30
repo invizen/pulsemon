@@ -159,7 +159,7 @@ type ProbeWorker struct {
 	sensors map[string]*ProbeState
 	mu      sync.Mutex
 	loops   map[string]context.CancelFunc
-	db      *DB
+	db      *store.Store
 
 	// spawnedIDs records every id this worker has ever spawned a loop for,
 	// so syncSensors can tell a FIRST spawn (process start, brand-new
@@ -274,7 +274,7 @@ type ProbeWorker struct {
 // cache never goes stale relative to a DB read. Mirrors purgeOld's 24h.
 const retentionSeconds int64 = 24 * 3600
 
-func NewProbeWorker(db *DB) *ProbeWorker {
+func NewProbeWorker(db *store.Store) *ProbeWorker {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &ProbeWorker{
 		sensors:         make(map[string]*ProbeState),
@@ -1143,7 +1143,6 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 		}
 	}
 }
-
 
 // validTarget accepts only well-formed probe targets (all SQL is parameterized; this is input hygiene).
 //

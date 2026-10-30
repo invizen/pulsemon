@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
 )
@@ -88,7 +89,7 @@ func TestSetupModeBootstrapOnly(t *testing.T) {
 // open" behavior is preserved. A genuinely fresh install (no probe rows)
 // must stay in setup mode.
 func TestMigrateAuthBootstrappedLegacyInstall(t *testing.T) {
-	seedLegacy := func(t *testing.T) *DB {
+	seedLegacy := func(t *testing.T) *store.Store {
 		t.Helper()
 		db := newTestDB(t)
 		if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)

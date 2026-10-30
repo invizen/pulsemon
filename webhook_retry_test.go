@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -75,7 +76,7 @@ func TestFix_M9_RetryStopsOnShutdown(t *testing.T) {
 	})
 }
 
-func fcProviders(t *testing.T, db *DB, urls map[string]string) {
+func fcProviders(t *testing.T, db *store.Store, urls map[string]string) {
 	t.Helper()
 	for kind, u := range urls {
 		if err := db.SetSetting(kind+"_url", u); err != nil {

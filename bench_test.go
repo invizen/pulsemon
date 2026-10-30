@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // This file holds the opt-in performance benchmarks (2026-10-23 external
@@ -70,7 +70,7 @@ func BenchmarkPurgeOld(b *testing.B) {
 // benchPurgeRowsPerSensor past-boundary (old) rows + 10 in-window (young)
 // rows, in a single transaction with prepared statements (the same pattern as
 // TestPurgeOldMultiBatchPerSensor, scaled up).
-func seedPurgeBenchmark(b *testing.B, db *DB) {
+func seedPurgeBenchmark(b *testing.B, db *store.Store) {
 	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
 	tx, err := db.Begin()
 	if err != nil {

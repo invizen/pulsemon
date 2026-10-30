@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"strconv"
 	"strings"
 )
@@ -49,7 +50,7 @@ type listenerCfg struct {
 
 // loadListenerCfg resolves the listener configuration from env + settings.
 // db may be nil (pre-DB contexts); env is always read first.
-func loadListenerCfg(db *DB) listenerCfg {
+func loadListenerCfg(db *store.Store) listenerCfg {
 	c := listenerCfg{httpsPort: defaultHTTPSPort}
 	if db == nil {
 		return c
@@ -73,7 +74,7 @@ func loadListenerCfg(db *DB) listenerCfg {
 
 // tlsDir is where the dashboard stores uploaded TLS material: inside the
 // data dir (the one volume that always exists and persists).
-func tlsDir(db *DB) string {
+func tlsDir(db *store.Store) string {
 	return filepath.Join(filepath.Dir(dbPathFromEnv()), "tls")
 }
 

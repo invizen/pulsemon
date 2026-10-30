@@ -159,7 +159,7 @@ type authSession struct {
 }
 
 type AuthState struct {
-	db *DB
+	db *store.Store
 
 	// nextSweepSessions rate-limits the session-map GC (see
 	// sweepExpiredSessions / CreateSession; review nit 2026-10-24).
@@ -231,7 +231,7 @@ type AuthState struct {
 	trustedProxies []*net.IPNet
 }
 
-func NewAuthState(db *DB) *AuthState {
+func NewAuthState(db *store.Store) *AuthState {
 	a := &AuthState{
 		db:          db,
 		sessions:    map[string]authSession{},
@@ -396,7 +396,7 @@ func (a *AuthState) refreshEnabledNow() {
 	a.refreshEnabledLocked()
 }
 
-// UserCount/CRUD live on *DB (see db.go); AuthState adds the password
+// UserCount/CRUD live on *store.Store (see db.go); AuthState adds the password
 // hashing, validation, and session bookkeeping on top.
 
 var (

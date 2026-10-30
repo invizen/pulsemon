@@ -5,9 +5,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // seedFailingHTTPSensor builds a DB + worker + server with one HTTP sensor
@@ -15,7 +15,7 @@ import (
 // sensor would have just before its history is cleared): lastStatus=error,
 // fastRetry on, lastHTTPStatus=503, lastCertExpiry set, plus a cached series
 // entry so the reset has something to wipe.
-func seedFailingHTTPSensor(t *testing.T, id, name string) (*DB, *ProbeWorker, *Server) {
+func seedFailingHTTPSensor(t *testing.T, id, name string) (*store.Store, *ProbeWorker, *Server) {
 	t.Helper()
 	db, err := store.NewStore(filepath.Join(t.TempDir(), id+"-clear.db"))
 	if err != nil {

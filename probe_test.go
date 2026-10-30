@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // baseProbeTime is the start of the synthetic probe timeline; each probe in
@@ -18,7 +18,7 @@ var probeSeq int
 // seedSensor inserts a sensor (id is also its unique name) and its probes,
 // oldest to newest. rtt[i] == nil means a lost probe. Returns a
 // ProbeWorker whose deriveStatus can be called for that sensor.
-func seedSensor(t *testing.T, db *DB, id string, lossWarn, downAfter, spikeMult int, rtt []*float64) *ProbeWorker {
+func seedSensor(t *testing.T, db *store.Store, id string, lossWarn, downAfter, spikeMult int, rtt []*float64) *ProbeWorker {
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)

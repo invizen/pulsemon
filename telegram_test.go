@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -152,7 +153,7 @@ func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
 	pw := NewProbeWorker(db)
 
 	orig := getSettingErr
-	getSettingErr = func(db *DB, key string) (string, error) {
+	getSettingErr = func(db *store.Store, key string) (string, error) {
 		if key == "telegram_chat_id" {
 			return "", errors.New("simulated transient DB lock")
 		}

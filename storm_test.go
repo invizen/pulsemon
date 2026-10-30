@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"strings"
 	"sync"
 	"testing"
@@ -38,7 +39,7 @@ func withStormBudget(t *testing.T, budget int, window time.Duration, fn func()) 
 
 // newStormTestWorker builds a worker with a google_chat provider pointing at
 // a capture server; bodies (the "text" field) are returned via the closure.
-func newStormTestWorker(t *testing.T) (*ProbeWorker, *DB, func() []string, func()) {
+func newStormTestWorker(t *testing.T) (*ProbeWorker, *store.Store, func() []string, func()) {
 	t.Helper()
 	db := newTestDB(t)
 	pw := NewProbeWorker(db)
@@ -69,7 +70,7 @@ func newStormTestWorker(t *testing.T) (*ProbeWorker, *DB, func() []string, func(
 	return pw, db, get, cleanup
 }
 
-func insertStormSensor(t *testing.T, db *DB, id string) {
+func insertStormSensor(t *testing.T, db *store.Store, id string) {
 	t.Helper()
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)

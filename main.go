@@ -11,16 +11,11 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"pulsemon/internal/store"
 	"strings"
 	"sync"
 	"time"
-	"pulsemon/internal/store"
 )
-
-// DB is an alias for store.Store: the pilot move of db.go into
-// internal/store (2026-10-30, DECISIONS.md). It keeps every existing *DB
-// signature compiling unchanged; a follow-up commit drops the alias.
-type DB = store.Store
 
 // listenAddr is the HTTP listen address. Override with PULSEMON_ADDR — a full
 // "host:port" (e.g. ":9299" for all interfaces on 9299, "127.0.0.1:9299" for
@@ -278,7 +273,7 @@ func bindServeWithRetry(retry bool, label string, bind func() error) {
 // bind may fail for up to ~30s while the parent still holds the port;
 // bindServeWithRetry retries it until reexecBindDeadline instead of
 // dying (and dies loudly if the parent never releases).
-func startListener(srv *http.Server, db *DB) {
+func startListener(srv *http.Server, db *store.Store) {
 	cfg := loadListenerCfg(db)
 	retry := os.Getenv("PULSEMON_RESTARTING") == "1"
 
@@ -581,7 +576,7 @@ func runAuthUser(args []string) dispatchKind {
 // install stays in setup mode until the first account exists.
 //
 // Idempotent: once a user exists or the flag is set, it is a no-op.
-func migrateAuthBootstrapped(db *DB) {
+func migrateAuthBootstrapped(db *store.Store) {
 	n, err := db.UserCount()
 	if err != nil || n > 0 {
 		return

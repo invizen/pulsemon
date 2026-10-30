@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
-	"pulsemon/internal/store"
 )
 
 // fixServerWithDB builds a Server on a fresh schema-initialized DB.
-func fixServerWithDB(t *testing.T) (*Server, *DB) {
+func fixServerWithDB(t *testing.T) (*Server, *store.Store) {
 	t.Helper()
 	db := newTestDB(t)
 	return NewServer(db, NewProbeWorker(db)), db

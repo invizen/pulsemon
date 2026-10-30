@@ -12,12 +12,12 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
-func clearBatchFixture(t *testing.T, sensorID string, rows int) *DB {
+func clearBatchFixture(t *testing.T, sensorID string, rows int) *store.Store {
 	t.Helper()
 	db, err := store.NewStore(filepath.Join(t.TempDir(), "clearbatch.db"))
 	if err != nil {
@@ -52,7 +52,7 @@ func clearBatchFixture(t *testing.T, sensorID string, rows int) *DB {
 	return db
 }
 
-func countProbes(t *testing.T, db *DB, id string) int {
+func countProbes(t *testing.T, db *store.Store, id string) int {
 	t.Helper()
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", id).Scan(&n); err != nil {

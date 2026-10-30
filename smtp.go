@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"pulsemon/internal/store"
 	"strconv"
 	"strings"
 	"time"
@@ -354,7 +355,7 @@ func smtpBodyRe(state, name, target string, rttMs float64) string {
 }
 
 // smtpEnabled: explicit "1" flag. No legacy default (fresh install = off).
-func smtpEnabled(db *DB) bool { return db.GetSetting("smtp_enabled") == "1" }
+func smtpEnabled(db *store.Store) bool { return db.GetSetting("smtp_enabled") == "1" }
 
 // smtpHasURL: SMTP is "configured" when it has a host, a SENDER, and a
 // recipient — the mail-server equivalent of Telegram needing a URL and a
@@ -362,6 +363,6 @@ func smtpEnabled(db *DB) bool { return db.GetSetting("smtp_enabled") == "1" }
 // alone has nowhere to go, and a missing sender produces MAIL FROM:<>
 // (a null reverse path that submission servers reject with 501) — so all
 // three are required for the provider to count as ready.
-func smtpHasURL(db *DB) bool {
+func smtpHasURL(db *store.Store) bool {
 	return db.GetSetting("smtp_host") != "" && db.GetSetting("smtp_from") != "" && db.GetSetting("smtp_to") != ""
 }

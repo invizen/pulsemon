@@ -4,12 +4,12 @@ import (
 	"context"
 	"github.com/google/uuid"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
-func fcDB(t *testing.T) *DB {
+func fcDB(t *testing.T) *store.Store {
 	t.Helper()
 	db, err := store.NewStore(filepath.Join(t.TempDir(), "fc.db"))
 	if err != nil {
@@ -22,7 +22,7 @@ func fcDB(t *testing.T) *DB {
 	return db
 }
 
-func fcSensor(t *testing.T, db *DB, id, name, state string) {
+func fcSensor(t *testing.T, db *store.Store, id, name, state string) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at)
 		VALUES (?,?,'10.0.0.1','icmp',60,1000,25,2,5,?,'up',?)`, id, name, state, store.Now()); err != nil {
@@ -30,7 +30,7 @@ func fcSensor(t *testing.T, db *DB, id, name, state string) {
 	}
 }
 
-func fcProbe(t *testing.T, db *DB, id string, ts time.Time, rtt any) {
+func fcProbe(t *testing.T, db *store.Store, id string, ts time.Time, rtt any) {
 	t.Helper()
 	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?,?,?)`, id, store.FormatTS(ts), rtt); err != nil {
 		t.Fatal(err)

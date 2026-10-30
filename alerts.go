@@ -12,13 +12,13 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
+	"pulsemon/internal/store"
 	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // alertPanicRecovered guards the fire-and-forget alert paths (review
@@ -331,8 +331,8 @@ type providerMeta struct {
 	URLField    string // JSON field the settings payload uses
 	Placeholder string // input placeholder
 	EnvFallback string // env var that supplies a URL when the dashboard one is empty ("") = none
-	Enabled     func(db *DB) bool
-	HasURL      func(db *DB) bool
+	Enabled     func(db *store.Store) bool
+	HasURL      func(db *store.Store) bool
 }
 
 var providerList = []providerMeta{
@@ -379,7 +379,7 @@ func providerByKey(kind string) (providerMeta, bool) {
 // explicitly disabled ("0") wins; with no flag, a present URL (dashboard or
 // env) keeps it active so an upgrade changes nothing. Fresh install: no URL,
 // no flag → off.
-func chatEnabled(db *DB) bool {
+func chatEnabled(db *store.Store) bool {
 	switch db.GetSetting("google_chat_enabled") {
 	case "1":
 		return true
@@ -391,7 +391,7 @@ func chatEnabled(db *DB) bool {
 
 // chatHasURL: the dashboard URL, falling back to the GOOGLE_CHAT_WEBHOOK_URL
 // env (the pre-multi-provider mechanism, kept working).
-func chatHasURL(db *DB) bool {
+func chatHasURL(db *store.Store) bool {
 	if db.GetSetting("google_chat_url") != "" {
 		return true
 	}
@@ -401,17 +401,17 @@ func chatHasURL(db *DB) bool {
 // flagEnabled / flagHasURL: a generic provider — explicit "1" flag and a
 // non-empty URL. No env fallback, no legacy default. Built as closures over
 // the provider kind so each entry is self-contained.
-func flagEnabled(kind string) func(db *DB) bool {
-	return func(db *DB) bool { return db.GetSetting(kind+"_enabled") == "1" }
+func flagEnabled(kind string) func(db *store.Store) bool {
+	return func(db *store.Store) bool { return db.GetSetting(kind+"_enabled") == "1" }
 }
 
-func flagHasURL(kind string) func(db *DB) bool {
-	return func(db *DB) bool { return db.GetSetting(kind+"_url") != "" }
+func flagHasURL(kind string) func(db *store.Store) bool {
+	return func(db *store.Store) bool { return db.GetSetting(kind+"_url") != "" }
 }
 
 // telegramHasURL: Telegram needs BOTH the bot endpoint and a chat_id to
 // deliver; a URL alone can't reach anyone.
-func telegramHasURL(db *DB) bool {
+func telegramHasURL(db *store.Store) bool {
 	return db.GetSetting("telegram_url") != "" && db.GetSetting("telegram_chat_id") != ""
 }
 
@@ -459,7 +459,7 @@ type providerStatus struct {
 // providerExtra returns a provider's non-secret, non-URL fields for the
 // dashboard to pre-fill. chat_id is not a credential — the token lives in
 // the masked URL — so it is returned in the clear.
-func providerExtra(p providerMeta, db *DB) map[string]string {
+func providerExtra(p providerMeta, db *store.Store) map[string]string {
 	if p.Kind == "telegram" {
 		if cid := db.GetSetting("telegram_chat_id"); cid != "" {
 			return map[string]string{"chat_id": cid}
@@ -821,7 +821,7 @@ type dest struct {
 // provider URLs and the Telegram chat_id. A var so tests can simulate a
 // transient read failure on a specific key (same seam idiom as smtpDial);
 // production is a plain DB read.
-var getSettingErr = func(db *DB, key string) (string, error) { return db.GetSettingErr(key) }
+var getSettingErr = func(db *store.Store, key string) (string, error) { return db.GetSettingErr(key) }
 
 // resolveDestinations returns the active, configured providers with their
 // URLs (and, for telegram, the chat_id). ok=false means the provider list
