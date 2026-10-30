@@ -508,56 +508,60 @@ foreign-signed binary with a MATCHING SHA is refused — the whole point). A
 sabotage that drops the authenticity gate makes `_Unsigned` and `_ForeignSig`
 fail.
 
-## package-structure (repo-wide) — DEFERRED, decision 2026-10-29 (pilot done 2026-10-30)
+## package-structure (repo-wide) — CLOSED, decision 2026-10-30 (pilot shipped)
 
 **Status:** `package main` (~14.6k LOC production, ~150 .go files) plus
-`internal/store` (the data layer, moved by the 2026-10-30 pilot), with
-mutable package-level test seams (`probeTarget`, `alertGateIdle`,
+`internal/store` (the data layer, extracted 2026-10-30), with mutable
+package-level test seams (`probeTarget`, `alertGateIdle`,
 `stormBudget`, `readerRestartDelay`, `reexecBindDeadline`, …) that tests
 swap and restore in `t.Cleanup`.
 
-**Decision: KEEP as-is for now; the split into internal packages
-(store, probe/icmp, probe/http, stats, alert, auth, api) with injected
-dependencies is DEFERRED as a project, not a review-batch fix.**
+**Decision: the full split into internal packages (probe, alert, auth,
+api, stats) with injected dependencies is CLOSED — not planned work.**
+Originally deferred 2026-10-29; the user closed the thread 2026-10-30
+with the hardening cycle complete: a deferral implies scheduled work,
+and the recommendation was "not worth it at current scale" — so the
+honest state is closed, not a permanent watchlist item. Nothing is
+pending; this entry is the durable record.
 
-**Pilot executed 2026-10-30 (user approved early start): `db.go` →
-`internal/store`.** C1 (c4d8433): the move — db.go + 4 test files,
-`DB`→`Store`, 9 symbols relocated+exported (`FormatTS`, `Now`,
-`TSLayout`, `SetSettingInTx`, `InQueryChunk`, `AuthUser`, `NewID`,
-`MigrateLegacyAuthToken`, `ErrLastUser`/`ErrUserNotFound`); a temporary
-`type DB = store.Store` alias kept all existing signatures compiling.
-C2 (054f425): alias dropped, all references qualified `store.Store`.
-Pure moves, zero behavior change; each commit gated green (gofmt, vet
-linux+windows, build, full -race 238–239s — at the 241.6s baseline).
-Proved the extraction machinery (rename detection, alias trick,
-sentinel/helper relocation, test-file moves) works on this codebase
-without gate regression. Did NOT reduce the seam globals, the no-
-`t.Parallel` constraint, or gate time — those payoffs belong to the
-probe/alert/auth extractions, which remain parked on the triggers
-below. `tsformat_test.go`/`chunk_test.go` stayed in main (they
-exercise `ProbeWorker`) and call the `store.*` exports.
+**Pilot (shipped): `db.go` → `internal/store`.** C1 (c4d8433): the move
+— db.go + 4 test files, `DB`→`Store`, 9 symbols relocated+exported
+(`FormatTS`, `Now`, `TSLayout`, `SetSettingInTx`, `InQueryChunk`,
+`AuthUser`, `NewID`, `MigrateLegacyAuthToken`, `ErrLastUser`/
+`ErrUserNotFound`); a temporary `type DB = store.Store` alias kept all
+existing signatures compiling. C2 (054f425): alias dropped, all
+references qualified `store.Store`. Pure moves, zero behavior change;
+each commit gated green (gofmt, vet linux+windows, build, full -race
+238–239s — at the 241.6s baseline). Proved the extraction machinery
+(rename detection, alias trick, sentinel/helper relocation, test-file
+moves) works on this codebase without gate regression.
+`tsformat_test.go`/`chunk_test.go` stayed in main (they exercise
+`ProbeWorker`) and call the `store.*` exports.
 
-**Costs accepted (known, mitigated):**
-- Swappable globals are a -race hazard by construction: a consumer
-  goroutine that reads a swapped var can outlive the test's restore
-  (the `alert-gate` capture rule exists because of a real -race hit).
-  Standing rule: any new test-swapped var must be captured into a
-  parameter at spawn time, never read by long-lived goroutines.
+**Why the rest is not worth it (current scale):** the split touches
+nearly every file and every test seam, with regression risk across a
+70+-test-file suite that is -race-green on a steady release cadence.
+For a single-binary homelab tool with one operator, the expected value
+(faster tests, compile-time dependency clarity) does not justify that
+risk. The pilot's own result is the data point: a clean extraction that
+bought no gate-time, no seam, and no parallelism — those payoffs live
+in the probe/alert/auth packages, and reaching them costs the full
+split.
+
+**Standing operational costs (accepted, not pending):**
+- Swappable globals are a -race hazard by construction (the `alert-gate`
+  capture rule exists because of a real -race hit). Standing rule: any
+  new test-swapped var must be captured into a parameter at spawn
+  time, never read by long-lived goroutines.
 - No `t.Parallel()` anywhere: the shared globals make parallel tests
   unsafe. Test time is the price (~4 min full -race).
 
-**Why not split now:** the split touches nearly every file and every
-test seam, with regression risk across a 70+-test-file suite that is
-currently -race-green on a steady release cadence. For a single-binary
-homelab tool with one operator, the expected value of the split (faster
-tests, compile-time dependency clarity) does not yet justify that risk.
-The readability half of the finding IS addressed: rationale and
-rejected alternatives live in THIS file, and in-code comments state the
-current contract only.
-
-**Revisit trigger:** if test time becomes a real bottleneck (the suite
-doubled again), if a globals-related -race hit recurs after the capture
-rule, or if a second developer joins the project.
+**Re-litigation clause (a condition to REOPEN the decision, not a
+watchlist):** if test time doubles again (~8+ min), a globals-related
+-race hit recurs despite the capture rule, or a second developer joins,
+revisit the split as a fresh decision. The pilot means it would then be
+a known process (leaf-first, one green-gated package at a time,
+constructor injection), not an experiment.
 
 ## admin-gate double session check (auth.go `requireAdmin`/`sessionFrom`) — REJECTED, decision 2026-10-30
 
