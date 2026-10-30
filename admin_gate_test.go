@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -82,6 +83,34 @@ func TestNonAdminCannotReachAdminSurface(t *testing.T) {
 		if code != http.StatusForbidden {
 			t.Errorf("%s %s (non-admin): got %d, want 403", c.method, c.path, code)
 		}
+	}
+
+	// Pin the intentional INVERSE of the table above: GET
+	// /api/update-check stays open to EVERY session (re-adjudicated
+	// 2026-10-30 — see DECISIONS.md → update-check-refresh-throttle).
+	// Read-only, non-secret (the versions are rendered in the header
+	// pill for every user), fixed upstream URL (no SSRF), and
+	// ?refresh=1 is throttled to one outbound fetch per 60s globally.
+	// The admin gate belongs on POST /api/update (code execution +
+	// restart), which the table covers. This assertion fails if a
+	// future change wraps the route in requireAdmin. Hermetic: fake
+	// GitHub + reset cache globals.
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"tag_name":"v9.9.9","html_url":"https://github.com/invizen/pulsemon/releases/tag/v9.9.9"}`))
+	}))
+	defer gh.Close()
+	oldBase := releaseBase
+	releaseBase = gh.URL + "/releases"
+	oldUCache, oldUAt, oldUAttempt, oldUFailed := updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed
+	t.Cleanup(func() {
+		releaseBase = oldBase
+		updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed = oldUCache, oldUAt, oldUAttempt, oldUFailed
+	})
+	updateCheckCached, updateCheckFailed = nil, false
+	updateCheckAt, updateCheckAttemptAt = time.Time{}, time.Time{}
+	if code := requestStatus(t, helper, http.MethodGet, httpSrv.URL+"/api/update-check", ""); code != http.StatusOK {
+		t.Errorf("GET /api/update-check (non-admin): got %d, want 200 (intentionally open — DECISIONS.md → update-check-refresh-throttle)", code)
 	}
 
 	// Admin positive controls: the same routes reach the handler.

@@ -453,6 +453,16 @@ func (s *Server) authGate() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
+	// GET /api/update-check is intentionally NOT requireAdmin-gated
+	// (re-adjudicated 2026-10-30 after a second review re-flag): the
+	// check is read-only, its response (running/latest versions) is
+	// non-secret — rendered in the header pill for every user — it hits
+	// a fixed upstream URL (no SSRF), and ?refresh=1 is throttled to
+	// one outbound fetch per 60s globally. A viewer (or any LAN host on
+	// an auth-off install, where requireAdmin stands down anyway) can at
+	// most degrade the version readout for ≤1h. The admin gate belongs
+	// on POST /api/update, where the action is downloading + executing
+	// new code. docs/DECISIONS.md → update-check-refresh-throttle.
 	s.mux.HandleFunc("GET /api/update-check", s.handleUpdateCheck)
 	s.mux.HandleFunc("POST /api/update", s.requireAdmin(s.handleUpdate))
 	// Sensor routes: reads and Pulse Now are open to EVERY authenticated

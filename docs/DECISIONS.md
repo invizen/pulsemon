@@ -373,6 +373,21 @@ there). The 60s throttle bounds the abuse without that friction. Pinned by
 `?refresh=1` is ignored — no new upstream hit; a `?refresh=1` after the
 interval forces a fresh fetch).
 
+**Re-adjudicated 2026-10-30 (second external review re-flagged the same
+endpoint as an "unprivileged external network trigger"):** stance upheld.
+Additional rationale: the response is non-secret — running/latest versions
+are rendered in the header pill for every user, so an admin gate buys no
+confidentiality; the upstream URL is a server-side constant (no SSRF); and
+the only real cost (an outbound fetch against GitHub's 60 req/hour budget)
+is bounded by the 60s global throttle above — worst case degrades the
+version readout for ≤1h. On auth-off installs `requireAdmin` stands down,
+so the gate would be a no-op fleet-wide; it would only bind on a future
+auth-on install with viewer accounts, where it would gate a read whose data
+the viewer already sees. The admin gate belongs on `POST /api/update`
+(code execution + restart), which has it. Pinned by the in-code note at the
+route (api.go routes()) and by the non-admin 200 assertion in
+`TestNonAdminCannotReachAdminSurface`.
+
 ## precompiled-tailwind-strict-csp (web/, api.go, 2026-10-29)
 
 **Contract:** the dashboard is fully self-contained and ships **zero** inline
