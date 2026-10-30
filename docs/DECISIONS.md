@@ -562,3 +562,37 @@ mutation sites.)
 
 Pinned in-code: the `sessionFrom` comment in auth.go states the double
 check is deliberate and must not be "fixed" away.
+
+## shouldAlert filter reads (alerts.go `shouldAlert`) — REJECTED, decision 2026-10-30
+
+**Finding (external review 2026-10-30 #8):** `shouldAlert` re-reads
+`alert_scope`/`alert_filter` from SQLite and re-unmarshals the filter
+list (up to 500 items) on every status transition and re-alert check;
+suggested fixes were an in-memory cache invalidated in
+`handleSettingsPut`, or a `map[string]struct{}` for large lists.
+
+**Decision: REJECTED — the per-decision read is the established
+alert-routing pattern, and the cost is unmeasurable.**
+- The default path is already O(1): `alert_scope` defaults to "all" and
+  returns after ONE point query — no filter read, no unmarshal, no loop.
+- The loop only runs for opt-in routing (scope=tags/sensors), on a list
+  already capped at 500 entries (2026-10-22,
+  `TestFix_SettingsAlertFilterBounded`): worst case ~2.5K short-string
+  comparisons (5 tags × 500 items) — tens of microseconds.
+- Frequency is cold by the reviewer's own admission: transitions are
+  rare, and re-alerts fire at most once per re-alert interval (default
+  30 min) per sensor — after the alert_state read and interval check.
+- `alertsEnabled` (the same gate chain) deliberately re-reads
+  `maintenance_mode` from the DB on EVERY alert decision — the project's
+  chosen pattern for alert routing is "read the current setting per
+  decision": an operator's routing change takes effect on the next
+  transition with zero staleness. A cached filter would deviate from that
+  pattern inside the same gate chain and add an invalidation surface
+  (dashboard PUT, CLI, env fallback) where a missed invalidation means
+  STALE ROUTING — "why didn't I get an alert?" is a far worse failure
+  mode than the microseconds saved.
+- The `map[string]struct{}` variant saves the same unmeasurable amount
+  and adds an allocation on the cold path.
+
+Pinned in-code: the `shouldAlert` doc comment states the per-decision
+read is deliberate.

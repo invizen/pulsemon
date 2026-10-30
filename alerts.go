@@ -189,7 +189,10 @@ func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, oldStatus, newStatus strin
 
 // shouldAlert applies the global alert routing rule (settings table):
 // "all", "tags" (any of the sensor's tags in filter list), or "sensors"
-// (id in filter list).
+// (id in filter list). The per-decision DB read is deliberate (no
+// in-memory cache): the same pattern as alertsEnabled's maintenance_mode
+// read — a routing change takes effect on the next transition with zero
+// staleness. docs/DECISIONS.md → shouldAlert-filter-reads.
 func (pw *ProbeWorker) shouldAlert(id string, tags []string) bool {
 	scope := pw.db.GetSetting("alert_scope")
 	if scope == "" {
