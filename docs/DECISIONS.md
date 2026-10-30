@@ -508,16 +508,34 @@ foreign-signed binary with a MATCHING SHA is refused — the whole point). A
 sabotage that drops the authenticity gate makes `_Unsigned` and `_ForeignSig`
 fail.
 
-## package-structure (repo-wide) — DEFERRED, decision 2026-10-29
+## package-structure (repo-wide) — DEFERRED, decision 2026-10-29 (pilot done 2026-10-30)
 
-**Status:** single `package main` (~15k LOC production, 154 .go files)
-with mutable package-level test seams (`probeTarget`, `alertGateIdle`,
+**Status:** `package main` (~14.6k LOC production, ~150 .go files) plus
+`internal/store` (the data layer, moved by the 2026-10-30 pilot), with
+mutable package-level test seams (`probeTarget`, `alertGateIdle`,
 `stormBudget`, `readerRestartDelay`, `reexecBindDeadline`, …) that tests
 swap and restore in `t.Cleanup`.
 
 **Decision: KEEP as-is for now; the split into internal packages
 (store, probe/icmp, probe/http, stats, alert, auth, api) with injected
 dependencies is DEFERRED as a project, not a review-batch fix.**
+
+**Pilot executed 2026-10-30 (user approved early start): `db.go` →
+`internal/store`.** C1 (c4d8433): the move — db.go + 4 test files,
+`DB`→`Store`, 9 symbols relocated+exported (`FormatTS`, `Now`,
+`TSLayout`, `SetSettingInTx`, `InQueryChunk`, `AuthUser`, `NewID`,
+`MigrateLegacyAuthToken`, `ErrLastUser`/`ErrUserNotFound`); a temporary
+`type DB = store.Store` alias kept all existing signatures compiling.
+C2 (054f425): alias dropped, all references qualified `store.Store`.
+Pure moves, zero behavior change; each commit gated green (gofmt, vet
+linux+windows, build, full -race 238–239s — at the 241.6s baseline).
+Proved the extraction machinery (rename detection, alias trick,
+sentinel/helper relocation, test-file moves) works on this codebase
+without gate regression. Did NOT reduce the seam globals, the no-
+`t.Parallel` constraint, or gate time — those payoffs belong to the
+probe/alert/auth extractions, which remain parked on the triggers
+below. `tsformat_test.go`/`chunk_test.go` stayed in main (they
+exercise `ProbeWorker`) and call the `store.*` exports.
 
 **Costs accepted (known, mitigated):**
 - Swappable globals are a -race hazard by construction: a consumer
