@@ -3,8 +3,8 @@ package main
 import (
 	"context"
 	"path/filepath"
-	"testing"
 	"pulsemon/internal/store"
+	"testing"
 )
 
 // TestDeriveStatusDBErrorNeverFakesUp pins the "never fake up" principle for

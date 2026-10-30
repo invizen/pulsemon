@@ -3,10 +3,10 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestValidSensorName pins the stored-XSS name gate: names that could escape

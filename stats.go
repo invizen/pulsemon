@@ -4,10 +4,10 @@ import (
 	"context"
 	"log"
 	"math"
+	"pulsemon/internal/store"
 	"sort"
 	"strings"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // Stats cache: the in-memory probe series and per-sensor statistics

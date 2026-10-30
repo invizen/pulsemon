@@ -4,10 +4,10 @@ import (
 	"errors"
 	"net/http"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestBindServeWithRetryFailsFastWhenNotRetrying pins the inverted-branch

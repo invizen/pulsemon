@@ -3,10 +3,10 @@ package main
 import (
 	"context"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestDoProbeDropsResultWhenCancelled locks the finding-6 fix: when the

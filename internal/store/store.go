@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/google/uuid"
+	_ "modernc.org/sqlite"
 )
 
 var (

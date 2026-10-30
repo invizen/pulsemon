@@ -4,10 +4,10 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestRespawnLoopFirstTickCapped pins the 2026-10-20 external-review fix:

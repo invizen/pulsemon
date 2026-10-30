@@ -4,9 +4,9 @@ import (
 	"context"
 	"math"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestPulseNowNeverAffectsStatus pins the 2026-10-20 external-review fix:

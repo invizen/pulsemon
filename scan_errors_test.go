@@ -6,9 +6,9 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
-	"pulsemon/internal/store"
 )
 
 // TestFix_ScanErrorsLoggedNotSilent pins the per-row scan-error contract

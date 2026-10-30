@@ -2,8 +2,8 @@ package main
 
 import (
 	"path/filepath"
-	"testing"
 	"pulsemon/internal/store"
+	"testing"
 )
 
 // TestLossWarnIsARealGate pins the fix for the dead loss_warn setting:

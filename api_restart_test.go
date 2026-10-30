@@ -8,10 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync/atomic"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // patchSensorRespawned drives a real PATCH through the API against a live

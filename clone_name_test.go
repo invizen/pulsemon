@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
 	"unicode/utf8"
-	"pulsemon/internal/store"
 )
 
 // TestFix_CloneNamePickedInOneQuery pins the clone name-pick optimization:

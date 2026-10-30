@@ -7,8 +7,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"testing"
 	"pulsemon/internal/store"
+	"testing"
 )
 
 // TestFix_m3_TLSPutAtomicInstall pins the m3 fix: a pair install that

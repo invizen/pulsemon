@@ -4,9 +4,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"strings"
 	"testing"
-	"pulsemon/internal/store"
 )
 
 // TestDispatch pins the command-line structure: known commands dispatch,

@@ -4,9 +4,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"pulsemon/internal/store"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {

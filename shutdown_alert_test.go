@@ -6,10 +6,10 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync/atomic"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestDrainAlertsWaitsForInFlightDelivery pins the shutdown alert-drain: a

@@ -4,11 +4,11 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"pulsemon/internal/store"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-	"pulsemon/internal/store"
 )
 
 // TestSensorLoopResetCadence pins the sensorLoop timer-reset behavior the
