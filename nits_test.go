@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -229,7 +230,7 @@ func TestEnterMaintenanceWithFreshSnapshot(t *testing.T) {
 	ins("a2", "active")
 	ins("p1", "paused")
 
-	ids, err := d.EnterMaintenanceWithFreshSnapshot()
+	ids, err := d.EnterMaintenanceWithFreshSnapshot(context.Background())
 	if err != nil {
 		t.Fatalf("EnterMaintenanceWithFreshSnapshot: %v", err)
 	}

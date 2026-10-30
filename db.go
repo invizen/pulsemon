@@ -458,8 +458,8 @@ func (db *DB) SetSensorTags(id string, tags []string) error {
 //
 // The chunked sensor-state UPDATE mirrors SetSensorStates so an unbounded
 // id list can't exceed SQLite's parameter limit.
-func (db *DB) SetMaintenanceMode(on bool, ids []string, snapJSON string) error {
-	tx, err := db.Begin()
+func (db *DB) SetMaintenanceMode(ctx context.Context, on bool, ids []string, snapJSON string) error {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -477,13 +477,13 @@ func (db *DB) SetMaintenanceMode(on bool, ids []string, snapJSON string) error {
 // mode flag. Returns the ids actually paused (the handler feeds them to the
 // SetPaused in-memory fast path). The handler's earlier read survives only
 // as a UX pre-check (400 "no active sensors"); this read is authoritative.
-func (db *DB) EnterMaintenanceWithFreshSnapshot() ([]string, error) {
-	tx, err := db.Begin()
+func (db *DB) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]string, error) {
+	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
-	rows, err := tx.Query("SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
+	rows, err := tx.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -683,8 +683,8 @@ func migrateLegacyAuthToken(db *DB) error {
 }
 
 // DeleteTag removes one tag from every sensor; returns how many sensors lost it.
-func (db *DB) DeleteTag(tag string) (int64, error) {
-	res, err := db.Exec("DELETE FROM sensor_tags WHERE tag = ?", tag)
+func (db *DB) DeleteTag(ctx context.Context, tag string) (int64, error) {
+	res, err := db.ExecContext(ctx, "DELETE FROM sensor_tags WHERE tag = ?", tag)
 	if err != nil {
 		return 0, err
 	}
@@ -859,8 +859,8 @@ func (db *DB) ListUsers() ([]authUser, error) {
 // ActiveSensorIDs lists the ids of every sensor currently in state 'active',
 // in name order. Used to snapshot which sensors are running before maintenance
 // mode pauses them, so resume can restore exactly that set.
-func (db *DB) ActiveSensorIDs() ([]string, error) {
-	rows, err := db.Query("SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
+func (db *DB) ActiveSensorIDs(ctx context.Context) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
 	if err != nil {
 		return nil, err
 	}

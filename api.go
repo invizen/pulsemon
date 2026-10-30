@@ -1688,7 +1688,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
-		n, err := s.db.DeleteTag(tag)
+		n, err := s.db.DeleteTag(r.Context(), tag)
 		if err != nil {
 			respondInternal(w, "delete tag "+tag, err)
 			return
@@ -2107,7 +2107,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	maintAlreadyOn := s.db.GetSetting("maintenance_mode") == "1"
 	var maintIDs []string
 	if req.MaintMode != nil && *req.MaintMode && !maintAlreadyOn {
-		ids, err := s.db.ActiveSensorIDs()
+		ids, err := s.db.ActiveSensorIDs(r.Context())
 		if err != nil {
 			respondInternal(w, "snapshot active sensors", err)
 			return
@@ -2220,7 +2220,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				// Atomic: pause + snapshot + mode flag in ONE transaction
 				// so a crash can't leave sensors paused without the mode
 				// flag (or vice versa). See EnterMaintenanceWithFreshSnapshot in db.go.
-				ids, err := s.db.EnterMaintenanceWithFreshSnapshot()
+				ids, err := s.db.EnterMaintenanceWithFreshSnapshot(r.Context())
 				if err != nil {
 					respondInternal(w, "enter maintenance mode", err)
 					return
@@ -2263,7 +2263,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			}
 			// Atomic: resume + clear snapshot + mode flag in ONE transaction.
 			// See SetMaintenanceMode in db.go.
-			if err := s.db.SetMaintenanceMode(false, ids, ""); err != nil {
+			if err := s.db.SetMaintenanceMode(r.Context(), false, ids, ""); err != nil {
 				respondInternal(w, "leave maintenance mode", err)
 				return
 			}
