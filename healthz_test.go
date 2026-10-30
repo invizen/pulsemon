@@ -9,6 +9,7 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"pulsemon/internal/store"
 )
 
 // TestHealthzPragmaParity pins the fix for the -healthz flag bypassing the
@@ -16,12 +17,12 @@ import (
 // _pragma=busy_timeout / journal_mode / foreign_keys), so the healthcheck ran
 // with a 0 ms busy timeout — any moment of write contention (probe worker
 // mid-write, WAL checkpoint) failed it with SQLITE_BUSY and could crash-loop
-// a container. -healthz must open the store exactly like the app does (NewDB).
+// a container. -healthz must open the store exactly like the app does (store.NewStore).
 func TestHealthzPragmaParity(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "healthz.db")
-	app, err := NewDB(path)
+	app, err := store.NewStore(path)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer app.Close()
 	if _, err := app.Exec("CREATE TABLE sensors (id TEXT PRIMARY KEY)"); err != nil {
@@ -48,11 +49,11 @@ func TestHealthzPragmaParity(t *testing.T) {
 		}
 	})
 
-	t.Run("healthz open via NewDB has the app pragmas", func(t *testing.T) {
+	t.Run("healthz open via store.NewStore has the app pragmas", func(t *testing.T) {
 		// This is exactly what `pulsemon -healthz` does now.
-		hz, err := NewDB(path)
+		hz, err := store.NewStore(path)
 		if err != nil {
-			t.Fatalf("healthz NewDB: %v", err)
+			t.Fatalf("healthz store.NewStore: %v", err)
 		}
 		defer hz.Close()
 		var bt int
@@ -78,12 +79,12 @@ func TestHealthzPragmaParity(t *testing.T) {
 		}
 	})
 
-	t.Run("write contention: bare fails instantly, NewDB waits it out", func(t *testing.T) {
+	t.Run("write contention: bare fails instantly, store.NewStore waits it out", func(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 
 		// Hold a write transaction for ~700 ms (simulates a probe write).
-		holder, err := NewDB(path)
+		holder, err := store.NewStore(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -126,9 +127,9 @@ func TestHealthzPragmaParity(t *testing.T) {
 			t.Fatalf("bare open should fail instantly (0 ms timeout), took %v", bareDur)
 		}
 
-		// The fixed healthz (NewDB, 15 s timeout) blocks until the writer
+		// The fixed healthz (store.NewStore, 15 s timeout) blocks until the writer
 		// commits, then proceeds.
-		waiter, err := NewDB(path)
+		waiter, err := store.NewStore(path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -140,7 +141,7 @@ func TestHealthzPragmaParity(t *testing.T) {
 		defer wconn.Close()
 		start = time.Now()
 		if _, err := wconn.ExecContext(ctx, "BEGIN IMMEDIATE"); err != nil {
-			t.Fatalf("NewDB connection should wait out the 700 ms write lock (15 s timeout): %v", err)
+			t.Fatalf("store.NewStore connection should wait out the 700 ms write lock (15 s timeout): %v", err)
 		}
 		waitDur := time.Since(start)
 		if _, err := wconn.ExecContext(ctx, "COMMIT"); err != nil {

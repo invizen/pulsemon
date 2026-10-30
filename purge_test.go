@@ -9,6 +9,7 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"pulsemon/internal/store"
 )
 
 // TestRFC3339NanoStringCompareBoundary pins the "string compare on
@@ -75,9 +76,9 @@ func TestRFC3339NanoStringCompareBoundary(t *testing.T) {
 // it. Offsets use comfortable margins (6h / 10s / 1h) so the sub-second
 // uncertainty in purgeOld's internal time.Now() can't flake the assertions.
 func TestPurgeOldNoEarlyDeletion(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "purge.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "purge.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -141,9 +142,9 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 // past-boundary row is deleted (the batch loop terminates correctly) and NO
 // in-window row is touched.
 func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "purgemulti.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "purgemulti.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -9,6 +9,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestDrainAlertsWaitsForInFlightDelivery pins the shutdown alert-drain: a
@@ -173,9 +174,9 @@ func TestPostJSONContextCancelledBeforeStart(t *testing.T) {
 // so only the cancelled caller context ends the POST early.
 func TestTestWebhookBoundedByRequestContext(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "testwebhook.db")
-	db, err := NewDB(dbPath)
+	db, err := store.NewStore(dbPath)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestPulseNowNeverAffectsStatus pins the 2026-10-20 external-review fix:
@@ -16,9 +17,9 @@ import (
 // manual pulse + one lost scheduled probe tripped a down_after=2 sensor
 // to "error" (an alert) — while the docs promised the opposite.
 func TestPulseNowNeverAffectsStatus(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "pulse-status.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "pulse-status.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -54,7 +55,7 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 	}
 	base := time.Now().UTC().Add(2 * time.Second)
 	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, manual) VALUES (?, ?, NULL, 0)`,
-		id, fmtTS(base)); err != nil {
+		id, store.FormatTS(base)); err != nil {
 		t.Fatalf("insert scheduled loss: %v", err)
 	}
 
@@ -72,7 +73,7 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 	// (3) Control: two SCHEDULED losses still trip it — the consecutive-
 	// loss logic itself is intact.
 	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, manual) VALUES (?, ?, NULL, 0)`,
-		id, fmtTS(base.Add(time.Second))); err != nil {
+		id, store.FormatTS(base.Add(time.Second))); err != nil {
 		t.Fatalf("insert second scheduled loss: %v", err)
 	}
 	if st := pw.deriveStatus(cfg, "up"); st != "error" {

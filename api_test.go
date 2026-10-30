@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestValidSensorName pins the stored-XSS name gate: names that could escape
@@ -478,9 +479,9 @@ func TestMaintenanceModeFlipsInMemoryPauseImmediately(t *testing.T) {
 	// One ACTIVE sensor, with its in-memory state as syncSensors would have
 	// built it (probing, not paused). No loop is spawned — the test asserts
 	// the flag flip, not the probe cadence.
-	id := newID()
+	id := store.NewID()
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, 'maint-test', '10.99.99.1', 'icmp', 60, 1000, 25, 2, 3, 'active', ?, 'up')`, id, tsNow()); err != nil {
+		VALUES (?, 'maint-test', '10.99.99.1', 'icmp', 60, 1000, 25, 2, 3, 'active', ?, 'up')`, id, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	pw.mu.Lock()
@@ -546,8 +547,8 @@ func TestMaintenanceModeFlipsInMemoryPauseImmediately(t *testing.T) {
 func TestPatchSingleReadValidation(t *testing.T) {
 	srv, db := fixServerWithDB(t)
 	mk := func(target string, intervalS int) string {
-		id := newID()
-		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,?,'icmp',?,1000,25,2,5,'paused','up',?)`, id, id, target, intervalS, tsNow()); err != nil {
+		id := store.NewID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,?,'icmp',?,1000,25,2,5,'paused','up',?)`, id, id, target, intervalS, store.Now()); err != nil {
 			t.Fatal(err)
 		}
 		return id
@@ -578,8 +579,8 @@ func TestPatchSingleReadValidation(t *testing.T) {
 	}
 
 	// 2. Target-only change to a bare host on an http sensor: 400.
-	idHTTP := newID()
-	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'h','http://example.com/health','http',60,1000,25,2,5,'paused','up',?)`, idHTTP, tsNow()); err != nil {
+	idHTTP := store.NewID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'h','http://example.com/health','http',60,1000,25,2,5,'paused','up',?)`, idHTTP, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if rr := patch(idHTTP, `{"target":"bare-host"}`); rr.Code != http.StatusBadRequest {
@@ -608,7 +609,7 @@ func TestPatchSingleReadValidation(t *testing.T) {
 	}
 
 	// 6. Nonexistent sensor: 404 (now carried by the in-tx read).
-	if rr := patch(newID(), `{"name":"ghost"}`); rr.Code != http.StatusNotFound {
+	if rr := patch(store.NewID(), `{"name":"ghost"}`); rr.Code != http.StatusNotFound {
 		t.Fatalf("PATCH nonexistent sensor: %d, want 404: %s", rr.Code, rr.Body.String())
 	}
 }

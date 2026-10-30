@@ -14,12 +14,13 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 func TestWarmStatsDropsStaleLiveEntries(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "warm-stale.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "warm-stale.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

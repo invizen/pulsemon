@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestFix_HandlerDBCallsHonorRequestContext pins the contract that HTTP
@@ -35,10 +36,10 @@ func TestFix_HandlerDBCallsHonorRequestContext(t *testing.T) {
 
 	// Seed a sensor + probe rows that the wipe handlers would delete.
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-		VALUES ('ctx-s1', 'ctx-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, tsNow()); err != nil {
+		VALUES ('ctx-s1', 'ctx-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('ctx-s1', ?, 1.0)`, tsNow()); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('ctx-s1', ?, 1.0)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -110,7 +111,7 @@ func TestFix_MaintenanceAndTagDeleteHonorRequestContext(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-		VALUES ('ctx-m1', 'ctx-m1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, tsNow()); err != nil {
+		VALUES ('ctx-m1', 'ctx-m1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO sensor_tags (sensor_id, tag) VALUES ('ctx-m1', 'ctxtag')`); err != nil {

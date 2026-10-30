@@ -1,4 +1,4 @@
-package main
+package store
 
 // Review 2026-10-24 (Major): InitSchema cleared the legacy auth_token
 // setting UNCONDITIONALLY — including when UserCount() errored or the
@@ -14,11 +14,11 @@ import (
 	"time"
 )
 
-func legacyTokenFixture(t *testing.T) *DB {
+func legacyTokenFixture(t *testing.T) *Store {
 	t.Helper()
-	db, err := NewDB(filepath.Join(t.TempDir(), "legacy-token.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "legacy-token.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {
@@ -39,7 +39,7 @@ func TestLegacyTokenKeptOnMigrationFailure(t *testing.T) {
 	if _, err := db.Exec("DROP TABLE users"); err != nil {
 		t.Fatalf("drop users: %v", err)
 	}
-	if err := migrateLegacyAuthToken(db); err != nil {
+	if err := MigrateLegacyAuthToken(db); err != nil {
 		t.Fatalf("migration failure must defer, not fail boot: %v", err)
 	}
 	if got := db.GetSetting("auth_token"); got != tok {
@@ -59,7 +59,7 @@ func TestLegacyTokenMigratesOnRetry(t *testing.T) {
 	if _, err := db.Exec("DROP TABLE users"); err != nil {
 		t.Fatalf("drop users: %v", err)
 	}
-	if err := migrateLegacyAuthToken(db); err != nil {
+	if err := MigrateLegacyAuthToken(db); err != nil {
 		t.Fatalf("first pass: %v", err)
 	}
 	if db.GetSetting("auth_token") == "" {
@@ -97,7 +97,7 @@ func TestLegacyTokenClearedWhenUsersExist(t *testing.T) {
 	if err := db.SetSetting("auth_token", "stale-token"); err != nil {
 		t.Fatalf("set token: %v", err)
 	}
-	if err := migrateLegacyAuthToken(db); err != nil {
+	if err := MigrateLegacyAuthToken(db); err != nil {
 		t.Fatalf("helper: %v", err)
 	}
 	if got := db.GetSetting("auth_token"); got != "" {

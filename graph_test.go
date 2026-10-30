@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestGraphTimeWindowRegression locks the epoch-based window fix for the
@@ -24,9 +25,9 @@ import (
 // string filter over-counts the 1h window whenever the out-of-window probe
 // shares the same calendar day as now (most of the day).
 func TestGraphTimeWindowRegression(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "graph.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "graph.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -103,9 +104,9 @@ func TestGraphTimeWindowRegression(t *testing.T) {
 // bucket. The card's in-memory aggregates (computeSensorStats) skip manual
 // rows; the graph is the DB-side twin and must agree.
 func TestGraphExcludesManualRows(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "graph-manual.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "graph-manual.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

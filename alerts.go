@@ -18,6 +18,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // alertPanicRecovered guards the fire-and-forget alert paths (review
@@ -271,7 +272,7 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
 	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES (?, ?, ?)
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		id, status, fmtTS(ts))
+		id, status, store.FormatTS(ts))
 }
 
 // alertRetryAfter is how soon a re-alert is retried after every provider
@@ -293,7 +294,7 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 		back = 0
 	}
 	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ? WHERE sensor_id = ? AND status = ?`,
-		fmtTS(time.Now().UTC().Add(-back)), id, status)
+		store.FormatTS(time.Now().UTC().Add(-back)), id, status)
 }
 
 // realertMin returns the re-alert interval in minutes. 0 means alert
@@ -311,7 +312,7 @@ func (pw *ProbeWorker) realertMin() int {
 // sensors already in a bad state do not immediately re-alert right after
 // maintenance mode is turned off.
 func (pw *ProbeWorker) ResetAlertStates() {
-	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, tsNow())
+	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.Now())
 }
 
 // parseTSForRealert reads an alert_state.last_ts back into a time.Time for

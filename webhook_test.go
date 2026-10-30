@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestWebhookMasked locks the credential-masking contract. Google Chat keeps
@@ -64,9 +65,9 @@ func index(s, sub string) int {
 // (existing installs keep alerting with zero config); no URL → off (fresh
 // installs stay clean). An explicit flag always wins.
 func TestChatEnabledLegacyDefault(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "prov.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "prov.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -104,9 +105,9 @@ func TestChatEnabledLegacyDefault(t *testing.T) {
 // TestFlagEnabledGeneric locks the generic provider (discord): it needs an
 // explicit "1" flag AND a URL to be active; no legacy default.
 func TestFlagEnabledGeneric(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "prov2.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "prov2.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -138,9 +139,9 @@ func TestFlagEnabledGeneric(t *testing.T) {
 // no legacy row must have neither key.
 func TestLegacyWebhookMigration(t *testing.T) {
 	// Case A: fresh install — no legacy row → no google_chat_url, no flag.
-	fresh, err := NewDB(filepath.Join(t.TempDir(), "fresh.db"))
+	fresh, err := store.NewStore(filepath.Join(t.TempDir(), "fresh.db"))
 	if err != nil {
-		t.Fatalf("NewDB fresh: %v", err)
+		t.Fatalf("store.NewStore fresh: %v", err)
 	}
 	if err := fresh.InitSchema(); err != nil {
 		t.Fatalf("InitSchema fresh: %v", err)
@@ -157,9 +158,9 @@ func TestLegacyWebhookMigration(t *testing.T) {
 	// We open the DB and write the legacy key directly (simulating a pre-
 	// v0.1.14 database file), then re-run InitSchema.
 	path := filepath.Join(t.TempDir(), "legacy.db")
-	legacy, err := NewDB(path)
+	legacy, err := store.NewStore(path)
 	if err != nil {
-		t.Fatalf("NewDB legacy: %v", err)
+		t.Fatalf("store.NewStore legacy: %v", err)
 	}
 	if err := legacy.InitSchema(); err != nil {
 		t.Fatalf("InitSchema legacy: %v", err)
@@ -171,7 +172,7 @@ func TestLegacyWebhookMigration(t *testing.T) {
 	legacy.Close()
 
 	// Re-open and re-run InitSchema — the migration should fire.
-	db2, err := NewDB(path)
+	db2, err := store.NewStore(path)
 	if err != nil {
 		t.Fatalf("reopen legacy: %v", err)
 	}

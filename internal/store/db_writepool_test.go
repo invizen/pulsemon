@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"database/sql"
@@ -17,7 +17,7 @@ import (
 // + UPDATE sensors, plus the one Begin()/Commit transaction (SetSensorTags) —
 // from many goroutines, and adds a WRITE-LOCK HOLDER (a goroutine with an
 // uncommitted transaction) that holds the exclusive SQLite write lock for 400ms
-// while the writers fire. Under the real NewDB config (WAL + busy_timeout(15000)
+// while the writers fire. Under the real NewStore config (WAL + busy_timeout(15000)
 // + MaxOpenConns(10)) every blocked writer WAITS (400ms << 15s) and then
 // succeeds: zero errors, all rows land, and the pool drains. This refutes
 // "periodic database is locked errors under fleet growth."
@@ -27,9 +27,9 @@ import (
 // lock), and one short transaction (SetSensorTags: a DELETE + a few INSERTs).
 // No single write holds the lock for seconds, so busy_timeout never trips.
 func TestConcurrentProbeWritesDoNotBusy(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "writepool.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "writepool.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // testNowUnix is a fixed reference time (epoch seconds) so the differential
@@ -312,9 +313,9 @@ func compareStats(t *testing.T, label string, got, want *SensorStats) {
 // reproduce the four-query DB aggregation field-for-field. If the cache ever
 // diverges from the DB, this fails.
 func TestComputeSensorStatsMatchesSQL(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "stats.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "stats.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -389,9 +390,9 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 // and checks GetStats returns what the DB aggregation says — proving the
 // append-then-read path (not just the warm-up read) is correct.
 func TestGetStatsRoundTrip(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "rt.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "rt.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -546,9 +547,9 @@ func TestSeriesEviction(t *testing.T) {
 // TestClearHistoryInvalidatesCache confirms ResetStatsFor empties one sensor's
 // series (the clear-history endpoint relies on this) without touching others.
 func TestClearHistoryInvalidatesCache(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "clr.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "clr.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

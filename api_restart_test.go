@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // patchSensorRespawned drives a real PATCH through the API against a live
@@ -33,7 +34,7 @@ import (
 func patchSensorRespawned(t *testing.T, body string, wantRespawn bool) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "test.db"))
+	db, err := store.NewStore(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +142,7 @@ func TestPatchSpikeMultNoRespawn(t *testing.T) {
 // clone carries the value over.
 func TestSpikeMultLifecycle(t *testing.T) {
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "test.db"))
+	db, err := store.NewStore(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -229,7 +230,7 @@ func TestPatchTargetStillRespawns(t *testing.T) {
 // waiting out the 5s ticker.
 func TestRestartSignalsImmediateSync(t *testing.T) {
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "test.db"))
+	db, err := store.NewStore(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +299,7 @@ func TestRespawnUsesFreshConfig(t *testing.T) {
 	defer srvB.Close()
 
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "test.db"))
+	db, err := store.NewStore(filepath.Join(dir, "test.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

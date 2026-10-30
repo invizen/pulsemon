@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestFix_PostAndCloneTagsAtomic pins the atomic create+tag fix: POST
@@ -23,8 +24,8 @@ func TestFix_PostAndCloneTagsAtomic(t *testing.T) {
 
 	// Seed a source sensor carrying the poison tag BEFORE the trigger
 	// exists (the trigger would block the seed insert too).
-	srcID := newID()
-	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'src','127.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, srcID, tsNow()); err != nil {
+	srcID := store.NewID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'src','127.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, srcID, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.SetSensorTags(srcID, []string{"bad"}); err != nil {

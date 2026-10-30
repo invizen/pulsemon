@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // testTLSChain builds a throwaway CA + leaf cert pair. The leaf is valid
@@ -805,9 +806,9 @@ func TestValidURL(t *testing.T) {
 // URL, an ICMP sensor must not carry a bare host, and a mixed pair is
 // rejected with a clear 400.
 func TestAPIHTTPTargetValidation(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "httpapi.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "httpapi.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -852,9 +853,9 @@ func TestAPIHTTPTargetValidation(t *testing.T) {
 // for an HTTP sensor only when the probe worker has a result; ICMP sensors
 // omit both.
 func TestAPIHTTPViewFields(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "httpview.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "httpview.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -947,9 +948,9 @@ func TestProbeTargetDispatch(t *testing.T) {
 // (via probeTarget), records the row with http_status, and does NOT derive
 // status.
 func TestPingNowHTTPSensor(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "pnowhttp.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "pnowhttp.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

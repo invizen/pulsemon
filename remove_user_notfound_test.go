@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestRemoveUserNonexistentReportsNotFound pins the 2026-10-20 external-review
@@ -16,7 +17,7 @@ import (
 // no-op"), so the API answered 200 and the CLI printed
 // "User removed: <name>" for a mistyped username — a false success on an
 // admin operation. Now:
-//   - RemoveUser returns the errUserNotFound sentinel (name in the message)
+//   - RemoveUser returns the store.ErrUserNotFound sentinel (name in the message)
 //   - a mistyped name in a single-user install is "no such user", not
 //     "cannot remove the last user"
 //   - the API answers 404 — the same policy as the password endpoint
@@ -32,9 +33,9 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// Multi-user install: nonexistent name → errUserNotFound, users intact.
-	if err := a.RemoveUser("ghost"); !errors.Is(err, errUserNotFound) {
-		t.Fatalf("RemoveUser(ghost) with 3 users = %v, want errUserNotFound", err)
+	// Multi-user install: nonexistent name → store.ErrUserNotFound, users intact.
+	if err := a.RemoveUser("ghost"); !errors.Is(err, store.ErrUserNotFound) {
+		t.Fatalf("RemoveUser(ghost) with 3 users = %v, want store.ErrUserNotFound", err)
 	} else if !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("RemoveUser(ghost) = %q, want the name in the message", err)
 	}
@@ -48,12 +49,12 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := a.RemoveUser("ghost"); !errors.Is(err, errUserNotFound) {
-		t.Fatalf("RemoveUser(ghost) with 1 user = %v, want errUserNotFound (not the last-user guard)", err)
+	if err := a.RemoveUser("ghost"); !errors.Is(err, store.ErrUserNotFound) {
+		t.Fatalf("RemoveUser(ghost) with 1 user = %v, want store.ErrUserNotFound (not the last-user guard)", err)
 	}
 	// The real last user is still protected.
-	if err := a.RemoveUser("third"); !errors.Is(err, errLastUser) {
-		t.Fatalf("RemoveUser(third) with 1 user = %v, want errLastUser", err)
+	if err := a.RemoveUser("third"); !errors.Is(err, store.ErrLastUser) {
+		t.Fatalf("RemoveUser(third) with 1 user = %v, want store.ErrLastUser", err)
 	}
 
 	// --- API level

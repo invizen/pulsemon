@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestDispatch pins the command-line structure: known commands dispatch,
@@ -57,16 +58,16 @@ func TestDispatchHealthzRunsForReal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cli.db")
 	t.Setenv("PULSEMON_DB", path)
 
-	// Empty store: NewDB creates the file but no schema exists, so the COUNT
+	// Empty store: store.NewStore creates the file but no schema exists, so the COUNT
 	// fails — a store that isn't actually usable must not report healthy.
 	if k := dispatch([]string{"pulsemon", "-healthz"}); k != dExit1 {
 		t.Fatalf("healthz on schemaless store = %v, want dExit1", k)
 	}
 
 	// Seeded store: both spellings report healthy.
-	db, err := NewDB(path)
+	db, err := store.NewStore(path)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -140,7 +141,7 @@ func TestAuthUserAdd(t *testing.T) {
 
 	// Verify the three users exist and their passwords are exactly the
 	// ones supplied (stdin forms included).
-	db, err := NewDB(path)
+	db, err := store.NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

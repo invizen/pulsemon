@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestWarmStatsUNIONDedupAndOrder locks the warmStats fetch semantics the
@@ -43,9 +44,9 @@ import (
 // EXACT production query text as UNION vs UNION ALL to show the 0-dup vs 60-dup
 // difference directly.
 func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "warmstats-union.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "warmstats-union.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -191,16 +192,16 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 // chunk, each with a TOP-LEVEL defer (probe.go:366, 424) — not a bare close
 // below a loop. After a multi-chunk run the pool fully drains and settles.
 func TestWarmStatsCursorDrains(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "warmstats-drain.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "warmstats-drain.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
 	}
 	// 600 active sensors -> 600 id rows, so fetchChunk runs in 2 chunks
-	// (inQueryChunk=500), exercising the per-chunk cursor-close path.
+	// (store.InQueryChunk=500), exercising the per-chunk cursor-close path.
 	for i := 0; i < 600; i++ {
 		id := fmt.Sprintf("s%03d", i)
 		if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)

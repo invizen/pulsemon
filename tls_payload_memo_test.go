@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // testCertWithCN generates a self-signed cert PEM with the given CN
@@ -64,9 +65,9 @@ func padPEM(t *testing.T, pem string, targetLen int) []byte {
 func TestTlsPayloadMemoizesOnMtime(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "pulsemon.db")
 	t.Setenv("PULSEMON_DB", dbPath)
-	db, err := NewDB(dbPath)
+	db, err := store.NewStore(dbPath)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

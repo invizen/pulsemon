@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestBindServeWithRetryFailsFastWhenNotRetrying pins the inverted-branch
@@ -131,7 +132,7 @@ func TestFix_m2_UnreadableTLSPairIsFatal(t *testing.T) {
 	bindFatal = func(msg string) { fatals <- msg; select {} } // must NOT be reached
 	t.Cleanup(func() { certFatal, bindFatal = oldCert, oldBind })
 
-	db, err := NewDB(filepath.Join(t.TempDir(), "m2.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "m2.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +172,7 @@ func TestFix_m2_PlaintextFallbackEnv(t *testing.T) {
 	bindFatal = func(msg string) { binds <- msg; select {} }
 	t.Cleanup(func() { certFatal, bindFatal = oldCert, oldBind })
 
-	db, err := NewDB(filepath.Join(t.TempDir(), "m2b.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "m2b.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

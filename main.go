@@ -14,7 +14,13 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"pulsemon/internal/store"
 )
+
+// DB is an alias for store.Store: the pilot move of db.go into
+// internal/store (2026-10-30, DECISIONS.md). It keeps every existing *DB
+// signature compiling unchanged; a follow-up commit drops the alias.
+type DB = store.Store
 
 // listenAddr is the HTTP listen address. Override with PULSEMON_ADDR — a full
 // "host:port" (e.g. ":9299" for all interfaces on 9299, "127.0.0.1:9299" for
@@ -132,13 +138,13 @@ func dispatch(args []string) dispatchKind {
 	return dRunServer
 }
 
-// runHealthcheck opens the store via NewDB so the pragmas (busy_timeout,
+// runHealthcheck opens the store via store.NewStore so the pragmas (busy_timeout,
 // WAL, foreign_keys) apply — a bare sql.Open runs with a 0 ms busy_timeout
 // and fails with SQLITE_BUSY the instant a probe write or WAL checkpoint is
-// in flight, which would crash-loop a container. NewDB's SELECT 1 already
+// in flight, which would crash-loop a container. store.NewStore's SELECT 1 already
 // verifies reachability; the COUNT additionally proves the schema exists.
 func runHealthcheck() dispatchKind {
-	db, err := NewDB(dbPathFromEnv())
+	db, err := store.NewStore(dbPathFromEnv())
 	if err != nil {
 		log.Printf("healthz: open: %v", err)
 		return dExit1
@@ -162,7 +168,7 @@ func runHealthcheck() dispatchKind {
 // the updater skips it: the question is "is the server answering", not "is
 // the certificate trusted" — a self-signed homelab cert must pass.
 func runHealthcheckHTTP() dispatchKind {
-	db, err := NewDB(dbPathFromEnv())
+	db, err := store.NewStore(dbPathFromEnv())
 	if err != nil {
 		log.Printf("healthz-http: open: %v", err)
 		return dExit1
@@ -481,7 +487,7 @@ func runAuthUser(args []string) dispatchKind {
 		fmt.Fprintln(os.Stderr, authUserUsage)
 		return dExit2
 	}
-	db, err := NewDB(dbPathFromEnv())
+	db, err := store.NewStore(dbPathFromEnv())
 	if err != nil {
 		log.Printf("auth-user: open: %v", err)
 		return dExit1
@@ -631,7 +637,7 @@ func runServer(stop <-chan struct{}) {
 		log.Fatalf("pulsemon: %v", err)
 	}
 
-	db, err := NewDB(dbPathFromEnv())
+	db, err := store.NewStore(dbPathFromEnv())
 	if err != nil {
 		log.Fatalf("Failed to open DB: %v", err)
 	}

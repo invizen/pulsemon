@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestFix_ScanErrorsLoggedNotSilent pins the per-row scan-error contract
@@ -28,17 +29,17 @@ func TestFix_ScanErrorsLoggedNotSilent(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-		VALUES ('scan-s1', 'scan-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, tsNow()); err != nil {
+		VALUES ('scan-s1', 'scan-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	// One good row (valid RFC3339 ts) plus one corrupt row (INTEGER ts).
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('scan-s1', ?, 1.0)`, tsNow()); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('scan-s1', ?, 1.0)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('scan-s1', 12345, 2.0)`); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES ('scan-s1', ?, 'up', 'error', 'good')`, tsNow()); err != nil {
+	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES ('scan-s1', ?, 'up', 'error', 'good')`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES ('scan-s1', 99999, 'up', 'error', 'bad')`); err != nil {

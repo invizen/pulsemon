@@ -74,7 +74,7 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 	}
 
 	// 3. Last-user guard: business rule → 400 with the friendly message
-	// (now the errLastUser sentinel, message byte-identical).
+	// (now the store.ErrLastUser sentinel, message byte-identical).
 	if code, body := do(http.MethodDelete, "/api/auth/users/admin", ""); code != 400 {
 		t.Fatalf("delete last user: got %d (%s), want 400", code, body)
 	} else if !strings.Contains(body, "cannot remove the last user") {

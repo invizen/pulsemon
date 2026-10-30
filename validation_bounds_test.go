@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // newM10bServer builds a real server over a temp DB and returns it plus a
@@ -17,7 +18,7 @@ import (
 func newM10bServer(t *testing.T) (*Server, func(string, string, string) (int, map[string]interface{})) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "m10b.db"))
+	db, err := store.NewStore(filepath.Join(dir, "m10b.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,9 +150,9 @@ func TestFix_M10b_TimeoutVsInterval(t *testing.T) {
 
 	// PATCH: seed a 10s/10000ms row via SQL (a fast row the API would now
 	// refuse to create), then exercise the stored-value fallback.
-	id := newID()
+	id := store.NewID()
 	if _, err := srv.db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
-		VALUES (?, 'p1', '192.0.2.9', 'icmp', 10, 10000, 25, 2, 5, 'paused', ?, 'up')`, id, tsNow()); err != nil {
+		VALUES (?, 'p1', '192.0.2.9', 'icmp', 10, 10000, 25, 2, 5, 'paused', ?, 'up')`, id, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 	// Shrink the interval below the stored timeout: 10000ms > 5s*1000.

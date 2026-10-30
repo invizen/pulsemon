@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // seedFailingHTTPSensor builds a DB + worker + server with one HTTP sensor
@@ -16,9 +17,9 @@ import (
 // entry so the reset has something to wipe.
 func seedFailingHTTPSensor(t *testing.T, id, name string) (*DB, *ProbeWorker, *Server) {
 	t.Helper()
-	db, err := NewDB(filepath.Join(t.TempDir(), id+"-clear.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), id+"-clear.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {
@@ -141,9 +142,9 @@ func TestClearAllHistoryResetsProbeState(t *testing.T) {
 // The status-untouched assertion below is what still fails if someone
 // re-splits the small steps back into autocommit-with-ignored-errors.
 func TestClearHistoryAtomicOnFailure(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "clr3.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "clr3.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	// NO InitSchema: only the tables the clear can succeed on exist.

@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/google/uuid"
+	"pulsemon/internal/store"
 )
 
 type ProbeState struct {
@@ -489,15 +489,15 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 }
 
 // freshStates re-reads the state column for exactly the given sensor ids,
-// batched in inQueryChunk. syncSensors calls it
+// batched in store.InQueryChunk. syncSensors calls it
 // under pw.mu: the pre-lock config read can be arbitrarily stale by apply
 // time (an operator pause landing in the read→apply gap would otherwise be
 // clobbered by the stale row), so the pause sync uses this fresh read. A
 // missing id (row deleted in the gap) is simply absent from the map.
 func (pw *ProbeWorker) freshStates(ids []string) map[string]string {
 	out := make(map[string]string, len(ids))
-	for i := 0; i < len(ids); i += inQueryChunk {
-		end := i + inQueryChunk
+	for i := 0; i < len(ids); i += store.InQueryChunk {
+		end := i + store.InQueryChunk
 		if end > len(ids) {
 			end = len(ids)
 		}
@@ -855,7 +855,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), dbWriteTimeout)
 	defer cancelWrite()
 	if _, err := pw.db.ExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, ?, ?, ?, 1)",
-		id, fmtTS(ts), rttVal, o.ip, o.httpCode); err != nil {
+		id, store.FormatTS(ts), rttVal, o.ip, o.httpCode); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
@@ -960,7 +960,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	// it is already cancelled-and-checked above (a cancelled probe drops
 	// its result), and it lets shutdown interrupt a write parked on the
 	// 15s busy_timeout instead of outrunning the drain budget.
-	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, fmtTS(now), rttVal, o.ip, o.httpCode); err != nil {
+	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -1019,7 +1019,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 		note = "recovered" // first transition back to up after warning/error
 	}
 	if _, err := pw.db.Exec("INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES (?, ?, ?, ?, ?)",
-		c.id, tsNow(), oldStatus, newStatus, note); err != nil {
+		c.id, store.Now(), oldStatus, newStatus, note); err != nil {
 		log.Printf("ProbeWorker: failed to record event for %s: %v", c.id, err)
 	}
 
@@ -1084,7 +1084,7 @@ const purgeBatchSize = 5000
 // longest window the dashboard reads, so nothing on screen needs older data.
 //
 // ts is compared as a string. That is exact because every writer uses the
-// fixed-width fmtTS layout (lexicographic order == chronological order). Rows
+// fixed-width store.FormatTS layout (lexicographic order == chronological order). Rows
 // written by older versions used a variable-width layout; for those the
 // comparison can be off by under one second right at the cutoff, which only
 // ever over- or under-retains a single boundary row once and ages out within a
@@ -1107,7 +1107,7 @@ const purgeBatchSize = 5000
 // context-free loop could run minutes of DELETEs uninterruptibly on a
 // large retention backlog, past the shutdown drain budget.
 func (pw *ProbeWorker) purgeOld(ctx context.Context) {
-	cutoff := fmtTS(time.Now().Add(-24 * time.Hour))
+	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
 	ids, err := pw.db.SensorIDs()
 	if err != nil {
 		log.Printf("retention: failed to list sensors: %v", err)
@@ -1144,10 +1144,6 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 	}
 }
 
-// newID generates a unique sensor id.
-func newID() string {
-	return uuid.NewString()
-}
 
 // validTarget accepts only well-formed probe targets (all SQL is parameterized; this is input hygiene).
 //

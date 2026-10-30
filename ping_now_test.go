@@ -8,15 +8,16 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestEchoNowProbeRowCount drives the real handler against a live worker and
 // asserts the sample is recorded: the probes row count increases by one, the
 // row is a lost probe (rtt_ms NULL), and the sensor status is unchanged.
 func TestEchoNowProbeRowCount(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "echo3.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "echo3.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -96,9 +97,9 @@ func TestEchoNowProbeRowCount(t *testing.T) {
 // 100-30000) gets the pingNowTimeout fallback, not a zero-duration (instant)
 // timeout that would lose every probe (2026-10-23 external review F5).
 func TestPingNowZeroedTimeoutFallsBack(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "echoz.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "echoz.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -133,9 +134,9 @@ func TestPingNowZeroedTimeoutFallsBack(t *testing.T) {
 // target lookup fails with sql.ErrNoRows, which the handler must map to 404
 // (not 500), and it must not record anything.
 func TestEchoNowUnknownSensorReturns404(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "echo4.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "echo4.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -156,9 +157,9 @@ func TestEchoNowUnknownSensorReturns404(t *testing.T) {
 // pulseNowCooldown is refused with 429 and NOT recorded, so an unthrottled
 // loop of "Pulse Now" clicks can't starve the probe queue.
 func TestEchoNowCooldownThrottles(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "echo5.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "echo5.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -214,9 +215,9 @@ func TestEchoNowCooldownThrottles(t *testing.T) {
 // older entry) and could put the cached entry in a different 1-minute
 // sparkline bucket than the SQLite row.
 func TestPingNowCacheUsesPostProbeTimestamp(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "echo6.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "echo6.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -282,9 +283,9 @@ func TestPingNowSlowHTTPTargetReadsUp(t *testing.T) {
 	}))
 	defer slow.Close()
 
-	db, err := NewDB(filepath.Join(t.TempDir(), "slow.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "slow.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

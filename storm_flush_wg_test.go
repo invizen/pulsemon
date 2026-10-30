@@ -13,13 +13,14 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 func stormFixture(t *testing.T) *ProbeWorker {
 	t.Helper()
-	db, err := NewDB(filepath.Join(t.TempDir(), "storm-wg.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "storm-wg.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {

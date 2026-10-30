@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
+	"pulsemon/internal/store"
 )
 
 // ---------- dashboard authentication (username / password) ----------
@@ -421,19 +422,6 @@ var (
 	// IP for ordinary traffic). errors.Is(errBootstrapped) stays true so
 	// the 409 mapping is unchanged.
 	errBootstrappedEarly = fmt.Errorf("%w (pre-check)", errBootstrapped)
-	// errLastUser: RemoveUser refuses to delete the final account (use
-	// auth-off for that). A sentinel, not an inline fmt.Errorf, so the
-	// HTTP handler can errors.Is it to a 400 while every other db
-	// failure 500s (the handler used to
-	// echo every RemoveUser error, raw driver text included, as a 400).
-	errLastUser = fmt.Errorf("cannot remove the last user — disable authentication instead")
-	// errUserNotFound: RemoveUser of a name that doesn't exist. The db
-	// layer used to treat this as a silent no-op, so the API answered
-	// 200 and the CLI printed "User removed: <name>" for a mistyped
-	// username — a false success on an admin operation. The handler maps it to 404, the same policy as
-	// the password endpoint (unknown username → 404, not 403, so the
-	// endpoint doesn't confirm which names exist).
-	errUserNotFound = fmt.Errorf("no such user")
 )
 
 func validUsername(u string) bool {
@@ -515,7 +503,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 		}
 		if _, err := c.ExecContext(ctx,
 			"INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
-			username, string(hash), tsNow(), admin); err != nil {
+			username, string(hash), store.Now(), admin); err != nil {
 			// Only the exact UNIQUE-constraint text means "account
 			// exists" — any other db failure must surface as a 500, not
 			// be misreported as a duplicate.
@@ -535,7 +523,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 			// the user row).
 			if _, err := c.ExecContext(ctx,
 				"INSERT OR REPLACE INTO settings (setting_key, value, updated_at) VALUES ('auth_bootstrapped', '1', ?)",
-				tsNow()); err != nil {
+				store.Now()); err != nil {
 				return err
 			}
 		}
@@ -609,9 +597,9 @@ func (a *AuthState) RemoveUser(username string) error {
 		// not "cannot remove the last user" — check existence before
 		// blaming the guard.
 		if !a.userExists(username) {
-			return fmt.Errorf("%w: %s", errUserNotFound, username)
+			return fmt.Errorf("%w: %s", store.ErrUserNotFound, username)
 		}
-		return errLastUser
+		return store.ErrLastUser
 	}
 	if err := a.db.RemoveUser(username); err != nil {
 		return err
@@ -1385,7 +1373,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if caller := s.sessionFrom(r); !s.auth.IsAdmin(caller) {
-			mine := make([]authUser, 0, 1)
+			mine := make([]store.AuthUser, 0, 1)
 			for _, u := range users {
 				if u.Username == caller {
 					mine = append(mine, u)
@@ -1601,14 +1589,14 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 		// the last-user guard so a mistyped name in a single-user
 		// install is 404, not 400. This used to report SUCCESS for a
 		// nonexistent user.
-		if errors.Is(err, errUserNotFound) {
+		if errors.Is(err, store.ErrUserNotFound) {
 			respondWithError(w, http.StatusNotFound, err.Error())
 			return
 		}
 		// The last-user guard is a client-facing business rule (400);
 		// any other failure (db) is a 500 with the detail logged — a
 		// raw driver string is not a client fault (same pattern as AddUser).
-		if errors.Is(err, errLastUser) {
+		if errors.Is(err, store.ErrLastUser) {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}

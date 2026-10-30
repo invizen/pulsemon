@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // resetSharedEngine rewinds the process-wide engine state so a test can
@@ -25,9 +26,9 @@ func resetSharedEngine(t *testing.T, mode string, err error) {
 // runHealthz drives handleHealthz against a real store and decodes the JSON.
 func runHealthz(t *testing.T, dbPath string) map[string]interface{} {
 	t.Helper()
-	db, err := NewDB(dbPath)
+	db, err := store.NewStore(dbPath)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

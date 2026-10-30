@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestTestWebhookStatusHandling pins TestWebhook's response handling: a 2xx
@@ -23,9 +24,9 @@ import (
 // branches can't silently change what TestWebhook reports.
 func TestTestWebhookStatusHandling(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "testwebhook_status.db")
-	db, err := NewDB(dbPath)
+	db, err := store.NewStore(dbPath)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -35,7 +35,7 @@ func TestFix_M3_DataDirHardened(t *testing.T) {
 	if got := st.Mode().Perm(); got != 0o700 {
 		t.Errorf("created data dir mode = %o, want 0700", got)
 	}
-	// The DB is created by NewDB with the umask in effect; simulate it
+	// The DB is created by store.NewStore with the umask in effect; simulate it
 	// here and verify the file-tightening pass.
 	if err := os.WriteFile(dbPath, []byte("x"), 0o644); err != nil {
 		t.Fatal(err)

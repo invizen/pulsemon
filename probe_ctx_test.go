@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestDoProbeDropsResultWhenCancelled locks the finding-6 fix: when the
@@ -15,9 +16,9 @@ import (
 // was written regardless — for a deleted sensor that is an FK violation, and
 // on shutdown it races db.Close().
 func TestDoProbeDropsResultWhenCancelled(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "ctxdrop.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "ctxdrop.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -67,9 +68,9 @@ func TestDoProbeDropsResultWhenCancelled(t *testing.T) {
 // ran its full probe on context.Background(), so Run sat out the whole 30s —
 // shutdown then hit db.Close() with a live writer.
 func TestRunReturnsWithinBudgetWhenProbeInFlight(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "runbudget.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "runbudget.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -6,6 +6,7 @@ import (
 	"sort"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // ---------------------------------------------------------------- timestamps
@@ -26,8 +27,8 @@ func TestFix_TS_FixedWidthLexicographicEqualsChronological(t *testing.T) {
 	}
 	strs := make([]string, len(times))
 	for i, tm := range times {
-		strs[i] = fmtTS(tm)
-		if len(strs[i]) != len(fmtTS(base)) {
+		strs[i] = store.FormatTS(tm)
+		if len(strs[i]) != len(store.FormatTS(base)) {
 			t.Fatalf("variable width: %q", strs[i])
 		}
 		if back, err := time.Parse(time.RFC3339Nano, strs[i]); err != nil || !back.Equal(tm) {
@@ -39,12 +40,12 @@ func TestFix_TS_FixedWidthLexicographicEqualsChronological(t *testing.T) {
 	sortedS := append([]string(nil), strs...)
 	sort.Strings(sortedS)
 	for i := range sortedT {
-		if fmtTS(sortedT[i]) != sortedS[i] {
-			t.Fatalf("string order != time order at %d: %s vs %s", i, fmtTS(sortedT[i]), sortedS[i])
+		if store.FormatTS(sortedT[i]) != sortedS[i] {
+			t.Fatalf("string order != time order at %d: %s vs %s", i, store.FormatTS(sortedT[i]), sortedS[i])
 		}
 	}
-	if s := tsNow(); len(s) != len(fmtTS(base)) {
-		t.Fatalf("tsNow width %d", len(s))
+	if s := store.Now(); len(s) != len(store.FormatTS(base)) {
+		t.Fatalf("store.Now width %d", len(s))
 	}
 }
 

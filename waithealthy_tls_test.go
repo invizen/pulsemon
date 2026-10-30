@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestWaitHealthyReachesTLSServer locks the Major fix: once a cert is
@@ -50,9 +51,9 @@ func TestWaitHealthyReachesTLSServer(t *testing.T) {
 // timed out and exited 1 on every TLS install. This test fails against the
 // old code.
 func TestWaitHealthyReachesTLSOnConfiguredPort(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "tlsport.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "tlsport.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

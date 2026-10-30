@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestRespawnLoopFirstTickCapped pins the 2026-10-20 external-review fix:
@@ -23,9 +24,9 @@ import (
 // stagger exists for (see the staggerPhase comment).
 func TestRespawnLoopFirstTickCapped(t *testing.T) {
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "respawn-tick.db"))
+	db, err := store.NewStore(filepath.Join(dir, "respawn-tick.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	// The probe loops spawned by syncSensors are children of this context.
 	// Cancelling it stops them. Declared AFTER defer db.Close() so it runs

@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // Stats cache: the in-memory probe series and per-sensor statistics
@@ -122,8 +123,8 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// because how far back the last-60 window reaches depends on each
 	// sensor's own row counts (the UNION ALL "fix" was reverted for breaking this contract).
 	// The query has two IN-clauses (last-60 part + 24h part), so the id list
-	// appears twice, followed by the 24h cutoff. It runs in inQueryChunk
-	// batches (see db.go): 2*inQueryChunk+1 params per chunk stays far under
+	// appears twice, followed by the 24h cutoff. It runs in store.InQueryChunk
+	// batches (see db.go): 2*store.InQueryChunk+1 params per chunk stays far under
 	// the driver's 32,766 host-parameter limit, so a very large fleet can't
 	// fail the warm-up with "too many SQL variables". Partitioning by sensor
 	// id keeps each sensor's rows in exactly one chunk, so per-sensor order is
@@ -148,7 +149,7 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 		for _, id := range chunk {
 			args = append(args, id)
 		}
-		args = append(args, fmtTS(cutoff))
+		args = append(args, store.FormatTS(cutoff))
 		// manual MUST be selected: warmed Pulse-Now rows default to
 		// manual=false otherwise and re-enter the aggregates + status
 		// derivation as scheduled probes for up to 24h after every
@@ -193,12 +194,12 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 			log.Printf("stats warm: chunk read ended early: %v", err)
 		}
 	}
-	for i := 0; i < len(idList); i += inQueryChunk {
+	for i := 0; i < len(idList); i += store.InQueryChunk {
 		if ctx.Err() != nil {
 			log.Printf("stats warm: aborted after %d probes (shutdown)", built)
 			return
 		}
-		end := i + inQueryChunk
+		end := i + store.InQueryChunk
 		if end > len(idList) {
 			end = len(idList)
 		}

@@ -1,4 +1,4 @@
-package main
+package store
 
 // Review 2026-10-24 (Major): ImmediateTx had two connection-poisoning gaps
 // that both hand a pooled *sql.Conn back with an OPEN SQLite transaction —
@@ -19,11 +19,11 @@ import (
 	"testing"
 )
 
-func immediatetxFixture(t *testing.T) *DB {
+func immediatetxFixture(t *testing.T) *Store {
 	t.Helper()
-	db, err := NewDB(filepath.Join(t.TempDir(), "imtx.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "imtx.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {

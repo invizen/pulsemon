@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestFix_m3_TLSPutAtomicInstall pins the m3 fix: a pair install that
@@ -20,7 +21,7 @@ func TestFix_m3_TLSPutAtomicInstall(t *testing.T) {
 	dataDir := t.TempDir()
 	t.Setenv("PULSEMON_DB", filepath.Join(dataDir, "pulsemon.db"))
 
-	db, err := NewDB(dbPathFromEnv())
+	db, err := store.NewStore(dbPathFromEnv())
 	if err != nil {
 		t.Fatal(err)
 	}

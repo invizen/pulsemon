@@ -7,6 +7,7 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"pulsemon/internal/store"
 )
 
 // TestRunAbortsInFlightProbesOnCancel pins the finding-6 shutdown contract:
@@ -30,9 +31,9 @@ import (
 // a timestamp after cancel+100ms (the 100ms absorbs a microsecond-scale
 // race where a probe passed the ctx check a hair before the cancel landed).
 func TestRunAbortsInFlightProbesOnCancel(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "shutdown.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "shutdown.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE sensors (
@@ -123,9 +124,9 @@ func add100ms(rfc3339 string) string {
 // active sensors Run must return quickly on cancel (no 5s-ticker or loop
 // stall), so a healthy shutdown never waits.
 func TestRunExitsPromptlyWithNoLoops(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "empty.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "empty.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if _, err := db.Exec(`CREATE TABLE sensors (

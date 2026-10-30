@@ -14,13 +14,14 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 func clearBatchFixture(t *testing.T, sensorID string, rows int) *DB {
 	t.Helper()
-	db, err := NewDB(filepath.Join(t.TempDir(), "clearbatch.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "clearbatch.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {

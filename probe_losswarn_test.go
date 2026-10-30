@@ -3,6 +3,7 @@ package main
 import (
 	"path/filepath"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestLossWarnIsARealGate pins the fix for the dead loss_warn setting:
@@ -19,9 +20,9 @@ import (
 // DESC, so the LAST element is the newest probe.
 func TestLossWarnIsARealGate(t *testing.T) {
 	probeErrCount.Store(0) // isolate from the broken-socket gate
-	db, err := NewDB(filepath.Join(t.TempDir(), "losswarn.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "losswarn.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -162,9 +163,9 @@ func TestLossWarnIsARealGate(t *testing.T) {
 // 2-straight-good tick.
 func TestLossWarnZeroedRowNeverReadsUp(t *testing.T) {
 	probeErrCount.Store(0) // isolate from the broken-socket gate
-	db, err := NewDB(filepath.Join(t.TempDir(), "losswarn0.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "losswarn0.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)

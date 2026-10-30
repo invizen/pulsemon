@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+	"pulsemon/internal/store"
 )
 
 //go:embed web/*
@@ -716,8 +717,8 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		id := newID()
-		now := tsNow()
+		id := store.NewID()
+		now := store.Now()
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
 		// mistyped, target can't fire down alerts before the user has a chance
 		// to review it. The user resumes it from the dashboard.
@@ -1524,8 +1525,8 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// suffix), an under-match (a "[" class) lets a taken name through to
 	// the INSERT, where the UNIQUE index rejects it and the retry below
 	// moves on — the same contract the old exact-match loop had.
-	newID := newID()
-	now := tsNow()
+	cloneID := store.NewID()
+	now := store.Now()
 	created := false
 	next := 1 // candidate suffix: 1 -> "-copy", n>=2 -> "-copyN"
 	// The clone name must itself satisfy validSensorName (≤60 runes) —
@@ -1594,11 +1595,11 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		err = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-				newID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now); err != nil {
+				cloneID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now); err != nil {
 				return err
 			}
 			if len(src.Tags) > 0 {
-				return setSensorTagsInConn(r.Context(), c, newID, src.Tags)
+				return setSensorTagsInConn(r.Context(), c, cloneID, src.Tags)
 			}
 			return nil
 		})
@@ -1627,7 +1628,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondWithJSON(w, http.StatusCreated, Sensor{
-		ID: newID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
+		ID: cloneID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
 		IntervalS: src.IntervalS, TimeoutMS: src.TimeoutMS,
 		LossWarn: src.LossWarn, DownAfter: src.DownAfter, SpikeMult: src.SpikeMult,
 		State: "paused", Status: "up", CreatedAt: now,
@@ -1769,7 +1770,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	//
 	// SECOND PROPOSAL (same review pass — rejected as UNSAFE): binding a
 	// Go-formatted RFC3339 cutoff and comparing `ts >= ?` as a string to
-	// unlock an index range seek. ts is stored as RFC3339Nano (tsNow, db.go),
+	// unlock an index range seek. ts is stored as RFC3339Nano (store.Now, db.go),
 	// which STRIPS trailing zeros — the live DB contains rows with 6-9 digit
 	// fractional widths. Variable-width fractions break lexicographic ==
 	// chronological: '...T01:57:25.13Z' (25.130s) compares GREATER than
@@ -1795,14 +1796,14 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// filter with a string compare remains UNSAFE (second proposal). The
 	// 24h query gains nothing (window == retention), which is why the
 	// bound is harmless there. FORMAT CONTRACT: the bound only compares
-	// correctly against the single-writer fmtTS format (Z-suffix, 9-digit
+	// correctly against the single-writer store.FormatTS format (Z-suffix, 9-digit
 	// fraction — db.go tsLayout). Rows written in other RFC3339
 	// renderings (e.g. "+00:00" offsets, which sort BELOW the bound)
-	// would be silently excluded — test seeders must use fmtTS.
+	// would be silently excluded — test seeders must use store.FormatTS.
 	// Measured (17,280 rows, one sensor): plan goes from "scan sensor
 	// slice + strftime per row" to a B-tree range seek; see commit
 	// message for timings.
-	cutoffStr := fmtTS(time.Now().UTC().Add(-dur - time.Second))
+	cutoffStr := store.FormatTS(time.Now().UTC().Add(-dur - time.Second))
 	// manual = 0: "Pulse Now" rows are diagnostic clicks, not scheduled
 	// samples — the card's loss/uptime aggregates (computeSensorStats)
 	// skip them, so the graph must too: // a lost pulse on a healthy sensor must not draw a loss bucket here.
@@ -2170,20 +2171,20 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.RealertMin != nil {
-		if err := setSettingInTx(tx, "realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
+		if err := store.SetSettingInTx(tx, "realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
 			respondInternal(w, "save setting realert_min", err)
 			return
 		}
 	}
 	if req.AlertScope != nil {
-		if err := setSettingInTx(tx, "alert_scope", *req.AlertScope); err != nil {
+		if err := store.SetSettingInTx(tx, "alert_scope", *req.AlertScope); err != nil {
 			respondInternal(w, "save setting alert_scope", err)
 			return
 		}
 	}
 	if req.AlertFilter != nil {
 		filterJSON, _ := json.Marshal(*req.AlertFilter)
-		if err := setSettingInTx(tx, "alert_filter", string(filterJSON)); err != nil {
+		if err := store.SetSettingInTx(tx, "alert_filter", string(filterJSON)); err != nil {
 			respondInternal(w, "save setting alert_filter", err)
 			return
 		}
@@ -2193,7 +2194,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		if *req.AllowUnauth {
 			val = "1"
 		}
-		if err := setSettingInTx(tx, "allow_unauth_update", val); err != nil {
+		if err := store.SetSettingInTx(tx, "allow_unauth_update", val); err != nil {
 			respondInternal(w, "save setting allow_unauth_update", err)
 			return
 		}
@@ -2532,11 +2533,11 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		if kind == "smtp" {
 			// Persist the host under smtp_host (not smtp_url) so the SMTP
 			// transport reads it from the right key.
-			if err := setSettingInTx(tx, "smtp_host", u); err != nil {
+			if err := store.SetSettingInTx(tx, "smtp_host", u); err != nil {
 				return fmt.Errorf("failed to save smtp host: %s", err.Error())
 			}
 		} else {
-			if err := setSettingInTx(tx, kind+"_url", u); err != nil {
+			if err := store.SetSettingInTx(tx, kind+"_url", u); err != nil {
 				return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
 			}
 		}
@@ -2546,7 +2547,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		if *enabled {
 			val = "1"
 		}
-		if err := setSettingInTx(tx, kind+"_enabled", val); err != nil {
+		if err := store.SetSettingInTx(tx, kind+"_enabled", val); err != nil {
 			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
 		}
 	}
@@ -2577,7 +2578,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 				vv = addr
 			}
 		}
-		if err := setSettingInTx(tx, kind+"_"+k, vv); err != nil {
+		if err := store.SetSettingInTx(tx, kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
 		}
 	}

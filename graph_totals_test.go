@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
@@ -32,10 +33,10 @@ func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 			isLost = true
 		}
 		// The seekable ts >= bound in handleSensorGraph presumes the
-		// single-writer fmtTS format (Z-suffix, db.go tsLayout) — seed with
+		// single-writer store.FormatTS format (Z-suffix, db.go store.TSLayout) — seed with
 		// it, not RFC3339Nano, which on a UTC host renders "+00:00" and
 		// sorts lexicographically BELOW the bound.
-		ts := fmtTS(now.Add(time.Duration(-i) * time.Minute))
+		ts := store.FormatTS(now.Add(time.Duration(-i) * time.Minute))
 		var rttVal interface{}
 		if isLost {
 			rttVal = nil

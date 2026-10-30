@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // This file holds the opt-in performance benchmarks (2026-10-23 external
@@ -38,9 +39,9 @@ const benchPurgeRowsPerSensor = 10_000
 // correctness is locked by TestPurgeOldMultiBatchPerSensor).
 func BenchmarkPurgeOld(b *testing.B) {
 	b.ReportAllocs()
-	db, err := NewDB(filepath.Join(b.TempDir(), "purgebench.db"))
+	db, err := store.NewStore(filepath.Join(b.TempDir(), "purgebench.db"))
 	if err != nil {
-		b.Fatalf("NewDB: %v", err)
+		b.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

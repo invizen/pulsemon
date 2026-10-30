@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"context"
@@ -11,13 +11,35 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite"
+	"github.com/google/uuid"
 )
 
-type DB struct {
+var (
+	// ErrLastUser: RemoveUser refuses to delete the final account (use
+	// auth-off for that). A sentinel, not an inline fmt.Errorf, so the
+	// HTTP handler can errors.Is it to a 400 while every other db
+	// failure 500s (the handler used to
+	// echo every RemoveUser error, raw driver text included, as a 400).
+	ErrLastUser = fmt.Errorf("cannot remove the last user — disable authentication instead")
+	// ErrUserNotFound: RemoveUser of a name that doesn't exist. The db
+	// layer used to treat this as a silent no-op, so the API answered
+	// 200 and the CLI printed "User removed: <name>" for a mistyped
+	// username — a false success on an admin operation. The handler maps it to 404, the same policy as
+	// the password endpoint (unknown username → 404, not 403, so the
+	// endpoint doesn't confirm which names exist).
+	ErrUserNotFound = fmt.Errorf("no such user")
+)
+
+// NewID generates a unique sensor id.
+func NewID() string {
+	return uuid.NewString()
+}
+
+type Store struct {
 	*sql.DB
 }
 
-func NewDB(dsn string) (*DB, error) {
+func NewStore(dsn string) (*Store, error) {
 	// Pragma settings go in the DSN query string so modernc.org/sqlite applies
 	// them to EVERY connection the pool opens. Setting them via db.Exec() would
 	// only configure the single connection that call happened to use — the
@@ -29,15 +51,15 @@ func NewDB(dsn string) (*DB, error) {
 	//                         failing immediately (critical under write bursts)
 	//   foreign_keys(ON)    — enforce ON DELETE CASCADE on probes/events/tags
 	//   synchronous(NORMAL) — with WAL, commits no longer fsync each time. The
-	//                         DB stays consistent across an app crash; only the
+	//                         Store stays consistent across an app crash; only the
 	//                         last few commits can be lost on a power cut, which
 	//                         is acceptable for probe samples.
 	//
 	// NOTE: the '?' is load-bearing. modernc.org/sqlite treats everything after
 	// it as query params; omit it and the whole string becomes a filename and
 	// the driver silently opens a brand-new empty database (see v0.1.x incident
-	// where a missing '?' caused a fresh seed-DB to be created beside the real
-	// one). Verified against the live 22-sensor DB: all three path forms with
+	// where a missing '?' caused a fresh seed-Store to be created beside the real
+	// one). Verified against the live 22-sensor Store: all three path forms with
 	// the '?' return sensors=22, busy_timeout=15000, journal_mode=wal.
 	fullDSN := dsn
 	if strings.Contains(dsn, "?") {
@@ -72,10 +94,10 @@ func NewDB(dsn string) (*DB, error) {
 	if _, err := db.Exec("SELECT 1"); err != nil {
 		return nil, err
 	}
-	return &DB{db}, nil
+	return &Store{db}, nil
 }
 
-func (db *DB) InitSchema() error {
+func (db *Store) InitSchema() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS sensors (
 		id TEXT PRIMARY KEY,
@@ -221,7 +243,7 @@ func (db *DB) InitSchema() error {
 	// Each UPDATE is filtered to the legacy rows it actually rewrites. An
 	// unfiltered `UPDATE ... SET col = CASE ... ELSE col END` matches EVERY
 	// row and, in SQLite, re-assigns+re-writes each one even where the value
-	// is unchanged — so on a fully-migrated DB this forced a full-table WAL
+	// is unchanged — so on a fully-migrated Store this forced a full-table WAL
 	// write on every boot, churning pages and blocking active probe writes
 	// (WAL has a single writer). With the WHERE, a no-op boot touches zero
 	// rows, so this is a true one-time migration.
@@ -284,7 +306,7 @@ func (db *DB) InitSchema() error {
 	// AND no users exist yet, it becomes the "admin" account (the hash is
 	// already bcrypt, so it verifies exactly as before). The row is then
 	// cleared either way — the users table is the source of truth.
-	if err := migrateLegacyAuthToken(db); err != nil {
+	if err := MigrateLegacyAuthToken(db); err != nil {
 		return err
 	}
 	// One-time migration: the users table gained is_admin (the account
@@ -292,7 +314,7 @@ func (db *DB) InitSchema() error {
 	// bootstrapped user is the admin). Old DBs get the column added, and
 	// the OLDEST user is promoted when no admin exists yet, so an existing
 	// install never boots with zero admins (that would lock every
-	// account-management endpoint). Idempotent: on a fresh DB the column
+	// account-management endpoint). Idempotent: on a fresh Store the column
 	// exists and first accounts are created with the flag, so both
 	// statements no-op. Runs AFTER the legacy token migration above so the
 	// migrated 'admin' account (inserted without the flag) gets promoted.
@@ -305,7 +327,7 @@ func (db *DB) InitSchema() error {
 // migrateUserAdminColumn adds users.is_admin to pre-admin-flag DBs and
 // promotes the oldest user when the table has no admin. Called from
 // InitSchema on every boot; both statements are idempotent.
-func (db *DB) migrateUserAdminColumn() error {
+func (db *Store) migrateUserAdminColumn() error {
 	var n int
 	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'is_admin'").Scan(&n); err != nil {
 		return err
@@ -328,7 +350,7 @@ func (db *DB) migrateUserAdminColumn() error {
 }
 
 // SensorTags returns the sorted tag list for a sensor.
-func (db *DB) SensorTags(id string) []string {
+func (db *Store) SensorTags(id string) []string {
 	rows, err := db.Query("SELECT tag FROM sensor_tags WHERE sensor_id = ? ORDER BY tag", id)
 	if err != nil {
 		return []string{}
@@ -342,7 +364,7 @@ func (db *DB) SensorTags(id string) []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		// Mid-stream iteration error (DB file I/O failure): same contract
+		// Mid-stream iteration error (Store file I/O failure): same contract
 		// as the query error above — empty list — plus a log so the
 		// failure is visible.
 		log.Printf("db: sensor tag query failed mid-stream: %v", err)
@@ -351,7 +373,7 @@ func (db *DB) SensorTags(id string) []string {
 	return out
 }
 
-// inQueryChunk is the max number of ids per IN(...) chunk for batch queries.
+// InQueryChunk is the max number of ids per IN(...) chunk for batch queries.
 // modernc.org/sqlite (v1.29.1) accepts up to 32,766 bound parameters
 // (verified against the real driver: 32,766 binds, 32,767 fails with "too
 // many SQL variables"). A query that repeats an id list N times needs
@@ -360,16 +382,16 @@ func (db *DB) SensorTags(id string) []string {
 // A realistic homelab fleet runs on a single chunk; the cap only engages if
 // the fleet ever grows to thousands of sensors, where it prevents the query
 // from failing outright with "too many SQL variables".
-const inQueryChunk = 500
+const InQueryChunk = 500
 
 // SensorTagsFor fetches the sorted tag lists for a batch of sensors. It runs
-// in inQueryChunk-sized batches so an unbounded id list can't exceed the
+// in InQueryChunk-sized batches so an unbounded id list can't exceed the
 // SQLite host-parameter limit. Batch callers (fetchSensors, syncSensors) must
 // not run a per-row SensorTags() inside a rows.Next() loop: the outer
 // iteration holds a pooled connection, and per-row queries starve the pool
 // under concurrent load. Empty ids → empty map; ids are internal UUIDs (no
 // user string injection).
-func (db *DB) SensorTagsFor(ids []string) map[string][]string {
+func (db *Store) SensorTagsFor(ids []string) map[string][]string {
 	out := make(map[string][]string, len(ids))
 	if len(ids) == 0 {
 		return out
@@ -404,14 +426,14 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 		}
 		if err := rows.Err(); err != nil {
 			// Mid-stream chunk failure: log and keep the rows already read
-			// — the function has no error channel, and a DB file I/O
+			// — the function has no error channel, and a Store file I/O
 			// failure this deep is visible in the service log.
 			log.Printf("db: sensor tag batch query failed mid-stream: %v", err)
 			return
 		}
 	}
-	for i := 0; i < len(ids); i += inQueryChunk {
-		end := i + inQueryChunk
+	for i := 0; i < len(ids); i += InQueryChunk {
+		end := i + InQueryChunk
 		if end > len(ids) {
 			end = len(ids)
 		}
@@ -425,7 +447,7 @@ func (db *DB) SensorTagsFor(ids []string) map[string][]string {
 // the sensor is never left with a partial/empty tag set. A torn tag set is
 // worse than stale tags: with alert_scope='tags' it silently changes which
 // sensors alert.
-func (db *DB) SetSensorTags(id string, tags []string) error {
+func (db *Store) SetSensorTags(id string, tags []string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -458,7 +480,7 @@ func (db *DB) SetSensorTags(id string, tags []string) error {
 //
 // The chunked sensor-state UPDATE mirrors SetSensorStates so an unbounded
 // id list can't exceed SQLite's parameter limit.
-func (db *DB) SetMaintenanceMode(ctx context.Context, on bool, ids []string, snapJSON string) error {
+func (db *Store) SetMaintenanceMode(ctx context.Context, on bool, ids []string, snapJSON string) error {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -477,7 +499,7 @@ func (db *DB) SetMaintenanceMode(ctx context.Context, on bool, ids []string, sna
 // mode flag. Returns the ids actually paused (the handler feeds them to the
 // SetPaused in-memory fast path). The handler's earlier read survives only
 // as a UX pre-check (400 "no active sensors"); this read is authoritative.
-func (db *DB) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]string, error) {
+func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -525,8 +547,8 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 
 	// 1. Pause/resume the sensors (chunked to stay under SQLite's param limit).
 	if len(ids) > 0 {
-		for start := 0; start < len(ids); start += inQueryChunk {
-			end := start + inQueryChunk
+		for start := 0; start < len(ids); start += InQueryChunk {
+			end := start + InQueryChunk
 			if end > len(ids) {
 				end = len(ids)
 			}
@@ -547,14 +569,14 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 	// 2. Save/clear the snapshot.
 	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		"maintenance_active_ids", snapJSON, tsNow()); err != nil {
+		"maintenance_active_ids", snapJSON, Now()); err != nil {
 		return err
 	}
 
 	// 3. Set the mode flag.
 	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		"maintenance_mode", modeVal, tsNow()); err != nil {
+		"maintenance_mode", modeVal, Now()); err != nil {
 		return err
 	}
 
@@ -562,7 +584,7 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 }
 
 // AllTags returns each distinct tag with the number of sensors using it.
-func (db *DB) AllTags() map[string]int {
+func (db *Store) AllTags() map[string]int {
 	rows, err := db.Query(`SELECT tag, COUNT(DISTINCT sensor_id) FROM sensor_tags GROUP BY tag ORDER BY tag`)
 	if err != nil {
 		return map[string]int{}
@@ -595,7 +617,7 @@ func (db *DB) AllTags() map[string]int {
 // transaction lives on that connection); ImmediateTx commits on a nil
 // return and rolls back on error. The connection goes back to the pool
 // when the function returns.
-func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error {
+func (db *Store) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error {
 	conn, err := db.Conn(ctx)
 	if err != nil {
 		return err
@@ -643,7 +665,7 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 	return nil
 }
 
-// migrateLegacyAuthToken converts a pre-accounts auth_token setting into the
+// MigrateLegacyAuthToken converts a pre-accounts auth_token setting into the
 // "admin" user (the stored hash is already bcrypt, so it verifies exactly as
 // before) and then clears the setting — the users table is the source of
 // truth. The token is destroyed ONLY on a confirmed outcome (users already
@@ -653,7 +675,7 @@ func (db *DB) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error
 // credential on a failed migration and left zero users + no
 // auth_bootstrapped flag — which the setup gate reads as a FRESH install,
 // downgrading the dashboard to unauthenticated setup mode.
-func migrateLegacyAuthToken(db *DB) error {
+func MigrateLegacyAuthToken(db *Store) error {
 	if db.GetSetting("auth_token") == "" {
 		return nil
 	}
@@ -665,7 +687,7 @@ func migrateLegacyAuthToken(db *DB) error {
 	if n == 0 {
 		if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at)
 			VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), ?)`,
-			tsNow()); err != nil {
+			Now()); err != nil {
 			log.Printf("WARNING: legacy auth_token migration to users table failed: %v; token kept, retried next start", err)
 			return nil
 		}
@@ -683,7 +705,7 @@ func migrateLegacyAuthToken(db *DB) error {
 }
 
 // DeleteTag removes one tag from every sensor; returns how many sensors lost it.
-func (db *DB) DeleteTag(ctx context.Context, tag string) (int64, error) {
+func (db *Store) DeleteTag(ctx context.Context, tag string) (int64, error) {
 	res, err := db.ExecContext(ctx, "DELETE FROM sensor_tags WHERE tag = ?", tag)
 	if err != nil {
 		return 0, err
@@ -692,7 +714,7 @@ func (db *DB) DeleteTag(ctx context.Context, tag string) (int64, error) {
 }
 
 // GetSetting reads a key from the settings table ("" when absent).
-func (db *DB) GetSetting(key string) string {
+func (db *Store) GetSetting(key string) string {
 	var v string
 	if err := db.QueryRow("SELECT value FROM settings WHERE setting_key = ?", key).Scan(&v); err != nil {
 		return ""
@@ -700,11 +722,11 @@ func (db *DB) GetSetting(key string) string {
 	return v
 }
 
-// GetSettingErr is GetSetting that surfaces real DB errors: an absent key is
+// GetSettingErr is GetSetting that surfaces real Store errors: an absent key is
 // ("", nil), any other failure ("", err). GetSetting's 83 call sites keep
 // their swallow-to-"" contract; this exists for paths where "unset" and
 // "read failed" must not look the same — alert delivery.
-func (db *DB) GetSettingErr(key string) (string, error) {
+func (db *Store) GetSettingErr(key string) (string, error) {
 	var v string
 	err := db.QueryRow("SELECT value FROM settings WHERE setting_key = ?", key).Scan(&v)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -716,32 +738,32 @@ func (db *DB) GetSettingErr(key string) (string, error) {
 	return v, nil
 }
 
-// tsLayout is the single writer-side timestamp format: UTC, ALWAYS 9
+// TSLayout is the single writer-side timestamp format: UTC, ALWAYS 9
 // fractional digits. Fixed width is what makes string order equal
 // chronological order (time.RFC3339Nano trims trailing zeros, so "…25.13Z"
 // sorted AFTER "…25.134Z"), which the string-compared retention purge and
 // ORDER BY ts rely on. It still parses under time.RFC3339Nano, and rows
 // written by older versions (variable width) remain readable.
-const tsLayout = "2006-01-02T15:04:05.000000000Z"
+const TSLayout = "2006-01-02T15:04:05.000000000Z"
 
-// fmtTS formats t for storage in any ts column.
-func fmtTS(t time.Time) string { return t.UTC().Format(tsLayout) }
+// FormatTS formats t for storage in any ts column.
+func FormatTS(t time.Time) string { return t.UTC().Format(TSLayout) }
 
-// tsNow is fmtTS(now).
-func tsNow() string { return fmtTS(time.Now()) }
+// Now is FormatTS(now).
+func Now() string { return FormatTS(time.Now()) }
 
-func (db *DB) SetSetting(key, value string) error {
+func (db *Store) SetSetting(key, value string) error {
 	_, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		key, value, tsNow())
+		key, value, Now())
 	return err
 }
 
-// setSettingInTx is SetSetting through a caller's transaction (lets handleSettingsPut apply a multi-key save atomically).
-func setSettingInTx(tx *sql.Tx, key, value string) error {
+// SetSettingInTx is SetSetting through a caller's transaction (lets handleSettingsPut apply a multi-key save atomically).
+func SetSettingInTx(tx *sql.Tx, key, value string) error {
 	_, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
-		key, value, tsNow())
+		key, value, Now())
 	return err
 }
 
@@ -749,7 +771,7 @@ func setSettingInTx(tx *sql.Tx, key, value string) error {
 
 // UserCount returns how many dashboard accounts exist. Auth is enabled
 // iff this is > 0.
-func (db *DB) UserCount() (int, error) {
+func (db *Store) UserCount() (int, error) {
 	var n int
 	err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n)
 	return n, err
@@ -757,7 +779,7 @@ func (db *DB) UserCount() (int, error) {
 
 // UserHash returns the stored bcrypt hash for a username ("", sql.ErrNoRows
 // when absent).
-func (db *DB) UserHash(username string) (string, error) {
+func (db *Store) UserHash(username string) (string, error) {
 	var h string
 	err := db.QueryRow("SELECT password_hash FROM users WHERE username = ?", username).Scan(&h)
 	if err != nil {
@@ -767,7 +789,7 @@ func (db *DB) UserHash(username string) (string, error) {
 }
 
 // SetUserPassword overwrites a user's hash.
-func (db *DB) SetUserPassword(username, passwordHash string) error {
+func (db *Store) SetUserPassword(username, passwordHash string) error {
 	res, err := db.Exec("UPDATE users SET password_hash = ? WHERE username = ?", passwordHash, username)
 	if err != nil {
 		return err
@@ -786,10 +808,10 @@ func (db *DB) SetUserPassword(username, passwordHash string) error {
 // oldest remaining user is promoted in the SAME transaction — the install
 // must never be left without an admin (that would lock every
 // account-management endpoint). 0 rows affected = the last user (
-// errLastUser) or no such user (errUserNotFound): the sentinel replaced the
+// ErrLastUser) or no such user (ErrUserNotFound): the sentinel replaced the
 // silent no-op, which made the API answer 200 and the
 // CLI print "User removed" for a mistyped name).
-func (db *DB) RemoveUser(username string) error {
+func (db *Store) RemoveUser(username string) error {
 	ctx := context.Background()
 	return db.ImmediateTx(ctx, func(c *sql.Conn) error {
 		res, err := c.ExecContext(ctx,
@@ -803,9 +825,9 @@ func (db *DB) RemoveUser(username string) error {
 				return err
 			}
 			if exists == 0 {
-				return fmt.Errorf("%w: %s", errUserNotFound, username)
+				return fmt.Errorf("%w: %s", ErrUserNotFound, username)
 			}
-			return errLastUser
+			return ErrLastUser
 		}
 		// The removed account was the last admin: hand the flag to the
 		// oldest remaining user so the install is never left without an
@@ -824,12 +846,12 @@ func (db *DB) RemoveUser(username string) error {
 }
 
 // RemoveAllUsers clears every account (the "disable authentication" path).
-func (db *DB) RemoveAllUsers() error {
+func (db *Store) RemoveAllUsers() error {
 	_, err := db.Exec("DELETE FROM users")
 	return err
 }
 
-type authUser struct {
+type AuthUser struct {
 	Username  string `json:"username"`
 	CreatedAt string `json:"created_at"`
 	IsAdmin   bool   `json:"is_admin"`
@@ -837,15 +859,15 @@ type authUser struct {
 
 // ListUsers returns every account, oldest first (created_at is the standard
 // app timestamp, RFC3339Nano).
-func (db *DB) ListUsers() ([]authUser, error) {
+func (db *Store) ListUsers() ([]AuthUser, error) {
 	rows, err := db.Query("SELECT username, created_at, is_admin FROM users ORDER BY created_at, username")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []authUser{}
+	out := []AuthUser{}
 	for rows.Next() {
-		var u authUser
+		var u AuthUser
 		var admin int
 		if err := rows.Scan(&u.Username, &u.CreatedAt, &admin); err != nil {
 			return nil, err
@@ -859,7 +881,7 @@ func (db *DB) ListUsers() ([]authUser, error) {
 // ActiveSensorIDs lists the ids of every sensor currently in state 'active',
 // in name order. Used to snapshot which sensors are running before maintenance
 // mode pauses them, so resume can restore exactly that set.
-func (db *DB) ActiveSensorIDs(ctx context.Context) ([]string, error) {
+func (db *Store) ActiveSensorIDs(ctx context.Context) ([]string, error) {
 	rows, err := db.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
 	if err != nil {
 		return nil, err
@@ -880,7 +902,7 @@ func (db *DB) ActiveSensorIDs(ctx context.Context) ([]string, error) {
 // Used by the retention purge: every probes/events row references a current
 // sensor (FK ON DELETE CASCADE removes a deleted sensor's rows), so
 // per-sensor purging over this set covers the whole table.
-func (db *DB) SensorIDs() ([]string, error) {
+func (db *Store) SensorIDs() ([]string, error) {
 	rows, err := db.Query("SELECT id FROM sensors ORDER BY name")
 	if err != nil {
 		return nil, err
@@ -898,16 +920,16 @@ func (db *DB) SensorIDs() ([]string, error) {
 }
 
 // SetSensorStates sets the state for a batch of sensor ids, running in
-// inQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
+// InQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
 // SQLite host-parameter limit (same rule as SensorTagsFor). Returns the number
 // of rows changed. An empty id list is a no-op.
-func (db *DB) SetSensorStates(ids []string, state string) (int64, error) {
+func (db *Store) SetSensorStates(ids []string, state string) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
 	var total int64
-	for start := 0; start < len(ids); start += inQueryChunk {
-		end := start + inQueryChunk
+	for start := 0; start < len(ids); start += InQueryChunk {
+		end := start + InQueryChunk
 		if end > len(ids) {
 			end = len(ids)
 		}
@@ -929,7 +951,7 @@ func (db *DB) SetSensorStates(ids []string, state string) (int64, error) {
 	return total, nil
 }
 
-func (db *DB) SeedSensors() error {
+func (db *Store) SeedSensors() error {
 	var count int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&count); err != nil {
 		return err
@@ -957,11 +979,11 @@ func (db *DB) SeedSensors() error {
 	for _, s := range sensors {
 		// A real UUID id (not the name) so seeded sensors carry the same id
 		// format as every API-created sensor.
-		id := newID()
+		id := NewID()
 		if _, err := db.Exec(`
 			INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
 			VALUES (?, ?, ?, 60, 1000, 25, 2, 3, 'paused', 'up', ?)`,
-			id, s.name, s.target, tsNow()); err != nil {
+			id, s.name, s.target, Now()); err != nil {
 			return err
 		}
 		if s.tags != "" {

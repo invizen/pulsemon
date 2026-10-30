@@ -1,4 +1,4 @@
-package main
+package store
 
 import (
 	"path/filepath"
@@ -9,9 +9,9 @@ import (
 // sensor's sorted tags, comma-containing tags survive intact (the reason
 // this uses an IN-list instead of GROUP_CONCAT), and empty input is safe.
 func TestSensorTagsFor(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "tags.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "tags.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -73,9 +73,9 @@ func equalTags(got, want []string) bool {
 // sensors alert. This test fails against the old delete-then-insert code
 // (delete committed, partial/empty set left behind).
 func TestSetSensorTagsAtomic(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "atomic.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "atomic.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -125,9 +125,9 @@ func TestSetSensorTagsAtomic(t *testing.T) {
 // post-upgrade probe does not log a spurious transition or fire a one-time
 // alert on every already-affected sensor.
 func TestStatusRenameMigration(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "migration.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "migration.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -219,7 +219,7 @@ func TestStatusRenameMigration(t *testing.T) {
 // the v0.1.13 status-rename migration. The old code ran
 // `UPDATE ... SET col = CASE ... ELSE col END` with NO WHERE, so it matched
 // EVERY row and — in SQLite — re-assigned+re-wrote each one even where the
-// value was unchanged. On a fully-migrated DB that forced a full-table WAL
+// value was unchanged. On a fully-migrated Store that forced a full-table WAL
 // write on every single boot, churning pages and blocking active probe writes
 // (WAL has one writer). This test proves the fix: after a migration has
 // already run, a re-InitSchema (a fresh process boot) must write ZERO rows.
@@ -229,9 +229,9 @@ func TestStatusRenameMigration(t *testing.T) {
 // UPDATEs the delta is > 0 (every row rewritten); with the WHERE filter it
 // is exactly 0.
 func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "noop.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "noop.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -288,7 +288,7 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 		t.Fatalf("after migration s1 = %q, want error", st1)
 	}
 
-	// SECOND re-run (a boot on an already-migrated DB): must write ZERO rows.
+	// SECOND re-run (a boot on an already-migrated Store): must write ZERO rows.
 	// Old unfiltered code rewrites every row here (delta > 0) — this is the
 	// regression the fix eliminates.
 	before2, err := changes()
@@ -303,7 +303,7 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 		t.Fatalf("total_changes: %v", err)
 	}
 	if delta := after2 - before2; delta != 0 {
-		t.Errorf("re-InitSchema on migrated DB wrote %d rows, want 0 (unfiltered UPDATEs rewrite the whole table every boot)", delta)
+		t.Errorf("re-InitSchema on migrated Store wrote %d rows, want 0 (unfiltered UPDATEs rewrite the whole table every boot)", delta)
 	}
 }
 
@@ -315,9 +315,9 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 // 192.168.1.x; a wrong ACTIVE target would fire down alerts on day one),
 // and they must carry their tags.
 func TestSeedSensorsFreshInstallTuning(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "seed.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "seed.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -350,10 +350,10 @@ func TestSeedSensorsFreshInstallTuning(t *testing.T) {
 			Scan(&id, &target, &intervalS, &timeoutMS, &lossWarn, &downAfter, &spikeMult, &state, &status); err != nil {
 			t.Fatalf("read %s: %v", want.name, err)
 		}
-		// Seed ids are UUIDs (newID()), matching API-created sensors — not
+		// Seed ids are UUIDs (NewID()), matching API-created sensors — not
 		// the legacy name-as-id shape.
 		if len(id) != 36 {
-			t.Errorf("%s seed id = %q, want a 36-char UUID (newID())", want.name, id)
+			t.Errorf("%s seed id = %q, want a 36-char UUID (NewID())", want.name, id)
 		}
 		if target != want.target {
 			t.Errorf("%s target = %q, want %q (environment-neutral placeholder, not 192.168.1.x)", want.name, target, want.target)
@@ -383,9 +383,9 @@ func TestSeedSensorsFreshInstallTuning(t *testing.T) {
 // before a restart, or any later boot) SeedSensors must be a no-op —
 // no duplicates, no clobbering of existing tuning.
 func TestSeedSensorsSkipsNonEmptyDB(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "seed-skip.db"))
+	db, err := NewStore(filepath.Join(t.TempDir(), "seed-skip.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -405,7 +405,7 @@ func TestSeedSensorsSkipsNonEmptyDB(t *testing.T) {
 		t.Fatalf("count: %v", err)
 	}
 	if count != 1 {
-		t.Fatalf("sensors after SeedSensors = %d, want 1 (guard must skip a non-empty DB)", count)
+		t.Fatalf("sensors after SeedSensors = %d, want 1 (guard must skip a non-empty Store)", count)
 	}
 	var intervalS int
 	if err := db.QueryRow("SELECT interval_s FROM sensors WHERE id='mine'").Scan(&intervalS); err != nil {

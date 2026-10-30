@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+	"pulsemon/internal/store"
 )
 
 // TestFix_CloneNamePickedInOneQuery pins the clone name-pick optimization:
@@ -26,8 +27,8 @@ import (
 func TestFix_CloneNamePickedInOneQuery(t *testing.T) {
 	srv, db := fixServerWithDB(t)
 	mk := func(name string) string {
-		id := newID()
-		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, tsNow()); err != nil {
+		id := store.NewID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, store.Now()); err != nil {
 			t.Fatal(err)
 		}
 		return id

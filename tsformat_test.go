@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestParseTSForRealert locks the alert-state timestamp parser. It must accept
@@ -45,45 +46,45 @@ func TestParseTSForRealert(t *testing.T) {
 // and the parsed column (alert_state.last_ts) all share one layout, so a
 // future ORDER BY on any of them is well-defined.
 //
-// It checks tsNow() (the single writer helper) produces an RFC3339Nano value
+// It checks store.Now() (the single writer helper) produces an RFC3339Nano value
 // that (a) has a 'T' separator and 'Z' suffix, (b) parses back to the same
 // instant under RFC3339Nano, and (c) matches what setAlertState would store.
 func TestTimestampWritersAreUniform(t *testing.T) {
-	// tsNow() is the single source for new writer timestamps.
-	s := tsNow()
+	// store.Now() is the single source for new writer timestamps.
+	s := store.Now()
 	if !strings.Contains(s, "T") || !strings.HasSuffix(s, "Z") {
-		t.Fatalf("tsNow() = %q, want an RFC3339 (T-separated, Z-suffixed) value", s)
+		t.Fatalf("store.Now() = %q, want an RFC3339 (T-separated, Z-suffixed) value", s)
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, s)
 	if err != nil {
-		t.Fatalf("tsNow() %q does not parse under RFC3339Nano: %v", s, err)
+		t.Fatalf("store.Now() %q does not parse under RFC3339Nano: %v", s, err)
 	}
-	// Round-trip: the writer layout is FIXED width (tsLayout), so formatting
+	// Round-trip: the writer layout is FIXED width (store.TSLayout), so formatting
 	// the parsed instant with it must give back the identical string - even
 	// when the nanoseconds end in zeros, where time.RFC3339Nano would trim
 	// them (the old, order-breaking behaviour this test used to encode).
-	if got := parsed.UTC().Format(tsLayout); got != s {
-		t.Errorf("tsNow() round-trip: %q -> %q, want unchanged", s, got)
+	if got := parsed.UTC().Format(store.TSLayout); got != s {
+		t.Errorf("store.Now() round-trip: %q -> %q, want unchanged", s, got)
 	}
-	if len(s) != len(tsLayout) {
-		t.Errorf("tsNow() = %q has width %d, want fixed %d", s, len(s), len(tsLayout))
+	if len(s) != len(store.TSLayout) {
+		t.Errorf("store.Now() = %q has width %d, want fixed %d", s, len(s), len(store.TSLayout))
 	}
-	// Deterministic trailing-zero instant (tsNow() only hits this ~1 run in 10).
+	// Deterministic trailing-zero instant (store.Now() only hits this ~1 run in 10).
 	zero := time.Date(2026, 10, 15, 19, 2, 38, 130000000, time.UTC)
-	if got := fmtTS(zero); got != "2026-10-15T19:02:38.130000000Z" {
-		t.Errorf("fmtTS(trailing zeros) = %q, want all 9 fractional digits kept", got)
+	if got := store.FormatTS(zero); got != "2026-10-15T19:02:38.130000000Z" {
+		t.Errorf("store.FormatTS(trailing zeros) = %q, want all 9 fractional digits kept", got)
 	}
 
-	// The re-alert parser must accept tsNow()'s output (the new writer format).
+	// The re-alert parser must accept store.Now()'s output (the new writer format).
 	if _, err := parseTSForRealert(s); err != nil {
-		t.Errorf("parseTSForRealert(tsNow()) = %v, want OK (new writer output must be parseable)", err)
+		t.Errorf("parseTSForRealert(store.Now()) = %v, want OK (new writer output must be parseable)", err)
 	}
 
 	// setAlertState stores via the same format: write a known instant to a real
 	// DB and confirm it round-trips through parseTSForRealert.
-	db, err := NewDB(filepath.Join(t.TempDir(), "ts.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "ts.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // fixServerWithDB builds a Server on a fresh schema-initialized DB.
@@ -80,8 +81,8 @@ func TestFix_M7_PutSettingsKeepsRouting(t *testing.T) {
 // validation, in the same transaction as the UPDATE.
 func TestFix_M7_PatchInvalidFieldDoesNotPersistTags(t *testing.T) {
 	srv, db := fixServerWithDB(t)
-	id := newID()
-	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'a','10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, tsNow()); err != nil {
+	id := store.NewID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'a','10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, store.Now()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -118,8 +119,8 @@ func TestFix_M7_PatchInvalidFieldDoesNotPersistTags(t *testing.T) {
 func TestFix_M7_PatchDuplicateName409(t *testing.T) {
 	srv, db := fixServerWithDB(t)
 	mk := func(name string) string {
-		id := newID()
-		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, tsNow()); err != nil {
+		id := store.NewID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, store.Now()); err != nil {
 			t.Fatal(err)
 		}
 		return id
@@ -170,7 +171,7 @@ func TestFix_M7_PatchDuplicateName409(t *testing.T) {
 		if i > 1 {
 			nm = fmt.Sprintf("capped-copy%d", i)
 		}
-		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, newID(), nm, tsNow()); err != nil {
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, store.NewID(), nm, store.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}

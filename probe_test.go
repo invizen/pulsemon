@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // baseProbeTime is the start of the synthetic probe timeline; each probe in
@@ -59,9 +60,9 @@ func f64(v float64) *float64 { return &v }
 func TestDeriveStatus(t *testing.T) {
 	probeErrCount.Store(0) // no simulated socket errors
 
-	db, err := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "test.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -246,9 +247,9 @@ func TestDeriveStatus(t *testing.T) {
 // everything involving error alerts — into error, error->warning (partial
 // recovery), and error->up (recovery). This is the noise-reduction policy.
 func TestAlertPolicy(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "policy.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "policy.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

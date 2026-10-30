@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestInQueryChunking locks the IN(...) batch-size fix. Both batch queries
@@ -13,16 +14,16 @@ import (
 // params (32,767 fails with "too many SQL variables" — verified against the
 // real driver), and warmStats repeats its id list twice (once per UNION arm),
 // so a fleet of >16,383 sensors would have failed the startup warm-up
-// outright. Both now run in inQueryChunk-sized batches.
+// outright. Both now run in store.InQueryChunk-sized batches.
 //
 // The test seeds a fleet LARGER than one chunk and verifies the chunked path
 // returns complete, per-sensor-correct results — a bug in the chunk boundaries
 // (off-by-one, dropped last partial chunk, ids landing in the wrong chunk)
 // would surface as a missing or wrong sensor.
 func TestInQueryChunking(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "chunk.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "chunk.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -30,15 +31,15 @@ func TestInQueryChunking(t *testing.T) {
 	}
 
 	// A fleet that spans multiple chunks, including a partial final one.
-	n := 2*inQueryChunk + 70 // 1070 -> chunks of 500, 500, 70
+	n := 2*store.InQueryChunk + 70 // 1070 -> chunks of 500, 500, 70
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	probeRTT := func(i int) float64 { return float64(10 + i%7) } // 10..16 ms
 
 	// Seed sensors, one probe each (ts within 24h so warmStats loads it), and
 	// one tag each. Chunked ourselves to stay under the param limit — the same
 	// pattern the production code now uses.
-	for start := 0; start < n; start += inQueryChunk {
-		end := start + inQueryChunk
+	for start := 0; start < n; start += store.InQueryChunk {
+		end := start + store.InQueryChunk
 		if end > n {
 			end = n
 		}
@@ -111,7 +112,7 @@ func TestInQueryChunking(t *testing.T) {
 	}
 	if bad == 0 {
 		t.Logf("chunking verified across %d sensors (%d chunks): tags + warmStats complete and per-sensor correct",
-			n, (n+inQueryChunk-1)/inQueryChunk)
+			n, (n+store.InQueryChunk-1)/store.InQueryChunk)
 	}
 }
 

@@ -22,6 +22,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // ---------- validation length caps ----------
@@ -152,7 +153,7 @@ func TestInstallBinaryFreshInstallDefaultsExecutable(t *testing.T) {
 func TestDoProbeZeroTimeoutUsesFallback(t *testing.T) {
 	db := newTestDB(t)
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
-		VALUES ('zero1','zero','10.0.0.1','icmp',60,0,10,2,3,'active','up',?)`, fmtTS(time.Now())); err != nil {
+		VALUES ('zero1','zero','10.0.0.1','icmp',60,0,10,2,3,'active','up',?)`, store.FormatTS(time.Now())); err != nil {
 		t.Fatal(err)
 	}
 	pw := NewProbeWorker(db)
@@ -291,7 +292,7 @@ func TestUsersRosterSelfRowForNonAdmin(t *testing.T) {
 	}
 
 	// Admin sees the roster.
-	var users []authUser
+	var users []store.AuthUser
 	getJSON(t, admin, httpSrv.URL+"/api/auth/users", &users)
 	if len(users) != 2 {
 		t.Fatalf("admin roster = %d users, want 2", len(users))
@@ -309,7 +310,7 @@ func TestUsersRosterSelfRowForNonAdmin(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("helper login: %d", resp.StatusCode)
 	}
-	var mine []authUser
+	var mine []store.AuthUser
 	getJSON(t, helper, httpSrv.URL+"/api/auth/users", &mine)
 	if len(mine) != 1 || mine[0].Username != "helper" {
 		t.Fatalf("helper roster = %+v, want exactly its own row (roster was client-hidden, not server-gated)", mine)

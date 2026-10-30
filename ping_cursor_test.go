@@ -7,6 +7,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestPingResponseLostIsNull locks the "Pulse Now" null-vs-0 fix: a dropped
@@ -47,9 +48,9 @@ func TestPingResponseLostIsNull(t *testing.T) {
 // response body must carry rtt_ms: null when the diagnostic probe is lost.
 // This is a regression guard on the handler wiring (not just pingResponse).
 func TestPingHandlerLostReturnsNull(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "ping.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "ping.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -88,9 +89,9 @@ func TestPingHandlerLostReturnsNull(t *testing.T) {
 // returns to a low steady state) and a final query still completes quickly —
 // the observable symptom of the hang would be a timeout here.
 func TestPoolDoesNotDrainUnderProbeLoad(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "pool.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "pool.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {

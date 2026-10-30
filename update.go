@@ -22,6 +22,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // Version is stamped at build time:
@@ -1598,7 +1599,7 @@ func healthzDBPath() string {
 // restart tests run where no data dir exists). nil on any failure — the
 // health check then falls back to the default HTTPS port.
 var openHealthzDB = func() *DB {
-	db, err := NewDB(healthzDBPath())
+	db, err := store.NewStore(healthzDBPath())
 	if err != nil {
 		return nil
 	}

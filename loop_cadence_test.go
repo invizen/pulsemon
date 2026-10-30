@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"pulsemon/internal/store"
 )
 
 // TestSensorLoopResetCadence pins the sensorLoop timer-reset behavior the
@@ -36,9 +37,9 @@ import (
 // never faster than the interval), so "rapid spurious firing from dynamic
 // reconfiguration" is also impossible.
 func TestSensorLoopResetCadence(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "loop-cadence.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "loop-cadence.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	defer db.Close()
 	if err := db.InitSchema(); err != nil {
@@ -137,9 +138,9 @@ func TestSensorLoopResetCadence(t *testing.T) {
 // floor protected no load bound. Fails on the old code (gap ~10s).
 func TestSensorLoopFastRetryMatchesInterval(t *testing.T) {
 	dir := t.TempDir()
-	db, err := NewDB(filepath.Join(dir, "fast-retry.db"))
+	db, err := store.NewStore(filepath.Join(dir, "fast-retry.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	lctx, lcancel := context.WithCancel(context.Background())
 	defer db.Close()
@@ -190,7 +191,7 @@ func TestSensorLoopFastRetryMatchesInterval(t *testing.T) {
 	for i := 1; i <= 8; i++ {
 		ts := time.Now().UTC().Add(-time.Duration(i) * 5 * time.Second)
 		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, NULL, ?, NULL, 0)`,
-			id, fmtTS(ts), "127.0.0.1"); err != nil {
+			id, store.FormatTS(ts), "127.0.0.1"); err != nil {
 			t.Fatalf("seed loss %d: %v", i, err)
 		}
 	}

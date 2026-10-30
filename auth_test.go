@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 	_ "modernc.org/sqlite"
+	"pulsemon/internal/store"
 )
 
 // lastTestDBPath records the most recent newTestDB path so sibling-handle
@@ -27,9 +28,9 @@ func newTestDB(t *testing.T) *DB {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "auth.db")
 	lastTestDBPath = path
-	db, err := NewDB(path)
+	db, err := store.NewStore(path)
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	t.Cleanup(func() { db.Close() })
 	if err := db.InitSchema(); err != nil {
@@ -447,7 +448,7 @@ func TestAuthStateRefreshSeesExternalWrite(t *testing.T) {
 		t.Fatal("Enabled before any user exists")
 	}
 	// A sibling process (host CLI) writes through its own DB handle.
-	sibling, err := NewDB(lastTestDBPath)
+	sibling, err := store.NewStore(lastTestDBPath)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1411,7 +1412,7 @@ func TestRemoveUserConcurrentNeverZero(t *testing.T) {
 		// AuthState.AddUserMode owns atomically, with no production
 		// callers — 2026-10-22 external review).
 		for _, u := range []string{"alice", "bob"} {
-			if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, 'x', ?, 0)`, u, tsNow()); err != nil {
+			if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, 'x', ?, 0)`, u, store.Now()); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -1471,7 +1472,7 @@ func adminFlagServer(t *testing.T) (*DB, *httptest.Server) {
 	return db, httpSrv
 }
 
-func userByName(t *testing.T, db *DB, name string) (authUser, bool) {
+func userByName(t *testing.T, db *DB, name string) (store.AuthUser, bool) {
 	t.Helper()
 	users, err := db.ListUsers()
 	if err != nil {
@@ -1482,7 +1483,7 @@ func userByName(t *testing.T, db *DB, name string) (authUser, bool) {
 			return u, true
 		}
 	}
-	return authUser{}, false
+	return store.AuthUser{}, false
 }
 
 // TestSetupBootstrapUserIsAdmin pins the admin-flag invariant: the first
@@ -1691,7 +1692,7 @@ func TestLegacyTokenMigrationUserIsAdmin(t *testing.T) {
 // must never boot with zero admins.
 func TestAdminColumnMigration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
-	db, err := NewDB(path)
+	db, err := store.NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}

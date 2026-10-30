@@ -4,6 +4,7 @@ import (
 	"context"
 	"path/filepath"
 	"testing"
+	"pulsemon/internal/store"
 )
 
 // TestDeriveStatusDBErrorNeverFakesUp pins the "never fake up" principle for
@@ -25,9 +26,9 @@ import (
 // A brand-new sensor (no lastStatus) reads "warning" (unknown), never "up".
 func TestDeriveStatusDBErrorNeverFakesUp(t *testing.T) {
 	probeErrCount.Store(0) // isolate the DB-error path from the socket gate
-	db, err := NewDB(filepath.Join(t.TempDir(), "dberr.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "dberr.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -71,9 +72,9 @@ func TestDeriveStatusDBErrorNeverFakesUp(t *testing.T) {
 // event, no alert) and routes to the sustained-error re-alert.
 func TestDeriveStatusDBErrorRetainsLastError(t *testing.T) {
 	probeErrCount.Store(0)
-	db, err := NewDB(filepath.Join(t.TempDir(), "dberr-last.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "dberr-last.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
@@ -111,9 +112,9 @@ func TestDeriveStatusDBErrorRetainsLastError(t *testing.T) {
 // transient SQLite hiccup can never fire a false "recovered" or "down"
 // webhook.
 func TestDeriveStatusDBErrorNoAlert(t *testing.T) {
-	db, err := NewDB(filepath.Join(t.TempDir(), "dberr-alert.db"))
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "dberr-alert.db"))
 	if err != nil {
-		t.Fatalf("NewDB: %v", err)
+		t.Fatalf("store.NewStore: %v", err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema: %v", err)
