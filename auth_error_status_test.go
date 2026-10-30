@@ -97,12 +97,13 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 		t.Fatalf("password change with broken db: body %q leaks the raw driver text", body)
 	}
 
-	// 5. Delete-user DB failure: IsAdmin has no cache, so the table must
-	// exist for the gate to pass — but a MINIMAL users table (no
-	// created_at column) makes the last-admin promotion UPDATE inside
-	// db.RemoveUser hit a raw driver error. Deleting 'admin' (the last
-	// admin, with a second user present) is the only path that reaches
-	// that UPDATE.
+	// 5. Delete-user DB failure: the gate's IsAdmin("admin") passes on
+	// the TTL-cached answer primed by the back-to-back requests above
+	// (2026-10-30 review #4 — IsAdmin is now userOKTTL-cached), and the
+	// table exists for the handler. A MINIMAL users table (no created_at
+	// column) makes the last-admin promotion UPDATE inside db.RemoveUser
+	// hit a raw driver error. Deleting 'admin' (the last admin, with a
+	// second user present) is the only path that reaches that UPDATE.
 	if _, err := db.Exec("CREATE TABLE users (username TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0)"); err != nil {
 		t.Fatalf("recreate minimal users table: %v", err)
 	}

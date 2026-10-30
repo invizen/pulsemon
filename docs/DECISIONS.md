@@ -540,3 +540,25 @@ current contract only.
 **Revisit trigger:** if test time becomes a real bottleneck (the suite
 doubled again), if a globals-related -race hit recurs after the capture
 rule, or if a second developer joins the project.
+
+## admin-gate double session check (auth.go `requireAdmin`/`sessionFrom`) — REJECTED, decision 2026-10-30
+
+**Finding (external review 2026-10-30 #4, second half):** `requireAdmin`
+calls `s.requireAuth` (which calls `s.sessionFrom(r)`) and then calls
+`s.sessionFrom(r)` a second time in the inner closure — "acquires a.mu
+twice"; the suggested fix inlines the session check to avoid the double
+call.
+
+**Decision: REJECTED — the double check is deliberate defense-in-depth.**
+A handler's authorization decision (admin-only gates, per-user scoping)
+must not rest on the gate having run: a route registered without the
+gate, or a future gate change, must not silently widen authorization.
+The cost is one extra short `a.mu` critical section plus an in-memory
+map lookup — the second pass almost always hits the `userOKTTL` cache,
+so it adds no DB query. (The uncached-query half of the finding IS
+addressed: `IsAdmin` is now `userOKTTL`-cached via `adminCache`,
+fail-closed on DB error, cleared in `refreshEnabledNow` at the in-app
+mutation sites.)
+
+Pinned in-code: the `sessionFrom` comment in auth.go states the double
+check is deliberate and must not be "fixed" away.

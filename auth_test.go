@@ -1987,3 +1987,73 @@ func TestLoginOversizedBodyIs413(t *testing.T) {
 		t.Fatalf("malformed body: got %d, want 400", resp.StatusCode)
 	}
 }
+
+// TestIsAdminCachedWithinTTL (2026-10-30 review #4): the admin-flag answer
+// is cached per username for userOKTTL — a flag flip in the DB is served
+// stale inside the window and honored once the TTL expires. Pre-fix
+// IsAdmin hit SQLite on every call; its sibling checks (Enabled,
+// userExistsCached) were already TTL-cached.
+func TestIsAdminCachedWithinTTL(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if _, err := db.Exec("INSERT INTO users (username, password_hash, created_at, is_admin) VALUES ('alice', 'x', '2026-01-01T00:00:00Z', 1)"); err != nil {
+		t.Fatalf("seed alice: %v", err)
+	}
+	if !a.IsAdmin("alice") {
+		t.Fatal("IsAdmin = false for a seeded admin (want true; also primes the cache)")
+	}
+	// Flip the flag directly in the DB: the cached answer must be served
+	// within the TTL window (no re-query).
+	if _, err := db.Exec("UPDATE users SET is_admin = 0 WHERE username = 'alice'"); err != nil {
+		t.Fatalf("flip flag: %v", err)
+	}
+	if !a.IsAdmin("alice") {
+		t.Fatal("IsAdmin = false within the TTL of the flip — the stale cached answer (true) is expected here")
+	}
+	time.Sleep(userOKTTL + 100*time.Millisecond)
+	if a.IsAdmin("alice") {
+		t.Fatal("IsAdmin = true after the TTL expired — the flipped flag (0) must be honored")
+	}
+}
+
+// TestIsAdminFailsClosedOnDBError (2026-10-30 review #4): with the users
+// table gone and no cached answer, IsAdmin must return false — a read
+// error must never grant admin (the deliberate opposite of userExists,
+// which fails OPEN so a DB hiccup cannot log the operator out).
+func TestIsAdminFailsClosedOnDBError(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if _, err := db.Exec("DROP TABLE users"); err != nil {
+		t.Fatalf("drop users: %v", err)
+	}
+	if a.IsAdmin("ghost") {
+		t.Fatal("IsAdmin = true on a read error — must fail closed")
+	}
+}
+
+// TestIsAdminInvalidatedOnPromotion (2026-10-30 review #4): RemoveUser's
+// last-admin promotion must clear the admin cache — the promoted user's
+// cached "non-admin" (primed below) must not 403 their next admin request
+// for up to userOKTTL. Pins the invalidation the cache fix introduced
+// (refreshEnabledNow clears adminCache at the mutation sites).
+func TestIsAdminInvalidatedOnPromotion(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at, is_admin)
+		VALUES ('alice', 'x', '2026-01-01T00:00:00Z', 1),
+		       ('bob',   'x', '2026-01-02T00:00:00Z', 0)`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if !a.IsAdmin("alice") {
+		t.Fatal("seed: alice must be admin")
+	}
+	if a.IsAdmin("bob") {
+		t.Fatal("seed: bob must not be admin (this call primes bob's cached false)")
+	}
+	if err := a.RemoveUser("alice"); err != nil {
+		t.Fatalf("remove last admin: %v", err)
+	}
+	if !a.IsAdmin("bob") {
+		t.Fatal("bob is not admin immediately after the last admin's removal — the promotion must clear his cached non-admin")
+	}
+}

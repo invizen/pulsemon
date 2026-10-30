@@ -183,6 +183,17 @@ type AuthState struct {
 	// LIVE existence check on first use (the login/remove race, F2).
 	userOKCache map[string]time.Time
 
+	// adminCache: username → last IsAdmin answer + when it was read
+	// (see userOKTTL). Guarded by mu. Caches BOTH answers: non-admins are
+	// the steady state (viewer accounts 403 on every admin route), so a
+	// positives-only cache would leave the common path uncached — the
+	// point is zero DB queries per admin-gated request in steady state.
+	// A read error is NOT cached (IsAdmin fails closed). In-app user
+	// mutations (AddUser/RemoveUser/Disable) clear it via
+	// refreshEnabledNow so a last-admin promotion is visible on the very
+	// next request; the TTL bounds out-of-band CLI changes.
+	adminCache map[string]adminEntry
+
 	// enabledCache: whether auth is enabled (user count > 0), memoized for
 	// enabledTTL so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on
 	// every request. enabledAt is zero until the first read; in-app user
@@ -224,6 +235,7 @@ func NewAuthState(db *DB) *AuthState {
 		db:          db,
 		sessions:    map[string]authSession{},
 		userOKCache: map[string]time.Time{},
+		adminCache:  map[string]adminEntry{},
 	}
 	a.trustedProxies = parseTrustedProxies(os.Getenv("PULSEMON_TRUSTED_PROXIES"))
 	return a
@@ -234,8 +246,14 @@ func NewAuthState(db *DB) *AuthState {
 // enabledTTL: an out-of-band `pulsemon auth-user remove` is a separate
 // process that cannot touch this process's in-memory session map, so a
 // removed user's sessions die within this window instead of living out
-// their 30-day TTL.
+// their 30-day TTL. It also bounds the IsAdmin answer cache (adminCache).
 const userOKTTL = 2 * time.Second
+
+// adminEntry is one cached IsAdmin answer (see AuthState.adminCache).
+type adminEntry struct {
+	at    time.Time
+	admin bool
+}
 
 // userExists reports whether the account exists in the users table — the
 // cross-process source of truth for session validity. A read error is
@@ -361,7 +379,17 @@ func (a *AuthState) refreshEnabledLocked() {
 // Disable) so the gate reflects them on the very next request with no TTL
 // wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
 // handle and never reaches this method — which is exactly why the TTL exists.
+//
+// It also clears adminCache: these same mutation sites are the only in-app
+// places where an account's admin flag changes (bootstrap create, and
+// RemoveUser's last-admin promotion) — without the clear, a promoted
+// user's cached "non-admin" would 403 their next admin request for up to
+// userOKTTL. The map is tiny (one entry per user); clearing wholesale is
+// simpler than tracking the affected usernames.
 func (a *AuthState) refreshEnabledNow() {
+	a.mu.Lock()
+	a.adminCache = map[string]adminEntry{}
+	a.mu.Unlock()
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
 	a.refreshEnabledLocked()
@@ -532,14 +560,36 @@ func (a *AuthState) Bootstrapped() bool {
 }
 
 // IsAdmin reports whether the username holds the admin flag — the gate for
-// the account-management endpoints (add/remove user, disable auth). A
-// deleted or unknown user is not an admin; a db error fails closed.
+// the account-management endpoints (add/remove user, disable auth) and the
+// admin routes (settings, TLS, self-update, history wipes). A deleted or
+// unknown user is not an admin; a db error fails closed.
+//
+// The answer is cached per username for userOKTTL (adminCache) — the same
+// staleness contract as userExistsCached/Enabled: in-app mutations clear
+// the cache via refreshEnabledNow (a last-admin promotion is visible on
+// the very next request), an out-of-band CLI flag change is honored within
+// the TTL. Without the cache this was the only per-request auth check that
+// hit SQLite on every call (2026-10-30 review #4). The query runs OUTSIDE
+// a.mu (unlike userExistsCached, which is called from the validation path
+// that already holds it): this is a standalone gate check, so no lock is
+// held across the I/O.
 func (a *AuthState) IsAdmin(username string) bool {
-	var n int
-	if err := a.db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ? AND is_admin = 1", strings.ToLower(username)).Scan(&n); err != nil {
-		return false
+	username = strings.ToLower(username)
+	a.mu.Lock()
+	if e, ok := a.adminCache[username]; ok && time.Since(e.at) < userOKTTL {
+		a.mu.Unlock()
+		return e.admin
 	}
-	return n > 0
+	a.mu.Unlock()
+	var n int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM users WHERE username = ? AND is_admin = 1", username).Scan(&n); err != nil {
+		return false // fail closed: a read error must not grant admin
+	}
+	admin := n > 0
+	a.mu.Lock()
+	a.adminCache[username] = adminEntry{at: time.Now(), admin: admin}
+	a.mu.Unlock()
+	return admin
 }
 
 // RemoveUser deletes an account and every live session it owns. The last
@@ -679,6 +729,11 @@ func (a *AuthState) sweepExpiredSessions(now time.Time) {
 	for u, t := range a.userOKCache {
 		if now.After(t.Add(userOKTTL)) {
 			delete(a.userOKCache, u)
+		}
+	}
+	for u, e := range a.adminCache {
+		if now.After(e.at.Add(userOKTTL)) {
+			delete(a.adminCache, u)
 		}
 	}
 }
