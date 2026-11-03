@@ -1567,6 +1567,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "clone sensor "+id, err)
 		return
 	}
+	defer rows.Close()
 	taken := make(map[string]bool)
 	for rows.Next() {
 		var n string
@@ -1579,7 +1580,6 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 			taken[n] = true
 		}
 	}
-	rows.Close()
 	if err := rows.Err(); err != nil {
 		respondInternal(w, "clone sensor "+id, err)
 		return
@@ -1691,6 +1691,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
+		defer rows.Close()
 		for rows.Next() {
 			var id string
 			if err := rows.Scan(&id); err != nil {
@@ -1702,7 +1703,6 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 				tagged = append(tagged, id)
 			}
 		}
-		rows.Close()
 		if err := rows.Err(); err != nil {
 			// Fail before DeleteTag: a truncated tagged list would delete
 			// the tag while leaving some loops un-respawned with stale
