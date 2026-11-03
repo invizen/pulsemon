@@ -1144,6 +1144,12 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	if err := a.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
+	// Isolate this test from the per-user session cap: it fills the map with
+	// 70 sessions for ONE user to exercise the sweep, which would trip the
+	// cap (default 32) mid-fill. Raise the cap so only the sweep is under test.
+	origCap := maxSessionsPerUser
+	maxSessionsPerUser = 1000
+	t.Cleanup(func() { maxSessionsPerUser = origCap })
 
 	// Fill the map past the sweep threshold (64).
 	const n = 70
@@ -1202,6 +1208,77 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 		if !a.ValidSession(tok) {
 			t.Fatalf("live token %d rejected after sweep", i)
 		}
+	}
+}
+
+// TestCreateSessionCapsPerUser pins the per-user session cap: a repeated
+// login from ONE credential (the cookie-discarding script vector — a valid
+// viewer/compromised account that mints a fresh 30-day session on every
+// POST /api/auth/login, clearing the IP throttle and skipping loginSlowDown)
+// must not grow the session map unboundedly. At the cap, CreateSession evicts
+// the user's OLDEST session and keeps the newest live. sweepExpiredSessions
+// alone can't bound this (it reclaims only EXPIRED sessions; fresh ones
+// aren't expired). Sabotage: dropping the eviction lets the count climb past
+// the cap and leaves the oldest alive.
+func TestCreateSessionCapsPerUser(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	if err := a.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.AddUser("viewer", "viewerpw"); err != nil {
+		t.Fatal(err)
+	}
+	origCap := maxSessionsPerUser
+	maxSessionsPerUser = 3
+	t.Cleanup(func() { maxSessionsPerUser = origCap })
+
+	now := time.Now()
+	a.mu.Lock()
+	// admin at the cap, with KNOWN distinct created times (oldest → newest)
+	// so the eviction order is deterministic regardless of clock resolution.
+	a.sessions["admin-oldest"] = authSession{user: "admin", expiry: now.Add(time.Hour), created: now.Add(-3 * time.Hour), cookieIssued: now.Add(-3 * time.Hour)}
+	a.sessions["admin-middle"] = authSession{user: "admin", expiry: now.Add(time.Hour), created: now.Add(-2 * time.Hour), cookieIssued: now.Add(-2 * time.Hour)}
+	a.sessions["admin-newest"] = authSession{user: "admin", expiry: now.Add(time.Hour), created: now.Add(-1 * time.Hour), cookieIssued: now.Add(-1 * time.Hour)}
+	// a second user, well under the cap — must be untouched by admin's cap.
+	a.sessions["viewer-1"] = authSession{user: "viewer", expiry: now.Add(time.Hour), created: now.Add(-time.Hour), cookieIssued: now.Add(-time.Hour)}
+	a.mu.Unlock()
+
+	// admin's 4th login is at the cap → evict admin's OLDEST only.
+	tok, ok := a.CreateSession("admin", "secretpw", false)
+	if !ok {
+		t.Fatal("CreateSession failed")
+	}
+	a.mu.Lock()
+	_, adminOldest := a.sessions["admin-oldest"]
+	_, adminMiddle := a.sessions["admin-middle"]
+	_, adminNewest := a.sessions["admin-newest"]
+	_, viewer1 := a.sessions["viewer-1"]
+	_, fresh := a.sessions[tok]
+	adminN, viewerN := 0, 0
+	for _, s := range a.sessions {
+		switch s.user {
+		case "admin":
+			adminN++
+		case "viewer":
+			viewerN++
+		}
+	}
+	a.mu.Unlock()
+
+	if adminN != 3 {
+		t.Fatalf("admin session count = %d, want the cap (3) — the per-user cap did not bound the map", adminN)
+	}
+	if adminOldest {
+		t.Fatal("admin's OLDEST session survived a cap-overflow login — it must be evicted first")
+	}
+	if !adminMiddle || !adminNewest {
+		t.Fatal("a non-oldest admin session was evicted — the cap evicts the OLDEST only")
+	}
+	if !fresh {
+		t.Fatal("the freshly minted admin session is missing")
+	}
+	if viewerN != 1 || !viewer1 {
+		t.Fatal("the cap evicted a DIFFERENT user's session — it must be per-user, not global")
 	}
 }
 

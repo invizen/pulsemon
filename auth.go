@@ -654,6 +654,22 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 	return username, true
 }
 
+// maxSessionsPerUser caps the concurrent live sessions ONE user can hold:
+// CreateSession evicts that user's OLDEST session before minting a new one
+// once they're at the cap. The session map has no other bound —
+// sweepExpiredSessions evicts only EXPIRED sessions (30-day TTL / max-age),
+// and a repeated SUCCESSFUL login mints a fresh 30-day session while clearing
+// the IP's failure throttle (loginSuccess) and skipping loginSlowDown. So a
+// single valid credential — e.g. a lower-trust viewer account, or a
+// compromised one — driven by a script that discards each returned cookie
+// would otherwise mint unbounded sessions the GC never reclaims (unbounded
+// memory growth). A per-user cap (not a global one) bounds the total
+// (users × cap, and the users table is small) and targets the exact vector:
+// one principal can't exhaust the map. 32 is far above any real per-user
+// device count (a homelab operator runs 1–3 sessions); a var so tests shrink
+// it without minting 32 sessions.
+var maxSessionsPerUser = 32
+
 // CreateSession validates the credentials and returns a new opaque session
 // token tied to the user.
 func (a *AuthState) CreateSession(username, password string, cookieSecure bool) (string, bool) {
@@ -687,6 +703,31 @@ func (a *AuthState) CreateSession(username, password string, cookieSecure bool) 
 	if len(a.sessions) > 64 && now.After(a.nextSweepSessions) {
 		a.sweepExpiredSessions(now)
 		a.nextSweepSessions = now.Add(throttleSweepInterval)
+	}
+	// Per-user session cap (maxSessionsPerUser): before minting, evict this
+	// user's OLDEST session if they're already at the cap. This is the bound
+	// against the unbounded-mint vector — sweepExpiredSessions above only
+	// reclaims EXPIRED sessions, and a fresh login's session isn't expired,
+	// so without this a cookie-discarding login loop grows the map forever.
+	// The walk is O(n) but logins are bcrypt-rate-limited (cold) and n is
+	// bounded by the cap itself. Evicting the oldest (not the newest) keeps
+	// the latest login live — the "sign out the oldest device" behavior.
+	{
+		userCount := 0
+		oldestTok := ""
+		oldest := time.Time{}
+		for k, s := range a.sessions {
+			if s.user != user {
+				continue
+			}
+			userCount++
+			if oldestTok == "" || s.created.Before(oldest) {
+				oldestTok, oldest = k, s.created
+			}
+		}
+		if userCount >= maxSessionsPerUser && oldestTok != "" {
+			delete(a.sessions, oldestTok)
+		}
 	}
 	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), created: now, cookieIssued: now, cookieSecure: cookieSecure}
 	a.mu.Unlock()

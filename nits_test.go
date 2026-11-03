@@ -153,6 +153,13 @@ func TestSessionSweepRateLimited(t *testing.T) {
 	if err := a.AddUserMode("admin", "secretpw", true); err != nil {
 		t.Fatal(err)
 	}
+	// Isolate from the per-user session cap: this test seeds 68 same-user
+	// sessions (all created:now) to exercise the sweep rate-limit. The cap
+	// (default 32) would evict one on each CreateSession below, and with all
+	// created times equal it could evict "expired2" — flaking the assertion.
+	origCap := maxSessionsPerUser
+	maxSessionsPerUser = 1000
+	t.Cleanup(func() { maxSessionsPerUser = origCap })
 	now := time.Now()
 	a.mu.Lock()
 	for i := 0; i < 68; i++ {
