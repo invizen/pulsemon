@@ -618,3 +618,56 @@ alert-routing pattern, and the cost is unmeasurable.**
 
 Pinned in-code: the `shouldAlert` doc comment states the per-decision
 read is deliberate.
+
+## smtp delivery deadline (alerts.go `deliverOne`/`deliverStormSummary` → `sendSMTP`) — ALREADY ADDRESSED, decision 2026-11-03
+
+**Finding (external review 2026-11-03):** `pw.sendSMTP(pw.stopCtx, …)` is
+called with `pw.stopCtx` — cancelled only at process shutdown — in both
+`deliverOne` (inside `retryAlert`, on the sensor's 8-slot `alertOrderGates`
+FIFO) and `deliverStormSummary` (inside a `wg.Wait()`). The review: if
+`sendSMTP` does not enforce an internal deadline on its dial and protocol
+round-trip, a tarpitted relay hangs the delivery goroutine indefinitely,
+and 8 stuck SMTP deliveries fill a sensor's `alertOrderGates` channel and
+"permanently drop all subsequent alerts." Suggested fix: wrap
+`pw.stopCtx` in a `context.WithTimeout(…, 15*time.Second)` before each
+`sendSMTP` call.
+
+**Decision: ALREADY ADDRESSED — the indefinite-hang mechanism no longer
+exists; no code change.** `sendSMTP` (smtp.go) bounds every phase
+internally:
+- **Dial** — a 10s ctx timeout (`context.WithTimeout(ctx, 10s)` wrapping
+  the shared dialer, which has none of its own).
+- **Conversation** — an ABSOLUTE conn deadline (`smtpConnDeadline`, 15s)
+  set on the `net.Conn` covers every read/write from the 220 greeting
+  through QUIT. This is the tarpit bound: a relay that accepts TCP and
+  then goes silent (missing 220, blackholed socket) is cut off at 15s
+  with a deadline error, not held forever.
+- **Cancellation** — `context.AfterFunc(ctx, conn.Close)` closes the conn
+  when ctx is cancelled; closing the conn is the only way to abort a
+  blocked `net/smtp` read (its `Client` methods take no ctx).
+
+So the worst case for one SMTP delivery is **10s dial + 15s conversation =
+25s**, after which it returns an error and releases its gate slot —
+bounded, not indefinite. The 8-slot gate concern is real as a mechanism
+but "permanently" is overstated: a tarpit relay holds a slot for ≤ 25s,
+not forever.
+
+**Pinned by:** `TestSendSMTPDeadlineBoundsHungGreeting` (a silent relay
+must not block `sendSMTP` — the conn deadline turns the hang into a
+bounded error; pre-fix it hung until `-test.timeout`) and
+`TestSendSMTPContextCancelAborts` (cancelling ctx aborts an in-flight
+conversation via the conn close — the deadline is set long on purpose so
+the test returns via CANCELLATION, proving the AfterFunc path).
+
+**Why not add the call-site `WithTimeout(15s)` (considered, not
+adopted):** it is redundant with the internal bounds and only tightens the
+worst case from 25s → 15s. It also shifts the budget split — a 15s TOTAL
+cap leaves the conversation only 5s if the dial took 10s, whereas the
+absolute conn deadline gives the full 15s to the round-trip after the
+dial. The internal deadline IS the documented contract (the `sendSMTP`
+doc names `smtpConnDeadline` as "the SMTP equivalent of the webhook
+path's http.Client 10s total-request timeout"), and a second,
+call-site-level cap would duplicate it without covering a behavior the
+tests don't already pin. If provider-parity on the TOTAL cap (≤15s
+including dial) is ever wanted, the 15s `WithTimeout` is a safe two-line
+addition — a tightening, not a bug fix.
