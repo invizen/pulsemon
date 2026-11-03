@@ -983,7 +983,18 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	if !ok {
 		return false, "unknown provider"
 	}
-	url := pw.db.GetSetting(p.Kind + "_url")
+	// Error-aware settings read (getSettingErr — the same seam
+	// resolveDestinations uses): the test button is where an operator
+	// verifies their config, so a transient DB lock must surface as a
+	// database error, not masquerade as "no <provider> webhook URL
+	// configured" (the swallow-to-"" GetSetting maps a lock to an empty
+	// URL). p.URLField, not p.Kind+"_url": SMTP's value lives in
+	// smtp_host (url is unused for SMTP — the smtp branch below uses
+	// smtpHasURL + sendSMTP).
+	url, err := getSettingErr(pw.db, p.URLField)
+	if err != nil {
+		return false, "database error reading provider settings"
+	}
 	if url == "" && p.EnvFallback != "" {
 		url = os.Getenv(p.EnvFallback)
 	}
@@ -999,9 +1010,16 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	if p.Kind == "discord" {
 		body = map[string]string{"content": "✅ **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
 	} else if p.Kind == "telegram" {
+		// chat_id resolved error-aware (same reason as the URL above): a
+		// transient DB lock must not post an empty chat_id to Telegram
+		// (HTTP 400).
+		chatID, err := getSettingErr(pw.db, "telegram_chat_id")
+		if err != nil {
+			return false, "database error reading provider settings"
+		}
 		body = map[string]string{
-			"chat_id":    pw.db.GetSetting("telegram_chat_id"),
-			"text":       "✅ <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings\n<b>Target:</b> webhook-verify\n<b>State:</b> <b>test</b> — your Telegram bot works.",
+			"chat_id":    chatID,
+			"text":       "✅ <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings · <b>Target:</b> webhook-verify · <b>State:</b> <b>test</b> — your Telegram bot works.",
 			"parse_mode": "HTML",
 		}
 	} else if p.Kind == "smtp" {

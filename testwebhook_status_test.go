@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"pulsemon/internal/store"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -65,6 +67,79 @@ func TestTestWebhookStatusHandling(t *testing.T) {
 					t.Errorf("status %d: detail %q, want substring %q", c.status, detail, c.wantSubstr)
 				}
 			})
+		}
+	})
+}
+
+// TestTestWebhookSurfacesURLReadError (review 2026-11-03): a transient
+// settings-read failure on the provider URL must surface as a database error
+// to the operator testing their config — not masquerade as "no <provider>
+// webhook URL configured". Pre-fix TestWebhook read the URL via the
+// swallow-to-"" GetSetting, so a locked DB reported the not-configured path
+// for a perfectly-configured provider. resolveDestinations (the delivery
+// path) was already hardened to getSettingErr; the test button was the
+// straggler.
+func TestTestWebhookSurfacesURLReadError(t *testing.T) {
+	db := newTestDB(t)
+	_ = db.SetSetting("discord_enabled", "1")
+	_ = db.SetSetting("discord_url", "http://10.99.99.1/hook")
+	pw := NewProbeWorker(db)
+
+	orig := getSettingErr
+	getSettingErr = func(db *store.Store, key string) (string, error) {
+		if key == "discord_url" {
+			return "", errors.New("simulated transient DB lock")
+		}
+		return orig(db, key)
+	}
+	defer func() { getSettingErr = orig }()
+
+	ok, msg := pw.TestWebhook(t.Context(), "discord")
+	if ok {
+		t.Fatalf("TestWebhook ok=true with a failing URL read (msg %q)", msg)
+	}
+	if msg != "database error reading provider settings" {
+		t.Fatalf("TestWebhook msg = %q, want the database error (pre-fix this was the swallow-to-empty 'no URL configured' path)", msg)
+	}
+}
+
+// TestTestWebhookSurfacesChatIDReadError (review 2026-11-03): a transient
+// settings-read failure on telegram_chat_id must surface as a database error
+// — not post an empty chat_id to Telegram (HTTP 400). Pre-fix the chat_id was
+// read via the swallow-to-"" GetSetting, so a DB lock at test time posted
+// {"chat_id": ""}. The test must fail BEFORE any POST.
+func TestTestWebhookSurfacesChatIDReadError(t *testing.T) {
+	withPlainTransport(t, func() {
+		db := newTestDB(t)
+		_ = db.SetSetting("telegram_enabled", "1")
+		var reqCount int32
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			atomic.AddInt32(&reqCount, 1)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		_ = db.SetSetting("telegram_url", srv.URL)
+		_ = db.SetSetting("telegram_chat_id", "111222")
+		pw := NewProbeWorker(db)
+
+		orig := getSettingErr
+		getSettingErr = func(db *store.Store, key string) (string, error) {
+			if key == "telegram_chat_id" {
+				return "", errors.New("simulated transient DB lock")
+			}
+			return orig(db, key)
+		}
+		defer func() { getSettingErr = orig }()
+
+		ok, msg := pw.TestWebhook(t.Context(), "telegram")
+		if ok {
+			t.Fatalf("TestWebhook ok=true with a failing chat_id read (msg %q)", msg)
+		}
+		if msg != "database error reading provider settings" {
+			t.Fatalf("TestWebhook msg = %q, want the database error", msg)
+		}
+		if n := atomic.LoadInt32(&reqCount); n != 0 {
+			t.Fatalf("endpoint received %d request(s); want 0 (the test must fail before any POST)", n)
 		}
 	})
 }
