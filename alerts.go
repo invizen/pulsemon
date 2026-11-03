@@ -1204,11 +1204,22 @@ func discordMentionSafe(s string) string {
 // Applied ONLY to the Markdown (google_chat/discord) builders — the Telegram
 // (HTML) and SMTP (plain) paths carry the data verbatim.
 func mdEscape(s string) string {
-	for _, c := range []string{"*", "_", "~", "`", "[", "]"} {
-		s = strings.ReplaceAll(s, c, "\\"+c)
-	}
-	return s
+	return mdReplacer.Replace(s)
 }
+
+// mdReplacer is the single-pass table behind mdEscape: strings.Replacer
+// applies all six mappings in one scan (no per-character intermediate
+// allocations the old ReplaceAll loop made). Each replacement output carries
+// a backslash, which is not itself a source character, so the single pass
+// cannot re-escape its own output.
+var mdReplacer = strings.NewReplacer(
+	"*", "\\*",
+	"_", "\\_",
+	"~", "\\~",
+	"`", "\\`",
+	"[", "\\[",
+	"]", "\\]",
+)
 
 func cardFor(oldState, state, name, target string, rttMs float64) string {
 	target = alertTarget(target)

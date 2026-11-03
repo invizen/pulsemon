@@ -744,6 +744,36 @@ func TestMarkdownEscapesLinkBrackets(t *testing.T) {
 	}
 }
 
+// TestMDEscapeEscapesAllMetachars pins mdEscape's exact contract: all six
+// metacharacters validSensorName permits (* _ ~ ` [ ]) are backslash-escaped,
+// and nothing else is. This is the direct unit pin for the mdEscape
+// strings.NewReplacer refactor (2026-11-03 finding #6) — the older
+// card-builder tests (TestMarkdownEscapesEmphasisChars /
+// TestMarkdownEscapesLinkBrackets) only exercise a subset (_ [ ])
+// indirectly, so this nails the full replacement table.
+func TestMDEscapeEscapesAllMetachars(t *testing.T) {
+	cases := map[string]string{
+		"a*b": "a\\*b",
+		"a_b": "a\\_b",
+		"a~b": "a\\~b",
+		"a`b": "a\\`b",
+		"a[b": "a\\[b",
+		"a]b": "a\\]b",
+		// All six at once, in a single name.
+		"*_~`[]": "\\*\\_\\~\\`\\[\\]",
+		// A name with no metachars is untouched (no stray backslashes).
+		"plain-host": "plain-host",
+		// Parens stay unescaped: no link syntax can form without the
+		// brackets (the documented 2026-10-30 #7 decision).
+		"a(b)": "a(b)",
+	}
+	for in, want := range cases {
+		if got := mdEscape(in); got != want {
+			t.Errorf("mdEscape(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 // TestDiscordMentionSafeKeepsAtSign (2026-10-28 review n4): the
 // neutralization inserts a zero-width space AFTER the @ (breaking Discord's
 // mention token) while KEEPING the @ visible. The old code replaced the @
