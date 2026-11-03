@@ -1217,7 +1217,14 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil {
+		// A DB error (canceled ctx, SQLITE_BUSY, I/O) is a transient 500,
+		// not "sensor not found" — only a zero count means the sensor is
+		// genuinely gone (the handleSensorByID/handleSensorPing contract).
+		respondInternal(w, "sensor history existence "+id, err)
+		return
+	}
+	if exists == 0 {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
@@ -1271,7 +1278,13 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 
 	var name string
 	if err := s.db.QueryRowContext(r.Context(), "SELECT name FROM sensors WHERE id = ?", id).Scan(&name); err != nil {
-		respondWithError(w, http.StatusNotFound, "sensor not found")
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "sensor not found")
+		} else {
+			// A DB error (canceled ctx, SQLITE_BUSY, I/O) is a transient
+			// 500, not "sensor not found" (the handleSensorByID contract).
+			respondInternal(w, "clear history existence "+id, err)
+		}
 		return
 	}
 
@@ -1744,7 +1757,14 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var exists int
-	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil || exists == 0 {
+	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors WHERE id = ?", id).Scan(&exists); err != nil {
+		// A DB error (canceled ctx, SQLITE_BUSY, I/O) is a transient 500,
+		// not "sensor not found" — only a zero count means the sensor is
+		// genuinely gone (the handleSensorByID/handleSensorPing contract).
+		respondInternal(w, "sensor graph existence "+id, err)
+		return
+	}
+	if exists == 0 {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}

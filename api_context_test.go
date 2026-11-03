@@ -198,3 +198,74 @@ func TestFix_MaintenanceAndTagDeleteHonorRequestContext(t *testing.T) {
 		t.Error("DeleteTag with live ctx did not delete the tag row")
 	}
 }
+
+// TestSensorExistenceCheckDistinguishesErrors pins the 2026-11-03 finding:
+// handleSensorHistory, handleSensorGraph and handleSensorClearHistory
+// collapsed EVERY existence-check error (context canceled, SQLITE_BUSY,
+// disk I/O) into a 404 "sensor not found", unlike handleSensorByID /
+// handleSensorPing which map only sql.ErrNoRows to a 404 and everything
+// else to a 500. A canceled client ctx (disconnected) must now surface as
+// a 500 (a transient server error), while a genuinely-missing sensor (live
+// ctx) stays a 404 — a locked DB must not read as "the sensor was deleted".
+//
+// The test routes through srv.Mux() (not the handler methods directly) so
+// r.PathValue("id") is populated; the fresh test DB has no users, so auth
+// is off and the requireAdmin-wrapped DELETE /history route stands down.
+func TestSensorExistenceCheckDistinguishesErrors(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	// One real sensor (happy path); the missing-sensor cases use an id
+	// that is never seeded.
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('exist-s1', 'exist-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('exist-s1', ?, 1.0)`, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/api/sensors/{id}/history"},
+		{"GET", "/api/sensors/{id}/graph?range=1h"},
+		{"DELETE", "/api/sensors/{id}/history"},
+	}
+
+	// 1. Dead request ctx (client disconnected before the DB call) → 500,
+	// NOT 404. Pre-fix the collapsed existence check returned 404.
+	deadCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, c := range cases {
+		req := httptest.NewRequest(c.method, strings.ReplaceAll(c.path, "{id}", "exist-s1"), nil).WithContext(deadCtx)
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		if rr.Code != http.StatusInternalServerError {
+			t.Errorf("%s %s with dead ctx: %d, want 500 (a canceled ctx is a transient server error, not 'sensor not found')", c.method, c.path, rr.Code)
+		}
+	}
+
+	// 2. Genuinely-missing sensor (live ctx) → 404, NOT 500. The sensor
+	// really is gone, so the 404 is correct — the fix must not over-correct
+	// a real miss into a 500.
+	for _, c := range cases {
+		req := httptest.NewRequest(c.method, strings.ReplaceAll(c.path, "{id}", "no-such-sensor"), nil)
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		if rr.Code != http.StatusNotFound {
+			t.Errorf("%s %s for a missing sensor: %d, want 404 (the sensor really is gone, not a 500)", c.method, c.path, rr.Code)
+		}
+	}
+
+	// 3. Existing sensor (live ctx) → 200 (happy path intact).
+	for _, c := range cases {
+		req := httptest.NewRequest(c.method, strings.ReplaceAll(c.path, "{id}", "exist-s1"), nil)
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Errorf("%s %s for an existing sensor: %d, want 200 (%s)", c.method, c.path, rr.Code, rr.Body.String())
+		}
+	}
+}
