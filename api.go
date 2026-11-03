@@ -493,8 +493,16 @@ func (s *Server) routes() {
 	// 404, regressing the handler's JSON 405. The handler switches on
 	// r.Method; that is the correct form under this architecture. Do
 	// not "fix" to method-prefixed (docs/DECISIONS.md → bare-routes).
-	s.mux.HandleFunc("/api/tags", s.handleTags)
-	s.mux.HandleFunc("/api/events", s.handleEvents)
+	// requireAuth (defense-in-depth, like handleAuthUsers): the GET
+	// branches of handleTags/handleEvents carry no session check of their
+	// own, so their authorization must not rest on authGate having run
+	// (the sessionFrom contract — "a route registered without the gate,
+	// or a future gate change, must not silently widen authorization").
+	// The inline admin check in each DELETE branch is unchanged;
+	// requireAuth only adds the session requirement the GET branch was
+	// missing. The routes stay BARE (the 405 annotation above).
+	s.mux.HandleFunc("/api/tags", s.requireAuth(s.handleTags))
+	s.mux.HandleFunc("/api/events", s.requireAuth(s.handleEvents))
 	// Settings READS are admin-only too: the payload carries operator
 	// PII and infrastructure metadata (smtp_from/to/username,
 	// telegram_chat_id, webhook scheme+host, TLS cert metadata) that a

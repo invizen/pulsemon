@@ -289,3 +289,68 @@ func TestNonAdminCannotMutateSensors(t *testing.T) {
 		t.Errorf("DELETE /api/sensors/{id}/history (admin): got %d, want 200", code)
 	}
 }
+
+// TestTagsEventsGetRequireSession pins the 2026-11-03 finding: the GET
+// branches of handleTags and handleEvents had NO session check of their own
+// — they rested entirely on authGate rejecting unauthenticated requests.
+// That violates the sessionFrom contract ("the handler's authorization
+// decision must not rest on the gate having run"): a route registered
+// without the gate, or a future gate change, would silently widen GET
+// /api/tags and GET /api/events to unauthenticated access. Wrapping both
+// bare routes in requireAuth (like handleAuthUsers) gives the GET branches
+// the same defense-in-depth the DELETE branches already have via their
+// inline admin check.
+//
+// The proof dispatches through srv.Mux() — NOT srv.authGate() — so the gate
+// is bypassed and only the handler's own check can produce the 401.
+func TestTagsEventsGetRequireSession(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	// A no-session request, dispatched through the mux (gate bypassed).
+	noSession := func(path string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		return rr.Code
+	}
+
+	// 1. Auth OFF: the "fully open" contract — GET is open (requireAuth
+	// stands down). The fix must not regress this.
+	for _, path := range []string{"/api/tags", "/api/events"} {
+		if code := noSession(path); code != http.StatusOK {
+			t.Errorf("%s with auth off: %d, want 200 (auth off = fully open)", path, code)
+		}
+	}
+
+	// 2. Auth ON, no session: the defense-in-depth — the handler's own
+	// requireAuth returns 401 even with the gate bypassed. Pre-fix the GET
+	// branch had no check and returned 200.
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"/api/tags", "/api/events"} {
+		if code := noSession(path); code != http.StatusUnauthorized {
+			t.Errorf("%s with auth on + no session (gate bypassed): %d, want 401 (the handler must not rest on the gate)", path, code)
+		}
+	}
+
+	// 3. Auth ON, valid session: GET is open to ANY session (the tag list
+	// and event feed are dashboard data, not an admin surface).
+	tok, ok := srv.auth.CreateSession("admin", "secretpw", false)
+	if !ok {
+		t.Fatal("CreateSession failed")
+	}
+	withSession := func(path string) int {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.AddCookie(&http.Cookie{Name: authSessionName, Value: tok})
+		rr := httptest.NewRecorder()
+		srv.Mux().ServeHTTP(rr, req)
+		return rr.Code
+	}
+	for _, path := range []string{"/api/tags", "/api/events"} {
+		if code := withSession(path); code != http.StatusOK {
+			t.Errorf("%s with a valid session: %d, want 200 (open to any session)", path, code)
+		}
+	}
+}
