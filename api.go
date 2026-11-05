@@ -2101,6 +2101,32 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		req.AlertFilter = &cleaned
 	}
+	// Reject the dead-alert state on save: with scope=tags/sensors and an
+	// EMPTY effective filter, shouldAlert matches no sensor — the monitor
+	// silently stops alerting for everything, the worst failure mode for
+	// a monitor. The UI can produce it (scope switched to "tags" with no
+	// tag selected stores alert_filter=[]), so the server refuses the
+	// state. Effective = incoming value if sent, else stored — the same
+	// read-then-400 posture as the rest of this handler, before any write.
+	effScope := s.db.GetSetting("alert_scope")
+	if req.AlertScope != nil {
+		effScope = *req.AlertScope
+	}
+	if effScope == "" {
+		effScope = "all"
+	}
+	if effScope != "all" {
+		effFilter := []string{}
+		if req.AlertFilter != nil {
+			effFilter = *req.AlertFilter
+		} else if f := s.db.GetSetting("alert_filter"); f != "" {
+			_ = json.Unmarshal([]byte(f), &effFilter)
+		}
+		if len(effFilter) == 0 {
+			respondWithError(w, http.StatusBadRequest, "alert_filter cannot be empty when alert_scope is tags or sensors")
+			return
+		}
+	}
 	// One stored-state snapshot per provider, taken BEFORE the tx and
 	// reused by the apply pass below, so validation and apply evaluate the
 	// same effective state and the two paths can't drift. (A concurrent

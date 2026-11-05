@@ -523,6 +523,24 @@ document.addEventListener('input', e => {
   render();
 });
 
+// The strict CSP (script-src 'self', no 'unsafe-inline') blocks inline
+// event-handler attributes, so the markup's former onchange/oninput/
+// onsubmit/onkeydown were dead — the data-act delegation only covers
+// clicks. Bind the rest here on the static elements (#q is the delegated
+// input listener above): sorting, the sensor form, the type hint, the tag
+// picker + new-tag Enter key, and the alert-routing scope options.
+// Unbound, switching the scope to "tags"/"sensors" never rendered the
+// option list, so a save stored alert_filter=[] and silently disabled
+// every alert (2026-11-05).
+$('sort').addEventListener('change', render);
+$('sensor-form').addEventListener('submit', submitSensor);
+$('f-type').addEventListener('change', onFormTypeChange);
+$('f-tagpick').addEventListener('change', e => { addFormTag(e.target.value); e.target.value = ''; });
+$('f-tagnew').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); addFormTag(e.target.value.trim()); e.target.value = ''; }
+});
+$('f-scope').addEventListener('change', () => renderScopeOptions());
+
 function setTag(t) {
   if (t === 'ALL') activeTags.clear();
   else if (activeTags.has(t)) activeTags.delete(t);

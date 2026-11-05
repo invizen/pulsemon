@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,23 @@ func TestFix_csp_NoInlineScriptsOrStyles(t *testing.T) {
 		if !strings.Contains(html, want) {
 			t.Errorf("index.html missing expected asset ref %s", want)
 		}
+	}
+}
+
+// TestIndexHasNoInlineHandlers pins the other half of the strict-CSP
+// contract: script-src 'self' (no 'unsafe-inline') also blocks inline
+// event-handler attributes (onclick/onchange/oninput/onsubmit/...). A
+// regression that re-adds one dies silently in the browser — the v0.4.1
+// data-act delegation fixed the clicks, and 2026-11-05 moved the remaining
+// form/select handlers to listeners in app.js (unbound, switching the
+// alert scope to "tags" never rendered its options, so a save stored
+// alert_filter=[] and silently disabled every alert).
+func TestIndexHasNoInlineHandlers(t *testing.T) {
+	b, err := content.ReadFile("web/index.html")
+	if err != nil {
+		t.Fatalf("read web/index.html: %v", err)
+	}
+	if m := regexp.MustCompile(`\son[a-z]+\s*=`).Find(b); m != nil {
+		t.Fatalf("inline handler %q is blocked by CSP", m)
 	}
 }

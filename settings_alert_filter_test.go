@@ -81,3 +81,60 @@ func TestFix_SettingsAlertFilterBounded(t *testing.T) {
 		t.Errorf("stored alert_filter = %v, want [prod core] (trimmed + deduped)", got)
 	}
 }
+
+// TestSettingsPutRejectsEmptyFilterWhenScopeIsNotAll pins the dead-alert
+// guard in PUT /api/settings: with alert_scope=tags/sensors and an EMPTY
+// effective filter (incoming or stored), shouldAlert matches no sensor —
+// the monitor silently stops alerting for everything, the worst failure
+// mode for a monitor. The UI can save exactly this state (scope switched
+// to "tags" with no tag selected), so the server 400s it before any write;
+// scope=all keeps the filter optional. Fails pre-fix (200 + the dead
+// state stored).
+func TestSettingsPutRejectsEmptyFilterWhenScopeIsNotAll(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.handleSettingsPut(rr, req)
+		return rr
+	}
+
+	// Fresh store, scope=tags, no filter sent: 400, nothing written.
+	if rr := put(`{"alert_scope":"tags"}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("PUT scope=tags without filter: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("alert_scope"); v != "" {
+		t.Errorf("alert_scope = %q after a 400 PUT, want empty (nothing written)", v)
+	}
+
+	// Explicit empty filter list: 400.
+	if rr := put(`{"alert_scope":"sensors","alert_filter":[]}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("PUT scope=sensors with empty filter: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+
+	// Stored non-all scope + incoming empty filter: 400 — the guard checks
+	// the EFFECTIVE state (incoming value if sent, else stored), not just
+	// the incoming fields.
+	_ = db.SetSetting("alert_scope", "tags")
+	_ = db.SetSetting("alert_filter", `["prod"]`)
+	if rr := put(`{"alert_filter":[]}`); rr.Code != http.StatusBadRequest {
+		t.Fatalf("PUT empty filter over stored scope=tags: %d, want 400: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("alert_filter"); v != `["prod"]` {
+		t.Errorf("alert_filter = %q after a 400 PUT, want [\"prod\"] (untouched)", v)
+	}
+
+	// scope=all accepts an empty filter (no routing — nothing to match).
+	if rr := put(`{"alert_scope":"all","alert_filter":[]}`); rr.Code != http.StatusOK {
+		t.Fatalf("PUT scope=all with empty filter: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+
+	// The valid state: scope=tags + a real filter: 200, stored.
+	if rr := put(`{"alert_scope":"tags","alert_filter":["prod"]}`); rr.Code != http.StatusOK {
+		t.Fatalf("PUT scope=tags with filter: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("alert_filter"); v != `["prod"]` {
+		t.Errorf("stored alert_filter = %q, want [\"prod\"]", v)
+	}
+}
