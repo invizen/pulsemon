@@ -152,11 +152,11 @@ func TestSpikeMultLifecycle(t *testing.T) {
 	}
 	pw := NewProbeWorker(db)
 	srv := NewServer(db, pw)
-	do := func(method, path, body string) (int, map[string]interface{}) {
+	do := func(method, path, body string) (int, map[string]any) {
 		req, _ := http.NewRequest(method, path, bytes.NewBufferString(body))
 		rr := httptest.NewRecorder()
 		srv.Mux().ServeHTTP(rr, req)
-		var out map[string]interface{}
+		var out map[string]any
 		_ = json.Unmarshal(rr.Body.Bytes(), &out)
 		return rr.Code, out
 	}

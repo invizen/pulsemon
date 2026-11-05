@@ -79,7 +79,7 @@ func TestGraphTimeWindowRegression(t *testing.T) {
 		if w.Code != http.StatusOK {
 			t.Fatalf("graph %s: status %d, body %s", rng, w.Code, w.Body.String())
 		}
-		var g map[string]interface{}
+		var g map[string]any
 		if err := json.Unmarshal(w.Body.Bytes(), &g); err != nil {
 			t.Fatalf("graph %s parse: %v", rng, err)
 		}
@@ -129,7 +129,7 @@ func TestGraphExcludesManualRows(t *testing.T) {
 	// Two SCHEDULED probes inside the 1h window: one good, one lost.
 	for _, row := range []struct {
 		age time.Duration
-		rtt interface{}
+		rtt any
 	}{
 		{10 * time.Minute, 10.0},
 		{20 * time.Minute, nil}, // scheduled loss
@@ -156,7 +156,7 @@ func TestGraphExcludesManualRows(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("graph 1h: status %d, body %s", w.Code, w.Body.String())
 	}
-	var g map[string]interface{}
+	var g map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &g); err != nil {
 		t.Fatalf("graph 1h parse: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestGraphExcludesManualRows(t *testing.T) {
 	}
 }
 
-func toInt(v interface{}) (int, bool) {
+func toInt(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
 		return int(n), true

@@ -27,7 +27,7 @@ func TestFix_M9_RetriesTransientFailuresOnly(t *testing.T) {
 			w.WriteHeader(200)
 		}))
 		defer srv.Close()
-		if err := pw.postJSON(srv.URL, map[string]interface{}{"text": "x"}); err != nil {
+		if err := pw.postJSON(srv.URL, map[string]any{"text": "x"}); err != nil {
 			t.Fatalf("503,503,200 should succeed after retries: %v", err)
 		}
 		if hits.Load() != 3 {
@@ -37,7 +37,7 @@ func TestFix_M9_RetriesTransientFailuresOnly(t *testing.T) {
 		var h400 atomic.Int32
 		bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h400.Add(1); w.WriteHeader(400) }))
 		defer bad.Close()
-		if err := pw.postJSON(bad.URL, map[string]interface{}{"text": "x"}); err == nil {
+		if err := pw.postJSON(bad.URL, map[string]any{"text": "x"}); err == nil {
 			t.Fatal("400 must be an error")
 		}
 		if h400.Load() != 1 {
@@ -47,7 +47,7 @@ func TestFix_M9_RetriesTransientFailuresOnly(t *testing.T) {
 		var h500 atomic.Int32
 		down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { h500.Add(1); w.WriteHeader(500) }))
 		defer down.Close()
-		if err := pw.postJSON(down.URL, map[string]interface{}{"text": "x"}); err == nil {
+		if err := pw.postJSON(down.URL, map[string]any{"text": "x"}); err == nil {
 			t.Fatal("persistent 500 must be an error")
 		}
 		if h500.Load() != 3 {
@@ -65,7 +65,7 @@ func TestFix_M9_RetryStopsOnShutdown(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 		defer srv.Close()
 		done := make(chan struct{})
-		go func() { pw.postJSON(srv.URL, map[string]interface{}{"text": "x"}); close(done) }()
+		go func() { pw.postJSON(srv.URL, map[string]any{"text": "x"}); close(done) }()
 		time.Sleep(100 * time.Millisecond)
 		pw.StopAlerts()
 		select {

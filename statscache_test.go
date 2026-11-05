@@ -44,7 +44,7 @@ func seedStatsSensor(t *testing.T, db *store.Store, id string) {
 	// Recent block: 120 probes, newest at testNowUnix, 30s apart.
 	for i := 0; i < 120; i++ {
 		ts := time.Unix(testNowUnix-int64(119-i)*30, 0).UTC().Format(time.RFC3339)
-		var val interface{}
+		var val any
 		if i%10 != 7 { // 12 losses at i=7,17,...,117
 			val = 10 + float64(i%5) // RTT 10..14ms, deterministic
 		}
@@ -332,7 +332,7 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 	}
 	for i := 0; i < 5; i++ {
 		ts := time.Unix(testNowUnix-int64(90-15*i), 0).UTC().Format(time.RFC3339)
-		var val interface{}
+		var val any
 		if i%2 == 0 {
 			val = float64(20 + i)
 		}

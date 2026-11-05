@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -591,8 +592,8 @@ func TestSendSMTPEmptyFromRefused(t *testing.T) {
 	if err == nil {
 		t.Fatal("sendSMTP with no sender succeeded, want a refusal")
 	}
-	if !strings.Contains(err.Error(), "no sender configured") {
-		t.Fatalf("sendSMTP error = %q, want 'no sender configured'", err.Error())
+	if !errors.Is(err, errSMTPNotConfigured) {
+		t.Fatalf("sendSMTP error = %q, want errSMTPNotConfigured", err.Error())
 	}
 }
 

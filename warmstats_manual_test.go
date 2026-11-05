@@ -36,7 +36,7 @@ func TestWarmStatsCarriesManualFlag(t *testing.T) {
 	// 4 scheduled probes (3 up, 1 lost).
 	for i := 0; i < 4; i++ {
 		ts := now.Add(-time.Duration(90-i*30) * time.Second).Format(time.RFC3339)
-		var val interface{} = 10.0
+		var val any = 10.0
 		if i == 2 {
 			val = nil
 		}

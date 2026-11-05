@@ -39,7 +39,7 @@ func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 		// it, not RFC3339Nano, which on a UTC host renders "+00:00" and
 		// sorts lexicographically BELOW the bound.
 		ts := store.FormatTS(now.Add(time.Duration(-i) * time.Minute))
-		var rttVal interface{}
+		var rttVal any
 		if isLost {
 			rttVal = nil
 		} else {

@@ -210,9 +210,7 @@ func tlsKeyPairOK(cert, key string) error {
 //
 // There is deliberately NO server-level WriteTimeout: POST /api/update
 // (self-update) runs up to ~60s (download + verify + install) and a
-// server write deadline would cut it off mid-install. See
-// docs/HANDOFF-esthero.md for the note and the middleware-shaped
-// alternative if a global write cap is ever wanted.
+// server write deadline would cut it off mid-install.
 //
 // Factored out of runServer so a test can pin the exact values.
 func newHTTPServer(handler http.Handler) *http.Server {

@@ -157,7 +157,7 @@ func requestBodyErr(err error) (int, string) {
 	return http.StatusBadRequest, "invalid request body: " + err.Error()
 }
 
-func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
+func respondWithJSON(w http.ResponseWriter, code int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	json.NewEncoder(w).Encode(payload)
@@ -400,21 +400,24 @@ func (s *Server) authGate() http.Handler {
 		// endpoints are the Origin/Sec-Fetch-Site gate above.
 		// (mechanism verified, documented
 		// as by design.)
-		if c, err := r.Cookie(authSessionName); err == nil && s.auth.ValidSession(c.Value) {
-			// Sliding cookie: the login cookie carries a fixed
-			// Max-Age=30d, so without a re-issue the browser would
-			// delete it exactly 30 days after login even though
-			// ValidSession slides the in-memory expiry on every use —
-			// the sliding-session design was defeated by the cookie's
-			// fixed expiry. Re-issue the
-			// SAME token once the cookie ages past half the TTL: at
-			// most one Set-Cookie per ~15 days of activity, never per
-			// 5s poll.
-			if due, pinSecure := s.auth.CookieRenewalDue(c.Value); due {
-				s.setAuthCookie(w, r, c.Value, pinSecure)
+		if c, err := r.Cookie(authSessionName); err == nil {
+			if user, ok := s.auth.SessionUser(c.Value); ok {
+				r = r.WithContext(context.WithValue(r.Context(), authUserCtxKeyVal, user))
+				// Sliding cookie: the login cookie carries a fixed
+				// Max-Age=30d, so without a re-issue the browser would
+				// delete it exactly 30 days after login even though
+				// ValidSession slides the in-memory expiry on every use —
+				// the sliding-session design was defeated by the cookie's
+				// fixed expiry. Re-issue the
+				// SAME token once the cookie ages past half the TTL: at
+				// most one Set-Cookie per ~15 days of activity, never per
+				// 5s poll.
+				if due, pinSecure := s.auth.CookieRenewalDue(c.Value); due {
+					s.setAuthCookie(w, r, c.Value, pinSecure)
+				}
+				s.mux.ServeHTTP(w, r)
+				return
 			}
-			s.mux.ServeHTTP(w, r)
-			return
 		}
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			// The login/status endpoints must be reachable WITHOUT a
@@ -522,8 +525,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/auth/users", s.requireAuth(s.handleAuthUsers))
 	s.mux.HandleFunc("POST /api/auth/users", s.requireAuth(s.handleAuthUsers))
 	s.mux.HandleFunc("POST /api/auth/users/{username}/password", s.requireAuth(s.handleAuthUserPassword))
-	s.mux.HandleFunc("DELETE /api/auth/users/{username}", s.requireAuth(s.handleAuthUserDelete))
-	s.mux.HandleFunc("POST /api/auth/disable", s.requireAuth(s.handleAuthDisable))
+	s.mux.HandleFunc("DELETE /api/auth/users/{username}", s.requireAdmin(s.handleAuthUserDelete))
+	s.mux.HandleFunc("POST /api/auth/disable", s.requireAdmin(s.handleAuthDisable))
 	s.mux.HandleFunc("/", s.handleStatic)
 }
 
@@ -538,7 +541,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusServiceUnavailable, "db unreachable")
 		return
 	}
-	hz := map[string]interface{}{
+	hz := map[string]any{
 		"status":  "ok",
 		"sensors": n,
 		"probing": s.probeWorker.ActiveCount(),
@@ -865,11 +868,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			resultTarget = strings.TrimSpace(*req.Target)
 		}
 
-		sets, args := []string{}, []interface{}{}
+		sets, args := []string{}, []any{}
 		// newTags holds the cleaned tag list when req.Tags was sent; the
 		// write happens after ALL validation, in the UPDATE transaction.
 		newTags := []string{}
-		add := func(col string, val interface{}) {
+		add := func(col string, val any) {
 			sets = append(sets, col+" = ?")
 			args = append(args, val)
 		}
@@ -1140,13 +1143,13 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 // dashboard keys off `lost` for the toast. http_status is present only for
 // HTTP sensors that got a response, so an HTTP card's toast can say
 // "HTTP 503" instead of a bare loss.
-func pulseResponse(o probeOutcome) map[string]interface{} {
+func pulseResponse(o probeOutcome) map[string]any {
 	var rttMs *float64
 	if !o.lost {
 		v := o.rttMs
 		rttMs = &v
 	}
-	resp := map[string]interface{}{
+	resp := map[string]any{
 		"rtt_ms": rttMs, // null when lost
 		"lost":   o.lost,
 	}
@@ -1215,7 +1218,7 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "sensor history "+id, err)
 		return
 	}
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"sensor_id": id,
 		"count":     len(out),
 		"probes":    out, // newest first
@@ -1295,7 +1298,7 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	s.probeWorker.ResetStatsFor(id)
 
 	log.Printf("API: cleared history for %s (%d probes, %d events)", name, probes, events)
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"sensor":  name,
 		"cleared": map[string]int64{"probes": probes, "events": events},
 	})
@@ -1389,7 +1392,7 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	s.probeWorker.ResetStatsAll()
 
 	log.Printf("API: cleared ALL history (%d probes, %d events)", probes, events)
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"cleared": map[string]int64{"probes": probes, "events": events},
 	})
 }
@@ -1654,7 +1657,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		for _, id := range tagged {
 			s.probeWorker.Restart(id)
 		}
-		respondWithJSON(w, http.StatusOK, map[string]interface{}{"status": "deleted", "sensors_updated": n})
+		respondWithJSON(w, http.StatusOK, map[string]any{"status": "deleted", "sensors_updated": n})
 	default:
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1732,7 +1735,7 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 		uptime = float64(total-lostTotal) / float64(total) * 100
 	}
 
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"sensor_id":   id,
 		"range":       r.URL.Query().Get("range"),
 		"bucket_secs": bucketSecs,
@@ -1772,7 +1775,7 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete events", err)
 			return
 		}
-		respondWithJSON(w, http.StatusOK, map[string]interface{}{"status": "cleared", "events_deleted": n})
+		respondWithJSON(w, http.StatusOK, map[string]any{"status": "cleared", "events_deleted": n})
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -1831,7 +1834,7 @@ func webhookMasked(raw string) string {
 }
 
 // settingsPayload is the shared GET/PUT response shape for /api/settings.
-func (s *Server) settingsPayload() map[string]interface{} {
+func (s *Server) settingsPayload() map[string]any {
 	scope := s.db.GetSetting("alert_scope")
 	if scope == "" {
 		scope = "all"
@@ -1860,7 +1863,7 @@ func (s *Server) settingsPayload() map[string]interface{} {
 		chatURL = os.Getenv("GOOGLE_CHAT_WEBHOOK_URL")
 		chatSource = "env"
 	}
-	return map[string]interface{}{
+	return map[string]any{
 		"webhook_url":         webhookMasked(chatURL),
 		"webhook_configured":  chatURL != "",
 		"source":              chatSource,
@@ -2560,7 +2563,7 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ok, detail := s.probeWorker.TestWebhook(r.Context(), req.Kind)
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"ok":     ok,
 		"detail": detail,
 	})

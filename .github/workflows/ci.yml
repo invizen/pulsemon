@@ -11,12 +11,6 @@ name: CI
 # BenchmarkComputeSensorStats (bench_test.go) are opt-in regression
 # benchmarks — run them explicitly with
 # `go test -run=^$ -bench=. -benchtime=1x .`.
-#
-# KNOWN FLAKE: TestStormFlushDropsRecovered is a pre-existing ~50-60%
-# bimodal flake (A/B-confirmed on the pristine v0.3.24 tree, unrelated to
-# this batch — no storm code is touched here). Until it is fixed it will
-# make this gate intermittently red; a targeted retry or the flake fix is
-# the follow-up, not a reason to skip the -race gate.
 on:
   push:
   pull_request:

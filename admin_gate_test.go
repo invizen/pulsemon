@@ -213,7 +213,7 @@ func TestNonAdminCannotMutateSensors(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var created map[string]interface{}
+	var created map[string]any
 	jsonDecode(t, resp, &created)
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusCreated {

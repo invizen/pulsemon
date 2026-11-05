@@ -29,7 +29,7 @@ func seedSensor(t *testing.T, db *store.Store, id string, lossWarn, downAfter, s
 	for _, v := range rtt {
 		probeSeq++
 		ts := baseProbeTime.Add(time.Duration(probeSeq) * time.Second).Format(time.RFC3339Nano)
-		var val interface{}
+		var val any
 		if v != nil {
 			val = *v
 		}

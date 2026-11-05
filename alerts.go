@@ -867,16 +867,16 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 			var ok bool
 			switch d.p.Kind {
 			case "google_chat":
-				ok = pw.postJSON(d.url, map[string]interface{}{"text": md}) == nil
+				ok = pw.postJSON(d.url, map[string]any{"text": md}) == nil
 			case "discord":
-				ok = pw.postJSON(d.url, map[string]interface{}{
+				ok = pw.postJSON(d.url, map[string]any{
 					"content":          md,
-					"allowed_mentions": map[string]interface{}{"parse": []string{}},
+					"allowed_mentions": map[string]any{"parse": []string{}},
 				}) == nil
 			case "telegram":
 				// d.chatID was resolved up front in resolveDestinations
 				// (see dest) — never a live re-read here.
-				ok = pw.postJSON(d.url, map[string]interface{}{
+				ok = pw.postJSON(d.url, map[string]any{
 					"chat_id":    d.chatID,
 					"text":       stormSummaryHTML(entries),
 					"parse_mode": "HTML",
@@ -1034,7 +1034,7 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 		if reAlert {
 			card = cardForRe(state, name, target, rttMs)
 		}
-		return pw.postJSON(url, map[string]interface{}{"text": card}) == nil
+		return pw.postJSON(url, map[string]any{"text": card}) == nil
 	case "discord":
 		card := discordCard(oldState, state, name, target, rttMs)
 		if reAlert {
@@ -1044,9 +1044,9 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 		// card text trigger role/user mentions — a sensor named
 		// "@everyone" would otherwise mass-ping the channel. Pairs with
 		// discordMentionSafe, which covers clients that ignore the field.
-		return pw.postJSON(url, map[string]interface{}{
+		return pw.postJSON(url, map[string]any{
 			"content":          card,
-			"allowed_mentions": map[string]interface{}{"parse": []string{}},
+			"allowed_mentions": map[string]any{"parse": []string{}},
 		}) == nil
 	case "telegram":
 		card := telegramCard(oldState, state, name, target, rttMs)
@@ -1056,7 +1056,7 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 		// d.chatID was resolved up front in resolveDestinations (see
 		// dest): a live re-read here would map a transient DB lock to ""
 		// and Telegram would 400 the message.
-		return pw.postJSON(url, map[string]interface{}{
+		return pw.postJSON(url, map[string]any{
 			"chat_id":    d.chatID,
 			"text":       card,
 			"parse_mode": "HTML",
@@ -1073,9 +1073,10 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 		}
 		err := pw.retryAlert(func() (bool, time.Duration, error) {
 			err := pw.sendSMTP(pw.stopCtx, subject, body)
-			// "smtp: no host/sender/recipient configured" cannot succeed on retry.
-			// SMTP has no Retry-After: 0 keeps the fixed alertRetryDelays.
-			return err != nil && !strings.HasPrefix(err.Error(), "smtp: no "), 0, err
+			// A configuration gap (no host/sender/recipient) cannot succeed
+			// on retry. SMTP has no Retry-After: 0 keeps the fixed
+			// alertRetryDelays.
+			return err != nil && !errors.Is(err, errSMTPNotConfigured), 0, err
 		})
 		if err != nil {
 			log.Printf("smtp alert to %s: %v", url, err)
@@ -1163,7 +1164,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	return true, "test alert sent via " + p.Label + " (HTTP " + http.StatusText(code) + ")"
 }
 
-func mustJSON(v interface{}) []byte {
+func mustJSON(v any) []byte {
 	b, _ := json.Marshal(v)
 	return b
 }
@@ -1483,10 +1484,10 @@ func (pw *ProbeWorker) doWebhookPost(ctx context.Context, url string, body []byt
 // that on shutdown a delivery stuck in a network blip - or sleeping between
 // retries - is aborted promptly instead of holding DrainAlerts. The returned
 // error never contains the URL (it carries the provider credential). The
-// payload is map[string]interface{} (not map[string]string) because the
+// payload is map[string]any (not map[string]string) because the
 // Discord provider needs a nested object — allowed_mentions
 // which a string-valued map can't express.
-func (pw *ProbeWorker) postJSON(url string, payload map[string]interface{}) error {
+func (pw *ProbeWorker) postJSON(url string, payload map[string]any) error {
 	body, _ := json.Marshal(payload)
 	err := pw.retryAlert(func() (bool, time.Duration, error) {
 		code, header, err := pw.doWebhookPost(pw.stopCtx, url, body)

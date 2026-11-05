@@ -66,7 +66,7 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	// A few deterministic losses (nil rtt_ms) to exercise the NULL path.
 	for i := 0; i < nRecent; i++ {
 		ts := now.Add(-time.Duration(nRecent-1-i) * 30 * time.Second).Format(time.RFC3339)
-		var val interface{}
+		var val any
 		if i%10 != 7 {
 			val = 10 + float64(i%5)
 		}

@@ -206,7 +206,7 @@ func pubKeyEquals(priv, certPub any) bool {
 
 // parsePrivateKey accepts PKCS8 ("PRIVATE KEY"), PKCS1 ("RSA PRIVATE KEY"),
 // and SEC1 ("EC PRIVATE KEY") blocks, and returns the public key.
-func parsePrivateKey(block *pem.Block) (interface{}, error) {
+func parsePrivateKey(block *pem.Block) (any, error) {
 	switch block.Type {
 	case "PRIVATE KEY":
 		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
@@ -231,7 +231,7 @@ func parsePrivateKey(block *pem.Block) (interface{}, error) {
 	}
 }
 
-func pubKeyFromAny(key interface{}) interface{} {
+func pubKeyFromAny(key any) any {
 	switch k := key.(type) {
 	case *rsa.PrivateKey:
 		return &k.PublicKey
@@ -418,7 +418,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// kills this process (SIGTERM via systemctl, or os.Exit via re-exec),
 	// so the client must already have the answer. The 200ms delay gives
 	// net/http time to write the response to the wire.
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"status":     "applied",
 		"restarting": true,
 		"tls":        s.tlsPayload(),
@@ -459,7 +459,7 @@ func (s *Server) handleTLSSettingsDelete(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	log.Printf("TLS: certificate removed — reverting to plain HTTP on %s", listenAddr())
-	respondWithJSON(w, http.StatusOK, map[string]interface{}{
+	respondWithJSON(w, http.StatusOK, map[string]any{
 		"status":     "removed",
 		"restarting": true,
 	})

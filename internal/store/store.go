@@ -115,7 +115,7 @@ func (db *Store) InitSchema() error {
 	);
 
 	CREATE TABLE IF NOT EXISTS probes (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id INTEGER PRIMARY KEY,
 		sensor_id TEXT NOT NULL,
 		ts DATETIME NOT NULL,
 		rtt_ms REAL,
@@ -126,7 +126,7 @@ func (db *Store) InitSchema() error {
 	);
 
 	CREATE TABLE IF NOT EXISTS events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id INTEGER PRIMARY KEY,
 		sensor_id TEXT NOT NULL,
 		ts DATETIME NOT NULL,
 		from_status TEXT,

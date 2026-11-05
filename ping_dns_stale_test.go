@@ -257,7 +257,7 @@ func TestDoProbeRecordsDNSLossOnRow(t *testing.T) {
 	defer cancel()
 	pw.doProbe(ctx, sensorConfig{id: "dnsr", name: "dnsr", target: "no-such-host-pulsemon-test.invalid", probeType: "icmp", intervalS: 15, timeoutMS: 1000, lossWarn: 25, downAfter: 1})
 
-	var dnsErr interface{}
+	var dnsErr any
 	if err := db.QueryRow("SELECT dns_error FROM probes WHERE sensor_id = 'dnsr'").Scan(&dnsErr); err != nil {
 		t.Fatalf("read dns_error: %v", err)
 	}

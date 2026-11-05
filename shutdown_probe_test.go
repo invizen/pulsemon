@@ -45,12 +45,12 @@ func TestRunAbortsInFlightProbesOnCancel(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TABLE probes (
-		id INTEGER PRIMARY KEY AUTOINCREMENT, sensor_id TEXT NOT NULL,
+		id INTEGER PRIMARY KEY, sensor_id TEXT NOT NULL,
 		ts DATETIME NOT NULL, rtt_ms REAL, resolved_ip TEXT, http_status INTEGER)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TABLE events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT, sensor_id TEXT NOT NULL, ts DATETIME NOT NULL,
+		id INTEGER PRIMARY KEY, sensor_id TEXT NOT NULL, ts DATETIME NOT NULL,
 		from_status TEXT, to_status TEXT, note TEXT)`); err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestRunExitsPromptlyWithNoLoops(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`CREATE TABLE probes (
-		id INTEGER PRIMARY KEY AUTOINCREMENT, sensor_id TEXT NOT NULL,
+		id INTEGER PRIMARY KEY, sensor_id TEXT NOT NULL,
 		ts DATETIME NOT NULL, rtt_ms REAL, resolved_ip TEXT, http_status INTEGER)`); err != nil {
 		t.Fatal(err)
 	}

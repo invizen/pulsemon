@@ -15,7 +15,7 @@ import (
 // newM10bServer builds a real server over a temp DB and returns it plus a
 // do() helper that drives the Mux directly (auth gate bypassed — these
 // tests exercise the sensor-write validation, not auth).
-func newM10bServer(t *testing.T) (*Server, func(string, string, string) (int, map[string]interface{})) {
+func newM10bServer(t *testing.T) (*Server, func(string, string, string) (int, map[string]any)) {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := store.NewStore(filepath.Join(dir, "m10b.db"))
@@ -27,11 +27,11 @@ func newM10bServer(t *testing.T) (*Server, func(string, string, string) (int, ma
 		t.Fatal(err)
 	}
 	srv := NewServer(db, NewProbeWorker(db))
-	do := func(method, path, body string) (int, map[string]interface{}) {
+	do := func(method, path, body string) (int, map[string]any) {
 		req, _ := http.NewRequest(method, path, bytes.NewBufferString(body))
 		rr := httptest.NewRecorder()
 		srv.Mux().ServeHTTP(rr, req)
-		var out map[string]interface{}
+		var out map[string]any
 		_ = json.Unmarshal(rr.Body.Bytes(), &out)
 		return rr.Code, out
 	}

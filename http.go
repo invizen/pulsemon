@@ -512,16 +512,23 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// reported RTT (see the Elapsed note on httpProbeResult) — the
 	// handshake/DNS/TCP cost that precedes it is deliberately excluded
 	// so HTTP and HTTPS sensors are comparable (F12).
+	//
+	// The httptrace docs allow hooks on other goroutines (h2 does); a
+	// small mutex makes the captures future-proof even though h1 + the
+	// custom DialTLSContext (no h2) call GotConn on the caller goroutine.
+	var mu sync.Mutex
 	var resolved string
 	var connAt time.Time
 	trace := &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
+			mu.Lock()
 			connAt = time.Now()
 			if info.Conn != nil && info.Conn.RemoteAddr() != nil {
 				if h, _, err := net.SplitHostPort(info.Conn.RemoteAddr().String()); err == nil {
 					resolved = h
 				}
 			}
+			mu.Unlock()
 		},
 	}
 
@@ -555,9 +562,12 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// HTTP and HTTPS sensor latencies comparable. No conn established ->
 	// GotConn never fired -> the full elapsed is the honest number.
 	rtt := el
+	mu.Lock()
 	if !connAt.IsZero() {
 		rtt = time.Since(connAt)
 	}
+	ip := resolved
+	mu.Unlock()
 	if err != nil {
 		// A transport-level failure: timeout, connection refused, DNS, or
 		// a TLS handshake aborted by probeDialTLS's verify (a cert that is
@@ -566,7 +576,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		// cert is a dial error here — no request bytes were written.
 		// certNotAfterFromErr extracts the failing leaf's expiry from the
 		// typed certVerifyError so the card still shows it.
-		return httpProbeResult{Elapsed: rtt, Lost: true, IP: resolved, CertExpiry: certNotAfterFromErr(err), Err: err}
+		return httpProbeResult{Elapsed: rtt, Lost: true, IP: ip, CertExpiry: certNotAfterFromErr(err), Err: err}
 	}
 
 	// Capture the server's presented certs and their expiry for the
@@ -621,7 +631,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 			Elapsed:    rtt,
 			Lost:       true,
 			Status:     &code,
-			IP:         resolved,
+			IP:         ip,
 			CertExpiry: certExp,
 			Err:        errors.New("https target redirected to plain http (TLS endpoint not healthy)"),
 		}
@@ -633,7 +643,7 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		Elapsed:    rtt,
 		Lost:       !up,
 		Status:     &code,
-		IP:         resolved,
+		IP:         ip,
 		CertExpiry: certExp,
 		Err:        nil,
 	}

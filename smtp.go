@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"mime"
@@ -131,6 +132,12 @@ var smtpDial = dialChecked
 // shorten it.
 var smtpConnDeadline = 15 * time.Second
 
+// errSMTPNotConfigured is a sentinel for "the SMTP provider has no
+// host/sender/recipient configured" — a configuration gap that cannot
+// succeed on retry. The retry loop classifies it with errors.Is, not a
+// string prefix, so the classification survives rewording.
+var errSMTPNotConfigured = errors.New("smtp: not configured")
+
 // sendSMTP delivers a plain-text alert email. Every phase is bounded,
 // matching the webhook deliveries:
 //
@@ -165,13 +172,13 @@ var smtpConnDeadline = 15 * time.Second
 func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error {
 	cfg := pw.smtpConfig()
 	if cfg.Host == "" {
-		return fmt.Errorf("smtp: no host configured")
+		return fmt.Errorf("%w: no host", errSMTPNotConfigured)
 	}
 	if cfg.From == "" {
-		return fmt.Errorf("smtp: no sender configured")
+		return fmt.Errorf("%w: no sender", errSMTPNotConfigured)
 	}
 	if cfg.To == "" {
-		return fmt.Errorf("smtp: no recipient configured")
+		return fmt.Errorf("%w: no recipient", errSMTPNotConfigured)
 	}
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	if ctx == nil {

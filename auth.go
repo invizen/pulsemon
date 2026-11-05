@@ -1345,18 +1345,33 @@ type authStatusPayload struct {
 	Bootstrapped bool `json:"bootstrapped,omitempty"`
 }
 
+// authUserCtxKey is the request-context key for the authenticated
+// username, stashed by authGate after ValidSession succeeds. Handlers
+// read it via sessionFrom, which avoids the second SessionUser lookup
+// (and its second expiry slide) that the old per-handler cookie re-read
+// performed.
+type authUserCtxKey int
+
+const authUserCtxKeyVal authUserCtxKey = 0
+
+func authUserFromContext(r *http.Request) string {
+	if u, ok := r.Context().Value(authUserCtxKeyVal).(string); ok {
+		return u
+	}
+	return ""
+}
+
 // sessionFrom returns the username the request's session belongs to
 // ("" when there is no live session).
 //
-// Handlers that call this are re-validating a session the auth gate
-// already validated for the same request (the double check is deliberate): the handler's
-// authorization decision (admin-only gates, per-user scoping) must not
-// rest on the gate having run — a route registered without the gate,
-// or a future gate change, must not silently widen authorization. The
-// cost is one extra short a.mu critical section: the second pass
-// almost always hits the userOKTTL cache (no DB query), and the
-// sliding-expiry update is idempotent.
+// The fast path reads the username authGate stashed in the request
+// context (one SessionUser lookup per request, not three). The cookie
+// fallback covers routes that bypass authGate (tests, /api/auth/status
+// which is gate-exempt).
 func (s *Server) sessionFrom(r *http.Request) string {
+	if u := authUserFromContext(r); u != "" {
+		return u
+	}
 	c, err := r.Cookie(authSessionName)
 	if err != nil {
 		return ""
@@ -1756,12 +1771,7 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	// Removing an account is an admin operation (the UI offers it to
 	// admins only). Self-removal is allowed — the last-user guard in
 	// db.RemoveUser stops it from ever locking the install out, and
-	// removing the last admin promotes the oldest remaining user
-	// (admin-flag fix).
-	if !s.auth.IsAdmin(s.sessionFrom(r)) {
-		respondWithError(w, http.StatusForbidden, "admin only")
-		return
-	}
+	// removing the last admin promotes the oldest remaining user.
 	user := strings.ToLower(r.PathValue("username"))
 	if err := s.auth.RemoveUser(user); err != nil {
 		// A name that doesn't exist is a 404 — the same policy as the
@@ -1790,16 +1800,10 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 // handleAuthDisable removes every user, opening the dashboard. The
 // operator's own session dies with the last user, so the UI re-shows the
 // login gate — which, with zero users, immediately becomes the open
-// dashboard.
+// dashboard. The route is registered with requireAdmin.
 func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// Disabling auth wipes EVERY account and opens the dashboard to the
-	// whole LAN — admin only (admin-flag fix).
-	if !s.auth.IsAdmin(s.sessionFrom(r)) {
-		respondWithError(w, http.StatusForbidden, "admin only")
 		return
 	}
 	if err := s.auth.Disable(); err != nil {

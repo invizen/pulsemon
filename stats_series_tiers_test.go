@@ -68,7 +68,7 @@ func TestGraph24hFromMemoryMatchesSQL(t *testing.T) {
 	// totals at the boundary).
 	for i := 0; i < n; i++ {
 		ts := now.Add(-time.Duration(n-1-i) * 5 * time.Second)
-		var val interface{}
+		var val any
 		if i%40 == 0 {
 			val = nil // ~2.5% losses
 		} else {

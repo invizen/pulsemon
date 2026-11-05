@@ -38,7 +38,7 @@ func TestFix_M8_PostJSONErrorDoesNotLeakToken(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(500) }))
 		srv.Close() // refuse connections
 		pw := NewProbeWorker(nil)
-		err := pw.postJSON(srv.URL+"/bot123:SECRETTOKEN/sendMessage", map[string]interface{}{"text": "x"})
+		err := pw.postJSON(srv.URL+"/bot123:SECRETTOKEN/sendMessage", map[string]any{"text": "x"})
 		if err == nil {
 			t.Fatal("expected an error")
 		}

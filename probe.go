@@ -824,9 +824,9 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 		// stale channel. A nil kick (test-constructed state) is a case
 		// that never fires.
 		pw.mu.Lock()
-		kick := struct{ ch chan struct{} }{}
+		var kick chan struct{}
 		if ps, ok := pw.sensors[c.id]; ok {
-			kick.ch = ps.kick
+			kick = ps.kick
 		}
 		pw.mu.Unlock()
 
@@ -834,7 +834,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-		case <-kick.ch:
+		case <-kick:
 			// Resume fast path: SetPaused(false)
 			// woke us — fall through and probe on this wake instead of
 			// waiting out the timer we were holding while paused.
@@ -938,30 +938,15 @@ const pulseNowCooldown = 2 * time.Second
 // lands in probes (history + dashboard sparkline) and the in-memory stats
 // cache, exactly as a scheduled tick would — but it deliberately does NOT
 // derive a status, write a transition event, or fire an alert. A manual
-// pulse is a diagnostic: recording it keeps the history honest (the user saw
-// a real RTT / loss at that instant), while keeping status and alerts driven
-// only by the scheduled probe loop (a single manual probe must not flip a
-// healthy sensor to error or fire a recovery webhook).
+// pulse is a diagnostic: recording it keeps the history honest, while
+// keeping status and alerts driven only by the scheduled probe loop.
 //
-// The "status and alerts are unaffected" half is enforced, not assumed
-// the row is tagged manual=1, and status
-// derivation (recentFromDB / recentFromCache) excludes manual rows. Before
-// the tag, a manual pulse's loss row was indistinguishable from a scheduled
-// loss, so ONE lost manual pulse + one lost scheduled probe tripped the
-// down_after=2 consecutive-loss test.
+// The "status and alerts are unaffected" half is enforced by the manual=1
+// tag: status derivation, loss/uptime aggregates, the sparkline, the 24h
+// counters, and the graph endpoint all exclude manual rows.
 //
-// The same exclusion covers EVERY loss/uptime aggregate: computeSensorStats skips manual entries in the 1h
-// loss/avg, the status window, the sparkline, and the 24h counters, and
-// the graph endpoint filters manual = 0. Before F5 only status derivation
-// skipped them, so a lost manual pulse — likelier than it should be,
-// because the pulse used to run a fixed 1s timeout — could make a healthy
-// sensor show packet loss on the card and the graph. The pulse now runs
-// with the sensor's own timeout_ms (pingNowTimeout only covers a legacy
-// zeroed row), so a slow-but-healthy target answers the pulse exactly as
-// it answers the schedule.
 // Works while paused (SPEC §2). Dispatches by sensor type, so an HTTP
-// sensor's manual pulse makes an HTTP request (the card's "Pulse Now"
-// shows its status code).
+// sensor's manual pulse makes an HTTP request.
 func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
 	var target, probeType string
 	var timeoutMS int
@@ -989,7 +974,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	}
 	o := probeTarget(ctx, probeType, target, timeout)
 
-	var rttVal interface{}
+	var rttVal any
 	if !o.lost {
 		rttVal = o.rttMs
 	}
@@ -1001,7 +986,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	// write without inheriting either problem.
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), dbWriteTimeout)
 	defer cancelWrite()
-	var dnsErrVal interface{}
+	var dnsErrVal any
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}
@@ -1113,7 +1098,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 	c.probeBroken = o.broken // per-probe, on this call's own copy of the config
 
-	var rttVal interface{}
+	var rttVal any
 	var rttMs float64
 	if !o.lost {
 		rttVal = o.rttMs
@@ -1125,7 +1110,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	// it is already cancelled-and-checked above (a cancelled probe drops
 	// its result), and it lets shutdown interrupt a write parked on the
 	// 15s busy_timeout instead of outrunning the drain budget.
-	var dnsErrVal interface{}
+	var dnsErrVal any
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}

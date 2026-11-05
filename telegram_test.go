@@ -219,7 +219,7 @@ func TestTelegramDeliveryPostsResolvedChatID(t *testing.T) {
 	var mu sync.Mutex
 	var gotChatID string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var payload map[string]interface{}
+		var payload map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&payload)
 		mu.Lock()
 		gotChatID, _ = payload["chat_id"].(string)

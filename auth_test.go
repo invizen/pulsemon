@@ -1102,7 +1102,7 @@ func TestLoginThrottleIgnoresUntrustedXFF(t *testing.T) {
 }
 
 // jsonDecode decodes a JSON response body into v.
-func jsonDecode(t *testing.T, resp *http.Response, v interface{}) {
+func jsonDecode(t *testing.T, resp *http.Response, v any) {
 	t.Helper()
 	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
 		t.Fatalf("decode response: %v", err)

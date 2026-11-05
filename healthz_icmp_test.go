@@ -24,7 +24,7 @@ func resetSharedEngine(t *testing.T, mode string, err error) {
 }
 
 // runHealthz drives handleHealthz against a real store and decodes the JSON.
-func runHealthz(t *testing.T, dbPath string) map[string]interface{} {
+func runHealthz(t *testing.T, dbPath string) map[string]any {
 	t.Helper()
 	db, err := store.NewStore(dbPath)
 	if err != nil {
@@ -42,7 +42,7 @@ func runHealthz(t *testing.T, dbPath string) map[string]interface{} {
 	if err != nil {
 		t.Fatalf("read body: %v", err)
 	}
-	var hz map[string]interface{}
+	var hz map[string]any
 	if err := json.Unmarshal(body, &hz); err != nil {
 		t.Fatalf("decode healthz %q: %v", body, err)
 	}
