@@ -41,7 +41,7 @@ pulsemon
 git clone https://github.com/invizen/pulsemon pulsemon && cd pulsemon
 cp .env.example .env          # optional: put a Google Chat webhook URL in .env
 chmod 600 .env
-mkdir -p data && chmod 0777 data  # pre-create the data dir (see note below)
+mkdir -p data && sudo chown 1000:1000 data && chmod 700 data  # pre-create the data dir (see note below)
 docker compose up -d --build
 ```
 
@@ -56,9 +56,13 @@ Open http://localhost:9299 and add sensors from the **new sensor** button.
 > **Why pre-create `data/`?** The container runs as uid 1000 (unprivileged).
 > If the bind-mount source doesn't exist, Docker creates it **root-owned**
 > and the container crash-loops with `Failed to open DB: unable to open
-> database file`. Pre-creating the directory yourself (any ownership works —
-> `chmod 0777` is the no-sudo option) avoids that. If it already happened,
-> `sudo chown -R 1000:1000 data` fixes it.
+> database file`. Pre-creating the directory yourself avoids that. Use
+> `sudo chown 1000:1000 data && chmod 700 data` so only the container user
+> (uid 1000) can read or write the directory — `data/` holds `pulsemon.db`,
+> which contains password hashes and plaintext webhook/SMTP/Telegram
+> secrets. A world-writable directory (`chmod 0777`) would let any local
+> user replace the database. If the directory is already root-owned,
+> `sudo chown -R 1000:1000 data && sudo chmod 700 data` fixes it.
 
 ## Bare install (no Docker, user-level systemd)
 
