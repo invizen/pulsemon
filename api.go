@@ -2057,6 +2057,21 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// allow_unauth_update re-allows the in-dashboard self-update button on an
+	// auth-off install (update_api.go) — i.e. it hands any LAN host the power
+	// to download a binary, overwrite the running one, and restart the service.
+	// It must therefore be changeable ONLY while an account exists (auth on):
+	// with auth off, requireAdmin/requireAuth stand down, so without this guard
+	// any LAN host could PUT {"allow_unauth_update":true} and then POST
+	// /api/update (finding 4, 2026-11-05). The stored VALUE is untouched — an
+	// install that already has it on keeps working; only the CHANGE is gated.
+	// A save that does NOT send the field (the general "save alerts" flow) is
+	// unaffected.
+	if req.AllowUnauth != nil && !s.auth.Enabled() {
+		respondWithError(w, http.StatusForbidden, "allow_unauth_update can only be changed while authentication is enabled")
+		return
+	}
+
 	// Validate EVERYTHING before any write: the old code applied provider
 	// writes as it went and reset alert_scope/alert_filter unconditionally
 	// (a partial save like {"realert_min":10} silently wiped the tag

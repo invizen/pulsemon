@@ -138,3 +138,64 @@ func TestSettingsPutRejectsEmptyFilterWhenScopeIsNotAll(t *testing.T) {
 		t.Errorf("stored alert_filter = %q, want [\"prod\"]", v)
 	}
 }
+
+// TestSettingsPutRejectsAllowUnauthWhenAuthOff pins the finding-4 guard in
+// PUT /api/settings: allow_unauth_update re-allows the in-dashboard
+// self-update button on an auth-off install — i.e. it hands any LAN host the
+// power to download a binary, overwrite the running one, and restart the
+// service. With auth off, requireAdmin/requireAuth stand down, so without the
+// guard any LAN host could PUT {"allow_unauth_update":true} and then POST
+// /api/update. The toggle is therefore changeable ONLY while an account
+// exists (auth on): a 403 when auth is off, a 200 (both directions) when an
+// account exists. The stored VALUE is untouched — only the change is gated —
+// and a save that does NOT send the field (the general "save alerts" flow) is
+// unaffected. Fails pre-fix (200 + the value written while auth is off).
+func TestSettingsPutRejectsAllowUnauthWhenAuthOff(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.handleSettingsPut(rr, req)
+		return rr
+	}
+
+	// Auth OFF (fresh store, no users): the toggle is 403, nothing written.
+	if n, _ := db.UserCount(); n != 0 {
+		t.Fatalf("precondition: UserCount = %d, want 0 (auth off)", n)
+	}
+	if rr := put(`{"allow_unauth_update": true}`); rr.Code != http.StatusForbidden {
+		t.Fatalf("PUT allow_unauth_update with auth off: %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("allow_unauth_update"); v != "" {
+		t.Errorf("allow_unauth_update = %q after a 403 PUT, want empty (nothing written)", v)
+	}
+
+	// Auth OFF, a save that does NOT send the field: unaffected (200).
+	if rr := put(`{"realert_min": 10}`); rr.Code != http.StatusOK {
+		t.Fatalf("PUT realert_min with auth off (no allow_unauth_update): %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if got := db.GetSetting("realert_min"); got != "10" {
+		t.Errorf("realert_min = %q after a 200 PUT, want 10", got)
+	}
+
+	// Auth ON (an account exists): the toggle is accepted, both directions.
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if n, _ := db.UserCount(); n != 1 {
+		t.Fatalf("precondition: UserCount = %d, want 1 (auth on)", n)
+	}
+	if rr := put(`{"allow_unauth_update": true}`); rr.Code != http.StatusOK {
+		t.Fatalf("PUT allow_unauth_update=true with auth on: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("allow_unauth_update"); v != "1" {
+		t.Errorf("allow_unauth_update = %q after auth-on PUT, want 1", v)
+	}
+	if rr := put(`{"allow_unauth_update": false}`); rr.Code != http.StatusOK {
+		t.Fatalf("PUT allow_unauth_update=false with auth on: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("allow_unauth_update"); v != "0" {
+		t.Errorf("allow_unauth_update = %q after auth-on false PUT, want 0", v)
+	}
+}

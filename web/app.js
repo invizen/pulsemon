@@ -77,7 +77,7 @@ let authState = null;
 let meIsAdmin = true;
 function applyAdminVisibility() {
   const hide = !meIsAdmin;
-  for (const id of ['alerts-btn', 'settings-btn', 'update-pill', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn']) {
+  for (const id of ['alerts-btn', 'settings-btn', 'update-pill', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn', 'unauth-update-row']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', hide);
   }
@@ -1088,8 +1088,11 @@ async function renderAuthPanel() {
       : 'Protect dashboard with secure credential gate.';
     $('auth-create-first-btn').classList.toggle('hidden', wasDisabled);
     $('auth-disabled-note').classList.toggle('hidden', !wasDisabled);
-    setUnauthUpdateUI(SETTINGS.allow_unauth_update === true);
   }
+  // The allow_unauth_update toggle now lives in the auth-ON panel (it is a
+  // setup control that can only be changed while an account exists), so its
+  // state must be refreshed in both branches — not just the off one.
+  setUnauthUpdateUI(SETTINGS.allow_unauth_update === true);
 }
 
 function openFirstAccountDialog() {
@@ -1235,8 +1238,9 @@ async function toggleMaint() {
 }
 
 // allow_unauth_update: opt-in to the in-dashboard self-update button on
-// auth-off (trusted-LAN) installs. Only meaningful while auth is off —
-// the row lives in the auth-off panel, so this is a no-op when auth is on.
+// auth-off (trusted-LAN) installs. The toggle is a SETUP control in the
+// auth-ON panel — the server 403s the change while auth is off (any LAN host
+// could otherwise flip it), so the operator sets it BEFORE turning auth off.
 function setUnauthUpdateUI(on) {
   const btn = $('unauth-update-btn'), txt = $('unauth-update-txt');
   if (!btn) return;

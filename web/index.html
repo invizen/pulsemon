@@ -353,17 +353,6 @@
             To re-enable it, create an account on the host:
             <code class="block mt-1.5 px-2 py-1.5 rounded bg-surface-950 border border-surface-800 text-[11px] text-slate-300">pulsemon auth-user add &lt;username&gt;</code>
           </div>
-          <!-- Opt-in: allow the in-dashboard self-update button while auth is
-               off (trusted-LAN installs). No-op while auth is on. -->
-          <div class="mt-2.5 flex items-center justify-between gap-3 border border-surface-800 rounded-lg px-2.5 py-2 bg-surface-900/60">
-            <div>
-              <span class="text-[12px] text-slate-200 font-semibold">Allow self-update without an account</span>
-              <span class="block text-[10px] text-slate-500">Only applies while authentication is off. Any LAN host can trigger an update while enabled.</span>
-            </div>
-            <button type="button" id="unauth-update-btn" data-act="toggleUnauthUpdate" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 text-[11px] font-mono shrink-0 transition">
-              <span id="unauth-update-txt">Off</span>
-            </button>
-          </div>
         </div>
 
         <div id="auth-enabled-box" class="hidden space-y-2.5">
@@ -378,6 +367,21 @@
             </div>
             <button data-act="addAuthUser" class="px-3 py-1 rounded-md bg-surface-800 hover:bg-surface-700 border border-surface-700 text-slate-200 text-[11px] font-mono">
               Add User
+            </button>
+          </div>
+
+          <!-- Opt-in: allow the in-dashboard self-update button while auth is
+               off (trusted-LAN installs). This is a SETUP control — it can only
+               be changed while an account exists (auth on), so set it BEFORE
+               turning authentication off. While auth is off the in-dashboard
+               update button reflects this state and the toggle is hidden. -->
+          <div id="unauth-update-row" class="flex items-center justify-between gap-3 border border-surface-800 rounded-lg px-2.5 py-2 bg-surface-900/60">
+            <div>
+              <span class="text-[12px] text-slate-200 font-semibold">Allow self-update without an account</span>
+              <span class="block text-[10px] text-slate-500">Shows the update button on auth-off installs. Set before turning auth off — any LAN host can trigger an update while enabled.</span>
+            </div>
+            <button type="button" id="unauth-update-btn" data-act="toggleUnauthUpdate" class="px-2.5 py-1 rounded-lg bg-surface-800 border border-surface-700 text-slate-300 text-[11px] font-mono shrink-0 transition">
+              <span id="unauth-update-txt">Off</span>
             </button>
           </div>
 
