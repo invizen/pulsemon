@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -11,7 +10,6 @@ import (
 	"net"
 	"regexp"
 	"runtime/debug"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -178,6 +176,21 @@ type ProbeWorker struct {
 	// its entry anyway.
 	spawnedIDs map[string]bool
 
+	// gens is a per-sensor generation counter that closes the syncSensors
+	// read→apply TOCTOU WITHOUT holding pw.mu across a DB read. Restart and
+	// SetPaused bump it (under pw.mu); syncSensors captures a fingerprint of
+	// the whole map BEFORE its config read, then under the lock compares each
+	// sensor's current generation against the fingerprint: a mismatch means a
+	// config change landed in the gap, so that sensor is skipped (the bumping
+	// op owns the re-sync — Restart signals syncReq, SetPaused already set
+	// isPaused) instead of spawning with a stale config. This replaces the
+	// old under-lock freshStates/freshConfig re-reads, which stalled every
+	// sensorLoop (pw.mu is touched twice per tick) + healthz up to the 15s
+	// busy_timeout (2026-11-05 finding #6). Guarded by mu; a nil map (bare
+	// test workers) is safe — bumpGen lazily creates it, range/read over a
+	// nil map are no-ops.
+	gens map[string]int64
+
 	// syncReq requests an immediate syncSensors pass (buffered 1, so the
 	// non-blocking send from Restart never stalls; a second request while a
 	// pass is in flight is coalesced into the next select iteration and
@@ -283,6 +296,7 @@ func NewProbeWorker(db *store.Store) *ProbeWorker {
 		sensors:         make(map[string]*ProbeState),
 		loops:           make(map[string]context.CancelFunc),
 		spawnedIDs:      make(map[string]bool),
+		gens:            make(map[string]int64),
 		db:              db,
 		syncReq:         make(chan struct{}, 1),
 		statsCache:      make(map[string]*probeSeries),
@@ -352,6 +366,20 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 }
 
 func (pw *ProbeWorker) syncSensors(ctx context.Context) {
+	// Capture the per-sensor generation fingerprint BEFORE any DB read.
+	// Restart/SetPaused bump pw.gens under pw.mu; a fingerprint taken now lets
+	// the under-lock reconcile below detect a config change that landed in the
+	// read→apply gap (the stale-read TOCTOU the old under-lock freshStates /
+	// freshConfig re-reads closed). This pw.mu section does NO DB I/O — copying
+	// a small map is O(seen sensors), negligible — so it can never stall the
+	// fleet the way an under-lock SQLite read could.
+	pw.mu.Lock()
+	genAtRead := make(map[string]int64, len(pw.gens))
+	for id, g := range pw.gens {
+		genAtRead[id] = g
+	}
+	pw.mu.Unlock()
+
 	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
 		FROM sensors WHERE state = 'active'`)
 	if err != nil {
@@ -388,9 +416,9 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 	// Close the cursor NOW (nit 2026-10-24): an exhausted-but-open Rows
 	// still holds its pooled connection until the top-level defer runs at
-	// FUNCTION return — which is after the pw.mu section below. Closing on
-	// the happy path releases the connection before the lock window (the
-	// defer above remains the error-path safety net; Close is idempotent).
+	// FUNCTION return. Closing on the happy path releases the connection
+	// before the lock window (the defer above remains the error-path safety
+	// net; Close is idempotent).
 	rows.Close()
 
 	// ONE batched tag query after the loop — never a per-sensor query inside
@@ -405,69 +433,38 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		configs[i].tags = tagMap[configs[i].id]
 	}
 
-	// Lock-across-I/O bound (review 2026-10-24): the reads below run under
-	// pw.mu deliberately (see the fresh-state comment), and pw.mu is the
-	// hot lock sensorLoops touch twice per iteration BEFORE their ctx.Done
-	// select. A stalled read here therefore stalls every loop (and healthz
-	// ActiveCount) up to the 15s busy_timeout — so NOTHING that can hold
-	// the SQLite write lock for seconds may exist: purgeOld batches
-	// (purgeBatchSize) and both clear-history handlers batch too. Keep any
-	// future bulk write batched or this window reopens.
+	// Reconcile under the lock with NO DB reads (finding #6): the generation
+	// fingerprint above replaces the old under-lock freshStates/freshConfig
+	// re-reads. pw.mu is the hot lock every sensorLoop touches twice per tick
+	// (plus healthz ActiveCount / LastHTTPStatus), so holding it across a
+	// SQLite read stalled the whole fleet up to the 15s busy_timeout. A sensor
+	// whose generation changed since genAtRead is skipped — a Restart/SetPaused
+	// landed in the gap and owns the re-sync (Restart signals syncReq, which
+	// fires a fresh pass with the new config; SetPaused already set isPaused in
+	// place). Every other sensor's config + state are current at read time, so
+	// the pre-read values are applied as-is — no re-read needed.
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
-
-	// Fresh state read UNDER the lock: the config
-	// read above ran before pw.mu and can be arbitrarily stale by apply
-	// time — an operator pause landing in that gap would be clobbered by
-	// the stale 'active' row (the loop would keep probing a DB-paused
-	// sensor). Re-read the state column for exactly this id set, batched,
-	// so the pause sync applies the freshest state the DB has. A missing
-	// id (row deleted in the gap) stays on the pre-lock value; the
-	// vanished-sensor pass below handles it on the next pass.
-	freshState := pw.freshStates(ids)
 
 	seen := make(map[string]bool, len(configs))
 	for _, c := range configs {
 		seen[c.id] = true
-		state := c.state
-		if s, ok := freshState[c.id]; ok {
-			state = s
+		if g, ok := pw.gens[c.id]; ok && g != genAtRead[c.id] {
+			// Stale read: a config change landed in the read→apply gap. Skip —
+			// the bumping op owns the re-sync. Any running loop keeps its
+			// current in-memory state; the fresh pass re-reads and respawns if
+			// needed (a row deleted in the gap is simply absent from the next
+			// pass's configs, so the vanished-sensor pass owns it there).
+			continue
 		}
 		ps, ok := pw.sensors[c.id]
 		if !ok {
-			ps = &ProbeState{id: c.id, isPaused: state == "paused", kick: make(chan struct{}, 1)}
+			ps = &ProbeState{id: c.id, isPaused: c.state == "paused", kick: make(chan struct{}, 1)}
 			pw.sensors[c.id] = ps
 		} else {
-			ps.isPaused = state == "paused" // keep pause in sync with DB (fresh read, F28)
+			ps.isPaused = c.state == "paused" // keep pause in sync with DB
 		}
 		if _, ok := pw.loops[c.id]; !ok {
-			// Re-read the row UNDER the lock (closes the M1b TOCTOU): configs was read from the DB above,
-			// before pw.mu — a PATCH+Restart landing in that gap would
-			// otherwise respawn here with the pre-read cfg, and the next
-			// sync won't respawn (loop exists), so the sensor would run the
-			// stale config until process restart. The under-lock re-read
-			// returns the freshest committed row, so a spawned loop always
-			// carries config that is current at spawn time. A row deleted
-			// in the gap is skipped — the vanished-sensor pass owns deleted
-			// ids. A read ERROR falls back to the pre-read cfg (probe with
-			// slightly stale config rather than drop the loop); the next
-			// pass retries.
-			cfg, found, err := pw.freshConfig(c.id)
-			if err != nil {
-				log.Printf("ProbeWorker: fresh config read for %s failed: %v (using pre-read cfg)", c.id, err)
-				cfg = c.sensorConfig
-			}
-			if !found {
-				// Row vanished between the config read and this
-				// under-lock read. We are inside the NO-LOOP branch, and
-				// the vanished-sensor stop pass only sweeps ids present
-				// in pw.loops — so a ProbeState created earlier in THIS
-				// pass (or left by an earlier one) would be orphaned
-				// forever (nit 2026-10-24). Remove it; a future re-create
-				// of the sensor rebuilds state cleanly on the next pass.
-				delete(pw.sensors, c.id)
-				continue
-			}
 			// First spawn vs RESPAWN (see the spawnedIDs field): a
 			// respawned loop — resume after a >5s pause, maintenance-mode
 			// end, config-edit Restart — caps its first tick at
@@ -483,7 +480,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			pw.wg.Add(1)
 			go func() {
 				defer pw.wg.Done()
-				pw.sensorLoop(lctx, cfg, resumed)
+				pw.sensorLoop(lctx, c.sensorConfig, resumed)
 			}()
 		}
 	}
@@ -499,64 +496,16 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 }
 
-// freshStates re-reads the state column for exactly the given sensor ids,
-// batched in store.InQueryChunk. syncSensors calls it
-// under pw.mu: the pre-lock config read can be arbitrarily stale by apply
-// time (an operator pause landing in the read→apply gap would otherwise be
-// clobbered by the stale row), so the pause sync uses this fresh read. A
-// missing id (row deleted in the gap) is simply absent from the map.
-func (pw *ProbeWorker) freshStates(ids []string) map[string]string {
-	out := make(map[string]string, len(ids))
-	for i := 0; i < len(ids); i += store.InQueryChunk {
-		end := i + store.InQueryChunk
-		if end > len(ids) {
-			end = len(ids)
-		}
-		chunk := ids[i:end]
-		q := make([]string, len(chunk))
-		args := make([]any, len(chunk))
-		for j, id := range chunk {
-			q[j] = "?"
-			args[j] = id
-		}
-		rows, err := pw.db.Query(`SELECT id, state FROM sensors WHERE id IN (`+strings.Join(q, ",")+`)`, args...)
-		if err != nil {
-			log.Printf("ProbeWorker: fresh state read failed: %v", err)
-			continue
-		}
-		for rows.Next() {
-			var id, state string
-			if rows.Scan(&id, &state) == nil {
-				out[id] = state
-			}
-		}
-		rows.Close()
+// bumpGen increments the sensor's generation counter so an in-flight
+// syncSensors pass detects a config change that landed in its read→apply gap
+// (finding #6). Called under pw.mu by Restart and SetPaused. It lazily creates
+// the map so bare test workers (&ProbeWorker{} with a nil gens) don't panic;
+// syncSensors' fingerprint copy and Remove's delete are safe on a nil map too.
+func (pw *ProbeWorker) bumpGen(id string) {
+	if pw.gens == nil {
+		pw.gens = make(map[string]int64)
 	}
-	return out
-}
-
-// freshConfig re-reads one sensor's spawn config from the DB: syncSensors calls it UNDER pw.mu in the respawn
-// branch, where the pre-lock configs slice can be arbitrarily stale (a
-// PATCH+Restart lands in the read→apply gap). Returns the row's CURRENT
-// values plus its tags; found=false when the row was deleted in the gap
-// (the caller skips the spawn — the vanished-sensor pass owns deleted
-// ids). Mirrors syncSensors' pre-lock SELECT column set exactly.
-func (pw *ProbeWorker) freshConfig(id string) (sensorConfig, bool, error) {
-	var c sensorConfig
-	err := pw.db.QueryRow(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after
-		FROM sensors WHERE id = ?`, id).
-		Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter)
-	if err == sql.ErrNoRows {
-		return c, false, nil
-	}
-	if err != nil {
-		return c, false, err
-	}
-	if c.probeType == "" {
-		c.probeType = "icmp" // legacy rows pre-migration
-	}
-	c.tags = pw.db.SensorTagsFor([]string{id})[id]
-	return c, true, nil
+	pw.gens[id]++
 }
 
 // SetPaused flips the in-memory pause flag immediately (API PATCH fast path).
@@ -580,6 +529,7 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 		return
 	}
 	ps.isPaused = paused
+	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read (finding #6)
 	if !paused && ps.kick != nil {
 		// Non-blocking: the buffer absorbs one pending kick; a second
 		// resume while the first is still queued is a no-op (the loop is
@@ -609,6 +559,7 @@ func (pw *ProbeWorker) Restart(id string) {
 		delete(pw.loops, id)
 	}
 	delete(pw.sensors, id)
+	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read (finding #6)
 	pw.mu.Unlock()
 	// Request an IMMEDIATE sync pass: Run's select runs it on the next
 	// iteration and respawns with the post-commit config, so a config
@@ -630,6 +581,7 @@ func (pw *ProbeWorker) Remove(id string) {
 	}
 	delete(pw.sensors, id)
 	delete(pw.spawnedIDs, id) // nil-map delete is a safe no-op
+	delete(pw.gens, id)       // nil-map delete is a safe no-op
 	delete(pw.lastPulse, id)
 	// Drop the cached stats series too, or a deleted sensor's 24h history
 	// stays pinned in memory for the process lifetime. Lock order: pw.mu (held) then pw.statsMu — see ResetStatsFor.
