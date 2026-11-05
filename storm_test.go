@@ -412,6 +412,47 @@ func TestStormFlushUsesInMemoryStatus(t *testing.T) {
 	})
 }
 
+// TestStormSummaryDropsRecoveredBeforePost (finding #10): the flush-time
+// filter (TestStormFlushDropsRecovered) only catches recoveries that happen
+// BEFORE flushStorm runs. This covers the other half of the window: a sensor
+// that the flush filter KEEPT (it was "error" at flush time) but that
+// recovers AFTER the filter, before the async post. The summary bypasses the
+// per-sensor ordering gate, so the recovery alert (ordered on that gate) can
+// land first — then the summary lists the sensor as "error", contradicting
+// the recovery. deliverStormSummary must re-check each entry's status and
+// drop the recovered ones before building the body.
+func TestStormSummaryDropsRecoveredBeforePost(t *testing.T) {
+	withPlainTransport(t, func() {
+		pw, db, getBodies, cleanup := newStormTestWorker(t)
+		defer cleanup()
+		// r10 is in the storm queue (errored at flush time). The flush filter
+		// ran and kept it (it was "error" then). It has since recovered: the
+		// in-memory lastStatus is "up" and the DB row agrees.
+		insertStormSensor(t, db, "r10")
+		if _, err := db.Exec(`UPDATE sensors SET status = 'up' WHERE id = 'r10'`); err != nil {
+			t.Fatalf("set r10 up: %v", err)
+		}
+		pw.mu.Lock()
+		pw.sensors["r10"] = &ProbeState{id: "r10", lastStatus: "up"}
+		pw.mu.Unlock()
+		// Deliver the summary with r10 (now "up") — exactly what flushStorm
+		// hands to launchAlert after its filter keeps r10. deliverStormSummary
+		// is synchronous here (no launchAlert), so the post is done by the
+		// time it returns.
+		pw.deliverStormSummary([]stormEntry{{id: "r10", name: "r10", target: "127.0.0.1", oldState: "up", state: "error"}})
+		bodies := getBodies()
+		for _, b := range bodies {
+			if strings.Contains(b, "r10") {
+				t.Errorf("summary lists recovered sensor r10 (lands after its recovery alert):\n%s", b)
+			}
+		}
+		// A summary whose entries all recovered before the post is not sent.
+		if len(bodies) != 0 {
+			t.Errorf("deliveries = %d, want 0 (every entry recovered before the post)", len(bodies))
+		}
+	})
+}
+
 // --- m10: TLS cert hot reload ---
 
 // writeTestCertPEM writes a fresh self-signed ECDSA pair to (certPath,

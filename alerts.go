@@ -830,6 +830,25 @@ func (pw *ProbeWorker) flushStorm() {
 // global meta-alert — NOT queued on any sensor's alertGate — so it cannot
 // disturb a sensor's per-sensor ordering guarantee (F4).
 func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
+	// Re-check each entry's status immediately before building the summary
+	// (finding #10): flushStorm's filter ran earlier, and this delivery is
+	// async (launchAlert) — a sensor that recovered in the gap would otherwise
+	// be listed as "error" in a summary that lands AFTER its recovery alert
+	// (which is ordered on the per-sensor gate the summary bypasses). The
+	// re-check narrows the race to the instant before the post. currentStatus
+	// is in-memory (lastStatus) for an actively-probed sensor, so this is
+	// cheap — no per-entry SQLite round-trip on the hot path.
+	still := make([]stormEntry, 0, len(entries))
+	for _, e := range entries {
+		if s, err := pw.currentStatus(e.id); err == nil && s == "up" {
+			continue
+		}
+		still = append(still, e)
+	}
+	if len(still) == 0 {
+		return
+	}
+	entries = still
 	dests, ok := pw.resolveDestinations()
 	if !ok {
 		log.Printf("alert: storm summary (%d sensors) not delivered — provider list unreadable", len(entries))
