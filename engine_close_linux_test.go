@@ -7,76 +7,24 @@ import (
 	"net"
 	"os"
 	"runtime"
-	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
-
-// TestEngineReaderRetriesEINTR is the deterministic regression test for the
-// v0.1.21 production incident: a SIGURG (the runtime's thread-wake signal)
-// interrupts the reader's poll() with EINTR, and unix.Poll — unlike
-// syscall.Recvfrom — surfaces EINTR instead of retrying. If the reader treats
-// EINTR as fatal, one signal ends the goroutine and every later probe is a
-// false loss, silently. This test injects EINTR directly (no signal
-// threading luck): the reader must survive and still be alive.
-func TestEngineReaderRetriesEINTR(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("datagram ICMP + poll EINTR behavior is Linux-specific here")
-	}
-	e, err := NewEngine()
-	if err != nil {
-		t.Skipf("ICMP engine unavailable on this host: %v", err)
-	}
-	defer e.Close()
-	if !e.isDgram {
-		t.Skip("datagram transport unavailable; EINTR path is datagram-only")
-	}
-
-	// Inject EINTR on the first 3 poll calls, then real behavior. The poll
-	// seam lives on the Linux datagram driver (ping_linux.go), not the Engine.
-	var calls int32
-	e.dgram.(*dgramTransport).pollFn = func(fds []unix.PollFd, timeout int) (int, error) {
-		if atomic.AddInt32(&calls, 1) <= 3 {
-			return 0, unix.EINTR
-		}
-		return unix.Poll(fds, timeout)
-	}
-
-	e.run()
-	defer e.Close()
-
-	// The reader must survive the injected EINTRs and still be running.
-	deadline := time.Now().Add(3 * time.Second)
-	for atomic.LoadInt32(&e.readerAlive) == 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if atomic.LoadInt32(&e.readerAlive) != 1 {
-		t.Fatal("reader exited after injected EINTR — EINTR must be retried, not fatal (v0.1.21 regression)")
-	}
-	if got := atomic.LoadInt32(&calls); got < 3 {
-		t.Fatalf("poll was only called %d times — reader exited before consuming the injected EINTRs", got)
-	}
-
-	// And it must still deliver real replies after the interruptions.
-	if res := e.Ping(context.Background(), net.ParseIP("127.0.0.1"), 500*time.Millisecond); res.Lost {
-		t.Fatal("reader not delivering after EINTR interruptions")
-	}
-}
 
 // TestEngineReaderSurvivesSignalInterrupt reproduces a real production
 // regression: the datagram reader must NOT die when the process is hit by a
-// signal. The Go runtime wakes parked threads with SIGURG, and unix.Poll
-// (unlike syscall.Recvfrom, which retries internally) surfaces EINTR to us.
-// If the reader treated EINTR as fatal, one SIGURG during its poll would end
-// the goroutine and every later probe would be a false loss — with no log
-// line, so it looks like "all sensors dropped".
+// signal. The Go runtime wakes parked threads with SIGURG, and the netpoller
+// (which drives the x/net/icmp ReadFrom) handles EINTR internally. If the
+// reader treated EINTR as fatal, one SIGURG during its read would end the
+// goroutine and every later probe would be a false loss — with no log
+// line, so it looks as "all sensors dropped".
 //
 // We storm the process with self-SIGURG while pinging loopback; the reader
-// must keep delivering. On the old code the reader dies mid-storm and the
-// final pings are lost.
+// must keep delivering. On the old hand-rolled code (unix.Poll + EINTR
+// retry), the reader survived only because of the explicit EINTR retry.
+// With the netpoller, EINTR is handled internally, so the reader survives
+// without any application-level retry.
 func TestEngineReaderSurvivesSignalInterrupt(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("SIGURG/EINTR behavior is Linux-specific here")

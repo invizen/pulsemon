@@ -166,15 +166,16 @@ type closeFunc func() error
 
 // dgramState is the platform-specific unprivileged-datagram transport driver:
 // the socket handle plus the reply-reader it runs. Implemented in
-// ping_linux.go (non-blocking fd + Poll loop) and ping_windows.go (blocking
-// Recvfrom). The portable Engine drives it through this interface so the
-// platform socket details never leak into the shared code.
+// ping_linux.go (x/net/icmp netpoller-driven ReadFrom) and ping_windows.go
+// (blocking Recvfrom). The portable Engine drives it through this interface
+// so the platform socket details never leak into the shared code.
 type dgramState interface {
 	// run starts the reader goroutine (the Engine tracks it via its wg).
 	run(e *Engine)
 	// stop interrupts the reader's blocking read so it can exit. Engine.Close
-	// calls this BEFORE wg.Wait(). Linux: no-op (the Poll loop exits on the
-	// done channel). Windows: closes the handle, which unblocks Recvfrom.
+	// calls this BEFORE wg.Wait(). Linux: closes the conn (netpoller wakes
+	// the blocked ReadFrom with net.ErrClosed). Windows: closes the handle,
+	// which unblocks Recvfrom.
 	stop()
 }
 
@@ -219,13 +220,13 @@ func (t *rawTransport) close() error { return t.conn.Close() }
 // 2^17, the second clears the remaining carry, and the uint16() on return
 // drops any residual carry bit.
 //
-// Why hand-rolled instead of x/net/icmp: x/net/icmp's checksum is UNEXPORTED
-// (message.go `func checksum`, no public Checksum symbol), and its only
-// public entry point is Message.Marshal(), which cannot write to the
-// SOCK_DGRAM/IPPROTO_ICMP socket the unprivileged-datagram transport uses
-// (that path hand-builds the raw packet at the byte level). The raw
-// transport (rawTransport.send) DOES use msg.Marshal(nil) and inherits
-// x/net/icmp's checksum — this function exists only for the datagram path.
+// Why hand-rolled: x/net/icmp's checksum is UNEXPORTED (message.go
+// `func checksum`, no public Checksum symbol). The Windows datagram
+// transport (ping_windows.go) hand-builds the raw packet at the byte level
+// and needs this. The Linux datagram transport now uses x/net/icmp
+// (Message.Marshal, which has its own checksum), and the raw transport
+// (rawTransport.send) also uses Message.Marshal — so this function exists
+// only for the Windows datagram path.
 //
 // NOTE: the previous odd-length handling was already correct — this is the
 // canonical form, not a bug fix. TestIcmpChecksumMatchesReference locks it
@@ -305,17 +306,16 @@ func (e *Engine) Mode() string { return e.mode }
 // interrupts the reader's blocking read, then blocks until the reader
 // goroutine has actually stopped. The interruption is transport-specific:
 //
-//   - datagram: stop() — a no-op on Linux (the Poll loop exits on done), but
-//     a handle-close on Windows (which unblocks the blocking Recvfrom). Both
-//     happen before wg.Wait(). The socket is then released after the wait
-//     (Linux dgram: closeFn closes the fd, keeping it alive for any in-flight
-//     Sendto until the reader is confirmed stopped; Windows dgram: no-op, the
-//     handle is already closed by stop()).
-//   - raw: ReadFrom blocks indefinitely and is NOT woken by the done channel
-//     alone — closing the conn is what makes it return net.ErrClosed. The conn
-//     must be closed BEFORE the wait for this transport (closing AFTER
-//     wg.Wait() would deadlock: wait for the reader ⇄ reader waits for the
-//     close).
+//   - datagram: stop() — closes the conn (Linux: netpoller wakes the
+//     blocked ReadFrom with net.ErrClosed) or the handle (Windows:
+//     unblocks the blocking Recvfrom). Both happen before wg.Wait().
+//     The post-wait closeFn is a no-op (the conn/handle is already
+//     closed by stop()).
+//   - raw: ReadFrom blocks indefinitely and is NOT woken by the done
+//     channel alone — closing the conn is what makes it return
+//     net.ErrClosed. The conn must be closed BEFORE the wait for this
+//     transport (closing AFTER wg.Wait() would deadlock: wait for the
+//     reader ⇄ reader waits for the close).
 //
 // wg.Wait() guarantees no stale reader is left delivering into the
 // package-global pending map. Safe to call when run() was never called (no
