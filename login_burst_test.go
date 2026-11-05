@@ -22,6 +22,12 @@ func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 	if err := srv.auth.AddUser("alice", "correct-horse-battery"); err != nil {
 		t.Fatal(err)
 	}
+	// A second user for the post-burst assertions: the per-username lockout
+	// (finding #11) trips for "alice" after the burst, so the per-IP
+	// isolation checks must use a different account.
+	if err := srv.auth.AddUser("bob", "correct-horse-battery"); err != nil {
+		t.Fatal(err)
+	}
 
 	const N = 60
 	var wg sync.WaitGroup
@@ -70,22 +76,26 @@ func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 		t.Errorf("post-burst sequential attempt from the burst IP: %d, want 429 (locked out)", rr.Code)
 	}
 
-	// A correct password from a DIFFERENT ip still logs in.
-	req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"alice","password":"correct-horse-battery"}`))
+	// A correct password from a DIFFERENT ip for a DIFFERENT user still
+	// logs in. (Uses "bob" to isolate the per-IP behavior: "alice" is
+	// per-username-locked after the burst, finding #11.)
+	req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"bob","password":"correct-horse-battery"}`))
 	req.RemoteAddr = "10.8.8.8:5555"
 	rr = httptest.NewRecorder()
 	srv.handleAuthLogin(rr, req)
 	if rr.Code != http.StatusOK {
-		t.Errorf("correct login from a fresh ip: %d, want 200", rr.Code)
+		t.Errorf("correct login from a fresh ip (different user): %d, want 200", rr.Code)
 	}
 
 	// A correct login clears the counter for its OWN ip: loginFailMax-1
 	// fails (under the limit), then a success, then a FULL fresh budget of
 	// loginFailMax more fails — if the success had not cleared the counter,
-	// the lockout would have arrived during the second batch.
+	// the lockout would have arrived during the second batch. Uses "bob"
+	// so the per-username lockout for "alice" (from the burst) doesn't
+	// interfere.
 	ip := "10.7.7.7:6666"
 	for i := 0; i < loginFailMax-1; i++ {
-		req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"alice","password":"bad-%d"}`, i)))
+		req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"bob","password":"bad-%d"}`, i)))
 		req.RemoteAddr = ip
 		rr = httptest.NewRecorder()
 		srv.handleAuthLogin(rr, req)
@@ -93,7 +103,7 @@ func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 			t.Fatalf("pre-success fail %d: %d, want 401", i, rr.Code)
 		}
 	}
-	req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"alice","password":"correct-horse-battery"}`))
+	req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(`{"username":"bob","password":"correct-horse-battery"}`))
 	req.RemoteAddr = ip
 	rr = httptest.NewRecorder()
 	srv.handleAuthLogin(rr, req)
@@ -101,7 +111,7 @@ func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 		t.Fatalf("success after %d fails: %d, want 200", loginFailMax-1, rr.Code)
 	}
 	for i := 0; i < loginFailMax; i++ {
-		req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"alice","password":"bad2-%d"}`, i)))
+		req = httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(fmt.Sprintf(`{"username":"bob","password":"bad2-%d"}`, i)))
 		req.RemoteAddr = ip
 		rr = httptest.NewRecorder()
 		srv.handleAuthLogin(rr, req)

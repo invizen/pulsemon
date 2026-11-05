@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -127,6 +128,19 @@ var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
 // weaker KDF than real hashes — a timing oracle.
 var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost))
 
+// bcryptSem bounds the number of CONCURRENT bcrypt KDFs (finding #11). The
+// per-IP throttle caps a single source at ~loginFailMax in-flight KDFs, but a
+// multi-IP burst (an IPv6 /48 is 65k distinct /64 buckets) can drive
+// NumCPU-or-more parallel CompareHashAndPassword calls and saturate every
+// core — the KDF is cost 10, so a handful of them already pin a small box.
+// A BLOCKING semaphore (capacity runtime.NumCPU) QUEUES the excess rather
+// than rejecting it: under attack the operator's login waits for a free core
+// instead of failing, which is the exact regression the non-blocking
+// (select/default → 429) variant would cause (see the handleAuthLogin
+// security note). Both the real-hash and dummy-hash paths go through it so
+// the unknown-user equalizer keeps its constant time AND its concurrency cap.
+var bcryptSem = make(chan struct{}, runtime.NumCPU())
+
 type authSession struct {
 	user   string
 	expiry time.Time
@@ -215,6 +229,17 @@ type AuthState struct {
 		sync.Mutex
 		fails   map[string][]time.Time
 		lockout map[string]time.Time
+		// userFails / userLock are a PER-USERNAME layer on top of the per-IP
+		// maps (finding #11): the per-IP throttle is keyed by source address,
+		// so a multi-IP attacker (an IPv6 /48 is 65k distinct /64 buckets)
+		// hammering ONE account never exhausts any single IP's budget. The
+		// per-username counter accumulates failures for that account across
+		// ALL sources and locks the account out at the same loginFailMax /
+		// loginFailWindow / loginLockout cadence. Only a failed credential
+		// check increments it (a success clears it via clearUserFail), so an
+		// operator who typos once from two devices doesn't self-lock.
+		userFails map[string][]time.Time
+		userLock  map[string]time.Time
 		// nextSweep rate-limits the O(n) map GC (review 2026-10-24 nit):
 		// once a multi-IP spray pushes the map past the threshold, every
 		// entry is in-window so the sweep deletes nothing — running it per
@@ -645,9 +670,16 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 		// two paths ALWAYS run at the same KDF cost and can never diverge into
 		// a timing oracle if bcryptCost is ever raised. It is precomputed (see
 		// dummyBcryptHash) so a failed lookup doesn't re-format the string.
+		// Both paths go through bcryptSem (finding #11): the dummy path is the
+		// one an unknown-username spray drives, so it needs the concurrency cap
+		// too — capping only the real-hash path would leave the spray unbounded.
+		bcryptSem <- struct{}{}
 		bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
+		<-bcryptSem
 		return "", false
 	}
+	bcryptSem <- struct{}{}
+	defer func() { <-bcryptSem }()
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return "", false
 	}
@@ -922,6 +954,12 @@ func (a *AuthState) ensureThrottleMaps() {
 	if a.loginThrottle.lockout == nil {
 		a.loginThrottle.lockout = map[string]time.Time{}
 	}
+	if a.loginThrottle.userFails == nil {
+		a.loginThrottle.userFails = map[string][]time.Time{}
+	}
+	if a.loginThrottle.userLock == nil {
+		a.loginThrottle.userLock = map[string]time.Time{}
+	}
 }
 
 // Throttle GC tuning (review 2026-10-24 nit). Vars, not consts, so tests
@@ -968,6 +1006,11 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		if len(a.loginThrottle.fails) > throttleHardCap {
 			a.loginThrottle.fails = map[string][]time.Time{}
 			a.loginThrottle.lockout = map[string]time.Time{}
+			// The per-username maps share the same fail-open bound: a wide
+			// spray that grows the per-IP map past the cap also resets the
+			// account budgets, so the wipe is all-or-nothing (finding #11).
+			a.loginThrottle.userFails = map[string][]time.Time{}
+			a.loginThrottle.userLock = map[string]time.Time{}
 		}
 	}
 	if until, ok := a.loginThrottle.lockout[ip]; ok {
@@ -1003,6 +1046,61 @@ func (a *AuthState) loginSuccess(ip string) {
 	a.ensureThrottleMaps()
 	delete(a.loginThrottle.fails, ip)
 	delete(a.loginThrottle.lockout, ip)
+}
+
+// checkUserLock reports whether username is locked out by the per-username
+// fail counter (finding #11) — a multi-IP attacker that has exhausted the
+// account's budget. Returns (false, how-long-until-the-lockout-lifts) when
+// locked; the caller answers 429 + Retry-After. An elapsed lockout is
+// cleared here so the next attempt starts fresh.
+func (a *AuthState) checkUserLock(username string) (bool, time.Duration) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.ensureThrottleMaps()
+	now := time.Now()
+	if until, ok := a.loginThrottle.userLock[username]; ok {
+		if now.Before(until) {
+			return false, until.Sub(now)
+		}
+		// Lockout elapsed: clear it and the stale failures.
+		delete(a.loginThrottle.userLock, username)
+		delete(a.loginThrottle.userFails, username)
+	}
+	return true, 0
+}
+
+// recordUserFail counts ONE failed credential check against username (across
+// all source IPs — the per-username layer the per-IP throttle can't see) and
+// locks the account out when the in-window count reaches loginFailMax. Called
+// ONLY on a failed check, after the KDF ran; a success clears it via
+// clearUserFail, so typos that eventually succeed don't accumulate.
+func (a *AuthState) recordUserFail(username string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.ensureThrottleMaps()
+	now := time.Now()
+	cutoff := now.Add(-loginFailWindow)
+	fails := a.loginThrottle.userFails[username]
+	kept := fails[:0]
+	for _, t := range fails {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	a.loginThrottle.userFails[username] = kept
+	if len(kept) >= loginFailMax {
+		a.loginThrottle.userLock[username] = now.Add(loginLockout)
+	}
+}
+
+// clearUserFail clears the per-username fail accounting for username (a
+// successful login resets the account's budget).
+func (a *AuthState) clearUserFail(username string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	delete(a.loginThrottle.userFails, username)
+	delete(a.loginThrottle.userLock, username)
 }
 
 // refundAttempt releases ONE counted admission (the timestamp
@@ -1065,6 +1163,25 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 		}
 		delete(a.loginThrottle.fails, ip)
 		delete(a.loginThrottle.lockout, ip)
+	}
+	// Per-username layer (finding #11): same drop rule — no in-window failure
+	// and no active account lockout.
+	for u, ts := range a.loginThrottle.userFails {
+		recent := false
+		for _, t := range ts {
+			if t.After(cutoff) {
+				recent = true
+				break
+			}
+		}
+		if recent {
+			continue
+		}
+		if until, ok := a.loginThrottle.userLock[u]; ok && now.Before(until) {
+			continue // active lockout: keep
+		}
+		delete(a.loginThrottle.userFails, u)
+		delete(a.loginThrottle.userLock, u)
 	}
 }
 
@@ -1266,28 +1383,30 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuthLogin is the only unauthenticated credential-checking endpoint,
-// so its DoS surface is the per-IP throttle, not a global concurrency cap.
+// so its DoS surface is the per-IP throttle PLUS the per-username account
+// budget (finding #11), not a global concurrency cap.
 //
-// Security-review note (deliberate, do NOT "fix" with an in-flight bcrypt
-// semaphore): the single-attacker vector is already closed — beginAttempt
+// Security-review note (deliberate, do NOT "fix" with a NON-BLOCKING in-flight
+// bcrypt semaphore): the single-attacker vector is already closed — beginAttempt
 // counts the attempt inside the throttle lock BEFORE any bcrypt runs, so at
 // most loginFailMax concurrent attempts can reach the KDF (7 fails/60s -> 5
 // min lockout, plus a constant 200ms delay on every 401 capping ~5
 // guesses/s/IP), and ClientIP keys the throttle to the TCP peer (a spoofed
 // X-Forwarded-For from an untrusted peer is ignored), so the counter cannot
-// be rotated to dodge the lockout. The only residual is a MULTI-source-IP
-// botnet — the classic per-IP-limit bypass — which is OUT of this tool's
-// threat model (single-operator LAN dashboard, not an anonymous internet
-// endpoint; see the file header). Bounding bcrypt concurrency in-app does not
-// stop that vector, and a non-blocking semaphore (select/default -> reject)
-// would actively REGRESS legitimate logins: under attack the 2 slots stay
-// busy with the attacker's requests and every real operator login hits the
-// default branch and fails at the exact moment they most need to get in to
-// check the degraded dashboard. If this ever becomes internet-facing, the
-// right hardening is a GLOBAL in-flight cap that QUEUES (blocking select with
-// a timeout) rather than fails, or a connection cap / fail2ban at the reverse
-// proxy (which PULSEMON_TRUSTED_PROXIES already anticipates) — not an in-app
-// semaphore that locks the operator out.
+// be rotated to dodge the lockout. The residual is a MULTI-source-IP botnet —
+// the classic per-IP-limit bypass — which is OUT of this tool's threat model
+// (single-operator LAN dashboard, not an anonymous internet endpoint; see the
+// file header). For the internet-facing case, finding #11 adds the two
+// hardenings that note below calls for: (1) a BLOCKING bcrypt semaphore
+// (bcryptSem, capacity runtime.NumCPU) that QUEUES excess KDFs rather than
+// rejecting them — the operator's login waits for a free core instead of
+// failing, which is the exact regression a non-blocking (select/default ->
+// 429) variant would cause — and (2) a per-USERNAME fail counter
+// (checkUserLock/recordUserFail) that accumulates failures for one account
+// across ALL source IPs, so a /48-spraying attacker can't dodge the per-IP
+// budget by rotating addresses. A connection cap / fail2ban at the reverse
+// proxy (PULSEMON_TRUSTED_PROXIES already anticipates) remains the outermost
+// layer.
 func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1338,8 +1457,28 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Per-username lockout (finding #11): the per-IP throttle above can't see
+	// a multi-IP attacker hammering one account, so this second gate checks
+	// the account's own failure budget. It runs AFTER the per-IP gate so a
+	// single locked IP gets its 429 first (no extra KDF, no account counter
+	// touched). A locked account gets a 429 too — the KDF is skipped, so the
+	// account counter is not incremented by the rejection.
+	userKey := strings.ToLower(req.Username)
+	if ok, wait := s.auth.checkUserLock(userKey); !ok {
+		secs := int((wait + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		respondWithError(w, http.StatusTooManyRequests, "too many failed login attempts — try again in a few minutes")
+		return
+	}
+
 	tok, ok := s.auth.CreateSession(req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
+		// Count the failure against the account (across all IPs) — the
+		// per-username layer the per-IP budget can't see (finding #11).
+		s.auth.recordUserFail(userKey)
 		// Constant-time-ish delay on rejection: equalizes response time across
 		// the unknown-user / wrong-password paths (closes the timing oracle)
 		// and caps an online attacker at ~5 guesses/second per IP. The
@@ -1349,6 +1488,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.auth.loginSuccess(key)
+	s.auth.clearUserFail(userKey) // success resets the account's budget
 	s.setAuthCookie(w, r, tok, false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
 }

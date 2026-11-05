@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -867,6 +868,12 @@ func TestLoginThrottleLockout(t *testing.T) {
 	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
+	// A second user for the "unaffected IP" assertions: the per-username
+	// lockout (finding #11) trips for "admin" after loginFailMax failures,
+	// so the per-IP isolation check must use a different account.
+	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
 
 	// Fill the failure window from a single simulated IP.
 	const attackerIP = "203.0.113.7"
@@ -897,15 +904,17 @@ func TestLoginThrottleLockout(t *testing.T) {
 		t.Fatal("429 must carry a Retry-After header")
 	}
 
-	// A DIFFERENT client IP is unaffected by the attacker's lockout.
-	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "198.51.100.1")
+	// A DIFFERENT client IP is unaffected by the attacker's per-IP lockout.
+	// (Uses "other" to isolate the per-IP behavior: "admin" is also
+	// per-username-locked after loginFailMax failures, finding #11.)
+	resp = loginPost(t, httpSrv.URL, `{"username":"other","password":"secretpw"}`, "198.51.100.1")
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("unaffected IP: got %d, want 200", resp.StatusCode)
 	}
 
 	// A direct-IP path (no XFF) also works — the lockout is per-IP.
-	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "")
+	resp = loginPost(t, httpSrv.URL, `{"username":"other","password":"secretpw"}`, "")
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("direct-IP login: got %d, want 200", resp.StatusCode)
@@ -1130,6 +1139,206 @@ func TestSweepThrottleDropsStaleEntries(t *testing.T) {
 	}
 	if _, ok := a.loginThrottle.lockout["locked"]; !ok {
 		t.Error("active lockout removed (should be kept)")
+	}
+}
+
+// TestLoginThrottlePerUsername drives the real server: failures spread
+// across multiple IPs for the same username accumulate in the per-username
+// counter (finding #11), so a multi-IP attacker (an IPv6 /48 is 65k distinct
+// /64 buckets) hammering one account is locked out even though no single IP
+// exhausted its per-IP budget. A different username is unaffected.
+func TestLoginThrottlePerUsername(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Spread loginFailMax (7) failures across 3 IPs: no single IP reaches
+	// the per-IP lockout threshold, but the per-username counter does.
+	// Private IPs are bucketed per host (/32), so each IP is its own
+	// per-IP budget — the per-IP throttle never trips.
+	// IP 1: 3, IP 2: 3, IP 3: 1 = 7 total for "admin".
+	ips := []string{"10.1.1.10", "10.1.1.11", "10.1.1.12"}
+	counts := []int{3, 3, 1}
+	for i, ip := range ips {
+		for j := 0; j < counts[i]; j++ {
+			resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, ip)
+			resp.Body.Close()
+			if resp.StatusCode != 401 {
+				t.Fatalf("IP %s attempt %d: got %d, want 401 (before account lockout)", ip, j, resp.StatusCode)
+			}
+		}
+	}
+
+	// The per-username counter has 7 failures → the account is locked.
+	// A FRESH IP with the CORRECT password must get 429 (per-username lockout).
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "10.1.1.20")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("fresh IP, correct pw, locked account: got %d, want 429 (body %s)", resp.StatusCode, body)
+	}
+	if ra := resp.Header.Get("Retry-After"); ra == "" {
+		t.Fatal("429 must carry a Retry-After header")
+	}
+
+	// A DIFFERENT username is unaffected by admin's account lockout.
+	resp = loginPost(t, httpSrv.URL, `{"username":"otheruser","password":"whatever"}`, "10.1.1.21")
+	resp.Body.Close()
+	if resp.StatusCode != 401 {
+		t.Fatalf("different username: got %d, want 401 (not 429 — the lockout is per-username)", resp.StatusCode)
+	}
+}
+
+// TestLoginThrottleHardCapWipesUserMaps verifies the all-or-nothing hard-cap
+// wipe (finding #11): when the per-IP map exceeds throttleHardCap, the
+// per-username maps (userFails, userLock) are reset alongside the per-IP
+// maps — the fail-open bound applies to both layers, not just the per-IP one.
+func TestLoginThrottleHardCapWipesUserMaps(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	// Lower the thresholds so we don't need 131k entries.
+	origThreshold := throttleSweepThreshold
+	origHardCap := throttleHardCap
+	throttleSweepThreshold = 2
+	throttleHardCap = 3
+	t.Cleanup(func() {
+		throttleSweepThreshold = origThreshold
+		throttleHardCap = origHardCap
+	})
+
+	now := time.Now()
+	// Seed the per-IP map past the hard cap (5 > 3).
+	for i := 0; i < 5; i++ {
+		a.loginThrottle.fails[fmt.Sprintf("ip%d", i)] = []time.Time{now.Add(-time.Second)}
+	}
+	// Seed the per-username maps with active state.
+	a.loginThrottle.userFails["admin"] = []time.Time{now.Add(-time.Second)}
+	a.loginThrottle.userLock["admin"] = now.Add(loginLockout)
+
+	// Force the sweep to run on the next beginAttempt.
+	a.loginThrottle.nextSweep = time.Time{}
+
+	// beginAttempt triggers the sweep + hard-cap wipe, then counts the new IP.
+	ok, _ := a.beginAttempt("newip")
+	if !ok {
+		t.Fatal("beginAttempt rejected a fresh IP after the hard-cap wipe")
+	}
+
+	// All maps must be reset; only the new IP's entry survives.
+	if len(a.loginThrottle.fails) != 1 {
+		t.Fatalf("per-IP map size = %d, want 1 (only newip)", len(a.loginThrottle.fails))
+	}
+	if _, ok := a.loginThrottle.fails["newip"]; !ok {
+		t.Fatal("newip missing from per-IP map after wipe")
+	}
+	if len(a.loginThrottle.userFails) != 0 {
+		t.Fatalf("userFails size = %d, want 0 (hard-cap wipe must reset per-username fails)", len(a.loginThrottle.userFails))
+	}
+	if len(a.loginThrottle.userLock) != 0 {
+		t.Fatalf("userLock size = %d, want 0 (hard-cap wipe must reset per-username lockouts)", len(a.loginThrottle.userLock))
+	}
+}
+
+// TestLoginSuccessClearsUserFail verifies that a successful login clears the
+// per-username failure counter (finding #11): typos that eventually succeed
+// don't accumulate toward the account lockout.
+func TestLoginSuccessClearsUserFail(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	// loginFailMax-1 failures from distinct IPs (one short of the
+	// per-username lockout; each IP is well under its per-IP budget).
+	for i := 0; i < loginFailMax-1; i++ {
+		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrong"}`, fmt.Sprintf("203.0.113.%d", 30+i))
+		resp.Body.Close()
+		if resp.StatusCode != 401 {
+			t.Fatalf("pre-success failure %d: got %d, want 401", i, resp.StatusCode)
+		}
+	}
+
+	// Success: clears the per-username counter.
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "203.0.113.40")
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("success after failures: got %d, want 200", resp.StatusCode)
+	}
+
+	// The counter is reset: the NEXT loginFailMax-1 failures (from fresh IPs)
+	// should all be plain 401s, not a 429 — proving the per-username counter
+	// restarted from zero.
+	for i := 0; i < loginFailMax-1; i++ {
+		r2 := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrong"}`, fmt.Sprintf("203.0.113.%d", 50+i))
+		r2.Body.Close()
+		if r2.StatusCode != 401 {
+			t.Fatalf("post-reset failure %d: got %d, want 401 (counter must have restarted)", i, r2.StatusCode)
+		}
+	}
+}
+
+// TestCheckUserLockClearsElapsed verifies that checkUserLock clears an
+// elapsed per-username lockout (finding #11): after the lockout duration
+// passes, the next check returns "not locked" and removes the stale entries.
+func TestCheckUserLockClearsElapsed(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	// Set an expired lockout (1 minute ago) with stale failures.
+	a.loginThrottle.userLock["admin"] = time.Now().Add(-time.Minute)
+	a.loginThrottle.userFails["admin"] = []time.Time{time.Now().Add(-2 * time.Minute)}
+
+	// checkUserLock should return "not locked" and clear the entries.
+	ok, _ := a.checkUserLock("admin")
+	if !ok {
+		t.Fatal("checkUserLock returned locked for an elapsed lockout")
+	}
+	if _, exists := a.loginThrottle.userLock["admin"]; exists {
+		t.Fatal("elapsed userLock entry not cleared by checkUserLock")
+	}
+	if _, exists := a.loginThrottle.userFails["admin"]; exists {
+		t.Fatal("elapsed userFails entry not cleared by checkUserLock")
+	}
+}
+
+// TestCheckUserLockActive verifies that checkUserLock returns "locked" with
+// the remaining duration when the per-username lockout is active (finding #11).
+func TestCheckUserLockActive(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	// Set an active lockout (2 minutes from now).
+	a.loginThrottle.userLock["admin"] = time.Now().Add(2 * time.Minute)
+
+	ok, remaining := a.checkUserLock("admin")
+	if ok {
+		t.Fatal("checkUserLock returned not-locked for an active lockout")
+	}
+	if remaining < time.Minute || remaining > 2*time.Minute {
+		t.Fatalf("remaining = %v, want between 1m and 2m", remaining)
+	}
+}
+
+// TestBcryptSemCapacity pins the bcrypt semaphore capacity to runtime.NumCPU()
+// (finding #11): the concurrency cap must match the box's core count so a
+// multi-IP burst can't drive more parallel KDFs than there are cores. A
+// blocking semaphore (not select/default) queues the excess rather than
+// rejecting it — under attack the operator's login waits, it doesn't fail.
+func TestBcryptSemCapacity(t *testing.T) {
+	if cap(bcryptSem) != runtime.NumCPU() {
+		t.Fatalf("bcryptSem capacity = %d, want %d (runtime.NumCPU)", cap(bcryptSem), runtime.NumCPU())
 	}
 }
 
@@ -1417,6 +1626,9 @@ func TestLoginThrottleIPv6Slash64(t *testing.T) {
 	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
+	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < loginFailMax; i++ {
 		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, fmt.Sprintf("2001:db8:1:2::%x", i+1))
 		resp.Body.Close()
@@ -1429,8 +1641,9 @@ func TestLoginThrottleIPv6Slash64(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("fresh address in locked /64: got %d, want 429", resp.StatusCode)
 	}
-	// A different /64 is unaffected.
-	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "2001:db8:1:3::1")
+	// A different /64 is unaffected by the per-IP lockout. (Uses "other"
+	// to isolate the per-IP behavior: "admin" is per-username-locked.)
+	resp = loginPost(t, httpSrv.URL, `{"username":"other","password":"secretpw"}`, "2001:db8:1:3::1")
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("other /64: got %d, want 200", resp.StatusCode)
@@ -1452,6 +1665,9 @@ func TestLoginThrottleLANPerHost(t *testing.T) {
 	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
+	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; i < loginFailMax; i++ {
 		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, "192.168.1.7")
 		resp.Body.Close()
@@ -1465,8 +1681,9 @@ func TestLoginThrottleLANPerHost(t *testing.T) {
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("locked host: got %d, want 429", resp.StatusCode)
 	}
-	// ...while a DIFFERENT host on the same /24 is unaffected.
-	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "192.168.1.8")
+	// ...while a DIFFERENT host on the same /24 is unaffected. (Uses
+	// "other" to isolate the per-IP behavior: "admin" is per-username-locked.)
+	resp = loginPost(t, httpSrv.URL, `{"username":"other","password":"secretpw"}`, "192.168.1.8")
 	resp.Body.Close()
 	if resp.StatusCode != 200 {
 		t.Fatalf("other LAN host: got %d, want 200", resp.StatusCode)
