@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -991,22 +992,32 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 		return
 	}
 
-	if _, err := pw.db.Exec("UPDATE sensors SET status = ? WHERE id = ?", newStatus, c.id); err != nil {
-		// lastStatus is NOT advanced, so the next tick sees the same
-		// transition and retries the write instead of believing it is done.
-		log.Printf("ProbeWorker: failed to update status for %s: %v", c.id, err)
-		return
-	}
-	pw.rememberStatus(c.id, newStatus) // only once the new status is durable
-
+	// The status write and the event row commit in ONE transaction (finding
+	// #7): if the events INSERT failed after the UPDATE succeeded, the
+	// transition was lost forever — rememberStatus had already advanced
+	// lastStatus, so the next tick saw oldStatus == newStatus and never wrote
+	// the event. A single tx makes the two atomic: a failed INSERT rolls back
+	// the UPDATE too, lastStatus is not advanced, and the next tick retries
+	// the whole transition.
 	note := fmt.Sprintf("%s -> %s", oldStatus, newStatus)
 	if newStatus == "up" {
 		note = "recovered" // first transition back to up after warning/error
 	}
-	if _, err := pw.db.Exec("INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES (?, ?, ?, ?, ?)",
-		c.id, store.Now(), oldStatus, newStatus, note); err != nil {
-		log.Printf("ProbeWorker: failed to record event for %s: %v", c.id, err)
+	err = pw.db.ImmediateTx(ctx, func(conn *sql.Conn) error {
+		if _, err := conn.ExecContext(ctx, "UPDATE sensors SET status = ? WHERE id = ?", newStatus, c.id); err != nil {
+			return err
+		}
+		_, err := conn.ExecContext(ctx, "INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES (?, ?, ?, ?, ?)",
+			c.id, store.Now(), oldStatus, newStatus, note)
+		return err
+	})
+	if err != nil {
+		// lastStatus is NOT advanced, so the next tick sees the same
+		// transition and retries the write + event instead of believing it is done.
+		log.Printf("ProbeWorker: failed to record status transition for %s: %v", c.id, err)
+		return
 	}
+	pw.rememberStatus(c.id, newStatus) // only once the new status + event are durable
 
 	pw.setAlertState(c.id, newStatus, time.Now().UTC())
 	// Warning-only flapping is dashboard-only; everything involving error
