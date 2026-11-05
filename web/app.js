@@ -31,7 +31,7 @@ const $ = id => document.getElementById(id);
 function dataArgs(...vals) {
   return 'data-args="' + JSON.stringify(vals).replace(/&/g, '&amp;').replace(/"/g, '&quot;') + '"';
 }
-const ACT_NEEDS_EL = new Set(['confirmClearActivity', 'confirmRemoveTLSCert', 'confirmDisableAuth', 'confirmClearHistory', 'echoPing', 'confirmInlineDelete']);
+const ACT_NEEDS_EL = new Set(['confirmClearActivity', 'confirmRemoveTLSCert', 'confirmDisableAuth', 'confirmClearHistory', 'echoPing', 'confirmInlineDelete', 'toggleScopeItem']);
 const ACT = {
   openSettings, toggleTheme, openAlerts, openSensorModal, setViewMode,
   confirmClearActivity, closeModal, closeSettings, toggleMaint, checkUpdate,
