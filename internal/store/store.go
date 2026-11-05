@@ -226,6 +226,19 @@ func (db *Store) InitSchema() error {
 			return err
 		}
 	}
+	// One-time migration: record the name-resolution failure for ICMP
+	// probes lost BEFORE a target IP could be determined (NULL for packet
+	// losses and HTTP probes). The homelab resolver (Pi-hole/AdGuard) is
+	// itself a monitored sensor: its death used to flip every hostname
+	// sensor to "error" at once — one root cause, an N-sensor storm that
+	// read as "N hosts down" — because a DNS loss was indistinguishable
+	// from a packet loss.
+	var dnsErrCol int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'dns_error'`).Scan(&dnsErrCol); err == nil && dnsErrCol == 0 {
+		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN dns_error TEXT`); err != nil {
+			return err
+		}
+	}
 	// One-time migration: sensor probe type. Existing sensors default to
 	// 'icmp' (the original and only type), so this is a no-op data-wise; it
 	// just lets the probe worker dispatch the right probe.

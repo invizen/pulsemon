@@ -854,8 +854,12 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	// write without inheriting either problem.
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), dbWriteTimeout)
 	defer cancelWrite()
-	if _, err := pw.db.ExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, ?, ?, ?, 1)",
-		id, store.FormatTS(ts), rttVal, o.ip, o.httpCode); err != nil {
+	var dnsErrVal interface{}
+	if o.dnsErr != "" {
+		dnsErrVal = o.dnsErr
+	}
+	if _, err := pw.db.ExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error, manual) VALUES (?, ?, ?, ?, ?, ?, 1)",
+		id, store.FormatTS(ts), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
@@ -902,6 +906,13 @@ type probeOutcome struct {
 	// broken: the probe could not be attempted because the ICMP engine is
 	// unusable (never set for HTTP probes or per-target ICMP failures).
 	broken bool
+	// dnsErr: the name-resolution failure for a probe lost BEFORE a target
+	// IP could be determined (empty for packet losses and HTTP probes).
+	// Recorded on the row (probes.dns_error) so a dead local resolver
+	// reads as "DNS failure", not "N hosts down" — the homelab resolver is
+	// itself monitored, and its death used to flip every hostname sensor
+	// to error at once (one root cause, an N-sensor storm).
+	dnsErr string
 }
 
 // probeTarget dispatches one probe to the sensor's transport. A var so a
@@ -921,6 +932,13 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 	// icmp (default)
 	res := pingHost(ctx, target, timeout)
 	o := probeOutcome{lost: res.Lost, ip: res.ResolvedIP, broken: res.Broken}
+	if res.DNS {
+		if res.Error != nil {
+			o.dnsErr = res.Error.Error()
+		} else {
+			o.dnsErr = "dns resolution failed"
+		}
+	}
 	if !res.Lost {
 		o.rttMs = res.RTT.Seconds() * 1000
 	}
@@ -960,7 +978,11 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	// it is already cancelled-and-checked above (a cancelled probe drops
 	// its result), and it lets shutdown interrupt a write parked on the
 	// 15s busy_timeout instead of outrunning the drain budget.
-	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status) VALUES (?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode); err != nil {
+	var dnsErrVal interface{}
+	if o.dnsErr != "" {
+		dnsErrVal = o.dnsErr
+	}
+	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error) VALUES (?, ?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}

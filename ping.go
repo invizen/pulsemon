@@ -17,6 +17,7 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
+	"golang.org/x/sync/singleflight"
 )
 
 // One shared ICMP socket for the whole process.
@@ -83,6 +84,12 @@ type PingResult struct {
 	// A per-target send failure (ENETUNREACH, EHOSTUNREACH, a netfilter EPERM)
 	// is NOT broken: it is simply a lost probe for that one sensor.
 	Broken bool
+	// DNS is true when the probe was lost at the NAME-RESOLUTION step —
+	// the target IP could not be determined (resolver down, NXDOMAIN,
+	// lookup timeout) — as opposed to a packet loss against a resolved IP.
+	// It is surfaced on the probe row (probes.dns_error) so a dead local
+	// resolver reads as "DNS failure", not "N hosts down".
+	DNS bool
 }
 
 // isBrokenSendErr reports whether a send error means the shared ICMP socket
@@ -612,9 +619,28 @@ var errNoIcmpTransport = errors.New("icmp: no transport available")
 // answer within one TTL.
 var dnsCacheTTL = 30 * time.Second
 
+// dnsStaleMaxAge is how long an EXPIRED resolution keeps being served
+// while re-resolution FAILS (bounded staleness). The homelab resolver
+// (Pi-hole/AdGuard) is itself a monitored sensor: when it dies, every
+// hostname sensor's re-resolution fails at once — without a fallback each
+// probe becomes a loss and the whole cohort flips to "error" together
+// (one root cause, an N-sensor storm that reads as "N hosts down").
+// Serving the last good IP keeps those sensors probing the right address
+// (and up) for up to dnsStaleMaxAge past the last SUCCESSFUL resolution;
+// after that the IP is too old to trust and the probe is a loss again,
+// with the DNS error surfaced on the row (probes.dns_error) instead of
+// masquerading as packet loss.
+var dnsStaleMaxAge = 10 * time.Minute
+
+// dnsStaleLogInterval rate-limits the per-target "serving stale IP" log:
+// a dead resolver re-triggers it on every probe, and a 5s-interval sensor
+// would otherwise log 12 lines/minute/target.
+var dnsStaleLogInterval = 30 * time.Second
+
 type dnsCacheEntry struct {
-	ip      net.IP
-	expires time.Time
+	ip           net.IP
+	expires      time.Time
+	lastStaleLog time.Time
 }
 
 var (
@@ -622,45 +648,97 @@ var (
 	dnsCache   = map[string]dnsCacheEntry{}
 )
 
+// dnsLookups collapses concurrent resolutions of the same name into ONE
+// shared lookup: when many hostname sensors' cache entries expire at the
+// same moment (or the resolver stalls), N probes would otherwise fire N
+// concurrent lookups at the same (possibly dying) resolver.
+var dnsLookups singleflight.Group
+
+// dnsLookup is the singleflight-wrapped resolution. The shared call is
+// bounded by its OWN 5s deadline rooted at context.Background(), not by
+// any single caller's probe ctx: the first caller to trigger the lookup
+// may be cancelled (shutdown, sensor removed) while other callers are
+// still waiting on its result — keying the shared call to one caller's
+// ctx would fail the lookup for everyone on that one cancellation. A
+// caller whose own ctx is done gets its ctx error back (its probe is
+// being dropped anyway).
+func dnsLookup(ctx context.Context, target string) (*net.IPAddr, error) {
+	v, err, _ := dnsLookups.Do(target, func() (any, error) {
+		lctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return resolveIPAddrWithTimeout(lctx, target, 5*time.Second)
+	})
+	if err != nil {
+		return nil, err
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return v.(*net.IPAddr), nil
+}
+
 // resolveICMPTarget resolves target to an IPv4 address through the
-// short-TTL cache (F24). Literal IPs short-circuit (no cache, no DNS).
-// Only successful IPv4 resolutions are cached: an IPv6-only answer is
-// re-resolved next probe (it is a loss path for the IPv4-only engine
-// anyway, and caching a nil would pin the loss for the whole TTL).
-// ctx bounds the lookup phase; the caller bounds the reply wait.
+// short-TTL cache (F24), with bounded staleness: when re-resolution FAILS,
+// the last good IP is served for up to dnsStaleMaxAge past the last
+// successful resolution (see dnsStaleMaxAge for the why). Literal IPs
+// short-circuit (no cache, no DNS). Only successful IPv4 resolutions are
+// cached: an IPv6-only answer is re-resolved next probe (it is a loss path
+// for the IPv4-only engine anyway, and caching a nil would pin the loss
+// for the whole TTL). ctx bounds the lookup phase; the caller bounds the
+// reply wait.
 func resolveICMPTarget(ctx context.Context, target string) (net.IP, error) {
 	if ip := net.ParseIP(target); ip != nil {
 		return ip.To4(), nil
 	}
+	var stale dnsCacheEntry
 	dnsCacheMu.Lock()
-	if e, ok := dnsCache[target]; ok && time.Now().Before(e.expires) {
-		dnsCacheMu.Unlock()
-		return e.ip, nil
+	if e, ok := dnsCache[target]; ok {
+		if time.Now().Before(e.expires) {
+			dnsCacheMu.Unlock()
+			return e.ip, nil
+		}
+		stale = e // expired — keep as fallback if re-resolution fails
 	}
 	dnsCacheMu.Unlock()
 
-	ip, err := resolveIPAddrWithTimeout(ctx, target, 5*time.Second)
-	if err != nil {
-		return nil, err
-	}
-	v4 := ip.IP.To4()
-	if v4 == nil {
-		return nil, fmt.Errorf("no IPv4 address found for %s", target)
-	}
-	dnsCacheMu.Lock()
-	dnsCache[target] = dnsCacheEntry{ip: v4, expires: time.Now().Add(dnsCacheTTL)}
-	// Opportunistic sweep so the map cannot grow unbounded as sensor
-	// targets churn: drop everything past its TTL.
-	if len(dnsCache) > 128 {
-		now := time.Now()
-		for k, e := range dnsCache {
-			if now.After(e.expires) {
-				delete(dnsCache, k)
+	ip, err := dnsLookup(ctx, target)
+	if err == nil {
+		v4 := ip.IP.To4()
+		if v4 == nil {
+			return nil, fmt.Errorf("no IPv4 address found for %s", target)
+		}
+		dnsCacheMu.Lock()
+		dnsCache[target] = dnsCacheEntry{ip: v4, expires: time.Now().Add(dnsCacheTTL)}
+		// Opportunistic sweep so the map cannot grow unbounded as sensor
+		// targets churn: drop entries EXPIRED past the staleness window
+		// (an entry inside the window is still a live fallback for a
+		// failing re-resolution — sweeping it here would destroy it).
+		if len(dnsCache) > 128 {
+			cutoff := time.Now().Add(-dnsStaleMaxAge)
+			for k, e := range dnsCache {
+				if cutoff.After(e.expires) {
+					delete(dnsCache, k)
+				}
 			}
 		}
+		dnsCacheMu.Unlock()
+		return v4, nil
 	}
-	dnsCacheMu.Unlock()
-	return v4, nil
+	// Bounded staleness: re-resolution failed — serve the last good IP
+	// while it is young enough to trust.
+	if stale.ip != nil && time.Since(stale.expires) < dnsStaleMaxAge {
+		dnsCacheMu.Lock()
+		if e, ok := dnsCache[target]; ok && e.ip.Equal(stale.ip) {
+			if now := time.Now(); now.Sub(e.lastStaleLog) >= dnsStaleLogInterval {
+				e.lastStaleLog = now
+				dnsCache[target] = e
+				log.Printf("dns: %s: re-resolution failed (%v); serving stale IP %s for up to %s more", target, err, stale.ip, dnsStaleMaxAge)
+			}
+		}
+		dnsCacheMu.Unlock()
+		return stale.ip, nil
+	}
+	return nil, err
 }
 
 // pingHost is the probe worker's entry point: resolve the target, then
@@ -670,7 +748,7 @@ func resolveICMPTarget(ctx context.Context, target string) (net.IP, error) {
 func pingHost(ctx context.Context, target string, timeout time.Duration) PingResult {
 	dst, err := resolveICMPTarget(ctx, target)
 	if err != nil {
-		return PingResult{Lost: true, Error: err}
+		return PingResult{Lost: true, Error: err, DNS: true}
 	}
 	if dst == nil {
 		// IPv6-only result — ICMP is IPv4-only by design; count as loss.
@@ -691,7 +769,9 @@ func pingHost(ctx context.Context, target string, timeout time.Duration) PingRes
 // a permanent block). Uses a context so the lookup is CANCELLED on timeout —
 // the old pattern (goroutine + net.ResolveIPAddr) returned on time but left
 // the un-cancellable resolver goroutine behind, leaking one per probe.
-func resolveIPAddrWithTimeout(ctx context.Context, host string, timeout time.Duration) (*net.IPAddr, error) {
+// It is a var (not a func) so tests can stub it and count/force resolutions
+// deterministically — the same pattern as probeTarget.
+var resolveIPAddrWithTimeout = func(ctx context.Context, host string, timeout time.Duration) (*net.IPAddr, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
