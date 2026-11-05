@@ -512,6 +512,15 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	if _, err := getSharedConn(); err != nil {
 		log.Printf("ProbeWorker: ICMP socket init: %v", err)
 	}
+	// Enforce the 24h retention ONCE at startup (finding #9): the retention
+	// ticker's first fire is 1h after start, so a process that restarts more
+	// often than hourly — crash loops, frequent updates — would never purge and
+	// the probes/events tables would grow without bound. Running it here (not
+	// just on the hourly tick) guarantees a sweep on every boot. It goes BEFORE
+	// warmStats so the warm query reads an already-trimmed 24h window instead
+	// of a stale backlog. It is idempotent and bounded (per-sensor batches), so
+	// the one-time startup cost is a few milliseconds on a healthy DB.
+	pw.purgeOld(ctx)
 	// Populate the stats cache from the DB so the first dashboard poll after a
 	// restart serves populated cards (RTT, sparkline, 24h uptime) instead of
 	// blanking them for up to an interval while probes re-accumulate. It MUST
