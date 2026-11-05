@@ -18,12 +18,12 @@ import (
 
 // TestProbeHTTPDrainsOnlyReusableConnections locks the finding-6 fix:
 // probeHTTP drains the response body ONLY to let the transport reuse a
-// keep-alive connection, and only up to drainBodyCap. An HTTPS probe forces
-// a fresh TLS handshake per probe (req.Close = true, for cert freshness,
-// M5), so its connection is discarded anyway — draining it is pure waste (a
-// 5s HTTPS sensor on a heavy UI like Proxmox/Nextcloud used to pull ~1 MB
-// per probe). The fix drains only when the final connection is kept
-// (!resp.Request.Close) and caps the drain at 64 KB.
+// keep-alive connection, and only up to drainBodyCap. An HTTPS probe with
+// a stale cert (> certFreshness) forces a fresh TLS handshake
+// (req.Close = true), so its connection is discarded anyway — draining it
+// is pure waste (a 5s HTTPS sensor on a heavy UI like Proxmox/Nextcloud
+// used to pull ~1 MB per probe). The fix drains only when the final
+// connection is kept (!resp.Request.Close) and caps the drain at 64 KB.
 //
 // Each subtest serves a 1 MB body from a server whose SEND buffer is bounded
 // (SO_SNDBUF=64KB) so the "bytes the server wrote" counter tracks what the

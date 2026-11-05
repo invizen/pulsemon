@@ -52,8 +52,9 @@ func (l *slowHandshakeListener) Accept() (net.Conn, error) {
 // handshake slowed to 500ms (via the server's first-read delay) must NOT
 // show up in the reported Elapsed — the number is the server's response
 // time after the connection is established, so an HTTPS sensor stays
-// comparable to an HTTP sensor. M5's fresh handshake still happens
-// (the wall time proves it); it just no longer inflates the metric.
+// comparable to an HTTP sensor. A fresh handshake (forced when the cert
+// is stale) still happens (the wall time proves it); it just no longer
+// inflates the metric.
 func TestProbeHTTPRTTExcludesHandshake(t *testing.T) {
 	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
 	const handshakeDelay = 500 * time.Millisecond

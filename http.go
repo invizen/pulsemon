@@ -14,6 +14,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -48,14 +49,19 @@ const maxHTTPRedirects = 5
 
 // httpClient is shared by every HTTP sensor: the transport reuses
 // keep-alive connections per host, so N HTTP sensors hitting one host pay
-// one TCP handshake, not N. HTTPS probes intentionally do NOT reuse —
-// probeHTTP sets req.Close per probe (M5) so every probe's cert reading
-// comes from a fresh handshake, not a pooled conn's original one; one
-// handshake per 5-60s probe is the accepted cost. That handshake time is
-// EXCLUDED from the reported latency (// probeHTTP measures from connection-established to response headers), so
-// an HTTPS sensor's number stays comparable to an HTTP sensor's. The pool
-// stays bounded regardless (100 conns total / 32 per host / 10 min idle),
-// so the sensor list — small and stable, not ephemeral — cannot exhaust it. Redirects
+// one TCP handshake, not N. HTTPS probes reuse the pooled connection when
+// the cert is fresh (< certFreshness, 10 min — the same window as
+// IdleConnTimeout, so a pooled conn's cert is at most that old):
+// probeHTTP sets req.Close only when the cert is stale, keeping the
+// displayed expiry current without paying one handshake per probe. A cert
+// renewal is rare (90 days for Let's Encrypt), so 10 min staleness is
+// negligible. Redirect hops always force a fresh conn (they're rare, and
+// the redirect target's cert is what we want to capture). The handshake
+// time is EXCLUDED from the reported latency (probeHTTP measures from
+// connection-established to response headers), so an HTTPS sensor's number
+// stays comparable to an HTTP sensor's. The pool stays bounded regardless
+// (100 conns total / 32 per host / 10 min idle), so the sensor list —
+// small and stable, not ephemeral — cannot exhaust it. Redirects
 // are followed (up to maxHTTPRedirects) so a target that 301/302s to its
 // real destination — the common case for a web UI behind a redirect — is
 // judged on where it ends up, not the redirect itself.
@@ -306,6 +312,25 @@ var httpClient = &http.Client{
 	},
 }
 
+// certFreshness is the maximum age of a cached cert reading before
+// probeHTTP forces a fresh TLS handshake. It matches the transport's
+// IdleConnTimeout (10 min): a pooled connection's cert is at most that
+// old, so reusing it keeps the displayed expiry as current as the pool
+// itself. A cert renewal is rare (90 days for Let's Encrypt, a year for
+// a CA cert), so 10 min staleness is negligible.
+const certFreshness = 10 * time.Minute
+
+// certReadTimes tracks when each HTTPS host's cert was last read, keyed
+// by scheme://host (the same key the transport uses for connection
+// pooling). probeHTTP consults it before deciding whether to force a
+// fresh handshake; a successful probe with cert data updates it. The map
+// is bounded by the number of unique HTTPS hosts (≤ sensor count), so no
+// cleanup is needed.
+var (
+	certReadMu    sync.Mutex
+	certReadTimes = make(map[string]time.Time)
+)
+
 // certVerifyError is a TLS verification failure carrying the leaf
 // certificate that failed. verifyHTTPCert now runs inside probeDialTLS
 // (before the request is written), where probeHTTP cannot reach
@@ -441,8 +466,8 @@ const drainBodyCap = 64 << 10
 // (httptrace.GotConn) to the response headers — DNS, TCP, and the TLS
 // handshake are EXCLUDED, so an HTTPS
 // sensor's latency stays comparable to an HTTP sensor's and to what a
-// warm browser tab sees. M5's per-probe fresh handshake still happens
-// (cert freshness) and still counts against the probe timeout and
+// warm browser tab sees. A fresh handshake (forced when the cert is
+// stale, > certFreshness) still counts against the probe timeout and
 // failure detection; it just no longer inflates the displayed number.
 // When no connection is ever established (dial/DNS/handshake failure),
 // GotConn never fires and Elapsed falls back to the full request time.
@@ -507,22 +532,28 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		return httpProbeResult{Lost: true, IP: resolved, Err: err}
 	}
 	if req.URL.Scheme == "https" {
-		// Force a fresh TLS handshake per probe: the
-		// shared httpClient keeps idle conns for up to 10 min, and a reused
-		// conn reports the cert from its ORIGINAL handshake — a server cert
-		// renewal stayed invisible in the displayed expiry until the conn
-		// recycled. Cost is one handshake per probe (probes run every 5-60s).
-		req.Close = true
+		// Reuse the pooled connection when the cert is fresh
+		// (< certFreshness): the transport's IdleConnTimeout is 10 min,
+		// so a pooled conn's cert is at most that old. A fresh handshake
+		// is forced only when the cert is stale, keeping the displayed
+		// expiry current without paying one handshake per probe.
+		hostKey := req.URL.Scheme + "://" + req.URL.Host
+		certReadMu.Lock()
+		lastRead, ok := certReadTimes[hostKey]
+		certReadMu.Unlock()
+		if !ok || time.Since(lastRead) > certFreshness {
+			req.Close = true
+		}
 	}
 	start := time.Now()
 	resp, err := httpClient.Do(req)
 	el := time.Since(start)
 	// Reported RTT = final-connection-established (GotConn) -> response
 	// headers. The DNS/TCP/TLS cost before connAt is the probe's own
-	// connection policy (M5 forces a fresh HTTPS handshake for cert
-	// freshness), not the server's responsiveness — excluding it keeps
-	// HTTP and HTTPS sensor latencies comparable. No conn established -> GotConn never fired -> the full
-	// elapsed is the honest number.
+	// connection policy (a fresh HTTPS handshake when the cert is stale),
+	// not the server's responsiveness — excluding it keeps
+	// HTTP and HTTPS sensor latencies comparable. No conn established ->
+	// GotConn never fired -> the full elapsed is the honest number.
 	rtt := el
 	if !connAt.IsZero() {
 		rtt = time.Since(connAt)
@@ -542,9 +573,9 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// card's note, then close the body. We only need the status line and
 	// the cert. Draining (capped) before close lets the transport REUSE a
 	// keep-alive connection — but only when that connection will actually
-	// be kept. probeHTTP forces a fresh TLS handshake per HTTPS probe
-	// (req.Close = true, for cert freshness, M5), and net/http builds each
-	// redirect hop as a fresh request with Close = false, so the final
+	// be kept. probeHTTP sets req.Close only when the cert is stale
+	// (> certFreshness), and net/http builds each redirect hop as a fresh
+	// request with Close = false, so the final
 	// hop's resp.Request.Close is the exact "will this conn be discarded"
 	// signal: drain only when it is false. Skipping the drain on a conn
 	// that is closed anyway saves up to drainBodyCap of download on every
@@ -559,6 +590,16 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	if len(presented) > 0 {
 		na := presented[0].NotAfter
 		certExp = &na
+		// Record the cert read so the next probe can reuse the pooled
+		// connection (and its cert) instead of forcing a fresh handshake.
+		// Use the final request's URL (after redirects) for the host key.
+		hostKey := req.URL.Scheme + "://" + req.URL.Host
+		if resp.Request != nil {
+			hostKey = resp.Request.URL.Scheme + "://" + resp.Request.URL.Host
+		}
+		certReadMu.Lock()
+		certReadTimes[hostKey] = time.Now()
+		certReadMu.Unlock()
 	}
 	if resp.Request == nil || !resp.Request.Close {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))

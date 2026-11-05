@@ -523,13 +523,26 @@ func TestProbeHTTPKeepAlive(t *testing.T) {
 	}
 }
 
-// TestProbeHTTPTLSFreshHandshake: every HTTPS probe must use a FRESH
-// connection (2026-10-19 review M5). A reused keep-alive conn reports the
-// cert from its original handshake, so a server cert renewal stayed
-// invisible in the displayed expiry for up to IdleConnTimeout (10 min).
-// This replaces the old TestProbeHTTPTLSKeepAlive, which pinned the reuse.
+// TestProbeHTTPTLSFreshHandshake: the first HTTPS probe to a host forces a
+// fresh TLS handshake (no cert in certReadTimes), and subsequent probes
+// within certFreshness (10 min) reuse the pooled connection — saving the
+// handshake cost while keeping the cert as fresh as the pool's
+// IdleConnTimeout. This replaces the old per-probe-fresh-handshake test
+// (M5), which paid one handshake per probe.
 func TestProbeHTTPTLSFreshHandshake(t *testing.T) {
 	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
+
+	// Clear certReadTimes so the first probe definitely forces a fresh
+	// handshake.
+	certReadMu.Lock()
+	oldMap := certReadTimes
+	certReadTimes = make(map[string]time.Time)
+	certReadMu.Unlock()
+	t.Cleanup(func() {
+		certReadMu.Lock()
+		certReadTimes = oldMap
+		certReadMu.Unlock()
+	})
 
 	var mu sync.Mutex
 	seen := map[string]bool{}
@@ -543,8 +556,8 @@ func TestProbeHTTPTLSFreshHandshake(t *testing.T) {
 	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
 	srv.StartTLS()
 	defer srv.Close()
-	if n := probeConnCount(t, srv.URL, seen, &mu); n != 3 {
-		t.Fatalf("server saw %d distinct client connections over 3 HTTPS probes, want 3 (fresh handshake per probe)", n)
+	if n := probeConnCount(t, srv.URL, seen, &mu); n != 2 {
+		t.Fatalf("server saw %d distinct client connections over 3 HTTPS probes, want 2 (probe 1 fresh+closed, probes 2-3 reuse probe 2's pooled conn)", n)
 	}
 }
 
