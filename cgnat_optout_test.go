@@ -108,11 +108,11 @@ func TestCGNATOptOutEmbeddedIPv6(t *testing.T) {
 // second breakage: http://nas → https://nas.tail1234.ts.net).
 func TestRedirectTargetAllowedCGNAT(t *testing.T) {
 	setAllowCGNAT(t, false)
-	if err := redirectTargetAllowed(context.Background(), "100.64.7.7", "nas.example"); err == nil {
+	if _, err := redirectTargetAllowed(context.Background(), "100.64.7.7", "nas.example"); err == nil {
 		t.Error("redirect to 100.64.7.7 by default = nil, want refusal")
 	}
 	setAllowCGNAT(t, true)
-	if err := redirectTargetAllowed(context.Background(), "100.64.7.7", "nas.example"); err != nil {
+	if _, err := redirectTargetAllowed(context.Background(), "100.64.7.7", "nas.example"); err != nil {
 		t.Errorf("redirect to 100.64.7.7 with opt-out = %v, want allow", err)
 	}
 }

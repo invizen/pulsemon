@@ -97,14 +97,13 @@ const maxHTTPRedirects = 5
 // is a legitimate redirect target there). RFC1918/ULA cross-host hops
 // pass: LAN-to-LAN redirects are legitimate for monitoring.
 //
-// Known limitation (stated, not hidden): hostname resolution here has a
-// TOCTOU window that the webhook path closes by pinning its dial to the
-// checked IPs. probeDialTLS now owns the probe client's dial, but it does
-// NOT pin to checked IPs: the initial target is the operator's own
-// configured sensor (admin privilege by design), and redirect hops are
-// already vetted by redirectTargetAllowed before their dial. A rebinding
-// attacker would need DNS control on the LAN — the same threat that the
-// cert verification itself is defending against.
+// The check-then-dial TOCTOU is closed: redirectTargetAllowed returns the
+// checked IP, and CheckRedirect rewrites the request URL to that IP so the
+// transport dials it directly (no re-resolution). This is the same pattern
+// webhook.go's dialChecked uses — validate the IP at dial time, not before.
+// The initial target is NOT rewritten (it is the operator's own configured
+// sensor, admin privilege by design); only cross-host redirect hops are
+// pinned to the checked IP.
 //
 // Security-review note (deliberate): allowing RFC1918/ULA cross-host
 // redirect hops is INTENTIONAL, not an oversight — the initial target is
@@ -116,12 +115,12 @@ const maxHTTPRedirects = 5
 // pinned legitimate cases (split-horizon DNS, external→internal 302)
 // while shrinking the real attack surface by zero. Rationale +
 // measured numbers: docs/DECISIONS.md → probe-redirect-guard.
-func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
+func redirectTargetAllowed(ctx context.Context, host, origHost string) (net.IP, error) {
 	if host == "" {
-		return errors.New("redirect with empty host")
+		return nil, errors.New("redirect with empty host")
 	}
 	if strings.EqualFold(host, origHost) {
-		return nil // same-host hop: the operator's own target
+		return nil, nil // same-host hop: the operator's own target, no rewrite
 	}
 	// Address judging delegates to checkWebhookIP — the single canonical
 	// implementation. This path used to carry
@@ -142,22 +141,30 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) error {
 	// explicitly.
 	if addr, err := netip.ParseAddr(host); err == nil {
 		if addr.Zone() != "" {
-			return fmt.Errorf("redirect target %q contains a zone identifier", host)
+			return nil, fmt.Errorf("redirect target %q contains a zone identifier", host)
 		}
-		return checkWebhookIP(addr.Unmap().AsSlice(), host)
+		ip := addr.Unmap().AsSlice()
+		if err := checkWebhookIP(ip, host); err != nil {
+			return nil, err
+		}
+		return ip, nil
 	}
 	// Resolve under the probe's context (g5): a slow DNS lookup must not
 	// be able to outlive the probe timeout.
 	addrs, err := net.DefaultResolver.LookupIPAddr(ctx, host)
 	if err != nil {
-		return fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
+		return nil, fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
 	}
 	for _, addr := range addrs {
 		if err := checkWebhookIP(addr.IP, host); err != nil {
-			return err
+			return nil, err
 		}
 	}
-	return nil
+	// Return the first checked IP so CheckRedirect can pin the dial to it
+	// (closing the DNS-rebinding TOCTOU — the transport dials this IP
+	// directly, not the hostname, so it cannot re-resolve to a different
+	// address).
+	return addrs[0].IP, nil
 }
 
 // probeTLSHandshakeTimeout caps the TLS handshake inside probeDialTLS. The
@@ -241,8 +248,29 @@ var httpClient = &http.Client{
 		if len(via) > 0 {
 			origHost = via[0].URL.Hostname()
 		}
-		if err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost); err != nil {
+		checkedIP, err := redirectTargetAllowed(req.Context(), req.URL.Hostname(), origHost)
+		if err != nil {
 			return err
+		}
+		if checkedIP != nil {
+			// Pin the dial to the checked IP: rewrite the URL so the
+			// transport dials the IP directly, not the hostname. This
+			// closes the DNS-rebinding TOCTOU — the transport no longer
+			// re-resolves the hostname, so it cannot land on an address
+			// the check never saw (the same pattern webhook.go's
+			// dialChecked uses). The Host header keeps the original
+			// hostname for virtual hosting.
+			origHostname := req.URL.Hostname()
+			port := req.URL.Port()
+			if port == "" {
+				if req.URL.Scheme == "https" {
+					port = "443"
+				} else {
+					port = "80"
+				}
+			}
+			req.Host = origHostname
+			req.URL.Host = net.JoinHostPort(checkedIP.String(), port)
 		}
 		// Force a fresh connection on EVERY HTTPS hop: the transport
 		// pools idle conns per host for up to IdleConnTimeout (10 min),

@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -59,7 +61,7 @@ func TestRedirectTargetAllowed(t *testing.T) {
 		{"", "example.com", true, "empty host"},
 	}
 	for _, c := range cases {
-		err := redirectTargetAllowed(context.Background(), c.host, c.orig)
+		_, err := redirectTargetAllowed(context.Background(), c.host, c.orig)
 		if c.wantErr && err == nil {
 			t.Errorf("redirectTargetAllowed(%q, %q) = nil, want refusal (%s)", c.host, c.orig, c.why)
 		}
@@ -97,6 +99,118 @@ func TestProbeHTTPCrossHostMetadataRedirectIsLoss(t *testing.T) {
 	}
 	if metadataHit {
 		t.Fatal("probe actually fetched the metadata-stand-in URL")
+	}
+}
+
+// TestProbeHTTPRedirectRebindingClosed proves the check-then-dial TOCTOU is
+// closed: a hostname that resolves to a public IP at check time
+// (redirectTargetAllowed passes) but to a loopback IP at dial time (DNS
+// rebinding) must NOT have the probe dial the loopback address. The fix
+// rewrites the redirect URL to the checked IP, so the transport dials the
+// public IP directly (no re-resolution) and the loopback stand-in is never
+// reached.
+func TestProbeHTTPRedirectRebindingClosed(t *testing.T) {
+	// Rebinding stand-in: a server on loopback. If the dial goes to
+	// 127.0.0.1:<port> (the rebinding IP), this server receives the
+	// request. If the dial goes to 203.0.113.1:<port> (the checked IP),
+	// it does not.
+	rebindingHit := int32(0)
+	rebindingSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.StoreInt32(&rebindingHit, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer rebindingSrv.Close()
+	rebindingPort := rebindingSrv.Listener.Addr().(*net.TCPAddr).Port
+
+	// Minimal DNS-over-UDP responder: returns 203.0.113.1 on the first
+	// lookup (the check) and 127.0.0.1 on the second (the dial, if it
+	// happens). With the fix, only the first lookup occurs.
+	udpConn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("cannot bind UDP for DNS responder: %v", err)
+	}
+	defer udpConn.Close()
+	dnsAddr := udpConn.LocalAddr().(*net.UDPAddr)
+
+	var callCount int32
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, from, err := udpConn.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			// Walk the question name to find the end of the question
+			// section (name + 2-byte qtype + 2-byte qclass).
+			i := 12
+			questionEnd := -1
+			for i+3 < n && buf[i] != 0 {
+				l := int(buf[i])
+				if i+l+1 > n {
+					break
+				}
+				i += l + 1
+			}
+			if i < n && buf[i] == 0 && i+5 <= n {
+				questionEnd = i + 1 + 4
+			}
+			if questionEnd < 0 {
+				continue
+			}
+			call := atomic.AddInt32(&callCount, 1)
+			var ipBytes []byte
+			if call == 1 {
+				ipBytes = []byte{203, 0, 113, 1} // public (check passes)
+			} else {
+				ipBytes = []byte{127, 0, 0, 1} // loopback (rebinding)
+			}
+			resp := append([]byte(nil), buf[0:2]...)
+			resp = append(resp, 0x81, 0x80, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00)
+			resp = append(resp, buf[12:questionEnd]...)
+			resp = append(resp,
+				0x00,
+				0x00, 0x01, 0x00, 0x01,
+				0x00, 0x00, 0x00, 0x00,
+				0x00, 0x04,
+			)
+			resp = append(resp, ipBytes...)
+			udpConn.WriteTo(resp, from)
+		}
+	}()
+
+	oldResolver := net.DefaultResolver
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			if network == "tcp" {
+				return nil, fmt.Errorf("resolver: no TCP DNS in this test")
+			}
+			d := &net.Dialer{}
+			c, err := d.DialContext(ctx, "udp4", dnsAddr.String())
+			if err != nil {
+				return nil, err
+			}
+			return c, nil
+		},
+	}
+	defer func() {
+		httpClient.Transport.(*http.Transport).CloseIdleConnections()
+		time.Sleep(50 * time.Millisecond) // let any in-flight dialer goroutine finish
+		net.DefaultResolver = oldResolver
+	}()
+
+	// Source server 302s to the rebinding hostname on the stand-in's port.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("http://rebind.example.com:%d/", rebindingPort), http.StatusFound)
+	}))
+	defer srv.Close()
+
+	res := probeHTTP(context.Background(), srv.URL, 5*time.Second)
+	if !res.Lost {
+		t.Fatalf("probe marked up, want loss (203.0.113.1 is not a real server): %+v", res)
+	}
+	if atomic.LoadInt32(&rebindingHit) != 0 {
+		t.Fatal("probe dialed the rebinding loopback address — TOCTOU not closed")
 	}
 }
 
