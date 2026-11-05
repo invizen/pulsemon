@@ -167,8 +167,12 @@ func TestFix_M9_FailedErrorAlertSchedulesRetry(t *testing.T) {
 		if age := time.Since(last); age < 25*time.Minute {
 			t.Fatalf("alert_state.last_ts only %v old; a failed delivery must backdate it so the next tick retries", age)
 		}
-		// realert_min=0 means "alert once only": never schedule a retry
+		// realert_min=0 means "alert once only": never schedule a retry.
+		// The gate reads the settings SNAPSHOT, so reload it after the change
+		// (the production path does this in handleSettingsPut after the
+		// settings commit).
 		db.SetSetting("realert_min", "0")
+		pw.reloadAlertSettings()
 		pw.setAlertState("s", "error", time.Now().UTC())
 		pw.scheduleAlertRetry("s", "error")
 		db.QueryRow(`SELECT last_ts FROM alert_state WHERE sensor_id='s'`).Scan(&ts)

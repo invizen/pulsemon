@@ -92,8 +92,8 @@ func TestChatEnabledLegacyDefault(t *testing.T) {
 	if chatEnabled(db) {
 		t.Error("explicit off should win over a present URL")
 	}
-	// Explicit on with no URL still reports enabled (but activeProviders
-	// separately requires a URL to actually send).
+	// Explicit on with no URL still reports enabled (but
+	// resolveDestinationsFromDB separately requires a URL to actually send).
 	if err := db.SetSetting("google_chat_enabled", "1"); err != nil {
 		t.Fatal(err)
 	}

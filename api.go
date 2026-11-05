@@ -2347,6 +2347,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
 		}
 	}
+	// Swap the alert settings snapshot now that BOTH the settings tx and the
+	// maintenance-mode change (its own transaction, above) have committed.
+	// The alert hot path (alertsEnabled, shouldAlert, realertMin,
+	// resolveDestinations) reads this snapshot lock-free, so a transient DB
+	// lock mid-probe can no longer read maintenance_mode as "0" and fire
+	// alerts during maintenance — the bug the per-call GetSetting reads had
+	// (2026-11-05 finding #5). reloadAlertSettings keeps the last good
+	// snapshot on a read error, so a hiccup here never installs a half-read
+	// state; it just leaves the previous (still-correct) snapshot in place
+	// until the next successful save.
+	s.probeWorker.reloadAlertSettings()
 	realertLog := 30
 	if v := s.db.GetSetting("realert_min"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {

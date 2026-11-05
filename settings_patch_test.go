@@ -74,6 +74,72 @@ func TestFix_M7_PutSettingsKeepsRouting(t *testing.T) {
 	}
 }
 
+// TestSettingsPutSwapsAlertSnapshot pins the finding-#5 snapshot swap:
+// PUT /api/settings must reload the probe worker's alert settings snapshot
+// after the commit, so the gate (maintenance, routing) reads the NEW values
+// lock-free — not a stale pre-PUT snapshot. Pre-snapshot the gate re-read
+// the DB on every decision, so a PUT took effect with no explicit swap; the
+// snapshot makes that swap a step, and this test proves it happens (a
+// missing reloadAlertSettings call in handleSettingsPut fails the
+// maintenance assertion below).
+func TestSettingsPutSwapsAlertSnapshot(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+	pw := srv.probeWorker
+
+	// An active sensor: entering maintenance pauses it (a fresh DB with no
+	// active sensors 400s the maintenance PUT with "no active sensors to
+	// pause").
+	id := store.NewID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'active1','10.0.0.1','icmp',60,1000,25,2,5,'active','up',?)`, id, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Baseline: maintenance off, scope all.
+	if !pw.alertsEnabled() {
+		t.Fatal("baseline: alertsEnabled=false, want true (maintenance off)")
+	}
+	if !pw.shouldAlert("any-sensor", nil) {
+		t.Fatal("baseline: shouldAlert=false, want true (scope all)")
+	}
+
+	// Enter maintenance via the settings PUT: the gate must go silent on the
+	// next decision (snapshot swapped) with no DB re-read on the hot path.
+	req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"maintenance_mode": true}`))
+	rr := httptest.NewRecorder()
+	srv.handleSettingsPut(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT maintenance_mode:true: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if pw.alertsEnabled() {
+		t.Error("alertsEnabled=true after a maintenance PUT, want false (the snapshot must reflect the committed change)")
+	}
+
+	// Leave maintenance: alerts return.
+	req = httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"maintenance_mode": false}`))
+	rr = httptest.NewRecorder()
+	srv.handleSettingsPut(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT maintenance_mode:false: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if !pw.alertsEnabled() {
+		t.Error("alertsEnabled=false after leaving maintenance, want true")
+	}
+
+	// Routing: scope=tags with a filter — only filtered sensors alert.
+	req = httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"alert_scope":"tags","alert_filter":["prod"]}`))
+	rr = httptest.NewRecorder()
+	srv.handleSettingsPut(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("PUT scope=tags: %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	if !pw.shouldAlert("s1", []string{"prod"}) {
+		t.Error("shouldAlert(s1, [prod])=false, want true (tag in filter)")
+	}
+	if pw.shouldAlert("s2", []string{"dev"}) {
+		t.Error("shouldAlert(s2, [dev])=true, want false (tag not in filter)")
+	}
+}
+
 // TestFix_M7_PatchInvalidFieldDoesNotPersistTags pins the M7(b) fix: a PATCH
 // used to write the tags BEFORE validating the remaining fields, so a 400
 // left the tag set changed (repro: {"tags":["sneaky"],"interval_s":0} ->

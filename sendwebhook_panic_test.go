@@ -12,14 +12,22 @@ import (
 	"time"
 )
 
-// TestSendWebhookReturnsOnPanickedJob pins the m1 fix. A nil DB stands in
-// for any future panic inside sendWebhookDeliver: activeProviders derefs
-// pw.db.Ping() first, so the job panics deterministically on its very first
-// step — the same contract the fix must hold for any panic in the delivery
-// path.
+// TestSendWebhookReturnsOnPanickedJob pins the m1 fix: a panicking job
+// still writes its `done` value (the delivery is sacrificed, the loop and
+// the caller's `<-done` wait survive). The panic is forced through the
+// deliverDestinations seam — destination resolution is the FIRST step of
+// sendWebhookDeliver, so a panic there stands in for any future panic in
+// the delivery path, independent of the per-provider recovers. (Pre-snapshot
+// the same role was played by a nil DB: activeProviders derefed pw.db.Ping()
+// first. The settings snapshot removed that DB read from the hot path, so the
+// seam is the deterministic panic source now.)
 func TestSendWebhookReturnsOnPanickedJob(t *testing.T) {
 	pw := NewProbeWorker(newTestDB(t))
-	pw.db = nil // first delivery step (activeProviders → db.Ping) panics
+	origDeliver := deliverDestinations
+	deliverDestinations = func(pw *ProbeWorker) ([]dest, bool) {
+		panic("simulated job-level panic in the delivery path")
+	}
+	defer func() { deliverDestinations = origDeliver }()
 
 	done := make(chan bool, 1)
 	go func() {

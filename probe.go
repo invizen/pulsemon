@@ -13,6 +13,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"pulsemon/internal/store"
@@ -242,14 +243,16 @@ type ProbeWorker struct {
 	alertMu         sync.Mutex
 	alertOrderGates map[string]chan func()
 
-	// lastProviders: the last successfully loaded active-provider list
-	// GetSetting maps a DB read error to "", so a
-	// failing DB looks exactly like "no providers configured" — and
-	// sendWebhook's len(dests)==0 branch then reports a DROPPED alert as
-	// delivered. activeProviders pings the DB first; on a read failure it
-	// serves this cache. Guarded by provMu.
-	provMu        sync.Mutex
-	lastProviders []providerMeta
+	// alertCfg is the typed settings snapshot the alert hot path reads
+	// lock-free (see alertSettings in alerts.go): the gate (maintenance,
+	// routing, re-alert interval) and the resolved delivery destinations.
+	// It is stored with a safe default at construction and swapped
+	// atomically by reloadAlertSettings — at worker start and after every
+	// PUT /api/settings commit. Replaces the old per-read GetSetting calls
+	// (and the activeProviders db.Ping fallback): a DB hiccup between
+	// reloads no longer reads maintenance as off / scope as all, and the
+	// hot path makes zero settings queries (2026-11-05 finding #5).
+	alertCfg atomic.Pointer[alertSettings]
 
 	// Storm budget: a global cap on individual
 	// non-recovery alerts per window. When the budget is exhausted (an
@@ -276,7 +279,7 @@ const retentionSeconds int64 = 24 * 3600
 
 func NewProbeWorker(db *store.Store) *ProbeWorker {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &ProbeWorker{
+	pw := &ProbeWorker{
 		sensors:         make(map[string]*ProbeState),
 		loops:           make(map[string]context.CancelFunc),
 		spawnedIDs:      make(map[string]bool),
@@ -288,6 +291,14 @@ func NewProbeWorker(db *store.Store) *ProbeWorker {
 		stopCtx:         ctx,
 		stopCancel:      cancel,
 	}
+	// Store a safe default BEFORE the first DB load so the alert hot path
+	// never derefs a nil snapshot, then replace it with the real DB state.
+	// If the DB is unreadable at this instant, the default stands (alerts
+	// enabled, scope all, 30-min re-alert, no providers) and the next
+	// PUT /api/settings commit reloads the real state.
+	pw.alertCfg.Store(defaultAlertSettings())
+	pw.reloadAlertSettings()
+	return pw
 }
 
 // Run reconciles the probe set from the DB every 5s, plus hourly retention.

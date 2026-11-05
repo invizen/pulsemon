@@ -298,10 +298,14 @@ func TestAlertPolicy(t *testing.T) {
 		}
 	}
 
-	// Maintenance mode silences even error alerts.
+	// Maintenance mode silences even error alerts. The gate reads the
+	// settings SNAPSHOT, not the DB, so a post-construction settings change
+	// must be reloaded into it before the next decision (the production path
+	// does this in handleSettingsPut after the settings commit).
 	if err := db.SetSetting("maintenance_mode", "1"); err != nil {
 		t.Fatalf("SetSetting: %v", err)
 	}
+	pw.reloadAlertSettings()
 	if pw.shouldAlertNow(c, "up", "error") {
 		t.Error("shouldAlertNow(up, error) = true while maintenance ON, want false")
 	}

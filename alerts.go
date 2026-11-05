@@ -145,10 +145,178 @@ func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time
 	}
 }
 
+// alertSettings is the typed, point-in-time snapshot of every setting the
+// alert hot path reads: the gate (maintenance, routing scope, filter,
+// re-alert interval) and the resolved delivery destinations (provider URL +
+// Telegram chat_id). It is loaded once at worker start and swapped
+// atomically after every successful PUT /api/settings commit — the gate and
+// delivery then read it lock-free, with ZERO per-probe / per-alert DB
+// queries.
+//
+// Why a snapshot (2026-11-05 finding #5): GetSetting maps a read error to
+// "", so a transient DB lock mid-probe made maintenance_mode read as "0"
+// (alerts ENABLED) and alert_scope read as "" (scope "all") — a DB hiccup
+// during maintenance fired alerts for every sensor, and each errored probe /
+// alert paid 5-10 single-row settings queries. The snapshot keeps the last
+// GOOD state in memory: a hiccup between reloads never touches it, so
+// maintenance stays on, routing stays put, and the hot path is lock-free.
+type alertSettings struct {
+	maintenance bool            // maintenance_mode == "1"
+	scope       string          // alert_scope, normalized to "all" when empty
+	filter      map[string]bool // alert_filter items (tag names, or sensor ids)
+	realertMin  int             // realert_min (0 = alert once only)
+	dests       []dest          // resolved active providers (url + chat_id)
+}
+
+// defaultAlertSettings is the safe fallback: alerts enabled, every sensor in
+// scope, the 30-min re-alert default, no providers. It matches the
+// pre-snapshot swallow-to-default behavior and is stored before the first DB
+// load so the hot path never derefs a nil snapshot.
+func defaultAlertSettings() *alertSettings {
+	return &alertSettings{
+		maintenance: false,
+		scope:       "all",
+		filter:      map[string]bool{},
+		realertMin:  30,
+		dests:       []dest{},
+	}
+}
+
+// resolveDestinationsFromDB resolves the active, URL-configured providers
+// (with the Telegram chat_id) from the DB. It is the single place that turns
+// raw provider settings into delivery destinations, run at snapshot-load
+// time so the hot path reads the result lock-free. It uses the error-aware
+// getSettingErr for the URL/chat_id reads: a real read failure aborts the
+// load (the caller keeps the previous snapshot) rather than posting an empty
+// chat_id.
+func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
+	var dests []dest
+	for _, p := range providerList {
+		if !p.Enabled(db) || !p.HasURL(db) {
+			continue
+		}
+		// p.URLField, NOT p.Kind + "_url": SMTP's value lives in
+		// "smtp_host", and a "smtp_url" lookup returns "" for every real
+		// SMTP config — silently skipping email (see resolveDestinations).
+		url, err := getSettingErr(db, p.URLField)
+		if err != nil {
+			return nil, err
+		}
+		if url == "" && p.EnvFallback != "" {
+			url = os.Getenv(p.EnvFallback)
+		}
+		if url == "" {
+			continue
+		}
+		var chatID string
+		if p.Kind == "telegram" {
+			// Resolved up front, error-aware: a transient DB lock must
+			// fail the load (and keep the previous snapshot), never post
+			// an empty chat_id (Telegram 400).
+			chatID, err = getSettingErr(db, "telegram_chat_id")
+			if err != nil || chatID == "" {
+				return nil, err
+			}
+		}
+		dests = append(dests, dest{p, url, chatID})
+	}
+	return dests, nil
+}
+
+// loadAlertSettings reads the alert-relevant settings from the DB into a
+// fresh snapshot. A MISSING key falls back to the same default the old
+// per-read code used (scope "all", realert 30, no filter). A read ERROR on
+// any core field (not a missing key) aborts the load with an error, so the
+// caller keeps the previous snapshot instead of installing a half-read one.
+func loadAlertSettings(db *store.Store) (*alertSettings, error) {
+	s := defaultAlertSettings()
+
+	maint, err := db.GetSettingErr("maintenance_mode")
+	if err != nil {
+		return nil, err
+	}
+	s.maintenance = maint == "1"
+
+	scope, err := db.GetSettingErr("alert_scope")
+	if err != nil {
+		return nil, err
+	}
+	if scope == "" {
+		scope = "all"
+	}
+	s.scope = scope
+
+	if f, err := db.GetSettingErr("alert_filter"); err != nil {
+		return nil, err
+	} else if f != "" {
+		var items []string
+		if err := json.Unmarshal([]byte(f), &items); err != nil {
+			// A corrupt filter is treated as "no filter": the old
+			// shouldAlert returned false on an unmarshal error (no sensor
+			// matched), which is the same as an empty set here.
+			items = nil
+		}
+		s.filter = make(map[string]bool, len(items))
+		for _, it := range items {
+			s.filter[it] = true
+		}
+	}
+
+	if v, err := db.GetSettingErr("realert_min"); err != nil {
+		return nil, err
+	} else if v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1440 {
+			s.realertMin = n
+		}
+	}
+
+	dests, err := resolveDestinationsFromDB(db)
+	if err != nil {
+		return nil, err
+	}
+	s.dests = dests
+	return s, nil
+}
+
+// reloadAlertSettings re-reads the alert settings from the DB and atomically
+// swaps the snapshot. Called at worker start (after the default is stored)
+// and after every successful PUT /api/settings commit. On a read error it
+// KEEPS the previous snapshot (logging a warning) — a hiccup must never
+// install a half-read state, which is exactly the bug this snapshot fixes.
+// A nil DB (test workers that don't exercise settings) keeps the current
+// snapshot too: the default stands until a real DB is present.
+func (pw *ProbeWorker) reloadAlertSettings() {
+	if pw.db == nil {
+		return
+	}
+	s, err := loadAlertSettings(pw.db)
+	if err != nil {
+		log.Printf("alert: settings snapshot reload failed (keeping last good): %v", err)
+		return
+	}
+	pw.alertCfg.Store(s)
+}
+
+// alertSettings returns the current snapshot lock-free. It is never nil:
+// NewProbeWorker stores a default snapshot before the first load, and the
+// lazy fallback covers tests that construct &ProbeWorker{} directly.
+func (pw *ProbeWorker) alertSettings() *alertSettings {
+	if s := pw.alertCfg.Load(); s != nil {
+		return s
+	}
+	pw.reloadAlertSettings()
+	if s := pw.alertCfg.Load(); s != nil {
+		return s
+	}
+	return defaultAlertSettings()
+}
+
 // alertsEnabled reports whether any alert may fire: maintenance mode
-// silences everything.
+// silences everything. It reads the SNAPSHOT, not the DB: a transient DB
+// lock between reloads must never read maintenance_mode as "0" and fire
+// alerts during maintenance (2026-11-05 finding #5).
 func (pw *ProbeWorker) alertsEnabled() bool {
-	return pw.db.GetSetting("maintenance_mode") != "1"
+	return !pw.alertSettings().maintenance
 }
 
 // alertableTransition reports whether a status CHANGE sends an alert.
@@ -188,40 +356,28 @@ func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, oldStatus, newStatus strin
 	return alertableTransition(oldStatus, newStatus)
 }
 
-// shouldAlert applies the global alert routing rule (settings table):
-// "all", "tags" (any of the sensor's tags in filter list), or "sensors"
-// (id in filter list). The per-decision DB read is deliberate (no
-// in-memory cache): the same pattern as alertsEnabled's maintenance_mode
-// read — a routing change takes effect on the next transition with zero
-// staleness. docs/DECISIONS.md → shouldAlert-filter-reads.
+// shouldAlert applies the global alert routing rule from the SNAPSHOT:
+// "all", "tags" (any of the sensor's tags in the filter), or "sensors" (id
+// in the filter). Lock-free: the snapshot is swapped after each
+// PUT /api/settings commit, so a routing change takes effect on the next
+// transition with zero staleness AND zero per-decision DB reads — a DB
+// hiccup can no longer read alert_scope as "" (scope "all") and alert every
+// sensor (2026-11-05 finding #5).
 func (pw *ProbeWorker) shouldAlert(id string, tags []string) bool {
-	scope := pw.db.GetSetting("alert_scope")
-	if scope == "" {
-		scope = "all"
-	}
-	if scope == "all" {
+	s := pw.alertSettings()
+	if s.scope == "all" {
 		return true
 	}
-	var items []string
-	if f := pw.db.GetSetting("alert_filter"); f != "" {
-		if err := json.Unmarshal([]byte(f), &items); err != nil {
-			return false
-		}
-	}
-	switch scope {
+	switch s.scope {
 	case "tags":
 		for _, t := range tags {
-			for _, f := range items {
-				if t == f {
-					return true
-				}
+			if s.filter[t] {
+				return true
 			}
 		}
 	case "sensors":
-		for _, s := range items {
-			if s == id {
-				return true
-			}
+		if s.filter[id] {
+			return true
 		}
 	}
 	return false
@@ -297,15 +453,12 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 		store.FormatTS(time.Now().UTC().Add(-back)), id, status)
 }
 
-// realertMin returns the re-alert interval in minutes. 0 means alert
-// once only (no re-alerts). Default 30.
+// realertMin returns the re-alert interval in minutes from the SNAPSHOT.
+// 0 means alert once only (no re-alerts). Default 30. Lock-free: a DB
+// hiccup can no longer read realert_min as "" and reset the interval to the
+// 30-min default mid-storm (2026-11-05 finding #5).
 func (pw *ProbeWorker) realertMin() int {
-	if v := pw.db.GetSetting("realert_min"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1440 {
-			return n
-		}
-	}
-	return 30
+	return pw.alertSettings().realertMin
 }
 
 // ResetAlertStates stamps every tracked sensor's alert_state to now, so
@@ -413,36 +566,6 @@ func flagHasURL(kind string) func(db *store.Store) bool {
 // deliver; a URL alone can't reach anyone.
 func telegramHasURL(db *store.Store) bool {
 	return db.GetSetting("telegram_url") != "" && db.GetSetting("telegram_chat_id") != ""
-}
-
-// activeProviders returns the enabled, URL-configured providers. The
-// second return value reports whether the DB read itself succeeded
-// GetSetting maps a read error to "", so a
-// failing DB is indistinguishable from "no providers configured" without
-// the liveness ping. On a read failure the LAST KNOWN-GOOD list is served
-// from the cache; if nothing was ever loaded, it returns (nil, false) and
-// the caller must report the alert NOT delivered — never "delivered" when
-// nothing was sent.
-func (pw *ProbeWorker) activeProviders() ([]providerMeta, bool) {
-	if err := pw.db.Ping(); err != nil {
-		pw.provMu.Lock()
-		cached := pw.lastProviders
-		pw.provMu.Unlock()
-		if cached != nil {
-			return cached, true
-		}
-		return nil, false
-	}
-	var out []providerMeta
-	for _, p := range providerList {
-		if p.Enabled(pw.db) && p.HasURL(pw.db) {
-			out = append(out, p)
-		}
-	}
-	pw.provMu.Lock()
-	pw.lastProviders = out
-	pw.provMu.Unlock()
-	return out, true
 }
 
 // providerStatus is the per-provider read the settings API returns to the
@@ -824,51 +947,23 @@ type dest struct {
 var getSettingErr = func(db *store.Store, key string) (string, error) { return db.GetSettingErr(key) }
 
 // resolveDestinations returns the active, configured providers with their
-// URLs (and, for telegram, the chat_id). ok=false means the provider list
-// is unreadable (DB error with no last-known-good cache) — the caller must
-// treat the send as FAILED, not delivered.
+// URLs (and, for telegram, the chat_id) from the settings SNAPSHOT. It is
+// lock-free: the destinations are resolved at snapshot-load time (worker
+// start + every PUT /api/settings commit), so the delivery path performs
+// ZERO settings reads. ok is always true — the snapshot is never nil (a
+// default is stored before the first load), so there is no "unreadable"
+// state to report. The delivery job calls it through the deliverDestinations
+// seam so the panic-recovery test can force a job-level panic.
 func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
-	providers, readOK := pw.activeProviders()
-	if !readOK {
-		return nil, false
-	}
-	var dests []dest
-	for _, p := range providers {
-		// p.URLField, NOT p.Kind + "_url": SMTP's value lives in
-		// "smtp_host" (see providerList), and a "smtp_url" lookup
-		// returns "" for every real SMTP config — silently skipping
-		// email in both the per-sensor delivery and the storm summary,
-		// with sendWebhookDeliver reporting "delivered" (no dests) for
-		// an alert nothing was sent in.
-		url, err := getSettingErr(pw.db, p.URLField)
-		if err != nil {
-			return nil, false
-		}
-		if url == "" && p.EnvFallback != "" {
-			url = os.Getenv(p.EnvFallback)
-		}
-		if url == "" {
-			continue
-		}
-		// Telegram's chat_id is resolved HERE, error-aware, for the same
-		// reason as the URL: a live read in the delivery goroutine maps a
-		// transient DB lock to "" and posts an empty chat_id (Telegram
-		// 400; the storm-summary path has no retry, so the alert drops).
-		// An active telegram provider passed telegramHasURL (chat_id
-		// non-empty), so "" here means "read failed or cleared
-		// mid-flight" — fail the whole send (the caller retries), never
-		// post an empty chat_id (2026-10-30 review #3).
-		var chatID string
-		if p.Kind == "telegram" {
-			chatID, err = getSettingErr(pw.db, "telegram_chat_id")
-			if err != nil || chatID == "" {
-				return nil, false
-			}
-		}
-		dests = append(dests, dest{p, url, chatID})
-	}
-	return dests, true
+	return pw.alertSettings().dests, true
 }
+
+// deliverDestinations is the seam the delivery job uses to resolve
+// destinations; a var so the panic-recovery test (sendwebhook_panic_test.go)
+// can force a JOB-LEVEL panic in sendWebhookDeliver — the m1 done-channel
+// guarantee — independent of the per-provider recovers. Production is a
+// plain snapshot read.
+var deliverDestinations = func(pw *ProbeWorker) ([]dest, bool) { return pw.resolveDestinations() }
 
 // sendWebhookDeliver delivers one alert to every active provider IN
 // PARALLEL (a slow endpoint must not delay the others) and reports whether
@@ -877,19 +972,18 @@ func (pw *ProbeWorker) resolveDestinations() ([]dest, bool) {
 // configured provider failed after its retries, so the caller can schedule
 // another attempt.
 func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
-	// Resolve every provider URL BEFORE delivering anything. GetSetting
-	// maps a DB error to "" — indistinguishable from "not configured" — so
-	// a transient read failure made every provider look unset and the alert
-	// was reported delivered (attempted == 0) and silently dropped. A real
-	// DB error now fails the send; resolving up front
-	// means no provider has fired yet when we bail.
-	dests, ok := pw.resolveDestinations()
+	// Resolve every provider destination from the SNAPSHOT before
+	// delivering anything: a transient DB lock can no longer make every
+	// provider look unset and the alert silently dropped (the old
+	// swallow-to-"" GetSetting). Resolving up front also means no provider
+	// has fired yet when we bail.
+	dests, ok := deliverDestinations(pw)
 	if !ok {
-		// DB unreadable and no last-known-good list: the alert CANNOT be
-		// delivered, and it must be reported as such so the caller can
-		// retry — never "delivered" on an empty (error-induced) provider
-		// list.
-		log.Printf("alert: provider list unreadable (no cache) — alert not delivered")
+		// The snapshot is never nil in practice, so this is defensive: an
+		// empty/unreadable destination list must be reported as NOT
+		// delivered so the caller can retry — never "delivered" on an
+		// empty provider list.
+		log.Printf("alert: provider list unreadable — alert not delivered")
 		return false
 	}
 	var wg sync.WaitGroup

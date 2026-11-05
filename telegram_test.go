@@ -132,14 +132,28 @@ func TestResolveDestinationsResolvesTelegramChatID(t *testing.T) {
 	}
 }
 
-// TestTelegramDeliveryFailsClosedOnChatIDReadError (2026-10-30 review #3):
-// a transient settings-read failure on telegram_chat_id must fail the whole
-// send (reported not-delivered, so the caller retries) — never post an
-// empty chat_id, which Telegram answers 400 and the storm-summary path
-// (no retry) would drop. Pre-fix the chat_id was re-read live in the
-// delivery goroutine via the swallow-to-"" GetSetting, so a DB lock at
-// delivery time posted {"chat_id": ""}.
+// TestTelegramDeliveryFailsClosedOnChatIDReadError (2026-10-30 review #3,
+// reworked 2026-11-05 for the settings snapshot): a transient settings-read
+// failure on telegram_chat_id must never post an empty chat_id — which
+// Telegram answers 400 and the storm-summary path (no retry) would drop.
+// Pre-snapshot the chat_id was re-read LIVE in the delivery goroutine via
+// the swallow-to-"" GetSetting, so a DB lock at delivery time posted
+// {"chat_id": ""}. The snapshot moves that read to LOAD time: a failing
+// chat_id read aborts the load and KEEPS the last good snapshot, so the
+// delivery path always carries the last known-good chat_id (or no provider
+// at all) — never an empty one.
 func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
+	// The cleartext client's dial-time SSRF check (dialCheckedCleartext)
+	// refuses loopback by design; the kept-good chat_id must actually reach
+	// the endpoint, so swap in a plain dialer (same seam as the healthy-path
+	// test below).
+	transport := webhookClientCleartext.Transport.(*http.Transport)
+	origDial := transport.DialContext
+	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+	}
+	t.Cleanup(func() { transport.DialContext = origDial })
+
 	db := newTestDB(t)
 	_ = db.SetSetting("telegram_enabled", "1")
 	var reqCount int32
@@ -150,8 +164,16 @@ func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
 	defer srv.Close()
 	_ = db.SetSetting("telegram_url", srv.URL)
 	_ = db.SetSetting("telegram_chat_id", "111222")
-	pw := NewProbeWorker(db)
 
+	// Healthy first load: the snapshot carries the resolved chat_id.
+	pw := NewProbeWorker(db)
+	if dests, _ := pw.resolveDestinations(); len(dests) != 1 || dests[0].chatID != "111222" {
+		t.Fatalf("initial snapshot did not resolve the telegram chat_id (dests=%v)", dests)
+	}
+
+	// Now a transient DB lock on the chat_id read: the reload must KEEP the
+	// last good snapshot (with the valid chat_id), never install a half-read
+	// state with an empty chat_id.
 	orig := getSettingErr
 	getSettingErr = func(db *store.Store, key string) (string, error) {
 		if key == "telegram_chat_id" {
@@ -160,15 +182,21 @@ func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
 		return orig(db, key)
 	}
 	defer func() { getSettingErr = orig }()
+	pw.reloadAlertSettings()
 
-	if dests, ok := pw.resolveDestinations(); ok {
-		t.Fatalf("resolveDestinations ok=true with a failing chat_id read (dests=%v)", dests)
+	// The snapshot kept the last good state: the telegram dest is still
+	// present with the VALID chat_id (not an empty one).
+	dests, ok := pw.resolveDestinations()
+	if !ok || len(dests) != 1 || dests[0].chatID != "111222" {
+		t.Fatalf("reload with a failing chat_id read lost the last good snapshot (ok=%v dests=%v)", ok, dests)
 	}
-	if pw.sendWebhookDeliver("s1", "s1", "10.0.0.1", "up", "error", 0, false) {
-		t.Fatal("sendWebhookDeliver reported delivered with a failing chat_id read")
+	// Delivery uses the kept chat_id — it reaches the endpoint exactly once,
+	// with the valid chat_id (never empty).
+	if !pw.sendWebhookDeliver("s1", "s1", "10.0.0.1", "up", "error", 0, false) {
+		t.Fatal("sendWebhookDeliver reported not-delivered with a kept-good chat_id")
 	}
-	if n := atomic.LoadInt32(&reqCount); n != 0 {
-		t.Fatalf("endpoint received %d request(s); want 0 (the send must fail before any POST)", n)
+	if n := atomic.LoadInt32(&reqCount); n != 1 {
+		t.Fatalf("endpoint received %d request(s); want 1 (the kept-good chat_id delivers)", n)
 	}
 }
 

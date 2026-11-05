@@ -56,6 +56,10 @@ func newStormTestWorker(t *testing.T) (*ProbeWorker, *store.Store, func() []stri
 		w.WriteHeader(http.StatusOK)
 	}))
 	_ = db.SetSetting("google_chat_url", srv.URL)
+	// The provider is set AFTER NewProbeWorker (which loaded the snapshot
+	// with no providers), so reload the snapshot to pick it up — the same
+	// swap the production PUT /api/settings path does (finding #5).
+	pw.reloadAlertSettings()
 	get := func() []string {
 		mu.Lock()
 		defer mu.Unlock()
