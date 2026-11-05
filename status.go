@@ -170,15 +170,15 @@ func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]float32, bool) {
 		return nil, false
 	}
 	out := make([]float32, 0, limit)
-	for i := len(s.data) - 1; i >= s.start && len(out) < limit; i-- {
+	for i := len(s.raw) - 1; i >= s.rawStart && len(out) < limit; i-- {
 		// Manual "Pulse Now" rows are excluded from status derivation
 		// (probes.manual): they stay in the series for the 60-probe
 		// inspector window, but never count toward loss % or the
 		// consecutive-loss test (see the PingNow doc; the loss/uptime aggregates skip them too).
-		if s.data[i].manual {
+		if s.raw[i].manual {
 			continue
 		}
-		out = append(out, s.data[i].rtt)
+		out = append(out, s.raw[i].rtt)
 	}
 	// A FULL window of scheduled probes is required. Manual pulses can
 	// dilute the tail (a 2s cooldown allows many), and a partial window

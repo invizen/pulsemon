@@ -48,35 +48,65 @@ func rttToPtr(rtt float32) *float64 {
 	return &v
 }
 
-// probeSeries is an append-only, oldest-first log of probeEntry with a
-// logical `start` offset. Appending is amortized O(1); entries older than the
-// 24h retention are evicted by advancing `start`, and the backing array is
-// compacted only occasionally (when `start` grows large) so the common
-// append path never pays an O(n) memmove.
-type probeSeries struct {
-	data  []probeEntry
-	start int // index (into data) of the oldest live entry
+// minuteBucket is one minute of folded probe history: the per-minute
+// {total, lost, sumRTT, maxRTT} aggregate that keeps the in-memory series
+// bounded at max(1h, last-60) raw entries (finding #8) and lets the 24h graph
+// be served from memory — folded into 15-min buckets — instead of a
+// per-request SQL aggregate over the probes table. Only non-manual probes are
+// folded in (a diagnostic click must not move the graph or the uptime counters).
+type minuteBucket struct {
+	minute int64   // minute start, epoch seconds (ts/60*60)
+	total  int32   // non-manual probes in the minute
+	lost   int32   // non-manual lost probes in the minute
+	sumRTT float64 // sum of non-lost RTTs (ms) — feeds the graph AVG
+	maxRTT float32 // max non-lost RTT (ms) — feeds the graph MAX
+	hasRTT bool    // at least one non-lost probe (maxRTT valid)
+}
 
-	// Incremental 24h counters: total24 and
-	// lost24 count the LIVE entries inside the 24h window so the per-poll
-	// stats read is O(1) for uptime instead of a full-series scan. append
-	// maintains them: the new entry is always inside its own window (+1),
-	// and in24Start — the first live index still inside the window — walks
-	// forward as the cutoff (newest ts - retention, monotonic) passes
-	// entries out of it (-1). in24Start only moves forward, so the
-	// bookkeeping is amortized O(1). The invariant start <= in24Start holds
-	// by induction: eviction (start) only passes entries that are OUT of
-	// the window, which in24Start has already passed — so the evict loop
-	// never touches the counters (decrementing there would double-count).
-	// A long-interval sensor's last-60 tail can hold entries older than 24h
-	// (kept by the 60-probe rule): in24Start passes them out of the
-	// counters even though start keeps them in the series. Manual "Pulse
-	// Now" rows are never counted (a diagnostic click must not move
-	// uptime_24h): append skips them on the way in and in24Start skips
-	// them on the way out.
-	total24   int
-	lost24    int
-	in24Start int
+// probeSeries is an append-only, oldest-first probe log split into two tiers:
+//
+//   - raw: the entries the per-probe read path needs at full resolution —
+//     max(1h, last 60). The 60-probe inspector window, the status window, the
+//     1h loss/avg, and the sparkline all read from raw (computeSensorStats).
+//   - buckets: per-minute {total, lost, sumRTT, maxRTT} aggregates for the
+//     entries older than the raw window (up to 24h). The 24h graph folds these
+//     into 15-min buckets; the 24h uptime comes from the incremental counters
+//     below, so the graph and the uptime never need a raw scan past 1h.
+//
+// Appending is amortized O(1): the new entry lands in raw, raw entries that
+// age out of the raw window are folded into a minute bucket (each entry is
+// folded exactly once), and minute buckets older than 24h are evicted
+// (decrementing the 24h counters). This bounds memory at ~max(1h,60) raw
+// entries + 1440 minute buckets per sensor — ~57 KB at a 5s interval — instead
+// of a full 24h of raw probes (17,280 entries ≈ 276 KB, up to ~2× with slice
+// slack). Slow-interval sensors (whose last-60 window already spans >1h) fold
+// nothing and stay at ~60 raw entries + no buckets, as before.
+type probeSeries struct {
+	raw      []probeEntry
+	rawStart int // index (into raw) of the oldest live raw entry
+	// raw24Start is the first live raw index inside the 24h window (ts >=
+	// newest - retentionSeconds). The raw tier keeps the last-60 tail even for
+	// slow-interval sensors, so it can hold entries OLDER than 24h (kept for
+	// the 60-probe inspector window); raw24Start walks forward past them so
+	// they stay in the series but drop out of the 24h counters. It is clamped
+	// to >= rawStart (folded entries are dead and never re-counted).
+	raw24Start int
+
+	buckets     []minuteBucket
+	bucketStart int // index (into buckets) of the oldest live bucket
+
+	// Incremental 24h counters: total24/lost24 count the LIVE entries inside
+	// the 24h window (raw from raw24Start + buckets) so the per-poll stats
+	// read is O(1) for uptime instead of a full-series scan. append maintains
+	// them: a new non-manual entry is always inside its own window (+1);
+	// advancing raw24Start past a raw entry out of the window (-1); and
+	// evicting a minute bucket older than 24h subtracts that bucket's
+	// total/lost. Folding a raw entry into a bucket is a no-op for the counters
+	// (it stays inside the window). Manual "Pulse Now" rows are never counted
+	// (a diagnostic click must not move uptime_24h): append skips them on the
+	// way in, folding drops them (no bucket), and both walk paths skip them.
+	total24 int
+	lost24  int
 }
 
 // warmStats loads every active sensor's 24h probe history into the cache so a
@@ -256,8 +286,8 @@ func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
 	// cutoff walks depend on. Clamping to the newest stored ts costs one
 	// comparison per append and restores the invariant; equality is fine
 	// for the cutoff walks.
-	if n := len(s.data); n > 0 && e.ts < s.data[n-1].ts {
-		e.ts = s.data[n-1].ts
+	if n := len(s.raw); n > 0 && e.ts < s.raw[n-1].ts {
+		e.ts = s.raw[n-1].ts
 	}
 	s.append(e)
 }
@@ -278,7 +308,11 @@ func (pw *ProbeWorker) statsFor(id string, nowUnix int64) *SensorStats {
 	if !ok || s.len() == 0 {
 		return nil
 	}
-	return computeSensorStats(s.data[s.start:], nowUnix, s.total24, s.lost24)
+	// computeSensorStats reads only the raw tier: the 60-probe inspector
+	// window, the status window, the 1h loss/avg, and the sparkline all fit
+	// inside max(1h, last 60). The 24h uptime comes from the incremental
+	// counters, so the per-poll read never scans the minute buckets.
+	return computeSensorStats(s.raw[s.rawStart:], nowUnix, s.total24, s.lost24)
 }
 
 // GetStats computes a sensor's SensorStats from the in-memory series,

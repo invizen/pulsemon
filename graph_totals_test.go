@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -12,12 +13,13 @@ import (
 func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 	// Setup DB
 	d := newTestDB(t)
+	pw := NewProbeWorker(d)
 	// Go through the real mux so the {id} path value is populated.
-	mux := NewServer(d, NewProbeWorker(d)).Mux()
+	mux := NewServer(d, pw).Mux()
 
 	sensorID := "test-sensor"
 	_, err := d.Exec("INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		sensorID, "Test Sensor", "127.0.0.1", "icmp", 60, 1000, 10, 30, 2.0, "up", "up", time.Now())
+		sensorID, "Test Sensor", "127.0.0.1", "icmp", 60, 1000, 10, 30, 2.0, "active", "up", time.Now())
 	if err != nil {
 		t.Fatalf("exec: %v", err)
 	}
@@ -48,6 +50,10 @@ func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 			t.Fatalf("exec: %v", err)
 		}
 	}
+
+	// Warm the stats cache (finding #8): the graph is served from the
+	// in-memory series, so the probe history must be loaded before the request.
+	pw.warmStats(context.Background())
 
 	// Test 1h range
 	req := httptest.NewRequest(http.MethodGet, "/api/sensors/"+sensorID+"/graph?range=1h", nil)

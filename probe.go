@@ -11,6 +11,7 @@ import (
 	"net"
 	"regexp"
 	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -50,7 +51,7 @@ type ProbeState struct {
 	lastCertExpiry *time.Time
 }
 
-func (ps *probeSeries) len() int { return len(ps.data) - ps.start }
+func (ps *probeSeries) len() int { return len(ps.raw) - ps.rawStart }
 
 // lastTs is the timestamp of the newest appended entry (0 when empty).
 // Entries are appended in arrival order; callers use it only as a
@@ -59,79 +60,258 @@ func (ps *probeSeries) lastTs() int64 {
 	if ps.len() == 0 {
 		return 0
 	}
-	return ps.data[len(ps.data)-1].ts
+	return ps.raw[len(ps.raw)-1].ts
 }
 
-// append adds a new (newest) entry and evicts entries the dashboard can never
-// need. The retention is the UNION of the two windows the stats read:
-//   - the 60-probe stats window keeps the LAST 60 probes even if a sensor's
-//     long interval pushes them past 24h (a 1h-interval sensor's 60 probes
-//     span 60h) — this is what `ORDER BY ts DESC LIMIT 60` reads;
-//   - the 24h time window keeps everything within retentionSeconds for the
-//     uptime/sparkline/hour fields — what `ts >= now-24h` reads.
+// rawWindowSecs is the time span the raw tier keeps at full resolution: the
+// per-probe read path (60-probe inspector, status window, 1h loss/avg,
+// sparkline) only ever needs the last hour. The last-60 count rule (below)
+// extends the raw tier further back for slow-interval sensors whose 60 probes
+// span more than an hour.
+const rawWindowSecs = 3600
+
+// append adds a new (newest) entry. It lands in the raw tier; raw entries that
+// age out of the raw window — max(1h, last 60) — are folded into per-minute
+// buckets (each entry folds exactly once); minute buckets older than the 24h
+// retention are evicted, decrementing the 24h counters.
 //
-// An entry is evicted only when it is BOTH beyond the last 60 AND older than
-// the 24h cutoff, so the series always holds exactly the union the DB path
-// returns (never fewer), and memory is bounded for fast-interval sensors.
+// The raw window is the UNION the DB read path returns at per-probe
+// resolution:
+//   - the 60-probe stats window keeps the LAST 60 probes even if a sensor's
+//     long interval pushes them past an hour (a 1h-interval sensor's 60 probes
+//     span 60h) — this is what `ORDER BY ts DESC LIMIT 60` reads;
+//   - the 1h window keeps everything within rawWindowSecs for the loss/avg/
+//     sparkline fields — what `ts >= now-1h` reads.
+//
+// An entry is evicted from raw only when it is BOTH beyond the last 60 AND
+// older than the 1h cutoff; it then folds into a minute bucket (manual rows
+// are dropped — they never enter the buckets or the counters). Memory is thus
+// bounded at ~max(1h, 60) raw entries + 1440 minute buckets, not a full 24h of
+// raw probes (finding #8).
 func (ps *probeSeries) append(e probeEntry) {
-	if ps.start > 0 && (ps.start >= 4096 || ps.start*2 >= len(ps.data)) {
+	if ps.rawStart > 0 && (ps.rawStart >= 4096 || ps.rawStart*2 >= len(ps.raw)) {
 		// Reclaim front space so future appends reuse the backing array
-		// instead of reallocating every time (the classic "resliced slice
-		// grows unbounded" trap). Entries are value types, so no zeroing
-		// is needed to free memory — shifting is all it takes.
-		n := copy(ps.data, ps.data[ps.start:])
-		ps.data = ps.data[:n]
-		ps.in24Start -= ps.start // the window pointer shifts with the array
-		ps.start = 0
-	}
-	ps.data = append(ps.data, e)
-	// Eviction boundary: the INDEX of the first entry beyond the last 60
-	// (len(data)-60) — NOT len()-60, which is off by `start` and, once
-	// start grows, stops evicting entirely: a long-interval sensor's
-	// series would then grow unbounded (the start < start+len-60 test
-	// fails at half density). Caught by
-	// TestSeriesCountersTrackRecount (6000 hourly appends → len 3030
-	// instead of 60 on the pre-fix code).
-	boundary := len(ps.data) - 60
-	if boundary < 0 {
-		boundary = 0
-	}
-	cutoff := e.ts - retentionSeconds
-	// 24h window bookkeeping: entries the window has passed drop out of the
-	// counters HERE (see the field doc for why the evict loop below must
-	// not touch them). Manual rows were never counted, so they never
-	// decrement.
-	for ps.in24Start < len(ps.data) && ps.data[ps.in24Start].ts < cutoff {
-		if !ps.data[ps.in24Start].manual {
-			if isLost(ps.data[ps.in24Start].rtt) {
-				ps.lost24--
-			}
-			ps.total24--
+		// instead of reallocating (the classic "resliced slice grows
+		// unbounded" trap). Entries are value types, so no zeroing is needed
+		// to free memory — shifting is all it takes.
+		n := copy(ps.raw, ps.raw[ps.rawStart:])
+		ps.raw = ps.raw[:n]
+		if ps.raw24Start > ps.rawStart {
+			ps.raw24Start -= ps.rawStart
+		} else {
+			ps.raw24Start = 0
 		}
-		ps.in24Start++
+		ps.rawStart = 0
 	}
-	for ps.start < boundary && ps.data[ps.start].ts < cutoff {
-		ps.start++
-	}
-	// Manual "Pulse Now" rows stay in the series (the inspector window
-	// reads them) but never enter the 24h counters: a diagnostic click
-	// must not move uptime_24h.
+	ps.raw = append(ps.raw, e)
+	// 24h counters: the new entry is always inside its own window.
 	if !e.manual {
 		ps.total24++
 		if isLost(e.rtt) {
 			ps.lost24++
 		}
 	}
+	// Fold raw entries that have aged out of the raw window into minute
+	// buckets. The boundary is the FIRST index to keep in raw: an entry is
+	// kept if it is within the 1h window (index >= timeBoundary) OR in the
+	// last 60 (index >= countBoundary), so it is kept iff index >=
+	// min(timeBoundary, countBoundary). raw is ts-sorted, so the time
+	// boundary is a clean binary search.
+	n := len(ps.raw)
+	cutoffHour := e.ts - rawWindowSecs
+	i := sort.Search(n, func(j int) bool { return ps.raw[j].ts >= cutoffHour })
+	if i < ps.rawStart {
+		i = ps.rawStart
+	}
+	c := n - 60
+	if c < ps.rawStart {
+		c = ps.rawStart
+	}
+	boundary := i
+	if c < boundary {
+		boundary = c
+	}
+	for ps.rawStart < boundary {
+		fe := ps.raw[ps.rawStart]
+		// Fold only entries still inside the 24h window (index >= raw24Start):
+		// an entry already out of the window was decremented when raw24Start
+		// passed it, so folding it into a bucket (then evicting the bucket)
+		// would double-decrement the counters. Entries out of the window — and
+		// manual rows, which never enter the buckets — are simply dropped.
+		if !fe.manual && ps.rawStart >= ps.raw24Start {
+			ps.foldIntoBucket(fe)
+		}
+		ps.rawStart++
+	}
+	// Evict minute buckets older than the 24h window, decrementing counters.
+	// A bucket is fully out of the window once its minute start is before the
+	// cutoff (at most a one-minute over-eviction, negligible for a 24h window
+	// and consistent with the entry-level cutoff the old code used).
+	cutoff24 := e.ts - retentionSeconds
+	for ps.bucketStart < len(ps.buckets) && ps.buckets[ps.bucketStart].minute < cutoff24 {
+		ps.total24 -= int(ps.buckets[ps.bucketStart].total)
+		ps.lost24 -= int(ps.buckets[ps.bucketStart].lost)
+		ps.bucketStart++
+	}
+	// Reclaim bucket front space (buckets max out at 1440 live).
+	if ps.bucketStart > 0 && (ps.bucketStart >= 256 || ps.bucketStart*2 >= len(ps.buckets)) {
+		nb := copy(ps.buckets, ps.buckets[ps.bucketStart:])
+		ps.buckets = ps.buckets[:nb]
+		ps.bucketStart = 0
+	}
+	// Advance raw24Start past live raw entries that have aged out of the 24h
+	// window. The raw tier keeps the last-60 tail (slow-interval sensors), so
+	// it can hold entries older than 24h; they stay in the series (the
+	// 60-probe inspector window reads them) but must not count toward
+	// uptime_24h. Folded entries (index < rawStart) are dead — the clamp keeps
+	// them from being re-counted (a fold is a no-op for the counters: the
+	// entry either stays in the window via its bucket or leaves via bucket
+	// eviction).
+	if ps.raw24Start < ps.rawStart {
+		ps.raw24Start = ps.rawStart
+	}
+	for ps.raw24Start < len(ps.raw) && ps.raw[ps.raw24Start].ts < cutoff24 {
+		if !ps.raw[ps.raw24Start].manual {
+			if isLost(ps.raw[ps.raw24Start].rtt) {
+				ps.lost24--
+			}
+			ps.total24--
+		}
+		ps.raw24Start++
+	}
 }
 
-// snapshot copies the live entries (oldest-first) into a fresh slice so a
+// foldIntoBucket folds one aged-out raw entry into the per-minute buckets.
+// Entries fold in ts order (oldest first), so the new minute is always >= the
+// newest bucket's minute: equal folds in place, greater appends a new bucket.
+func (ps *probeSeries) foldIntoBucket(e probeEntry) {
+	minute := e.ts / 60 * 60
+	lost := isLost(e.rtt)
+	if n := len(ps.buckets); n > ps.bucketStart && ps.buckets[n-1].minute == minute {
+		b := &ps.buckets[n-1]
+		b.total++
+		if lost {
+			b.lost++
+		} else {
+			b.sumRTT += float64(e.rtt)
+			if !b.hasRTT || e.rtt > b.maxRTT {
+				b.maxRTT = e.rtt
+				b.hasRTT = true
+			}
+		}
+		return
+	}
+	b := minuteBucket{minute: minute, total: 1}
+	if lost {
+		b.lost = 1
+	} else {
+		b.sumRTT = float64(e.rtt)
+		b.maxRTT = e.rtt
+		b.hasRTT = true
+	}
+	ps.buckets = append(ps.buckets, b)
+}
+
+// snapshot copies the live RAW entries (oldest-first) into a fresh slice so a
 // reader can compute stats off the shared lock without the series mutating
-// mid-read.
+// mid-read. The minute buckets are not copied: the per-probe read path
+// (computeSensorStats) never needs them, and the graph reads them in place
+// under the read lock.
 func (ps *probeSeries) snapshot() []probeEntry {
 	n := ps.len()
 	out := make([]probeEntry, n)
-	copy(out, ps.data[ps.start:])
+	copy(out, ps.raw[ps.rawStart:])
 	return out
+}
+
+// graphPoints serves the inspector's 1h/24h graphs from the in-memory series
+// (raw entries + minute buckets) instead of a per-request SQL aggregate.
+// bucketSecs is the bucket size (60 for 1h, 900 for 24h); rangeSecs is the
+// window (3600 for 1h, 86400 for 24h); nowUnix anchors the window. Manual rows
+// are excluded (diagnostic clicks, not scheduled samples) — matching the SQL
+// graph's `manual = 0`. Returns points oldest-first with T = bucket start
+// (epoch seconds), the same shape the SQL path returned.
+func (ps *probeSeries) graphPoints(bucketSecs, rangeSecs int, nowUnix int64) []GraphPoint {
+	cutoff := nowUnix - int64(rangeSecs)
+	bucketSize := int64(bucketSecs)
+	type agg struct {
+		total  int
+		lost   int
+		sumRTT float64
+		maxRTT float32
+		hasRTT bool
+	}
+	m := make(map[int64]*agg)
+	get := func(b int64) *agg {
+		a := m[b]
+		if a == nil {
+			a = &agg{}
+			m[b] = a
+		}
+		return a
+	}
+	addEntry := func(ts int64, rtt float32, manual bool) {
+		if manual || ts < cutoff {
+			return
+		}
+		a := get(ts / bucketSize * bucketSize)
+		a.total++
+		if isLost(rtt) {
+			a.lost++
+		} else {
+			a.sumRTT += float64(rtt)
+			if !a.hasRTT || rtt > a.maxRTT {
+				a.maxRTT = rtt
+				a.hasRTT = true
+			}
+		}
+	}
+	addBucket := func(mb *minuteBucket) {
+		if mb.minute < cutoff {
+			return
+		}
+		a := get(mb.minute / bucketSize * bucketSize)
+		a.total += int(mb.total)
+		a.lost += int(mb.lost)
+		a.sumRTT += mb.sumRTT
+		if mb.hasRTT && (!a.hasRTT || mb.maxRTT > a.maxRTT) {
+			a.maxRTT = mb.maxRTT
+			a.hasRTT = true
+		}
+	}
+	// Minute buckets (older than the raw window, within 24h), then the raw
+	// tier (the raw window). A raw entry and a bucket never cover the same
+	// probe — a probe is in exactly one tier — so there is no double-count.
+	for i := ps.bucketStart; i < len(ps.buckets); i++ {
+		addBucket(&ps.buckets[i])
+	}
+	for i := ps.rawStart; i < len(ps.raw); i++ {
+		e := &ps.raw[i]
+		addEntry(e.ts, e.rtt, e.manual)
+	}
+	keys := make([]int64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	points := make([]GraphPoint, 0, len(keys))
+	for _, k := range keys {
+		a := m[k]
+		p := GraphPoint{T: k, Total: a.total, Lost: a.lost}
+		if a.total > 0 {
+			p.LossPct = float64(a.lost) / float64(a.total) * 100
+		}
+		if a.total-a.lost > 0 {
+			avg := a.sumRTT / float64(a.total-a.lost)
+			p.Avg = &avg
+		}
+		if a.hasRTT {
+			v := float64(a.maxRTT)
+			p.Max = &v
+		}
+		points = append(points, p)
+	}
+	return points
 }
 
 type sensorConfig struct {

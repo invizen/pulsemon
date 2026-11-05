@@ -539,7 +539,7 @@ func TestSeriesEviction(t *testing.T) {
 		t.Errorf("slow: len = %d, want 60 (last-60 window dominates)", got)
 	}
 	// The oldest surviving entry is exactly 59h old (the newest 60 probes).
-	if got := slow.data[slow.start].ts; got != testNowUnix-int64(59)*3600 {
+	if got := slow.raw[slow.rawStart].ts; got != testNowUnix-int64(59)*3600 {
 		t.Errorf("slow: oldest kept ts = %d, want %d", got, testNowUnix-59*3600)
 	}
 }
@@ -632,13 +632,15 @@ func TestRecordProbeConcurrent(t *testing.T) {
 }
 
 // TestSeriesCountersTrackRecount locks the incremental 24h counters
-// (total24/lost24/in24Start) against a brute-force recount at EVERY append:
-// a 1h-interval sensor (so the last-60 tail holds entries OLDER than 24h —
-// they must stay in the series but drop out of the counters), a 1/3 loss
-// pattern, and 6000 appends (enough to force the compaction path,
-// start >= 4096, several times). Any drift in append's bookkeeping — a
-// double-decrement on evict, a missed aging-out, a compaction index bug —
-// surfaces as a divergence at some step.
+// (total24/lost24) against a brute-force recount at EVERY append: a 1h-interval
+// sensor (so the last-60 tail holds entries OLDER than 24h — they must stay in
+// the series but drop out of the counters), a 1/3 loss pattern, and 6000
+// appends (enough to force the compaction path, rawStart >= 4096, several
+// times). Any drift in append's bookkeeping — a double-decrement on evict, a
+// missed aging-out, a compaction index bug — surfaces as a divergence at some
+// step. The recount covers BOTH tiers: the raw entries inside the 24h window
+// plus the live minute buckets (a folded raw entry moves from one tier to the
+// other without leaving the window, so it must be counted in exactly one).
 func TestSeriesCountersTrackRecount(t *testing.T) {
 	var s probeSeries
 	const total = 6000
@@ -650,19 +652,23 @@ func TestSeriesCountersTrackRecount(t *testing.T) {
 			rtt = float32(10 + i%50)
 		}
 		s.append(probeEntry{ts: ts, rtt: rtt})
-		if s.in24Start < s.start {
-			t.Fatalf("after append %d: invariant broken, in24Start %d < start %d", i, s.in24Start, s.start)
-		}
 		// Brute-force recount: live entries inside the 24h window, anchored
 		// at the NEWEST entry (the same anchor append's cutoff uses).
-		newest := s.data[len(s.data)-1].ts
+		newest := s.raw[len(s.raw)-1].ts
+		cutoff := newest - retentionSeconds
 		wantT, wantL := 0, 0
-		for _, e := range s.data[s.start:] {
-			if e.ts >= newest-retentionSeconds {
+		for _, e := range s.raw[s.rawStart:] {
+			if !e.manual && e.ts >= cutoff {
 				wantT++
 				if isLost(e.rtt) {
 					wantL++
 				}
+			}
+		}
+		for i := s.bucketStart; i < len(s.buckets); i++ {
+			if s.buckets[i].minute >= cutoff {
+				wantT += int(s.buckets[i].total)
+				wantL += int(s.buckets[i].lost)
 			}
 		}
 		if s.total24 != wantT || s.lost24 != wantL {

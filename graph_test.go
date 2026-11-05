@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -65,7 +66,11 @@ func TestGraphTimeWindowRegression(t *testing.T) {
 		t.Fatalf("test setup: expected within1h=1 within24h=2, got %d/%d", within1h, within24h)
 	}
 
-	srv := NewServer(db, NewProbeWorker(db))
+	// Warm the stats cache: the graph is now served from the in-memory series
+	// (finding #8), so the probe history must be loaded before the request.
+	pw := NewProbeWorker(db)
+	pw.warmStats(context.Background())
+	srv := NewServer(db, pw)
 	mux := srv.Mux()
 
 	graphTotal := func(rng string) (int, float64) {
@@ -141,7 +146,11 @@ func TestGraphExcludesManualRows(t *testing.T) {
 		t.Fatalf("insert manual pulse: %v", err)
 	}
 
-	srv := NewServer(db, NewProbeWorker(db))
+	// Warm the stats cache (finding #8): the graph is served from the
+	// in-memory series, so the probe history must be loaded first.
+	pw := NewProbeWorker(db)
+	pw.warmStats(context.Background())
+	srv := NewServer(db, pw)
 	w := httptest.NewRecorder()
 	srv.Mux().ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/sensors/"+id+"/graph?range=1h", nil))
 	if w.Code != http.StatusOK {

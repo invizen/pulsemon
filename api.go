@@ -1751,14 +1751,12 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := r.PathValue("id")
-	var bucketSecs int
-	var from string
-	var dur time.Duration
+	var bucketSecs, rangeSecs int
 	switch r.URL.Query().Get("range") {
 	case "24h":
-		bucketSecs, from, dur = 900, "-24 hours", 24*time.Hour
+		bucketSecs, rangeSecs = 900, 24*3600
 	case "1h":
-		bucketSecs, from, dur = 60, "-1 hour", time.Hour
+		bucketSecs, rangeSecs = 60, 3600
 	default:
 		respondWithError(w, http.StatusBadRequest, "range must be 1h or 24h")
 		return
@@ -1777,99 +1775,26 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Time windows MUST compare epoch values, not raw strings: ts is stored
-	// as RFC3339 ('2026-10-04T20:47:28.530Z') while datetime('now', ?)
-	// returns space-separated ('2026-10-04 19:47:28'), so a plain
-	// `ts >= datetime('now', ?)` string comparison matched nearly every row
-	// and the "1h"/"24h" graphs silently showed the ENTIRE history.
-	// CAST(strftime('%s', ...)) normalizes both sides to epoch seconds.
-	//
-	// PERF NOTE (dismissed): a covering index
-	// probes(sensor_id, ts, rtt_ms) was proposed to avoid the base-table row
-	// fetches for COUNT/SUM/AVG/MAX. Measured at the review's own worst-case
-	// scale (72,000 rows = 50 sensors x 24h @ 60s): the query takes 0.74 ms
-	// as-is, the covering index saves ~0.06 ms (8%), and costs +48% on every
-	// probe INSERT (4.4 -> 6.5 ms per 2000 rows) plus index storage. The
-	// probes table is retention-bounded (24h, hourly purgeOld) so there is no
-	// growth trajectory, and the graph endpoint is on-demand, not the 5s poll
-	// hot path (that one is served from the in-memory stats cache). Net: a
-	// constant write-path tax to shave 0.06 ms off an occasional read — not
-	// worth it.
-	//
-	// SECOND PROPOSAL (same review pass — rejected as UNSAFE): binding a
-	// Go-formatted RFC3339 cutoff and comparing `ts >= ?` as a string to
-	// unlock an index range seek. ts is stored as RFC3339Nano (store.Now, db.go),
-	// which STRIPS trailing zeros — the live DB contains rows with 6-9 digit
-	// fractional widths. Variable-width fractions break lexicographic ==
-	// chronological: '...T01:57:25.13Z' (25.130s) compares GREATER than
-	// '...T01:57:25.134241458Z' (25.134s) because 'Z' > '4', so the window
-	// mis-filters by up to a second in both directions. This is the exact
-	// bug class the epoch-normalization comment above was written for (plain
-	// string comparison once made the graphs show the ENTIRE history). The
-	// strftime-epoch form is the format-robust comparison. And the range
-	// seek would save no rows anyway: the 24h graph window equals the 24h
-	// retention, so every row of a sensor is inside the window.
-	//
-	// THIRD PROPOSAL (APPLIED): a seekable
-	// string bound ADDED ALONGSIDE the epoch filter, which the epoch filter
-	// alone cannot express. The strftime filter stays the EXACT arbiter;
-	// `ts >= ?` only lets the planner range-seek idx_probes_sensor_ts to
-	// the 1h tail instead of scanning the sensor's full 24h slice
-	// (17,280 rows @ 5s minIntervalS -> 720). The 1s slack makes the bound
-	// safe against legacy variable-width fractional rows: any row the
-	// epoch filter includes has strictly greater integer seconds than the
-	// bound's instant (cutoff >= bound + 1s), so the seconds digits decide
-	// the string comparison regardless of fractional width; extras inside
-	// the slack are dropped by the epoch filter. Replacing the epoch
-	// filter with a string compare remains UNSAFE (second proposal). The
-	// 24h query gains nothing (window == retention), which is why the
-	// bound is harmless there. FORMAT CONTRACT: the bound only compares
-	// correctly against the single-writer store.FormatTS format (Z-suffix, 9-digit
-	// fraction — db.go tsLayout). Rows written in other RFC3339
-	// renderings (e.g. "+00:00" offsets, which sort BELOW the bound)
-	// would be silently excluded — test seeders must use store.FormatTS.
-	// Measured (17,280 rows, one sensor): plan goes from "scan sensor
-	// slice + strftime per row" to a B-tree range seek; see commit
-	// message for timings.
-	cutoffStr := store.FormatTS(time.Now().UTC().Add(-dur - time.Second))
-	// manual = 0: "Pulse Now" rows are diagnostic clicks, not scheduled
-	// samples — the card's loss/uptime aggregates (computeSensorStats)
-	// skip them, so the graph must too: // a lost pulse on a healthy sensor must not draw a loss bucket here.
-	rows, err := s.db.QueryContext(r.Context(), `SELECT (strftime('%s', ts) / ?) * ? AS bucket,
-		COUNT(*) AS total,
-		COALESCE(SUM(rtt_ms IS NULL), 0) AS lost,
-		AVG(rtt_ms) AS avg_rtt,
-		MAX(rtt_ms) AS max_rtt
-		FROM probes WHERE sensor_id = ?
-			AND manual = 0
-			AND ts >= ?
-			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', ?)) AS INTEGER)
-		GROUP BY bucket ORDER BY bucket`, bucketSecs, bucketSecs, id, cutoffStr, from)
-	if err != nil {
-		respondInternal(w, "graph query", err)
-		return
+	// Serve the buckets from the in-memory stats series (raw entries +
+	// per-minute buckets) instead of a per-request SQL aggregate (finding
+	// #8): the 24h graph folds the minute buckets into 15-min buckets and
+	// the 1h graph reads the raw hour, so neither touches the probes table.
+	// The series is the same data the warm-up loaded (the full 24h UNION),
+	// so the buckets match what the SQL path returned — including the
+	// epoch-based window (the series only holds entries within 24h of the
+	// newest probe) and the `manual = 0` exclusion (graphPoints skips
+	// manual rows). A sensor not in the cache (added after boot, before
+	// its first probe) has no series and serves an empty graph — the same
+	// as a zero-probe window.
+	s.probeWorker.statsMu.RLock()
+	ser, ok := s.probeWorker.statsCache[id]
+	var points []GraphPoint
+	if ok {
+		points = ser.graphPoints(bucketSecs, rangeSecs, time.Now().Unix())
 	}
-	defer rows.Close()
-
-	points := []GraphPoint{}
-	for rows.Next() {
-		var p GraphPoint
-		if err := rows.Scan(&p.T, &p.Total, &p.Lost, &p.Avg, &p.Max); err != nil {
-			// Defensive: the WHERE clause already drops NULL-bucket
-			// rows, so a scan failure here means a schema-level
-			// type change — log it, don't ship a silently truncated
-			// graph (same contract as fetchSensors).
-			log.Printf("API: skipping corrupt graph bucket row for %s: %v", id, err)
-			continue
-		}
-		if p.Total > 0 {
-			p.LossPct = float64(p.Lost) / float64(p.Total) * 100
-		}
-		points = append(points, p)
-	}
-	if err := rows.Err(); err != nil {
-		respondInternal(w, "graph query", err)
-		return
+	s.probeWorker.statsMu.RUnlock()
+	if points == nil {
+		points = []GraphPoint{}
 	}
 
 	var total, lostTotal int

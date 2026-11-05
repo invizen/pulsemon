@@ -183,15 +183,15 @@ func TestRecordProbeMonotonicTs(t *testing.T) {
 	pw.recordProbe("s", probeEntry{ts: 90, rtt: 2}) // racing append landed out of order
 	pw.recordProbe("s", probeEntry{ts: 95, rtt: 2})
 	s := pw.statsCache["s"]
-	if got := s.data[len(s.data)-1].ts; got != 100 {
-		// data: [100, 100(clamped 90), 100(clamped 95)]
+	if got := s.raw[len(s.raw)-1].ts; got != 100 {
+		// raw: [100, 100(clamped 90), 100(clamped 95)]
 		if got < 100 {
 			t.Fatalf("series ends at ts %d — ts-monotonic invariant broken", got)
 		}
 	}
-	for i := 1; i < len(s.data); i++ {
-		if s.data[i].ts < s.data[i-1].ts {
-			t.Fatalf("ts decreased at %d: %d -> %d", i, s.data[i-1].ts, s.data[i].ts)
+	for i := 1; i < len(s.raw); i++ {
+		if s.raw[i].ts < s.raw[i-1].ts {
+			t.Fatalf("ts decreased at %d: %d -> %d", i, s.raw[i-1].ts, s.raw[i].ts)
 		}
 	}
 }
