@@ -584,9 +584,6 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 			log.Printf("API: skipping corrupt sensor row: %v", err)
 			continue
 		}
-		if sn.Type == "" {
-			sn.Type = "icmp"
-		}
 		out = append(out, sn)
 	}
 	// A mid-stream iteration error (DB file I/O failure) ends rows.Next()
@@ -661,67 +658,20 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, code, msg)
 			return
 		}
-		req.Name = strings.TrimSpace(req.Name)
-		req.Target = strings.TrimSpace(req.Target)
-		req.Type = normalizeProbeType(req.Type)
-		if req.Name == "" || req.Target == "" {
-			respondWithError(w, http.StatusBadRequest, "name and target are required")
-			return
+		spec := sensorSpec{
+			Name:      strings.TrimSpace(req.Name),
+			Target:    strings.TrimSpace(req.Target),
+			Type:      normalizeProbeType(req.Type),
+			Tags:      cleanTags(req.Tags),
+			IntervalS: req.IntervalS,
+			TimeoutMS: req.TimeoutMS,
+			LossWarn:  req.LossWarn,
+			DownAfter: req.DownAfter,
+			SpikeMult: req.SpikeMult,
 		}
-		if !validSensorName(req.Name) {
-			respondWithError(w, http.StatusBadRequest, "name must be 1-60 characters and may not contain quotes, angle brackets, backslash, or control characters")
-			return
-		}
-		if req.Type == "http" {
-			if !validURL(req.Target) {
-				respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
-				return
-			}
-		} else if !validTarget(req.Target) {
-			respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
-			return
-		}
-		req.Tags = cleanTags(req.Tags)
-		if req.IntervalS <= 0 {
-			req.IntervalS = 60
-		}
-		if req.IntervalS < minIntervalS || req.IntervalS > 3600 {
-			respondWithError(w, http.StatusBadRequest, "interval_s must be 5-3600")
-			return
-		}
-		if req.TimeoutMS <= 0 {
-			req.TimeoutMS = 1000
-		}
-		if req.TimeoutMS < 100 || req.TimeoutMS > 30000 {
-			respondWithError(w, http.StatusBadRequest, "timeout_ms must be 100-30000")
-			return
-		}
-		// A probe timeout longer than the interval means two probes can
-		// never complete back-to-back — the loss window becomes
-		// meaningless. Reject it once both values are final.
-		if req.TimeoutMS > req.IntervalS*1000 {
-			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
-			return
-		}
-		if req.LossWarn <= 0 {
-			req.LossWarn = 25
-		}
-		if req.LossWarn < 1 || req.LossWarn > 100 {
-			respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
-			return
-		}
-		if req.DownAfter <= 0 {
-			req.DownAfter = 2
-		}
-		if req.DownAfter < 1 || req.DownAfter > 100 {
-			respondWithError(w, http.StatusBadRequest, "down_after must be 1-100")
-			return
-		}
-		if req.SpikeMult <= 0 {
-			req.SpikeMult = 5
-		}
-		if req.SpikeMult < 2 || req.SpikeMult > 10 {
-			respondWithError(w, http.StatusBadRequest, "spike_mult must be 2-10")
+		spec.applyDefaults()
+		if err := spec.validate(); err != nil {
+			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 
@@ -741,11 +691,11 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		err := s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-				id, req.Name, req.Target, req.Type, req.IntervalS, req.TimeoutMS, req.LossWarn, req.DownAfter, req.SpikeMult, now); err != nil {
+				id, spec.Name, spec.Target, spec.Type, spec.IntervalS, spec.TimeoutMS, spec.LossWarn, spec.DownAfter, spec.SpikeMult, now); err != nil {
 				return err
 			}
-			if len(req.Tags) > 0 {
-				return setSensorTagsInConn(r.Context(), c, id, req.Tags)
+			if len(spec.Tags) > 0 {
+				return setSensorTagsInConn(r.Context(), c, id, spec.Tags)
 			}
 			return nil
 		})
@@ -759,11 +709,11 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "create sensor", err)
 			return
 		}
-		log.Printf("API: created sensor %s (%s) [%s] [paused]", req.Name, id, req.Type)
+		log.Printf("API: created sensor %s (%s) [%s] [paused]", spec.Name, id, spec.Type)
 		respondWithJSON(w, http.StatusCreated, Sensor{
-			ID: id, Name: req.Name, Target: req.Target, Type: req.Type, Tags: req.Tags,
-			IntervalS: req.IntervalS, TimeoutMS: req.TimeoutMS,
-			LossWarn: req.LossWarn, DownAfter: req.DownAfter, SpikeMult: req.SpikeMult,
+			ID: id, Name: spec.Name, Target: spec.Target, Type: spec.Type, Tags: spec.Tags,
+			IntervalS: spec.IntervalS, TimeoutMS: spec.TimeoutMS,
+			LossWarn: spec.LossWarn, DownAfter: spec.DownAfter, SpikeMult: spec.SpikeMult,
 			State: "paused", Status: "up", CreatedAt: now,
 		})
 
@@ -869,9 +819,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		if sn.Type == "" {
-			sn.Type = "icmp"
-		}
 		sn.Tags = s.db.SensorTags(id)
 		v := SensorView{Sensor: sn}
 		if sn.State == "active" {
@@ -959,15 +906,15 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			newTags = cleanTags(*req.Tags)
 		}
 		if req.IntervalS != nil {
-			if *req.IntervalS < minIntervalS || *req.IntervalS > 3600 {
-				respondWithError(w, http.StatusBadRequest, "interval_s must be 5-3600")
+			if err := validateSensorRange("interval_s", *req.IntervalS); err != nil {
+				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			add("interval_s", *req.IntervalS)
 		}
 		if req.TimeoutMS != nil {
-			if *req.TimeoutMS < 100 || *req.TimeoutMS > 30000 {
-				respondWithError(w, http.StatusBadRequest, "timeout_ms must be 100-30000")
+			if err := validateSensorRange("timeout_ms", *req.TimeoutMS); err != nil {
+				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			add("timeout_ms", *req.TimeoutMS)
@@ -977,22 +924,22 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// existed only to fast-fail, and the in-tx check returns the
 		// identical 400.
 		if req.LossWarn != nil {
-			if *req.LossWarn < 1 || *req.LossWarn > 100 {
-				respondWithError(w, http.StatusBadRequest, "loss_warn must be 1-100")
+			if err := validateSensorRange("loss_warn", *req.LossWarn); err != nil {
+				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			add("loss_warn", *req.LossWarn)
 		}
 		if req.DownAfter != nil {
-			if *req.DownAfter < 1 || *req.DownAfter > 100 {
-				respondWithError(w, http.StatusBadRequest, "down_after must be 1-100")
+			if err := validateSensorRange("down_after", *req.DownAfter); err != nil {
+				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			add("down_after", *req.DownAfter)
 		}
 		if req.SpikeMult != nil {
-			if *req.SpikeMult < 2 || *req.SpikeMult > 10 {
-				respondWithError(w, http.StatusBadRequest, "spike_mult must be 2-10")
+			if err := validateSensorRange("spike_mult", *req.SpikeMult); err != nil {
+				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}
 			add("spike_mult", *req.SpikeMult)
@@ -1029,9 +976,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS); err != nil {
 				return errPatchSensorGone
 			}
-			if txType == "" {
-				txType = "icmp"
-			}
 			freshType := txType
 			if req.Type != nil {
 				freshType = normalizeProbeType(*req.Type)
@@ -1039,13 +983,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			freshTarget := txTarget
 			if req.Target != nil {
 				freshTarget = strings.TrimSpace(*req.Target)
-			}
-			if freshType == "http" {
-				if !validURL(freshTarget) {
-					return errPatchTargetNotURL
-				}
-			} else if !validTarget(freshTarget) {
-				return errPatchTargetInvalid
 			}
 			feffIntervalS := txIntervalS
 			if req.IntervalS != nil {
@@ -1055,8 +992,20 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			if req.TimeoutMS != nil {
 				feffTimeoutMS = *req.TimeoutMS
 			}
-			if feffTimeoutMS > feffIntervalS*1000 {
-				return errPatchTimeoutExceedsInterval
+			crossField := sensorSpec{
+				Target:    freshTarget,
+				Type:      freshType,
+				IntervalS: feffIntervalS,
+				TimeoutMS: feffTimeoutMS,
+			}
+			if err := crossField.validateCrossField(); err != nil {
+				if strings.Contains(err.Error(), "URL") {
+					return errPatchTargetNotURL
+				}
+				if strings.Contains(err.Error(), "timeout") {
+					return errPatchTimeoutExceedsInterval
+				}
+				return errPatchTargetInvalid
 			}
 
 			if len(sets) > 0 {
@@ -1477,9 +1426,6 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
-	if src.Type == "" {
-		src.Type = "icmp"
-	}
 	src.Tags = s.db.SensorTags(id)
 
 	// The clone is a NEW write, so it must honor the CURRENT new-write
@@ -1494,39 +1440,18 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// bypassing the API floor (2026-10-28 review n5). Clamp each copied
 	// numeric into its valid range; the clone starts PAUSED, so the operator
 	// reviews the normalized values before resuming it.
-	if src.IntervalS < minIntervalS {
-		src.IntervalS = minIntervalS
-	} else if src.IntervalS > 3600 {
-		src.IntervalS = 3600
+	spec := sensorSpec{
+		Name:      src.Name,
+		Target:    src.Target,
+		Type:      src.Type,
+		Tags:      src.Tags,
+		IntervalS: src.IntervalS,
+		TimeoutMS: src.TimeoutMS,
+		LossWarn:  src.LossWarn,
+		DownAfter: src.DownAfter,
+		SpikeMult: src.SpikeMult,
 	}
-	if src.TimeoutMS < 100 {
-		src.TimeoutMS = 100
-	} else if src.TimeoutMS > 30000 {
-		src.TimeoutMS = 30000
-	}
-	if src.LossWarn < 1 {
-		src.LossWarn = 1
-	} else if src.LossWarn > 100 {
-		src.LossWarn = 100
-	}
-	if src.DownAfter < 1 {
-		src.DownAfter = 1
-	} else if src.DownAfter > 100 {
-		src.DownAfter = 100
-	}
-	if src.SpikeMult < 2 {
-		src.SpikeMult = 2
-	} else if src.SpikeMult > 10 {
-		src.SpikeMult = 10
-	}
-	// Cross-field, AFTER the interval/timeout clamps above: a probe timeout
-	// longer than the interval means two probes can never complete
-	// back-to-back (the create path rejects it). If the source carried such
-	// a pair (legacy, pre-validation), clamp the timeout down to keep the
-	// clone valid.
-	if src.TimeoutMS > src.IntervalS*1000 {
-		src.TimeoutMS = src.IntervalS * 1000
-	}
+	spec.clamp()
 
 	// Pick the first free name and insert it. The existing clone names are
 	// fetched in ONE query and the first free suffix is picked in memory
@@ -1616,11 +1541,11 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		err = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
-				cloneID, name, src.Target, src.Type, src.IntervalS, src.TimeoutMS, src.LossWarn, src.DownAfter, src.SpikeMult, now); err != nil {
+				cloneID, name, spec.Target, spec.Type, spec.IntervalS, spec.TimeoutMS, spec.LossWarn, spec.DownAfter, spec.SpikeMult, now); err != nil {
 				return err
 			}
-			if len(src.Tags) > 0 {
-				return setSensorTagsInConn(r.Context(), c, cloneID, src.Tags)
+			if len(spec.Tags) > 0 {
+				return setSensorTagsInConn(r.Context(), c, cloneID, spec.Tags)
 			}
 			return nil
 		})
@@ -1649,9 +1574,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	respondWithJSON(w, http.StatusCreated, Sensor{
-		ID: cloneID, Name: name, Target: src.Target, Type: src.Type, Tags: src.Tags,
-		IntervalS: src.IntervalS, TimeoutMS: src.TimeoutMS,
-		LossWarn: src.LossWarn, DownAfter: src.DownAfter, SpikeMult: src.SpikeMult,
+		ID: cloneID, Name: name, Target: spec.Target, Type: spec.Type, Tags: spec.Tags,
+		IntervalS: spec.IntervalS, TimeoutMS: spec.TimeoutMS,
+		LossWarn: spec.LossWarn, DownAfter: spec.DownAfter, SpikeMult: spec.SpikeMult,
 		State: "paused", Status: "up", CreatedAt: now,
 	})
 }

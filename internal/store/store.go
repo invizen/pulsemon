@@ -248,6 +248,14 @@ func (db *Store) InitSchema() error {
 			return err
 		}
 	}
+	// One-time migration (finding #14): normalize legacy empty probe type
+	// to 'icmp'. The type column was added with DEFAULT 'icmp', but rows
+	// created before the column existed have type=''. The read paths used
+	// to normalize ''→'icmp' in 6 places; this migration makes the DB the
+	// single source of truth, so those normalizations are removed.
+	if _, err := db.Exec(`UPDATE sensors SET type = 'icmp' WHERE type = ''`); err != nil {
+		return err
+	}
 	// One-time migration (v0.1.13): rename stored statuses. "down" was the
 	// old name for error and "degraded" for warning; without this, the first
 	// probe after upgrade would log a spurious transition and fire a one-time

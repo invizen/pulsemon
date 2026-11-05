@@ -595,9 +595,6 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			partial = true
 			continue
 		}
-		if c.probeType == "" {
-			c.probeType = "icmp" // legacy rows pre-migration
-		}
 		configs = append(configs, c)
 	}
 	if err := rows.Err(); err != nil {
@@ -982,9 +979,6 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	}
 	pw.lastPulse[id] = now
 	pw.mu.Unlock()
-	if probeType == "" {
-		probeType = "icmp"
-	}
 
 	// The sensor's own configured timeout: // the pulse is the same probe the sensor runs on schedule, so a
 	// slow-but-healthy target answers it. A legacy zeroed row falls back
