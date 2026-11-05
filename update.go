@@ -308,6 +308,7 @@ func runUpdate(args []string) int {
 	restart := false
 	rollback := false
 	watchdog := false
+	allowDowngrade := false
 	wdPrev, wdDst := "", ""
 	wdTimeout := 30 * time.Second
 	wdOldPid := 0
@@ -321,6 +322,11 @@ func runUpdate(args []string) int {
 			restart = true
 		case "rollback":
 			rollback = true
+		case "--allow-downgrade":
+			// Opt out of the anti-downgrade floor (max_version_seen) for
+			// this one run — e.g. deliberately re-installing an older
+			// release after a rollback.
+			allowDowngrade = true
 		case "watchdog", "--watchdog":
 			// The detached post-restart guardian (I2) — see runWatchdog.
 			watchdog = true
@@ -351,7 +357,7 @@ func runUpdate(args []string) int {
 				wdTimeout = d
 			}
 		case "-h", "--help":
-			fmt.Println("usage: pulsemon update [check|rollback|watchdog|<version>] [--restart]")
+			fmt.Println("usage: pulsemon update [check|rollback|watchdog|<version>] [--restart] [--allow-downgrade]")
 			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--timeout 30s] [--old-pid PID]")
 			return 0
 		default:
@@ -428,6 +434,21 @@ func runUpdate(args []string) int {
 	if checkOnly {
 		uWarn("new version available: " + rel.TagName + " (running " + Version + "). Run 'pulsemon update' to install.")
 		return 2
+	}
+
+	// Anti-downgrade floor (2026-11-05): a release tag below the highest
+	// version this install has ever run is refused — a replayed old build
+	// published under a newer-looking tag must not install over a box that
+	// has already run something newer. The DB is opened best-effort (the
+	// same helper the healthz CLI uses): when it is unavailable (no data
+	// dir) the floor is empty and the update proceeds.
+	db := openHealthzDB()
+	if db != nil {
+		defer db.Close()
+	}
+	if err := downgradeGuard(db, rel.TagName, allowDowngrade); err != nil {
+		uErr(err.Error())
+		return 1
 	}
 
 	// Cross-process install lock: everything from
@@ -782,12 +803,17 @@ func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 }
 
 // releaseSelection is the (binary, digest, sidecar, signature) quad resolved
-// from a release's asset list for the running platform.
+// from a release's asset list for the running platform. tag + asset are the
+// manifest-binding fields: the release signature covers the manifest
+// (releaseManifestMessage), which binds it to THIS tag and THIS asset so a
+// signature for one release can never verify against another (replay).
 type releaseSelection struct {
 	assetURL   string
 	sha        string
 	sidecarURL string
 	sigURL     string
+	tag        string
+	asset      string
 }
 
 // selectAssets picks the release assets for this platform: the binary
@@ -796,7 +822,7 @@ type releaseSelection struct {
 // prefer the browser download URL; the API asset endpoint only works with
 // Accept: application/octet-stream and carries no asset name.
 func selectAssets(rel *ghRelease) releaseSelection {
-	sel := releaseSelection{}
+	sel := releaseSelection{tag: rel.TagName, asset: targetAsset()}
 	for _, a := range rel.Assets {
 		switch a.Name {
 		case targetAsset():
@@ -1101,6 +1127,62 @@ var runningExecutable = func() (string, error) {
 	return exe, nil
 }
 
+// maxVersionSeenSetting is the settings key holding the highest version this
+// install has EVER run. It is the anti-downgrade floor for self-update: a
+// release tag below it is refused (a replayed/old build published under a
+// tag that is still "newer" than the running version must not install over a
+// box that has already run something newer — e.g. after an operator
+// rollback, the old tag must not creep back up).
+const maxVersionSeenSetting = "max_version_seen"
+
+// bumpMaxVersionSeen records the running version as the highest ever seen.
+// MONOTONIC: a lower running version (post-rollback) never lowers the floor.
+// Best-effort by design — this is bookkeeping on the boot path, so a DB
+// failure is a log line, never a boot failure (and dev/unparseable versions
+// record nothing, so an unstamped build can't poison the floor).
+func bumpMaxVersionSeen(db *store.Store) {
+	if db == nil {
+		return
+	}
+	run := parseVer(Version)
+	if !run.ok {
+		return
+	}
+	if stored := db.GetSetting(maxVersionSeenSetting); stored != "" {
+		if p := parseVer(stored); p.ok && !p.lessThan(run) {
+			return // stored floor is already >= the running version
+		}
+	}
+	if err := db.SetSetting(maxVersionSeenSetting, Version); err != nil {
+		log.Printf("update: record highest version seen: %v", err)
+	}
+}
+
+// downgradeGuard refuses to install a release tag that is below the highest
+// version this install has ever run (maxVersionSeenSetting). allow (the
+// CLI's --allow-downgrade) overrides it; a missing DB or an unparseable
+// floor never blocks an update (the guard must not fail on bookkeeping
+// gaps). An EMPTY floor is a no-op: a fresh install has no history, so its
+// first update is always allowed.
+func downgradeGuard(db *store.Store, tag string, allow bool) error {
+	if allow || db == nil {
+		return nil
+	}
+	stored := db.GetSetting(maxVersionSeenSetting)
+	if stored == "" {
+		return nil
+	}
+	cand := parseVer(tag)
+	floor := parseVer(stored)
+	if !cand.ok || !floor.ok {
+		return nil
+	}
+	if cand.lessThan(floor) {
+		return fmt.Errorf("refusing to install %s: it is below the highest version this install has ever run (%s); re-run with --allow-downgrade to override", tag, stored)
+	}
+	return nil
+}
+
 // verifyDownloadedAsset enforces the mandatory authenticity + integrity
 // checks on a downloaded release asset. It runs TWO gates, in order:
 //
@@ -1209,12 +1291,36 @@ func fetchReleaseSignature(client *http.Client, url string) ([]byte, error) {
 	return sig, nil
 }
 
+// releaseManifestMessage is the exact byte string a release signature
+// covers: a versioned manifest binding the signature to the release TAG,
+// the ASSET NAME, and the binary's SHA-256. A signature made for one
+// (tag, asset, sha) triple cannot verify against any other — a compromised
+// account (no signing key) can no longer replay an old signed binary under
+// a new tag, and a wrong-arch .sig (linux-amd64 asset verified as
+// linux-arm64) is refused too. The format is versioned (line 1) so a
+// future field can be added without silently re-keying old signatures.
+//
+// Pre-manifest releases (v0.4.4 and earlier) signed the RAW BINARY BYTES
+// instead; verifyReleaseSignature falls back to that form so the first
+// release carrying the manifest verifier can itself be installed by
+// v0.4.4-era clients (it is cut with a legacy signature — see
+// docs/DECISIONS.md → release-signing, "Transition").
+func releaseManifestMessage(tag, asset, sha256Hex string) []byte {
+	return []byte(fmt.Sprintf("pulsemon-release-v1\n%s\n%s\n%s\n", tag, asset, sha256Hex))
+}
+
 // verifyReleaseSignature checks the downloaded binary's detached ed25519
 // signature against the embedded trusted pubkey set. FAIL-CLOSED: a missing
 // .sig asset, an undecodable/oversized signature, or a signature that
 // verifies against none of the trusted keys is a refusal — an unsigned or
 // foreign-signed release must never install. This is the authenticity root
 // the SHA-256 check cannot provide.
+//
+// The signature is checked against the MANIFEST (tag + asset + sha256)
+// first, then against the legacy raw-binary-bytes form (pre-manifest
+// releases — see releaseManifestMessage). The two forms are mutually
+// exclusive (different messages → a signature verifies under at most one),
+// so trying both is unambiguous.
 func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes []byte) error {
 	if sel.sigURL == "" {
 		return errors.New("release has no .sig signature asset — refusing to install an unsigned release")
@@ -1230,12 +1336,22 @@ func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes 
 	if err != nil {
 		return err
 	}
+	sum := sha256.Sum256(binBytes)
+	if sel.tag != "" && sel.asset != "" {
+		msg := releaseManifestMessage(sel.tag, sel.asset, hex.EncodeToString(sum[:]))
+		for _, pub := range keys {
+			if ed25519.Verify(pub, msg, sig) {
+				return nil
+			}
+		}
+	}
 	for _, pub := range keys {
 		if ed25519.Verify(pub, binBytes, sig) {
+			log.Printf("update: release %s verified under the LEGACY raw-bytes signature form (pre-manifest)", sel.tag)
 			return nil
 		}
 	}
-	return errors.New("release signature invalid — the binary is not signed by a trusted release key")
+	return errors.New("release signature invalid — the binary is not signed by a trusted release key for this release tag and asset")
 }
 
 // runSignRelease implements the maintainer's release-signing commands:
@@ -1276,8 +1392,13 @@ func runSignRelease(args []string) int {
 		fmt.Println("PRIVKEY=" + hex.EncodeToString(priv))
 		return 0
 	case "release":
-		if len(args) != 3 {
-			fmt.Fprintln(os.Stderr, "usage: pulsemon sign release <file> <keyfile>")
+		// 2 args = LEGACY form (sign the raw binary bytes; pre-manifest
+		// releases — the first release carrying the manifest verifier is
+		// cut this way so v0.4.4-era clients can install it).
+		// 4 args = MANIFEST form: sign "pulsemon-release-v1\n<tag>\n<asset>\n<sha256>\n",
+		// binding the signature to the release tag, asset name and digest.
+		if len(args) != 3 && len(args) != 5 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon sign release <file> <keyfile> [tag asset-name]")
 			return 1
 		}
 		file, keyfile := args[1], args[2]
@@ -1300,7 +1421,14 @@ func runSignRelease(args []string) int {
 			uErr("keyfile is " + strconv.Itoa(len(priv)) + " bytes, want " + strconv.Itoa(ed25519.PrivateKeySize))
 			return 1
 		}
-		sig := ed25519.Sign(ed25519.PrivateKey(priv), binBytes)
+		msg := binBytes
+		form := "legacy raw-bytes"
+		if len(args) == 5 {
+			sum := sha256.Sum256(binBytes)
+			msg = releaseManifestMessage(args[3], args[4], hex.EncodeToString(sum[:]))
+			form = "manifest (" + args[3] + ", " + args[4] + ")"
+		}
+		sig := ed25519.Sign(ed25519.PrivateKey(priv), msg)
 		sigPath := file + ".sig"
 		if err := os.WriteFile(sigPath, []byte(hex.EncodeToString(sig)+"\n"), 0o644); err != nil {
 			uErr("write " + sigPath + ": " + err.Error())
@@ -1308,17 +1436,20 @@ func runSignRelease(args []string) int {
 		}
 		// Self-check: the signature we just wrote must verify against the key's
 		// public half (an ed25519 private key's last 32 bytes are its pubkey).
-		if !ed25519.Verify(ed25519.PublicKey(priv[32:]), binBytes, sig) {
+		if !ed25519.Verify(ed25519.PublicKey(priv[32:]), msg, sig) {
 			uErr("sign self-check failed (signature did not verify)")
 			return 1
 		}
-		uInfo("signed " + file + " -> " + sigPath)
+		uInfo("signed " + file + " -> " + sigPath + " [" + form + "]")
 		sum := sha256.Sum256(binBytes)
 		uInfo("sha256:  " + hex.EncodeToString(sum[:]))
 		return 0
 	case "verify":
-		if len(args) != 2 {
-			fmt.Fprintln(os.Stderr, "usage: pulsemon sign verify <file>")
+		// 1 arg = LEGACY check (raw binary bytes). 3 args = MANIFEST check:
+		// the tag and asset name must match the signed manifest, which is
+		// what catches a signature replayed from a different release.
+		if len(args) != 2 && len(args) != 4 {
+			fmt.Fprintln(os.Stderr, "usage: pulsemon sign verify <file> [tag asset-name]")
 			return 1
 		}
 		file := args[1]
@@ -1346,16 +1477,33 @@ func runSignRelease(args []string) int {
 			uErr(err.Error())
 			return 1
 		}
-		for _, pub := range keys {
-			if ed25519.Verify(pub, binBytes, sig) {
-				uInfo("signature valid: " + file + " verifies against the embedded release_pubkeys")
-				return 0
+		verified, form := false, "legacy raw-bytes"
+		if len(args) == 4 {
+			sum := sha256.Sum256(binBytes)
+			msg := releaseManifestMessage(args[2], args[3], hex.EncodeToString(sum[:]))
+			for _, pub := range keys {
+				if ed25519.Verify(pub, msg, sig) {
+					verified, form = true, "manifest ("+args[2]+", "+args[3]+")"
+					break
+				}
 			}
 		}
-		uErr("signature INVALID: " + file + " does not verify against the embedded release_pubkeys (wrong signing key?)")
+		if !verified {
+			for _, pub := range keys {
+				if ed25519.Verify(pub, binBytes, sig) {
+					verified = true
+					break
+				}
+			}
+		}
+		if verified {
+			uInfo("signature valid: " + file + " verifies against the embedded release_pubkeys [" + form + "]")
+			return 0
+		}
+		uErr("signature INVALID: " + file + " does not verify against the embedded release_pubkeys (wrong signing key, or tag/asset mismatch?)")
 		return 1
 	default:
-		fmt.Fprintln(os.Stderr, "usage: pulsemon sign <genkey|release <file> <keyfile>|verify <file>>")
+		fmt.Fprintln(os.Stderr, "usage: pulsemon sign <genkey|release <file> <keyfile> [tag asset-name]|verify <file> [tag asset-name]>")
 		return 1
 	}
 }

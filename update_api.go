@@ -183,6 +183,18 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Anti-downgrade floor (2026-11-05): same rule as the CLI — a release
+	// tag below the highest version this install has ever run is refused
+	// (409). An EXPLICIT version pin in the request body is the API's
+	// opt-out, the dashboard's analog of the CLI's --allow-downgrade:
+	// pinning an old tag is a deliberate operator choice; an un-pinned
+	// "latest" request gets the full guard.
+	if err := downgradeGuard(s.db, rel.TagName, version != "latest"); err != nil {
+		log.Printf("update: downgrade guard: %v", err)
+		respondWithError(w, http.StatusConflict, err.Error())
+		return
+	}
+
 	sel := selectAssets(rel)
 	if sel.assetURL == "" {
 		respondWithError(w, http.StatusConflict, "release "+rel.TagName+" has no "+targetAsset()+" asset")

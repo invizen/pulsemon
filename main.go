@@ -646,6 +646,12 @@ func runServer(stop <-chan struct{}) {
 	// that ran with auth off must stay fully open — see
 	// migrateAuthBootstrapped.
 	migrateAuthBootstrapped(db)
+	// Anti-downgrade bookkeeping (2026-11-05): record this version as the
+	// highest this install has ever run (monotonic, best-effort). The
+	// self-update paths (CLI + dashboard) refuse release tags below this
+	// floor — a replayed old build under a newer-looking tag must not
+	// install over a box that has already run something newer.
+	bumpMaxVersionSeen(db)
 
 	if err := db.SeedSensors(); err != nil {
 		log.Printf("Warning: failed to seed sensors: %v", err)

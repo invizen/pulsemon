@@ -81,7 +81,7 @@ disabled (`handleUpdate`, update_api.go; pinned by
 `TestUpdateRefusedWhenAuthDisabled`). The CLI (`pulsemon update`)
 remains the operator path.
 
-### Self-update authenticity (lifted 2026-10-29)
+### Self-update authenticity (lifted 2026-10-29; manifest-bound 2026-11-05)
 `verifyDownloadedAsset` (update.go) checked the SHA-256 only — integrity,
 not authenticity. The binary and its SHA-256 come from the same GitHub
 release, so a compromised account or pipeline publishes both and the check
@@ -93,3 +93,11 @@ lifted it: a release binary is now installed only if its detached ed25519
 with the SHA-256 kept as a redundant integrity net. Both the CLI and the
 dashboard update path go through the shared check. See `docs/DECISIONS.md`
 → `release-signing` for the rationale, rotation, and key custody.
+**2026-11-05 tightening:** the signature now covers a manifest (tag +
+asset + sha256) instead of the raw bytes — a compromised account/pipeline
+can no longer replay an old signed binary under a new tag — and an
+anti-downgrade floor (`max_version_seen` in settings, `--allow-downgrade`
+CLI opt-out) refuses release tags below the highest version the install has
+ever run. Residual: a full pipeline compromise (key + tag) can still sign
+an old binary under a fake-newer tag; key custody/rotation is the
+mitigation.

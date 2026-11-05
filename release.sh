@@ -87,16 +87,32 @@ if [[ ! -f "$SIGN_KEY" ]]; then
   exit 1
 fi
 SIGNER="dist/pulsemon-linux-amd64"   # runs natively on the amd64 release host
+# Signature format (2026-11-05): "manifest" (the default) signs the release
+# manifest — tag + asset name + sha256 (releaseManifestMessage in
+# update.go) — binding the .sig to THIS release, so an old signed binary
+# replayed under a new tag no longer verifies. "legacy" signs the raw binary
+# bytes (the pre-manifest form) and is used ONLY for the first release that
+# ships the manifest verifier, so v0.4.4-era clients (raw-bytes only) can
+# install it: cut that release with RELEASE_SIGN_FORMAT=legacy, then switch
+# back to the default for the next cut.
+SIGN_FORMAT="${RELEASE_SIGN_FORMAT:-manifest}"
 for ARCH in amd64 arm64; do
   BIN="dist/pulsemon-linux-$ARCH"
-  "$SIGNER" sign release "$BIN" "$SIGN_KEY" >/dev/null \
-    || { echo "release.sh: signing failed for $BIN"; exit 1; }
-  # Verify against the EMBEDDED release_pubkeys (the keys a client checks):
-  # catches a release cut with the wrong signing key before it ships.
-  "$SIGNER" sign verify "$BIN" >/dev/null \
-    || { echo "release.sh: signature does not verify against release_pubkeys for $BIN"; exit 1; }
+  if [[ "$SIGN_FORMAT" == "manifest" ]]; then
+    "$SIGNER" sign release "$BIN" "$SIGN_KEY" "$VERSION" "pulsemon-linux-$ARCH" >/dev/null \
+      || { echo "release.sh: signing failed for $BIN"; exit 1; }
+    # Verify against the EMBEDDED release_pubkeys (the keys a client checks):
+    # catches a release cut with the wrong signing key before it ships.
+    "$SIGNER" sign verify "$BIN" "$VERSION" "pulsemon-linux-$ARCH" >/dev/null \
+      || { echo "release.sh: signature does not verify against release_pubkeys for $BIN"; exit 1; }
+  else
+    "$SIGNER" sign release "$BIN" "$SIGN_KEY" >/dev/null \
+      || { echo "release.sh: signing failed for $BIN"; exit 1; }
+    "$SIGNER" sign verify "$BIN" >/dev/null \
+      || { echo "release.sh: signature does not verify against release_pubkeys for $BIN"; exit 1; }
+  fi
   [[ -f "$BIN.sig" ]] || { echo "release.sh: no .sig produced for $BIN"; exit 1; }
-  echo "  signed $BIN"
+  echo "  signed $BIN [$SIGN_FORMAT]"
 done
 
 # --- 2. verify: the built binaries must satisfy the update verifier -----------

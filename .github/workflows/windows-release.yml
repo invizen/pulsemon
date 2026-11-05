@@ -82,11 +82,26 @@ jobs:
           }
           $keyfile = Join-Path $env:TEMP "pm-signing-key.hex"
           Set-Content -Path $keyfile -Value $env:RELEASE_SIGNING_KEY -Encoding ascii -NoNewline
-          & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile
-          if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
-          # Verify against the EMBEDDED release_pubkeys (the keys a client checks).
-          & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe"
-          if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
+          # Signature format (2026-11-05): "manifest" (default) signs the release
+          # manifest (tag + asset + sha256), binding the .sig to THIS release so
+          # an old signed .exe replayed under a new tag no longer verifies;
+          # "legacy" signs the raw .exe bytes (pre-manifest form) — used only for
+          # the first release that ships the manifest verifier, so v0.4.4-era
+          # clients can install it (set RELEASE_SIGN_FORMAT=legacy for that cut).
+          $signFormat = $env:RELEASE_SIGN_FORMAT
+          if (-not $signFormat) { $signFormat = "manifest" }
+          if ($signFormat -eq "manifest") {
+            & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile $env:VER "pulsemon-windows-amd64.exe"
+            if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
+            # Verify against the EMBEDDED release_pubkeys (the keys a client checks).
+            & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe" $env:VER "pulsemon-windows-amd64.exe"
+            if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
+          } else {
+            & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile
+            if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
+            & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe"
+            if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
+          }
           Remove-Item $keyfile -Force
           Write-Host "Signed dist\pulsemon-windows-amd64.exe -> .sig"
 

@@ -459,11 +459,39 @@ execution on every install that updates, often running with ping
 privileges) and the documented self-update authenticity deferral is now
 lifted (see `docs/DEFERRED.md` → "Self-update authenticity").
 
-**Why sign the raw bytes, not a manifest:** the signature is over the
-binary's exact bytes. A valid signature for v1 will not verify against v2's
-different bytes, so there is no replay risk, and a per-file detached `.sig`
-is simpler than a signed manifest (no second artifact to keep in sync, no
-manifest format to define).
+**Why sign a manifest, not the raw bytes (2026-11-05):** the signature is
+over a small versioned manifest —
+`pulsemon-release-v1\n<tag>\n<asset-name>\n<sha256-hex>\n`
+(`releaseManifestMessage`) — binding it to the release TAG, the ASSET NAME,
+and the digest, not just the bytes. The raw-bytes form (v0.4.4 and
+earlier) had a replay hole its own rationale missed: "a valid signature for
+v1 will not verify against v2's different bytes" is true, but a
+compromised pipeline can RE-UPLOAD v1's signed bytes under v2's tag — the
+signature still verifies (same bytes, same key), and v2's tag looks newer
+than anything real, so every install "upgrades" to the old (vulnerable)
+build and can sit pinned there. The manifest closes that: a v1 signature
+cannot verify as v2, and a linux-amd64 `.sig` cannot verify for the
+arm64 asset. **Transition:** `verifyReleaseSignature` checks the manifest
+first and falls back to the legacy raw-bytes form (the messages differ, so
+a signature verifies under at most one form — unambiguous). The pipeline
+signs with `RELEASE_SIGN_FORMAT=legacy` (the default is `manifest`) for
+ONE release only — the first one carrying the manifest verifier — so
+v0.4.4-era clients can install it; the next cut reverts to the default.
+
+**Anti-downgrade floor (2026-11-05):** the manifest binds a signature to a
+tag, but a compromised PIPELINE (which holds the signing key) can still sign
+a fake-newer tag over an old binary. The second line is version ORDER: the
+settings key `max_version_seen` records the highest version this install has
+ever run (bumped monotonically at server boot — `bumpMaxVersionSeen`; a
+post-rollback boot never lowers it, dev builds record nothing). Both
+install paths refuse a release tag below the floor: the CLI with exit 1 and
+a `--allow-downgrade` opt-out, the dashboard with 409 (an explicit version
+pin in the request body is the API's opt-out — pinning an old tag is a
+deliberate operator choice). A missing DB, an empty floor (fresh install),
+or an unparseable value never blocks an update. **Residual (accepted):**
+full pipeline compromise — key + tag control — can still sign an old binary
+under a fake-newer tag; the mitigations are key custody/rotation above, and
+the floor still stops the attacker's tag from silently creeping back DOWN.
 
 **Why keep the SHA-256 after the signature:** a valid signature already pins
 the exact bytes the key holder signed, so the SHA is redundant for
@@ -496,17 +524,30 @@ the trusted release host (a 600-perm file) and, for the Windows CI path, as
 the `RELEASE_SIGNING_KEY` GitHub Actions secret. It is NEVER committed; only
 `release_pubkeys` (the pubkeys) is committed. Maintainer tools:
 `pulsemon sign genkey` (new keypair), `pulsemon sign release <file>
-<keyfile>` (write a detached `.sig`), `pulsemon sign verify <file>`
-(re-check a `.sig` against the embedded pubkeys — the release pipeline runs
-this so a release cut with the wrong key is caught before it ships).
+<keyfile> [tag asset-name]` (write a detached `.sig` — 2 args = legacy
+raw-bytes form, 4 args = manifest form bound to the tag + asset),
+`pulsemon sign verify <file> [tag asset-name]` (re-check a `.sig` against
+the embedded pubkeys — the release pipeline runs this so a release cut with
+the wrong key is caught before it ships).
 
 **Pinned by:** `update_sig_test.go` — `TestVerifyReleaseSignature_{Valid,
 WrongKey,MissingSig,CorruptSig,WrongLength,Rotation}`,
 `TestParseReleasePubkeys`, and the end-to-end
 `TestVerifyDownloadedAsset_{Signed,Unsigned,ForeignSig}` (an unsigned or
-foreign-signed binary with a MATCHING SHA is refused — the whole point). A
+foreign-signed binary with a MATCHING SHA is refused — the whole point);
+`update_manifest_test.go` — the manifest form: `TestVerifyReleaseSignature_{
+ManifestValid,ManifestReplayWrongTag,ManifestWrongAsset,ManifestWrongSHA,
+LegacyFallback,ManifestNotLegacy,ManifestExactBytes}` and the end-to-end
+`TestVerifyDownloadedAsset_ManifestReplay` (a v0.3.11 signature served as
+v9.9.9 is refused); `update_downgrade_test.go` — the floor:
+`TestDowngradeGuard` (decision table), `TestBumpMaxVersionSeen` (monotonic,
+dev-safe), `TestRunUpdate_{RefusesDowngradeBelowMaxSeen,
+AllowDowngradePassesGuard}` (CLI end-to-end) and
+`TestUpdate_{RefusesDowngradeBelowMaxSeen,
+ExplicitPinBypassesDowngradeGuard}` (dashboard 409 / pin opt-out). A
 sabotage that drops the authenticity gate makes `_Unsigned` and `_ForeignSig`
-fail.
+fail; one that drops the manifest binding makes `_ManifestReplayWrongTag`
+fail; one that drops the floor makes `_RefusesDowngradeBelowMaxSeen` fail.
 
 ## package-structure (repo-wide) — CLOSED, decision 2026-10-30 (pilot shipped)
 
