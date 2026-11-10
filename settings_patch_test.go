@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -138,6 +140,84 @@ func TestSettingsPutSwapsAlertSnapshot(t *testing.T) {
 	if pw.shouldAlert("s2", []string{"dev"}) {
 		t.Error("shouldAlert(s2, [dev])=true, want false (tag not in filter)")
 	}
+}
+
+// TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails (2026-11-10 review
+// #6): the settings tx commits FIRST; if the maintenance-mode tx (its own
+// transaction) then fails with a 500, the old handler returned BEFORE
+// reloadAlertSettings — the provider/routing/realert_min changes in the
+// same PUT stayed stale in pw.alertCfg until the next successful PUT or a
+// restart. The reload is now deferred at commit, so every committed save
+// converges memory to the store. Both 500 paths are pinned: entering
+// maintenance (enterMaintenance seam) and leaving (setMaintenanceMode
+// seam).
+func TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+	pw := srv.probeWorker
+
+	// An active sensor so the entering-maintenance pre-check passes.
+	id := store.NewID()
+	if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, 'active1','10.0.0.1','icmp',60,1000,25,2,5,'active','up',?)`, id, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	// Baseline: realert_min 30 in the store AND in the snapshot.
+	if err := db.SetSetting("realert_min", "30"); err != nil {
+		t.Fatal(err)
+	}
+	pw.reloadAlertSettings()
+	if got := pw.realertMin(); got != 30 {
+		t.Fatalf("baseline snapshot realertMin = %d, want 30", got)
+	}
+
+	t.Run("enter-maintenance-500", func(t *testing.T) {
+		origEnter := enterMaintenance
+		enterMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
+			return nil, errors.New("simulated maintenance tx failure")
+		}
+		defer func() { enterMaintenance = origEnter }()
+
+		// The settings tx commits (realert_min=10); the maintenance tx 500s.
+		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"realert_min": 10, "maintenance_mode": true}`))
+		rr := httptest.NewRecorder()
+		srv.handleSettingsPut(rr, req)
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("PUT with failing maintenance tx: %d, want 500: %s", rr.Code, rr.Body.String())
+		}
+		if got := db.GetSetting("realert_min"); got != "10" {
+			t.Errorf("store realert_min = %q, want \"10\" (the settings tx committed)", got)
+		}
+		// The snapshot must follow the committed store even though the
+		// maintenance tx 500'd.
+		if got := pw.realertMin(); got != 10 {
+			t.Errorf("snapshot realertMin = %d after a 500 entering-maintenance PUT, want 10 (the reload must run on the committed-settings path)", got)
+		}
+	})
+
+	t.Run("leave-maintenance-500", func(t *testing.T) {
+		// Seed: maintenance ON, so the leave path reaches SetMaintenanceMode.
+		if err := db.SetSetting("maintenance_mode", "1"); err != nil {
+			t.Fatal(err)
+		}
+		pw.reloadAlertSettings()
+		origSet := setMaintenanceMode
+		setMaintenanceMode = func(db *store.Store, ctx context.Context, on bool, ids []string, snap string) error {
+			return errors.New("simulated maintenance tx failure")
+		}
+		defer func() { setMaintenanceMode = origSet }()
+
+		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"realert_min": 20, "maintenance_mode": false}`))
+		rr := httptest.NewRecorder()
+		srv.handleSettingsPut(rr, req)
+		if rr.Code != http.StatusInternalServerError {
+			t.Fatalf("PUT with failing leave-maintenance tx: %d, want 500: %s", rr.Code, rr.Body.String())
+		}
+		if got := db.GetSetting("realert_min"); got != "20" {
+			t.Errorf("store realert_min = %q, want \"20\" (the settings tx committed)", got)
+		}
+		if got := pw.realertMin(); got != 20 {
+			t.Errorf("snapshot realertMin = %d after a 500 leave-maintenance PUT, want 20", got)
+		}
+	})
 }
 
 // TestFix_M7_PatchInvalidFieldDoesNotPersistTags pins the M7(b) fix: a PATCH

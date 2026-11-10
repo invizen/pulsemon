@@ -1885,6 +1885,18 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, s.settingsPayload())
 }
 
+// enterMaintenance / setMaintenanceMode: the two maintenance-mode store
+// calls as vars so a test can force the post-commit failure path (review
+// 2026-11-10 #6) — settings tx committed, maintenance tx failed → the
+// alert snapshot must still reload. Production is a plain method call
+// (same seam pattern as deliverDestinations in alerts.go).
+var enterMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
+	return db.EnterMaintenanceWithFreshSnapshot(ctx)
+}
+var setMaintenanceMode = func(db *store.Store, ctx context.Context, on bool, ids []string, snap string) error {
+	return db.SetMaintenanceMode(ctx, on, ids, snap)
+}
+
 func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPut {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -2125,6 +2137,24 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "commit settings update", err)
 		return
 	}
+	// Swap the alert settings snapshot on EVERY path that got this far: the
+	// settings are committed, so the in-memory snapshot must follow —
+	// including the two maintenance-tx 500 paths below, which return before
+	// the explicit reload this handler used to end with (review 2026-11-10
+	// #6). Without the defer, a PUT that committed provider/routing/
+	// realert_min changes but 500'd on the maintenance transaction left
+	// pw.alertCfg stale until the next successful PUT or a restart. A
+	// failed maintenance tx leaves the DB's maintenance flag as the
+	// settings tx committed it, so the reload converges memory to the
+	// store. The alert hot path (alertsEnabled, shouldAlert, realertMin,
+	// resolveDestinations) reads this snapshot lock-free, so a transient DB
+	// lock mid-probe can no longer read maintenance_mode as "0" and fire
+	// alerts during maintenance — the bug the per-call GetSetting reads had
+	// (2026-11-05 finding #5). reloadAlertSettings keeps the last good
+	// snapshot on a read error, so a hiccup here never installs a half-read
+	// state; it just leaves the previous (still-correct) snapshot in place
+	// until the next successful save.
+	defer s.probeWorker.reloadAlertSettings()
 	if req.MaintMode != nil {
 		if *req.MaintMode {
 			if maintAlreadyOn {
@@ -2143,7 +2173,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				// Atomic: pause + snapshot + mode flag in ONE transaction
 				// so a crash can't leave sensors paused without the mode
 				// flag (or vice versa). See EnterMaintenanceWithFreshSnapshot in db.go.
-				ids, err := s.db.EnterMaintenanceWithFreshSnapshot(r.Context())
+				ids, err := enterMaintenance(s.db, r.Context())
 				if err != nil {
 					respondInternal(w, "enter maintenance mode", err)
 					return
@@ -2186,7 +2216,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			}
 			// Atomic: resume + clear snapshot + mode flag in ONE transaction.
 			// See SetMaintenanceMode in db.go.
-			if err := s.db.SetMaintenanceMode(r.Context(), false, ids, ""); err != nil {
+			if err := setMaintenanceMode(s.db, r.Context(), false, ids, ""); err != nil {
 				respondInternal(w, "leave maintenance mode", err)
 				return
 			}
@@ -2200,17 +2230,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
 		}
 	}
-	// Swap the alert settings snapshot now that BOTH the settings tx and the
-	// maintenance-mode change (its own transaction, above) have committed.
-	// The alert hot path (alertsEnabled, shouldAlert, realertMin,
-	// resolveDestinations) reads this snapshot lock-free, so a transient DB
-	// lock mid-probe can no longer read maintenance_mode as "0" and fire
-	// alerts during maintenance — the bug the per-call GetSetting reads had
-	// (2026-11-05 finding #5). reloadAlertSettings keeps the last good
-	// snapshot on a read error, so a hiccup here never installs a half-read
-	// state; it just leaves the previous (still-correct) snapshot in place
-	// until the next successful save.
-	s.probeWorker.reloadAlertSettings()
+	// (The alert settings snapshot was already reloaded by the defer after
+	// the settings tx committed — see there.)
 	realertLog := 30
 	if v := s.db.GetSetting("realert_min"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
