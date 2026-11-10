@@ -685,8 +685,8 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 }
 
 // bumpGen increments the sensor's generation counter so an in-flight
-// syncSensors pass detects a config change that landed in its read→apply gap
-// . Called under pw.mu by Restart and SetPaused. It lazily creates
+// syncSensors pass detects a config change that landed in its read→apply gap.
+// Called under pw.mu by Restart and SetPaused. It lazily creates
 // the map so bare test workers (&ProbeWorker{} with a nil gens) don't panic;
 // syncSensors' fingerprint copy and Remove's delete are safe on a nil map too.
 func (pw *ProbeWorker) bumpGen(id string) {

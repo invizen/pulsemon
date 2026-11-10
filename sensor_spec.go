@@ -5,7 +5,7 @@ import "errors"
 // sensorSpec is the validated, default-applied form of a sensor's tunable
 // fields. Every sensor write path (POST, PATCH, clone) funnels through
 // applyDefaults + validate (or clamp), so the ranges, defaults, and
-// cross-field rules live in ONE place (finding #14: the old code had the
+// cross-field rules live in ONE place (the old code had the
 // same ranges, defaults, and type==""→icmp normalization in 5+ places).
 type sensorSpec struct {
 	Name      string

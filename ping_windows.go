@@ -63,7 +63,7 @@ func (t *winDgram) run(e *Engine) {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		// Supervisor loop (review 2026-10-24), mirroring the Linux dgram
+		// Supervisor loop, mirroring the Linux dgram
 		// reader and the raw reader: readDgram returns on done (clean) or
 		// an unexpected Recvfrom error (WSAENOBUFS, a driver-raised
 		// WSAECONNRESET, ...). An unsupervised exit would turn EVERY later

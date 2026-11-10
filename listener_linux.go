@@ -175,7 +175,7 @@ func runRestartCommand() dispatchKind {
 }
 
 // restartSystemdService tries the user session first, then system-wide.
-// Bounded per attempt (review nit 2026-10-24): systemctl restart can block
+// Bounded per attempt: systemctl restart can block
 // (job queuing, a unit stuck in activating) and the update path's other
 // external calls are all bounded — an unbounded Run here could hang the
 // CLI/server past its own budgets. 60s is generous for a normal restart

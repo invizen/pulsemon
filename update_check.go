@@ -114,7 +114,7 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 		}
 		// The raw error can name upstream URLs, the resolver, or proxy
 		// config — details belong in the log, not the response body
-		// (review 2026-10-24; same contract as respondInternal).
+		// (same contract as respondInternal).
 		log.Printf("update check: %v", err)
 		respondWithError(w, http.StatusServiceUnavailable, "update check failed (upstream unreachable); try again later")
 		return

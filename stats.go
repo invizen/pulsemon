@@ -50,7 +50,7 @@ func rttToPtr(rtt float32) *float64 {
 
 // minuteBucket is one minute of folded probe history: the per-minute
 // {total, lost, sumRTT, maxRTT} aggregate that keeps the in-memory series
-// bounded at max(1h, last-60) raw entries (finding #8) and lets the 24h graph
+// bounded at max(1h, last-60) raw entries and lets the 24h graph
 // be served from memory — folded into 15-min buckets — instead of a
 // per-request SQL aggregate over the probes table. Only non-manual probes are
 // folded in (a diagnostic click must not move the graph or the uptime counters).
@@ -114,7 +114,7 @@ type probeSeries struct {
 // blanking them until each sensor re-accumulates a window. Runs once, before
 // probing starts.
 func (pw *ProbeWorker) warmStats(ctx context.Context) {
-	// ctx (review nit 2026-10-24): the warm UNION query on a large DB is
+	// ctx: the warm UNION query on a large DB is
 	// the first thing Run does; a shutdown landing during it must be able
 	// to abort the load instead of serving from a half-warmed process.
 	ids, err := pw.db.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active'")
@@ -184,7 +184,7 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 		// manual=false otherwise and re-enter the aggregates + status
 		// derivation as scheduled probes for up to 24h after every
 		// restart — the exact class the 2026-10-23 manual-exclusion
-		// batch closed on the live and DB paths (review 2026-10-24).
+		// batch closed on the live and DB paths.
 		rows, err := pw.db.QueryContext(ctx,
 			`SELECT sensor_id, ts, rtt_ms, manual FROM (
 				SELECT sensor_id, ts, rtt_ms, manual,
@@ -241,7 +241,7 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 		// recordProbe (probe loop or API PingNow) may have appended a
 		// fresher entry while this chunk query was in flight. Carry the
 		// newer tail over so the warm snapshot never goes backwards
-		// (review 2026-10-24; append keeps counters coherent).
+		// (append keeps counters coherent).
 		if old := pw.statsCache[sid]; old != nil && a.series.len() > 0 {
 			newest := a.series.lastTs()
 			for _, e := range old.snapshot() {
@@ -279,7 +279,7 @@ func (pw *ProbeWorker) recordProbe(id string, e probeEntry) {
 		s = &probeSeries{}
 		pw.statsCache[id] = s
 	}
-	// Monotonic ts clamp (review 2026-10-24): probeEntry.ts is captured
+	// Monotonic ts clamp: probeEntry.ts is captured
 	// OUTSIDE statsMu (each path stamps the time before calling in), so a
 	// manual pulse and a scheduled tick racing can append out of order by
 	// milliseconds and break the ts-monotonic invariant the in24Start

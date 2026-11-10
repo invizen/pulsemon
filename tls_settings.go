@@ -325,7 +325,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		// of the spec's F2): both temps are fsynced BEFORE close and the
 		// directory is fsynced after the renames, so a crash loses at most
 		// the window between the two renames (microseconds). CORRECTION
-		// (review 2026-10-24): the earlier text claimed the old pair
+		//: the earlier text claimed the old pair
 		// "stays loadable on either side" of that window — FALSE. The key
 		// rename OVERWRITES the old key, so inside the window (and after a
 		// crash inside it, or a cert-rename failure) the on-disk pair is

@@ -2160,8 +2160,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// store. The alert hot path (alertsEnabled, shouldAlert, realertMin,
 	// resolveDestinations) reads this snapshot lock-free, so a transient DB
 	// lock mid-probe can no longer read maintenance_mode as "0" and fire
-	// alerts during maintenance — the bug the per-call GetSetting reads had
-	//. reloadAlertSettings keeps the last good
+	// alerts during maintenance — the bug the per-call GetSetting reads had.
+	// reloadAlertSettings keeps the last good
 	// snapshot on a read error, so a hiccup here never installs a half-read
 	// state; it just leaves the previous (still-correct) snapshot in place
 	// until the next successful save.

@@ -66,7 +66,7 @@ var webhookResolver ipResolver = systemIPResolver{}
 // refuses every non-private address: a host that was allowed http:// only
 // because it resolved PRIVATE must never be dialed in cleartext at a
 // PUBLIC address (mixed A records, or DNS rebinding between the validation
-// resolution and this one; review 2026-10-24).
+// resolution and this one).
 func dialCheckedCleartext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -152,7 +152,7 @@ var webhookClient = &http.Client{
 
 // webhookClientCleartext serves http:// webhook URLs so the strict
 // all-private dial rule (dialCheckedCleartext) applies to every cleartext
-// delivery without touching https (review 2026-10-24). Redirects stay off
+// delivery without touching https. Redirects stay off
 // on both clients.
 var webhookClientCleartext = &http.Client{
 	Timeout: 10 * time.Second,

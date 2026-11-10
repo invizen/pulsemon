@@ -167,7 +167,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	rel, err := fetchRelease(client, version)
 	if err != nil {
 		// Upstream failure detail (URL/DNS/proxy) stays in the log
-		// (review 2026-10-24, same class as update_check.go:80).
+		// (same class as update_check.go:80).
 		log.Printf("update: fetch release: %v", err)
 		respondWithError(w, http.StatusBadGateway, "could not reach GitHub releases; try again later")
 		return
@@ -250,7 +250,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusAccepted)
 	// A failed encode leaves the client with an empty 202 body while the
 	// restart proceeds regardless — irreversible from their side, so at
-	// least make it visible in the log (review nit 2026-10-24).
+	// least make it visible in the log.
 	if err := json.NewEncoder(w).Encode(res); err != nil {
 		log.Printf("update: 202 response encode/flush failed before restart (client sees an empty body; restart proceeds): %v", err)
 	}

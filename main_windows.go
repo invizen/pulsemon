@@ -95,7 +95,7 @@ func (h *pulsemonHandler) Execute(args []string, r <-chan svc.ChangeRequest, s c
 		case req, ok := <-r:
 			if !ok {
 				// SCM closed the control channel (tearing the service
-				// down). Post StopPending FIRST (review nit 2026-10-24):
+				// down). Post StopPending FIRST:
 				// without it the SCM still believes the service is
 				// Running and its stop timer can kill the process mid
 				// drain on box shutdown.

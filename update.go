@@ -250,7 +250,7 @@ func targetAsset() string {
 	if goarch == "" {
 		goarch = runtime.GOARCH
 	} else if goarch != runtime.GOARCH {
-		// Loud (review 2026-10-24): the override is a deliberate packaging
+		// Loud: the override is a deliberate packaging
 		// feature (tests cross-arch asset naming), but a stray GOARCH in
 		// the SERVER's environment would fetch and INSTALL a wrong-arch
 		// binary that passes the SHA check (it IS the official asset) and
@@ -508,7 +508,7 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 		uErr("watchdog: --prev and --dst are required")
 		return 1
 	}
-	// Guard order (review 2026-10-24). The spawning server holds the update
+	// Guard order. The spawning server holds the update
 	// flock until its own death (the restart we are guarding), and its
 	// healthz answers with a VALID payload while it is still up. So the
 	// old order — lock once, then poll — failed both ways: the single
@@ -612,7 +612,7 @@ func watchdogTimeout() time.Duration {
 // API's auto-restart path keeps a guardian after this process dies. The
 // watchdog polls healthz and rolls back to <exe>.prev if the new binary
 // never comes up. --old-pid is us: the watchdog must not lock-acquire or
-// health-poll until THIS process is gone (review 2026-10-24).
+// health-poll until THIS process is gone.
 func spawnUpdateWatchdog(exe string) error {
 	cmd := exec.Command(exe, "update", "watchdog",
 		"--prev", exe+".prev", "--dst", exe, "--timeout", watchdogTimeout().String(),
@@ -995,7 +995,7 @@ func installBinary(src, dst, wantSHA string) error {
 	}
 	defer srcFile.Close()
 
-	// Hash while staging (review 2026-10-24): verifying the src PATH and
+	// Hash while staging: verifying the src PATH and
 	// then re-reading it leaves a window where the temp file can be
 	// swapped between verify and install. Hashing the exact bytes being
 	// staged closes it — a drifted source fails here, BEFORE dst is
@@ -1012,7 +1012,7 @@ func installBinary(src, dst, wantSHA string) error {
 		}
 	}
 	// Mode: PRESERVE the original binary's permission bits when dst
-	// exists (review nit 2026-10-24: forcing 0755 silently widened e.g.
+	// exists (forcing 0755 silently widened e.g.
 	// 0750), always ensuring owner-executable — a legacy 0600 dst must
 	// not come back unbootable. A fresh install with no dst is 0755.
 	dstMode := os.FileMode(0755)
@@ -1038,7 +1038,7 @@ func installBinary(src, dst, wantSHA string) error {
 	// dst (no running binary to back up) is tolerated: there is simply no
 	// previous version to roll back to.
 	//
-	// HARDLINK, not rename (review 2026-10-24): the old "rename dst→prev,
+	// HARDLINK, not rename: the old "rename dst→prev,
 	// then rename tmp→dst" left a window in which dst did NOT exist — a
 	// power loss between the two renames booted an install with NO binary.
 	// Linking makes .prev a second name for the old inode: dst never
@@ -1094,7 +1094,7 @@ func rollbackBinary(exe string) error {
 	if _, err := os.Stat(prev); err != nil {
 		return fmt.Errorf("no previous binary at %s to roll back to", prev)
 	}
-	// Windows note (review 2026-10-24; Win32 semantics reasoned, not
+	// Windows note (Win32 semantics reasoned, not
 	// executed — no Windows runner verified this): renaming OVER a loaded
 	// image fails with a sharing violation (ERROR_USER_MAPPED_FILE).
 	// Consequences: (a) the watchdog's rollback is fine — it runs after

@@ -248,7 +248,7 @@ func (db *Store) InitSchema() error {
 			return err
 		}
 	}
-	// One-time migration (finding #14): normalize legacy empty probe type
+	// One-time migration: normalize legacy empty probe type
 	// to 'icmp'. The type column was added with DEFAULT 'icmp', but rows
 	// created before the column existed have type=''. The read paths used
 	// to normalize ''→'icmp' in 6 places; this migration makes the DB the
@@ -431,7 +431,7 @@ func (db *Store) SensorTagsFor(ids []string) map[string][]string {
 			strings.Join(q, ",")+") ORDER BY tag", args...)
 		if err != nil {
 			// A silently-skipped chunk made the affected sensors route
-			// alerts as if they had NO tags (review 2026-10-24) — the
+			// alerts as if they had NO tags — the
 			// mid-stream path below already logs; do the same here.
 			log.Printf("db: sensor tag batch query failed for %d sensors (treated as untagged for alert routing): %v", len(chunk), err)
 			return
@@ -511,8 +511,8 @@ func (db *Store) SetMaintenanceMode(ctx context.Context, on bool, ids []string, 
 }
 
 // EnterMaintenanceWithFreshSnapshot enters maintenance mode with the
-// active-sensor snapshot computed INSIDE the pause transaction itself
-// (review nit 2026-10-24). The handler used to read ActiveSensorIDs before
+// active-sensor snapshot computed INSIDE the pause transaction itself.
+// The handler used to read ActiveSensorIDs before
 // the settings tx and apply that pre-tx list afterwards: a sensor activated
 // (or created) between the read and the pause escaped the snapshot and kept
 // probing under a mode that reads as ON until the next maintenance cycle.
@@ -651,7 +651,7 @@ func (db *Store) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) er
 	// to the pool: net/http recovers panics per-connection, the deferred
 	// conn.Close() still runs, and the next BEGIN IMMEDIATE on that pooled
 	// conn fails "cannot start a transaction within a transaction" —
-	// writes wedged until restart (review 2026-10-24, same failure mode the
+	// writes wedged until restart (same failure mode the
 	// ctx-canceled comment above defends against, via a different route).
 	// Registered AFTER the conn.Close defer so it runs BEFORE it (LIFO);
 	// the panic is re-raised for the HTTP layer to log.
@@ -674,7 +674,7 @@ func (db *Store) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) er
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
 		// Same hazard the rollback above defends against, COMMIT-side
-		// (review 2026-10-24): a ctx canceled at the driver skips the
+		//: a ctx canceled at the driver skips the
 		// statement, and SQLITE_BUSY after busy_timeout leaves the
 		// transaction ACTIVE (SQLite semantics) — the conn would go back
 		// to the pool holding the write lock with database/sql unaware.
@@ -692,7 +692,7 @@ func (db *Store) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) er
 // truth. The token is destroyed ONLY on a confirmed outcome (users already
 // exist, or the INSERT committed): on a UserCount error or an INSERT failure
 // the token stays in place and the migration retries next boot. Clearing it
-// unconditionally (review 2026-10-24) destroyed the operator's only
+// unconditionally destroyed the operator's only
 // credential on a failed migration and left zero users + no
 // auth_bootstrapped flag — which the setup gate reads as a FRESH install,
 // downgrading the dashboard to unauthenticated setup mode.

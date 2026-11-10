@@ -42,7 +42,7 @@ func updateLockPath() string {
 		// The fallback only means anything if the CLI and the server
 		// resolve the SAME TMPDIR — with systemd each unit can get a
 		// private /tmp, in which case CLI↔server mutual exclusion is
-		// silently gone. Say it loudly, once (review 2026-10-24).
+		// silently gone. Say it loudly, once.
 		lockFallbackOnce.Do(func() {
 			log.Printf("WARNING: update lock fell back to %s (running binary not locatable): CLI and server must share this TMPDIR for the lock to guard anything", path)
 		})

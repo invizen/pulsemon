@@ -102,7 +102,7 @@ func smtpAddr(v string) (string, error) {
 }
 
 // smtpEnvelopeAddr normalizes a STORED address for the SMTP envelope at
-// SEND time (review 2026-10-24). Parseable values — including legacy
+// SEND time. Parseable values — including legacy
 // display-name forms stored before smtpAddr existed — collapse to the
 // bare address; unparseable values pass through raw for the pre-validator
 // 501 behavior. But NEVER with control characters: net/smtp writes the
@@ -274,7 +274,7 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	// net/smtp writes the envelope verbatim, so a stored pre-validator
 	// value containing CRLF (written before save-time rejection existed,
 	// or by an older DB) would INJECT SMTP commands into the session at
-	// send time (review 2026-10-24). Reject loudly instead.
+	// send time. Reject loudly instead.
 	from, err := smtpEnvelopeAddr(cfg.From)
 	if err != nil {
 		return fmt.Errorf("smtp from address: %w", err)

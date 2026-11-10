@@ -772,7 +772,7 @@ func certNotAfterFromErr(err error) *time.Time {
 // makes an unresolvable name a loss row, not a wedged tick. The port
 // override below predates that change and stays.
 func validURL(t string) bool {
-	// Length bound (review 2026-10-24, same as validTarget): the URL
+	// Length bound (same as validTarget): the URL
 	// target is echoed on every poll and into every alert body. 2048 is
 	// the de-facto practical URL ceiling; the hostname inside is bounded
 	// at 253 by the FQDN check below.
