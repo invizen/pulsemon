@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"io"
 	"os"
 	"path/filepath"
@@ -168,7 +170,7 @@ func TestAuthUserAdd(t *testing.T) {
 		"bob":   "stdin-secret-2",
 		"carol": "argv-secret-3",
 	} {
-		if _, ok := a.CreateSession(user, pass, false); !ok {
+		if _, ok := a.CreateSession(context.Background(), user, pass, false); !ok {
 			t.Errorf("login %s with its added password failed — the stored password is wrong", user)
 		}
 	}

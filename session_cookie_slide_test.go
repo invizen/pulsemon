@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -28,7 +30,7 @@ func TestFix_SessionCookieSlides(t *testing.T) {
 
 	jar, _ := cookiejar.New(nil)
 	client := &http.Client{Jar: jar}
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 

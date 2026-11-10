@@ -326,7 +326,7 @@ func TestTagsEventsGetRequireSession(t *testing.T) {
 	// 2. Auth ON, no session: the defense-in-depth — the handler's own
 	// requireAuth returns 401 even with the gate bypassed. Pre-fix the GET
 	// branch had no check and returned 200.
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"/api/tags", "/api/events"} {
@@ -337,7 +337,7 @@ func TestTagsEventsGetRequireSession(t *testing.T) {
 
 	// 3. Auth ON, valid session: GET is open to ANY session (the tag list
 	// and event feed are dashboard data, not an admin surface).
-	tok, ok := srv.auth.CreateSession("admin", "secretpw", false)
+	tok, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}

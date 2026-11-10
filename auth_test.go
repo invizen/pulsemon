@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -62,7 +64,7 @@ func TestAuthUserValidation(t *testing.T) {
 		{"operator", "secretpw", true},
 	}
 	for i, c := range cases {
-		err := a.AddUser(c.user, c.pass)
+		err := a.AddUser(context.Background(), c.user, c.pass)
 		if c.ok && err != nil {
 			t.Fatalf("case %d (%q): AddUser: %v", i, c.user, err)
 		}
@@ -74,7 +76,7 @@ func TestAuthUserValidation(t *testing.T) {
 		t.Fatal("auth must be enabled after the first user is added")
 	}
 	// Case-insensitive uniqueness: OPERATOR and operator are one account.
-	if err := a.AddUser("OPERATOR", "secretpw"); err == nil {
+	if err := a.AddUser(context.Background(), "OPERATOR", "secretpw"); err == nil {
 		t.Fatal("duplicate user (case variant) must be rejected")
 	}
 	n, err := db.UserCount()
@@ -89,16 +91,16 @@ func TestAuthUserValidation(t *testing.T) {
 func TestAuthStateVerifyRoundTrip(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUser("admin", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if u, ok := a.VerifyUser("Admin", "secretpw"); !ok || u != "admin" {
+	if u, ok := a.VerifyUser(context.Background(), "Admin", "secretpw"); !ok || u != "admin" {
 		t.Fatalf("VerifyUser = %q, %v; want admin (case-insensitive)", u, ok)
 	}
-	if _, ok := a.VerifyUser("admin", "wrongpw123"); ok {
+	if _, ok := a.VerifyUser(context.Background(), "admin", "wrongpw123"); ok {
 		t.Fatal("VerifyUser accepted a wrong password")
 	}
-	if _, ok := a.VerifyUser("nobody", "secretpw"); ok {
+	if _, ok := a.VerifyUser(context.Background(), "nobody", "secretpw"); ok {
 		t.Fatal("VerifyUser accepted an unknown user")
 	}
 	// The stored value must be a bcrypt hash, never the plaintext.
@@ -117,7 +119,7 @@ func TestAuthStateVerifyRoundTrip(t *testing.T) {
 func TestAuthRemoveLastUserProtected(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUser("only", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "only", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.RemoveUser("only"); err == nil {
@@ -126,7 +128,7 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 	if n, _ := db.UserCount(); n != 1 {
 		t.Fatalf("UserCount = %d, want 1", n)
 	}
-	if err := a.AddUser("second", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "second", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	if err := a.RemoveUser("only"); err != nil {
@@ -141,7 +143,7 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 	if n, _ := db.UserCount(); n != 0 {
 		t.Fatalf("UserCount after Disable = %d, want 0", n)
 	}
-	if _, ok := a.VerifyUser("second", "secretpw"); ok {
+	if _, ok := a.VerifyUser(context.Background(), "second", "secretpw"); ok {
 		t.Fatal("VerifyUser must fail after Disable")
 	}
 }
@@ -151,13 +153,13 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 func TestAuthSessions(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUser("admin", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.CreateSession("admin", "wrongpw123", false); ok {
+	if _, ok := a.CreateSession(context.Background(), "admin", "wrongpw123", false); ok {
 		t.Fatal("CreateSession must reject a bad password")
 	}
-	sess, ok := a.CreateSession("admin", "secretpw", false)
+	sess, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok || sess == "" {
 		t.Fatal("CreateSession failed for valid credentials")
 	}
@@ -228,10 +230,10 @@ func TestExpiredSessionRejected(t *testing.T) {
 	}
 
 	// --- unit level: expired token is invalid and deleted on check ---
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	sess, ok := srv.auth.CreateSession("admin", "secretpw", false)
+	sess, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -248,7 +250,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 
 	// A live session still slides: a hit moves expiry back to now+TTL.
 	// Backdate it an hour first so the slide is measurable.
-	sess2, ok := srv.auth.CreateSession("admin", "secretpw", false)
+	sess2, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -300,7 +302,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 func TestSessionAbsoluteMaxAge(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUser("admin", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -309,7 +311,7 @@ func TestSessionAbsoluteMaxAge(t *testing.T) {
 	// the exact state a continuously-active session reaches createdAgo after
 	// login.
 	activeWithLoginAgo := func(createdAgo time.Duration) string {
-		tok, ok := a.CreateSession("admin", "secretpw", false)
+		tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 		if !ok {
 			t.Fatal("CreateSession failed")
 		}
@@ -356,7 +358,7 @@ func TestSessionAbsoluteMaxAge(t *testing.T) {
 	}
 
 	// 4. A just-logged-in session is unaffected by the cap.
-	fresh, ok := a.CreateSession("admin", "secretpw", false)
+	fresh, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -419,7 +421,7 @@ func TestAuthInAppMutationIsInstant(t *testing.T) {
 	_ = a.Enabled()
 
 	start := time.Now()
-	if err := a.AddUser("operator", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "operator", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	if !a.Enabled() {
@@ -457,7 +459,7 @@ func TestAuthStateRefreshSeesExternalWrite(t *testing.T) {
 	if err := sibling.InitSchema(); err != nil {
 		t.Fatal(err)
 	}
-	if err := (NewAuthState(sibling)).AddUser("cliuser", "secretpw"); err != nil {
+	if err := (NewAuthState(sibling)).AddUser(context.Background(), "cliuser", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// Within the TTL the live state MAY still be cached (disabled) — that's
@@ -467,7 +469,7 @@ func TestAuthStateRefreshSeesExternalWrite(t *testing.T) {
 	if !a.Enabled() {
 		t.Fatal("live AuthState did not pick up the external user write after the TTL")
 	}
-	if u, ok := a.VerifyUser("cliuser", "secretpw"); !ok || u != "cliuser" {
+	if u, ok := a.VerifyUser(context.Background(), "cliuser", "secretpw"); !ok || u != "cliuser" {
 		t.Fatalf("VerifyUser after external write = %q, %v", u, ok)
 	}
 	// And back again: auth-user remove from the host clears it live.
@@ -818,7 +820,7 @@ func TestAuthLegacyTokenMigration(t *testing.T) {
 		t.Fatalf("UserCount after migration = %d, want 1", n)
 	}
 	a := NewAuthState(db)
-	if u, ok := a.VerifyUser("admin", tok); !ok || u != "admin" {
+	if u, ok := a.VerifyUser(context.Background(), "admin", tok); !ok || u != "admin" {
 		t.Fatalf("VerifyUser(admin, old token) = %q, %v; want ok", u, ok)
 	}
 	if got := db.GetSetting("auth_token"); got != "" {
@@ -865,13 +867,13 @@ func TestLoginThrottleLockout(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// A second user for the "unaffected IP" assertions: the per-username
 	// lockout (finding #11) trips for "admin" after loginFailMax failures,
 	// so the per-IP isolation check must use a different account.
-	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "other", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -931,7 +933,7 @@ func TestLoginSuccessClearsThrottle(t *testing.T) {
 	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	const ip = "203.0.113.9"
@@ -968,7 +970,7 @@ func TestRejectedLoginIsSlowed(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// Warm up (first bcrypt call may include some one-time init).
@@ -1078,7 +1080,7 @@ func TestLoginThrottleIgnoresUntrustedXFF(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// loginFailMax attempts, each with a DIFFERENT spoofed XFF. If XFF were
@@ -1154,7 +1156,7 @@ func TestLoginThrottlePerUsername(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1256,7 +1258,7 @@ func TestLoginSuccessClearsUserFail(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1423,7 +1425,7 @@ func TestLoginThrottleUserFailsHardCapWipe(t *testing.T) {
 func TestLoginUnknownUserDoesNotRecordUserFail(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	login := func(username, ip string) int {
@@ -1473,6 +1475,111 @@ func TestBcryptSemCapacity(t *testing.T) {
 	}
 }
 
+// fillBcryptSem fills the semaphore so no slot frees until release is
+// called, and returns the release func.
+func fillBcryptSem() func() {
+	for i := 0; i < cap(bcryptSem); i++ {
+		bcryptSem <- struct{}{}
+	}
+	return func() {
+		for i := 0; i < cap(bcryptSem); i++ {
+			<-bcryptSem
+		}
+	}
+}
+
+// TestBcryptSemCoversGenerate pins that the GenerateFromPassword calls in
+// AddUserMode / SetUserPassword run under the SAME bcryptSem as VerifyUser
+// (review 2026-11-10 #4): with the semaphore FULL, a canceled ctx must make
+// the call return ctx.Err() promptly (the KDF is skipped, no side effects).
+// Without the semaphore, GenerateFromPassword would run unblocked and
+// return nil.
+func TestBcryptSemCoversGenerate(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	// Positive controls FIRST (sem free): the KDF-under-sem path works and
+	// leaves no slot behind.
+	if err := a.AddUser(context.Background(), "semuser", "secretpw-1"); err != nil {
+		t.Fatalf("AddUser (live ctx, free sem): %v", err)
+	}
+	if n := len(bcryptSem); n != 0 {
+		t.Fatalf("sem occupied after AddUser = %d, want 0 (slot leaked)", n)
+	}
+	if err := a.SetUserPassword(context.Background(), "semuser", "newpassword-1", ""); err != nil {
+		t.Fatalf("SetUserPassword (live ctx, free sem): %v", err)
+	}
+	if u, ok := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
+		t.Fatalf("VerifyUser after SetUserPassword = %q, %v; want semuser, true", u, ok)
+	}
+
+	release := fillBcryptSem()
+	// No defer: release is called exactly once below — a second drain
+	// would block on the (already empty) channel.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already canceled: the calls must skip the KDF entirely
+
+	if err := a.AddUserMode(ctx, "semuser2", "secretpw-2", false); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddUserMode(canceled ctx, full sem) = %v, want context.Canceled (KDF skipped)", err)
+	}
+	if err := a.AddUser(ctx, "semuser3", "secretpw-3"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("AddUser(canceled ctx, full sem) = %v, want context.Canceled", err)
+	}
+	// No side effects: the canceled calls created no accounts.
+	var n int
+	if err := a.db.QueryRow("SELECT COUNT(*) FROM users WHERE username IN ('semuser2','semuser3')").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("users rows from canceled calls = %d, want 0", n)
+	}
+	if err := a.SetUserPassword(ctx, "semuser", "newpassword-2", ""); !errors.Is(err, context.Canceled) {
+		t.Fatalf("SetUserPassword(canceled ctx, full sem) = %v, want context.Canceled", err)
+	}
+	// Release BEFORE the live VerifyUser below: it needs a slot, and a
+	// live (non-canceled) ctx would park forever on a full sem.
+	release()
+	// The old password is still the one (the KDF never ran).
+	if u, ok := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
+		t.Fatalf("password changed despite canceled ctx: VerifyUser = %q, %v", u, ok)
+	}
+}
+
+// TestVerifyUserCtxCancelSkipsQueuedKDF pins the ctx-aware acquire in
+// VerifyUser (review 2026-11-10 #4): with the semaphore FULL, a canceled
+// ctx makes VerifyUser return WITHOUT taking a slot. The old blocking send
+// (bcryptSem <- struct{}{}) would have parked here until a slot freed.
+func TestVerifyUserCtxCancelSkipsQueuedKDF(t *testing.T) {
+	release := fillBcryptSem()
+	defer release()
+
+	a := NewAuthState(newTestDB(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	done := make(chan struct {
+		user string
+		ok   bool
+	}, 1)
+	go func() {
+		u, ok := a.VerifyUser(ctx, "nobody", "secretpw")
+		done <- struct {
+			user string
+			ok   bool
+		}{u, ok}
+	}()
+	select {
+	case r := <-done:
+		if r.user != "" || r.ok {
+			t.Fatalf("VerifyUser(canceled ctx) = %q, %v; want \"\", false", r.user, r.ok)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("VerifyUser did not return with a canceled ctx while the sem was full (blocking acquire?)")
+	}
+	// The semaphore must STILL be full: the call took no slot.
+	if free := cap(bcryptSem) - len(bcryptSem); free != 0 {
+		t.Fatalf("free sem slots after canceled VerifyUser = %d, want 0 (no slot taken)", free)
+	}
+}
+
 // TestSweepExpiredSessionsEvictsAbandoned locks the opportunistic session
 // GC: when CreateSession runs past the sweep threshold, expired sessions
 // are evicted from the map while live sessions survive. Without the sweep,
@@ -1481,7 +1588,7 @@ func TestBcryptSemCapacity(t *testing.T) {
 // delete the specific token they are asked about.
 func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
-	if err := a.AddUser("admin", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// Isolate this test from the per-user session cap: it fills the map with
@@ -1495,7 +1602,7 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	const n = 70
 	toks := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		tok, ok := a.CreateSession("admin", "secretpw", false)
+		tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 		if !ok {
 			t.Fatal("create session")
 		}
@@ -1521,7 +1628,7 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	a.mu.Lock()
 	a.nextSweepSessions = time.Time{}
 	a.mu.Unlock()
-	fresh, ok := a.CreateSession("admin", "secretpw", false)
+	fresh, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("create session after sweep")
 	}
@@ -1562,10 +1669,10 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 // the cap and leaves the oldest alive.
 func TestCreateSessionCapsPerUser(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
-	if err := a.AddUser("admin", "secretpw"); err != nil {
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.AddUser("viewer", "viewerpw"); err != nil {
+	if err := a.AddUser(context.Background(), "viewer", "viewerpw"); err != nil {
 		t.Fatal(err)
 	}
 	origCap := maxSessionsPerUser
@@ -1584,7 +1691,7 @@ func TestCreateSessionCapsPerUser(t *testing.T) {
 	a.mu.Unlock()
 
 	// admin's 4th login is at the cap → evict admin's OLDEST only.
-	tok, ok := a.CreateSession("admin", "secretpw", false)
+	tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -1637,7 +1744,7 @@ func TestFix_m6_SecureCookieBehindTrustedProxy(t *testing.T) {
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1754,10 +1861,10 @@ func TestLoginThrottleIPv6Slash64(t *testing.T) {
 	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "other", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < loginFailMax; i++ {
@@ -1793,10 +1900,10 @@ func TestLoginThrottleLANPerHost(t *testing.T) {
 	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.auth.AddUser("other", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "other", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	for i := 0; i < loginFailMax; i++ {
@@ -1878,10 +1985,10 @@ func TestPasswordOver72Bytes(t *testing.T) {
 	if rr.Code != http.StatusBadRequest || !strings.Contains(rr.Body.String(), "exceeds 72 bytes") {
 		t.Fatalf("create with 73-byte password: %d %s, want 400 'exceeds 72 bytes'", rr.Code, rr.Body.String())
 	}
-	if err := srv.auth.AddUser("admin", strings.Repeat("a", 72)); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", strings.Repeat("a", 72)); err != nil {
 		t.Fatalf("72-byte password must be accepted: %v", err)
 	}
-	if err := srv.auth.SetUserPassword("admin", long, ""); !errors.Is(err, errPasswordTooLong) {
+	if err := srv.auth.SetUserPassword(context.Background(), "admin", long, ""); !errors.Is(err, errPasswordTooLong) {
 		t.Fatalf("SetUserPassword 73 bytes: err %v, want errPasswordTooLong", err)
 	}
 }
@@ -2281,7 +2388,7 @@ func TestSetupBootstrapGate(t *testing.T) {
 
 	// (3) CLI re-enable (direct AddUser, setupMode=false) keeps working
 	// in the disabled state.
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatalf("CLI re-enable (AddUser) in disabled state: %v", err)
 	}
 	if !srv.auth.Enabled() {

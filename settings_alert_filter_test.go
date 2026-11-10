@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -180,7 +182,7 @@ func TestSettingsPutRejectsAllowUnauthWhenAuthOff(t *testing.T) {
 	}
 
 	// Auth ON (an account exists): the toggle is accepted, both directions.
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatalf("AddUser: %v", err)
 	}
 	if n, _ := db.UserCount(); n != 1 {

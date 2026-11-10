@@ -137,9 +137,32 @@ var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcf
 // than rejecting it: under attack the operator's login waits for a free core
 // instead of failing, which is the exact regression the non-blocking
 // (select/default → 429) variant would cause (see the handleAuthLogin
-// security note). Both the real-hash and dummy-hash paths go through it so
-// the unknown-user equalizer keeps its constant time AND its concurrency cap.
+// security note). BOTH KDF flavors go through it — CompareHashAndPassword
+// (real + dummy hash paths, so the unknown-user equalizer keeps its constant
+// time AND its concurrency cap) and GenerateFromPassword (AddUserMode /
+// SetUserPassword — setup mode is an UNAUTHENTICATED surface, so without the
+// cap concurrent bootstrap POSTs would drive NumCPU-or-more parallel KDFs;
+// review 2026-11-10 #4). Acquire is ctx-aware (acquireBcryptSem): a client
+// that disconnected while queued stops waiting instead of burning a core for
+// a response nobody reads.
 var bcryptSem = make(chan struct{}, runtime.NumCPU())
+
+// acquireBcryptSem blocks until a KDF slot frees up or ctx is canceled.
+// Returns false (no slot taken) when ctx completes first — the caller must
+// then skip the KDF entirely. The select makes the wait cancellable: a
+// multi-IP burst whose clients time out no longer parks handlers on the
+// semaphore (and burns CPU on the queued KDFs) after the flood stops
+// (review 2026-11-10 #4).
+func acquireBcryptSem(ctx context.Context) bool {
+	select {
+	case bcryptSem <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func releaseBcryptSem() { <-bcryptSem }
 
 type authSession struct {
 	user   string
@@ -469,10 +492,10 @@ func validUsername(u string) bool {
 // user without the flag), the losers see user_count > 0 and get
 // errBootstrapped (409). In-app adds (user_count > 0) keep their normal
 // path: a duplicate username is errUserExists (400).
-func (a *AuthState) AddUser(username, password string) error {
+func (a *AuthState) AddUser(ctx context.Context, username, password string) error {
 	// In-app / CLI add: the user table may already be populated; a
 	// duplicate username is the expected client error (400).
-	return a.AddUserMode(username, password, false)
+	return a.AddUserMode(ctx, username, password, false)
 }
 
 // AddUserMode is AddUser with the setup-mode flag made explicit.
@@ -485,7 +508,7 @@ func (a *AuthState) AddUser(username, password string) error {
 // losers. Without it, four clients with four DIFFERENT usernames all see
 // an empty table at the gate, all pass the UNIQUE check (their names don't
 // collide), and four "first" accounts are created (// the ImmediateTx alone does not close the race; this check does).
-func (a *AuthState) AddUserMode(username, password string, setupMode bool) error {
+func (a *AuthState) AddUserMode(ctx context.Context, username, password string, setupMode bool) error {
 	username = strings.ToLower(username)
 	if !validUsername(username) {
 		return errUsernameInvalid
@@ -508,14 +531,26 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 			return errBootstrappedEarly
 		}
 	}
+	// Same bcrypt semaphore as VerifyUser (review 2026-11-10 #4): setup
+	// mode is an unauthenticated surface, so without the cap concurrent
+	// bootstrap POSTs would run NumCPU-or-more parallel KDFs. A canceled
+	// ctx (client gone) skips the KDF — it never ran, so the caller's
+	// throttle refund logic treats it as a no-KDF rejection.
+	if !acquireBcryptSem(ctx) {
+		return ctx.Err()
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	releaseBcryptSem()
 	if err != nil {
 		return err
 	}
-	ctx := context.Background()
-	err = a.db.ImmediateTx(ctx, func(c *sql.Conn) error {
+	// A FRESH context for the tx itself: the request ctx is only the
+	// KDF-skip signal above; the (millisecond) tx runs to completion so
+	// a mid-tx disconnect can't leave a half-committed bootstrap.
+	txCtx := context.Background()
+	err = a.db.ImmediateTx(txCtx, func(c *sql.Conn) error {
 		var n int
-		if err := c.QueryRowContext(ctx, "SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+		if err := c.QueryRowContext(txCtx, "SELECT COUNT(*) FROM users").Scan(&n); err != nil {
 			return err
 		}
 		if n > 0 && setupMode {
@@ -529,7 +564,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 		if n == 0 {
 			admin = 1 // first account = the admin (the account panel is admin-gated)
 		}
-		if _, err := c.ExecContext(ctx,
+		if _, err := c.ExecContext(txCtx,
 			"INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
 			username, string(hash), store.Now(), admin); err != nil {
 			// Only the exact UNIQUE-constraint text means "account
@@ -549,7 +584,7 @@ func (a *AuthState) AddUserMode(username, password string, setupMode bool) error
 			// First account: mark the install bootstrapped atomically
 			// (see the function comment for why the flag must commit with
 			// the user row).
-			if _, err := c.ExecContext(ctx,
+			if _, err := c.ExecContext(txCtx,
 				"INSERT OR REPLACE INTO settings (setting_key, value, updated_at) VALUES ('auth_bootstrapped', '1', ?)",
 				store.Now()); err != nil {
 				return err
@@ -641,7 +676,7 @@ func (a *AuthState) RemoveUser(username string) error {
 // SetUserPassword replaces a user's password and drops that user's other
 // sessions (the caller's own session, if any, is kept so "change my
 // password" does not log the operator out mid-panel).
-func (a *AuthState) SetUserPassword(username, password, keepSession string) error {
+func (a *AuthState) SetUserPassword(ctx context.Context, username, password, keepSession string) error {
 	username = strings.ToLower(username)
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
@@ -649,7 +684,15 @@ func (a *AuthState) SetUserPassword(username, password, keepSession string) erro
 	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
+	// Same bcrypt semaphore as VerifyUser (review 2026-11-10 #4): this is
+	// a KDF too — a session holder (or a throttled spray) must not drive
+	// NumCPU-or-more parallel GenerateFromPassword calls on top of the
+	// login-path KDFs.
+	if !acquireBcryptSem(ctx) {
+		return ctx.Err()
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcryptCost)
+	releaseBcryptSem()
 	if err != nil {
 		return err
 	}
@@ -662,7 +705,7 @@ func (a *AuthState) SetUserPassword(username, password, keepSession string) erro
 }
 
 // VerifyUser reports whether username/password is a valid account.
-func (a *AuthState) VerifyUser(username, password string) (string, bool) {
+func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (string, bool) {
 	username = strings.ToLower(username)
 	hash, err := a.db.UserHash(username)
 	if err != nil || hash == "" {
@@ -676,13 +719,21 @@ func (a *AuthState) VerifyUser(username, password string) (string, bool) {
 		// Both paths go through bcryptSem (finding #11): the dummy path is the
 		// one an unknown-username spray drives, so it needs the concurrency cap
 		// too — capping only the real-hash path would leave the spray unbounded.
-		bcryptSem <- struct{}{}
+		// The acquire is ctx-aware (review 2026-11-10 #4): a client that
+		// disconnected while queued skips the KDF — no core burned for a
+		// response nobody reads. ctx cancel only skips work for a GONE client,
+		// so the live-client timing equalizer is untouched.
+		if !acquireBcryptSem(ctx) {
+			return "", false
+		}
+		defer releaseBcryptSem()
 		bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
-		<-bcryptSem
 		return "", false
 	}
-	bcryptSem <- struct{}{}
-	defer func() { <-bcryptSem }()
+	if !acquireBcryptSem(ctx) {
+		return "", false
+	}
+	defer releaseBcryptSem()
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return "", false
 	}
@@ -707,8 +758,8 @@ var maxSessionsPerUser = 32
 
 // CreateSession validates the credentials and returns a new opaque session
 // token tied to the user.
-func (a *AuthState) CreateSession(username, password string, cookieSecure bool) (string, bool) {
-	user, ok := a.VerifyUser(username, password)
+func (a *AuthState) CreateSession(ctx context.Context, username, password string, cookieSecure bool) (string, bool) {
+	user, ok := a.VerifyUser(ctx, username, password)
 	if !ok {
 		return "", false
 	}
@@ -1500,8 +1551,17 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, ok := s.auth.CreateSession(req.Username, req.Password, s.cookieSecure(r))
+	tok, ok := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
+		// Client already gone (disconnected while queued on bcryptSem —
+		// review 2026-11-10 #4): a disconnect is not a failed password
+		// attempt, so it must not burn the account's failure budget, and
+		// the rejection delay buys nothing for a response nobody reads.
+		// Live clients take the full path below, so the timing equalizer
+		// is untouched.
+		if r.Context().Err() != nil {
+			return
+		}
 		// Count the failure against the account (across all IPs) — the
 		// per-username layer the per-IP budget can't see (finding #11).
 		// EXISTING accounts only: a failure for a name with no account
@@ -1660,7 +1720,16 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		if err := s.auth.AddUserMode(req.Username, req.Password, setup); err != nil {
+		if err := s.auth.AddUserMode(r.Context(), req.Username, req.Password, setup); err != nil {
+			// Client gone while queued on bcryptSem (review 2026-11-10
+			// #4): the KDF never ran, so refund the setup attempt and
+			// drop the response (the write would be a no-op anyway).
+			if r.Context().Err() != nil {
+				if setup {
+					s.auth.refundAttempt(setupKey)
+				}
+				return
+			}
 			if setup {
 				// Refund exactly the no-KDF-cost rejections: cheap
 				// validation and the early bootstrap pre-check both run
@@ -1777,7 +1846,13 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	if _, ok := s.auth.VerifyUser(user, req.Current); !ok {
+	if _, ok := s.auth.VerifyUser(r.Context(), user, req.Current); !ok {
+		// Client gone while queued on bcryptSem (review 2026-11-10 #4):
+		// a disconnect is not a failed current_password attempt — skip
+		// the failure budget and the rejection delay.
+		if r.Context().Err() != nil {
+			return
+		}
 		// Count the failure against the account (across all IPs) — the
 		// same shared budget login uses (review 2026-11-10). The caller
 		// holds a live session, so the account exists by construction —
@@ -1798,7 +1873,12 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 	if c, err := r.Cookie(authSessionName); err == nil {
 		keep = c.Value
 	}
-	if err := s.auth.SetUserPassword(user, req.Password, keep); err != nil {
+	if err := s.auth.SetUserPassword(r.Context(), user, req.Password, keep); err != nil {
+		// Client gone while queued on bcryptSem (review 2026-11-10 #4):
+		// nothing left to tell.
+		if r.Context().Err() != nil {
+			return
+		}
 		// Only the validation sentinels are client errors; any other
 		// failure (db, KDF) is a 500 with the detail logged — a raw
 		// driver string (e.g. "database is locked") is not a client

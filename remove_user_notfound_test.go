@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"errors"
 	"io"
 	"net/http"
@@ -29,7 +31,7 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
 	for _, u := range []string{"admin", "temp", "third"} {
-		if err := a.AddUser(u, "secretpw123"); err != nil {
+		if err := a.AddUser(context.Background(), u, "secretpw123"); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"errors"
 	"testing"
 	"time"
@@ -15,7 +17,7 @@ import (
 func TestFix_M2_EnabledFailsClosed(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUser("bob", "longenoughpw"); err != nil {
+	if err := a.AddUser(context.Background(), "bob", "longenoughpw"); err != nil {
 		t.Fatal(err)
 	}
 	if !a.Enabled() {

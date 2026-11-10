@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"bytes"
 	"encoding/json"
 	"net/http"
@@ -62,7 +64,7 @@ func updateServer(t *testing.T) *Server {
 	t.Helper()
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
-	if err := srv.auth.AddUser("admin", "update-test-password-1"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "update-test-password-1"); err != nil {
 		t.Fatal(err)
 	}
 	return srv

@@ -150,7 +150,7 @@ func TestThrottleHardCapResets(t *testing.T) {
 
 func TestSessionSweepRateLimited(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
-	if err := a.AddUserMode("admin", "secretpw", true); err != nil {
+	if err := a.AddUserMode(context.Background(), "admin", "secretpw", true); err != nil {
 		t.Fatal(err)
 	}
 	// Isolate from the per-user session cap: this test seeds 68 same-user
@@ -168,7 +168,7 @@ func TestSessionSweepRateLimited(t *testing.T) {
 	a.sessions["expired"] = authSession{user: "admin", expiry: now.Add(-time.Minute), created: now, cookieIssued: now}
 	a.mu.Unlock()
 
-	if _, ok := a.CreateSession("admin", "secretpw", false); !ok {
+	if _, ok := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
 		t.Fatal("CreateSession failed")
 	}
 	a.mu.Lock()
@@ -181,7 +181,7 @@ func TestSessionSweepRateLimited(t *testing.T) {
 	a.mu.Lock()
 	a.sessions["expired2"] = authSession{user: "admin", expiry: now.Add(-time.Minute), created: now, cookieIssued: now}
 	a.mu.Unlock()
-	if _, ok := a.CreateSession("admin", "secretpw", false); !ok {
+	if _, ok := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
 		t.Fatal("CreateSession failed")
 	}
 	a.mu.Lock()
@@ -194,7 +194,7 @@ func TestSessionSweepRateLimited(t *testing.T) {
 
 func TestCookieSecurePinAcrossRenewal(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
-	if err := a.AddUserMode("admin", "secretpw", true); err != nil {
+	if err := a.AddUserMode(context.Background(), "admin", "secretpw", true); err != nil {
 		t.Fatal(err)
 	}
 	age := func(tok string) {
@@ -205,11 +205,11 @@ func TestCookieSecurePinAcrossRenewal(t *testing.T) {
 		a.mu.Unlock()
 	}
 
-	secureTok, ok := a.CreateSession("admin", "secretpw", true)
+	secureTok, ok := a.CreateSession(context.Background(), "admin", "secretpw", true)
 	if !ok {
 		t.Fatal("CreateSession(secure) failed")
 	}
-	plainTok, ok := a.CreateSession("admin", "secretpw", false)
+	plainTok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}

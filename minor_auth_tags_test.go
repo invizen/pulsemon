@@ -14,6 +14,8 @@ package main
 //       session-only tier. Now admin-gated like DELETE /api/history.
 
 import (
+	"context"
+
 	"errors"
 	"net/http"
 	"net/http/cookiejar"
@@ -23,7 +25,7 @@ import (
 func TestSetupModeRejectsBeforeBcrypt(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)
-	if err := a.AddUserMode("first", "bootstrap-pw-1", true); err != nil {
+	if err := a.AddUserMode(context.Background(), "first", "bootstrap-pw-1", true); err != nil {
 		t.Fatalf("bootstrap AddUserMode: %v", err)
 	}
 	// With a user present, setup mode is guaranteed to lose the in-tx
@@ -32,14 +34,14 @@ func TestSetupModeRejectsBeforeBcrypt(t *testing.T) {
 	// errBootstrappedEarly (setup throttle, review 2026-10-24) WRAPS
 	// errBootstrapped so the handler can refund a never-paid KDF attempt;
 	// the verdict identity is errors.Is, not ==.
-	if err := a.AddUserMode("second", "another-pw-2", true); !errors.Is(err, errBootstrapped) {
+	if err := a.AddUserMode(context.Background(), "second", "another-pw-2", true); !errors.Is(err, errBootstrapped) {
 		t.Fatalf("setup-mode with existing user: err = %v, want errBootstrapped", err)
 	}
 	if n, err := a.db.UserCount(); err != nil || n != 1 {
 		t.Fatalf("user count = %d (err %v), want 1 — loser must not be created", n, err)
 	}
 	// Non-setup path unaffected: a normal admin add still works.
-	if err := a.AddUserMode("helper", "helper-pw-3", false); err != nil {
+	if err := a.AddUserMode(context.Background(), "helper", "helper-pw-3", false); err != nil {
 		t.Fatalf("non-setup AddUserMode: %v", err)
 	}
 }

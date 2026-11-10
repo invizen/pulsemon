@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"encoding/json"
 	"fmt"
 	"io"
@@ -179,7 +181,7 @@ func TestChangePasswordPerUsernameLockout(t *testing.T) {
 	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
-	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	// The "attacker" holds a legitimate session for the account (the
@@ -250,7 +252,7 @@ func TestChangePasswordPerUsernameLockout(t *testing.T) {
 	srv2.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv2 := httptest.NewServer(srv2.authGate())
 	defer httpSrv2.Close()
-	if err := srv2.auth.AddUser("admin", "secretpw"); err != nil {
+	if err := srv2.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
 	jar2, _ := cookiejar.New(nil)

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -22,7 +24,7 @@ func TestFix_g1_SecurityHeaders(t *testing.T) {
 
 	d.SetSetting("auth_bootstrapped", "1")
 	// Enable auth by adding a user
-	if err := srv.auth.AddUser("admin", "password123"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "admin", "password123"); err != nil {
 		t.Fatalf("failed to add admin user: %v", err)
 	}
 

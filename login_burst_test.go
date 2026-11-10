@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -19,13 +21,13 @@ import (
 func TestFix_C2_ConcurrentLoginBurst(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
-	if err := srv.auth.AddUser("alice", "correct-horse-battery"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "alice", "correct-horse-battery"); err != nil {
 		t.Fatal(err)
 	}
 	// A second user for the post-burst assertions: the per-username lockout
 	// (finding #11) trips for "alice" after the burst, so the per-IP
 	// isolation checks must use a different account.
-	if err := srv.auth.AddUser("bob", "correct-horse-battery"); err != nil {
+	if err := srv.auth.AddUser(context.Background(), "bob", "correct-horse-battery"); err != nil {
 		t.Fatal(err)
 	}
 

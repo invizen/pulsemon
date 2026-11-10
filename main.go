@@ -517,7 +517,7 @@ func runAuthUser(args []string) dispatchKind {
 		} else {
 			fmt.Fprintln(os.Stderr, "warning: the password is visible in `ps` and shell history — prefer `pulsemon auth-user add <username>` (password from stdin) or `--password-stdin`")
 		}
-		if err := a.AddUser(p.user, p.pass); err != nil {
+		if err := a.AddUser(context.Background(), p.user, p.pass); err != nil {
 			fmt.Fprintln(os.Stderr, "auth-user add:", err)
 			return dExit1
 		}
