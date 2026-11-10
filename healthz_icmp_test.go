@@ -16,6 +16,13 @@ import (
 // simulate each outcome of the startup warm-up. SharedEngine is a
 // sync.Once, so the Once must be re-zeroed between tests (tests in this
 // package run sequentially by default — no t.Parallel here).
+//
+// It also restores a clean "not yet opened" state when the test (or subtest)
+// ends. Without that, a re-zeroed Once can be consumed by a LATER test's
+// EngineMode()/EngineDead() no-op join (Do(func(){})) and left as
+// (done, nil, nil) — a state SharedEngine() can't recover from, because
+// sync.Once can't re-run NewEngine(). A later icmp probe then panics on a
+// nil engine (TestProbeTargetDispatch in the full -race run hit exactly this).
 func resetSharedEngine(t *testing.T, mode string, err error) {
 	t.Helper()
 	sharedEngineOnce = sync.Once{}
@@ -24,6 +31,11 @@ func resetSharedEngine(t *testing.T, mode string, err error) {
 	if mode != "" {
 		sharedEngineInst = &Engine{mode: mode}
 	}
+	t.Cleanup(func() {
+		sharedEngineOnce = sync.Once{}
+		sharedEngineInst = nil
+		sharedEngineErr = nil
+	})
 }
 
 // runHealthz drives handleHealthz against a real store and decodes the JSON.
@@ -104,6 +116,12 @@ func TestHealthzIcmpMode(t *testing.T) {
 // not be told the precise version (a targeting signal for known bugs), while a
 // logged-in operator still sees it.
 func TestHealthzVersionGated(t *testing.T) {
+	// handleHealthz reads EngineMode()/EngineDead(), which join the shared
+	// engine's sync.Once. Rewind + restore the state so a later icmp test
+	// (TestProbeTargetDispatch) can open a real engine instead of hitting the
+	// (done, nil, nil) state this test would otherwise leave behind.
+	resetSharedEngine(t, "", nil)
+
 	db, err := store.NewStore(t.TempDir() + "/hzver.db")
 	if err != nil {
 		t.Fatalf("store.NewStore: %v", err)
