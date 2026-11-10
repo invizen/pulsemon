@@ -659,22 +659,28 @@ var dnsLookups singleflight.Group
 // any single caller's probe ctx: the first caller to trigger the lookup
 // may be cancelled (shutdown, sensor removed) while other callers are
 // still waiting on its result — keying the shared call to one caller's
-// ctx would fail the lookup for everyone on that one cancellation. A
-// caller whose own ctx is done gets its ctx error back (its probe is
-// being dropped anyway).
+// ctx would fail the lookup for everyone on that one cancellation.
+//
+// DoChan (not Do) so a caller whose own ctx is done stops WAITING
+// immediately instead of blocking for the shared call's full 5s: a
+// 1s-timeout sensor must not stall 5s on a hung resolver, and shutdown
+// / remove must not wait out an in-flight lookup. The shared call keeps
+// running to completion for the other callers.
 func dnsLookup(ctx context.Context, target string) (*net.IPAddr, error) {
-	v, err, _ := dnsLookups.Do(target, func() (any, error) {
+	ch := dnsLookups.DoChan(target, func() (any, error) {
 		lctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return resolveIPAddrWithTimeout(lctx, target, 5*time.Second)
 	})
-	if err != nil {
-		return nil, err
-	}
-	if ctx.Err() != nil {
+	select {
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return r.Val.(*net.IPAddr), nil
+	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	return v.(*net.IPAddr), nil
 }
 
 // resolveICMPTarget resolves target to an IPv4 address through the

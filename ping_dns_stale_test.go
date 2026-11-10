@@ -164,6 +164,51 @@ func TestDNSLookupSingleflight(t *testing.T) {
 	}
 }
 
+// TestDNSLookupCtxBounded: a caller whose own ctx is done stops WAITING
+// immediately instead of blocking for the shared lookup's full deadline —
+// a 1s-timeout sensor must not stall 5s on a hung resolver, and shutdown /
+// remove must not wait out an in-flight lookup. The shared call keeps running
+// to completion for the other callers.
+func TestDNSLookupCtxBounded(t *testing.T) {
+	const target = "ctx-bound-pulsemon-test.invalid"
+	clearDNSCache(t, target)
+	// The shared resolver call blocks well past the second caller's ctx
+	// deadline.
+	stubResolver(t, func(ctx context.Context, host string, timeout time.Duration) (*net.IPAddr, error) {
+		select {
+		case <-time.After(1500 * time.Millisecond):
+			return &net.IPAddr{IP: net.ParseIP("10.0.0.1")}, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	})
+
+	// First caller triggers the shared lookup (runs to completion in the
+	// background for the other callers).
+	first := make(chan struct{})
+	go func() {
+		defer close(first)
+		_, _ = dnsLookup(context.Background(), target)
+	}()
+	// Give the shared lookup a moment to be in-flight.
+	time.Sleep(100 * time.Millisecond)
+
+	// Second caller with a short ctx: must return on ctx.Done(), not block
+	// for the resolver's 1.5s.
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := dnsLookup(ctx, target)
+	elapsed := time.Since(start)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second caller err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("second caller blocked %v waiting on the shared lookup; it must return on its own ctx", elapsed)
+	}
+	<-first // let the background lookup finish before t.Cleanup restores the resolver
+}
+
 // TestResolveICMPTargetSweepKeepsStaleWindow: the opportunistic sweep
 // (triggered by a successful write once the map is over 128 entries) must
 // not destroy an entry that is still inside its staleness window — that
