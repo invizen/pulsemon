@@ -13,11 +13,11 @@ import (
 )
 
 // TestFix_SessionCookieSlides pins the sliding-cookie fix: the session
-// cookie was issued once at login with a fixed Max-Age=30d, and
+// cookie was issued once at login with a fixed Max-Age=7d, and
 // ValidSession slid only the IN-MEMORY expiry — so the browser deleted
-// the cookie exactly 30 days after login even for a daily user, defeating
-// the sliding-session design (server expiry = last-use+30d is always >=
-// cookie expiry = login+30d, so the cookie always died first). The gate
+// the cookie exactly 7 days after login even for a daily user, defeating
+// the sliding-session design (server expiry = last-use+7d is always >=
+// cookie expiry = login+7d, so the cookie always died first). The gate
 // now re-issues the SAME token once the cookie ages past half the TTL
 // (CookieRenewalDue), and SessionUser (the gate-exempt /api/auth/status
 // path) slides like ValidSession. Fails pre-fix (no Set-Cookie on an
@@ -60,9 +60,9 @@ func TestFix_SessionCookieSlides(t *testing.T) {
 		}
 	}
 
-	// Age the cookie past half the TTL (16d) — as a daily user's cookie
-	// would be on day 16. The next authenticated request must re-issue
-	// the SAME token with a fresh 30-day Max-Age.
+	// Age the cookie past half the TTL (5d) — as a daily user's cookie
+	// would be on day 5. The next authenticated request must re-issue
+	// the SAME token with a fresh 7-day Max-Age.
 	su, _ := url.Parse(httpSrv.URL)
 	var tok string
 	for _, c := range jar.Cookies(su) {
@@ -75,7 +75,7 @@ func TestFix_SessionCookieSlides(t *testing.T) {
 	}
 	srv.auth.mu.Lock()
 	s := srv.auth.sessions[tok]
-	s.cookieIssued = time.Now().Add(-16 * 24 * time.Hour)
+	s.cookieIssued = time.Now().Add(-5 * 24 * time.Hour)
 	srv.auth.sessions[tok] = s
 	srv.auth.mu.Unlock()
 
@@ -94,7 +94,7 @@ func TestFix_SessionCookieSlides(t *testing.T) {
 		}
 	}
 	if reissued == nil {
-		t.Fatal("aged session (cookie 16d old): no Set-Cookie re-issue — the browser would delete the cookie at day 30 and log the active user out (the sliding design is defeated)")
+		t.Fatal("aged session (cookie 5d old): no Set-Cookie re-issue — the browser would delete the cookie at day 7 and log the active user out (the sliding design is defeated)")
 	}
 	if reissued.Value != tok {
 		t.Errorf("re-issued cookie value = %q, want the SAME token %q (refresh, not rotate)", reissued.Value, tok)

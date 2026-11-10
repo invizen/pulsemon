@@ -181,7 +181,7 @@ func TestAuthSessions(t *testing.T) {
 	}
 }
 
-// TestExpiredSessionRejected: the 30-day sliding expiry must be enforced,
+// TestExpiredSessionRejected: the sliding expiry must be enforced,
 // not cosmetic. Backdates a live session's stored expiry directly (no
 // waiting) and asserts both layers: ValidSession rejects + deletes the
 // entry, and the auth gate 401s a request carrying the stale cookie.
@@ -287,7 +287,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 	}
 }
 
-// TestSessionAbsoluteMaxAge: the 30-day sliding expiry must NOT let a
+// TestSessionAbsoluteMaxAge: the sliding expiry must NOT let a
 // session live forever. authSessionMaxAge caps the total lifetime from LOGIN
 // time (s.created), independent of activity — so a continuously-active
 // session (an open dashboard tab polling every few seconds, or a stolen

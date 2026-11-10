@@ -34,7 +34,8 @@ import (
 // enabled flag: the user table is the single source of truth.
 //
 // Login is username + password; success issues an httpOnly session cookie
-// (30-day sliding expiry, in-memory). Sessions are deliberately NOT
+// (7-day sliding expiry, 30-day absolute cap, in-memory). Sessions are
+// deliberately NOT
 // persisted — a restart invalidating logins is acceptable for a tool with
 // a handful of operators, and it keeps credentials to the users table.
 //
@@ -63,19 +64,27 @@ import (
 
 const (
 	authSessionName = "pulsemon_session"
-	authSessionTTL  = 30 * 24 * time.Hour
+	// authSessionTTL is the SLIDING inactivity window: a session lapses if it
+	// goes unused for this long. ValidSession and SessionUser move expiry
+	// forward on every live hit, so an active operator stays logged in while
+	// an idle session dies after a week. It is deliberately SHORTER than
+	// authSessionMaxAge (see below): with the two equal the sliding machinery
+	// was a no-op and every session died exactly 30 days after login.
+	authSessionTTL = 7 * 24 * time.Hour
 	// authSessionMaxAge is the ABSOLUTE lifetime of a session, counted from
-	// login time (authSession.created), independent of activity. authSessionTTL
-	// is a sliding inactivity window: ValidSession and SessionUser move expiry
-	// forward on every live hit, so with the TTL alone a continuously-active
-	// session — an open dashboard tab polling every few seconds, or a stolen
-	// cookie used periodically — would never lapse. The max-age cap bounds the
-	// total time any session can stay valid: after authSessionMaxAge from login
-	// the session is rejected and deleted even if it has been active the whole
-	// time, forcing a re-login. Set to the same 30 days as authSessionTTL, so
-	// an idle session (which lapses after TTL of inactivity) and a maximally
-	// active session both last at most 30 days from login; only activity in
-	// between extends an idle session up to that cap.
+	// login time (authSession.created), independent of activity. With the
+	// sliding TTL alone a continuously-active session — an open dashboard tab
+	// polling every few seconds, or a stolen cookie used periodically — would
+	// never lapse (activity keeps pushing expiry out); the max-age cap bounds
+	// the total time any session can stay valid: after authSessionMaxAge from
+	// login the session is rejected and deleted even if it has been active the
+	// whole time, forcing a re-login.
+	//
+	// 7-day idle / 30-day absolute: an idle session lapses after a week (the
+	// better security posture — a stolen cookie stops working after 7 days of
+	// inactivity, not a month), an active operator's cookie is renewed every
+	// ~3.5 days (CookieRenewalDue) and stays logged in, and no session
+	// outlives 30 days from login.
 	authSessionMaxAge = 30 * 24 * time.Hour
 	bcryptCost        = bcrypt.DefaultCost
 	minPasswordLen    = 8
@@ -109,12 +118,13 @@ const (
 	loginSlowDown = 200 * time.Millisecond
 
 	// knownGoodTTL bounds how long a previously-successful IP bucket stays
-	// exempt from the per-username lockout. It matches
-	// the session TTL: the operator's IP stays exempt for as long as a session
-	// would be valid, so a regularly-active operator is never locked out by a
-	// LAN host, while an IP that hasn't logged in in a month expires (and is
-	// recoverable via the CLI — see the file header).
-	knownGoodTTL = authSessionTTL
+	// exempt from the per-username lockout. It matches the session's ABSOLUTE
+	// cap (authSessionMaxAge), not the sliding idle TTL: a session can stay
+	// valid up to max-age if active, so the operator's IP must stay exempt for
+	// that whole window, not just the 7-day idle period. An IP that hasn't
+	// logged in in a month expires (and is recoverable via the CLI — see the
+	// file header).
+	knownGoodTTL = authSessionMaxAge
 
 	// enabledTTL bounds how long the "is auth enabled?" (user count > 0)
 	// cache is trusted before re-reading the DB. In-app user mutations
