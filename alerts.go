@@ -1137,9 +1137,17 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	} else if url == "" {
 		return false, "no " + p.Label + " webhook URL configured"
 	}
-	var body map[string]string
+	// map[string]any, not map[string]string: the discord payload nests
+	// allowed_mentions (review 2026-11-10 #8) — the test-alert body must be
+	// structurally identical to the production delivery payloads
+	// (deliverOne / deliverStormSummary), so the test button verifies the
+	// exact shape the real alerts send.
+	var body map[string]any
 	if p.Kind == "discord" {
-		body = map[string]string{"content": "✅ **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works."}
+		body = map[string]any{
+			"content":          "✅ **pulsemon: test alert**\nSensor: settings · Target: webhook-verify · State: **test** — your Discord webhook works.",
+			"allowed_mentions": map[string]any{"parse": []string{}},
+		}
 	} else if p.Kind == "telegram" {
 		// chat_id resolved error-aware (same reason as the URL above): a
 		// transient DB lock must not post an empty chat_id to Telegram
@@ -1148,7 +1156,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		if err != nil {
 			return false, "database error reading provider settings"
 		}
-		body = map[string]string{
+		body = map[string]any{
 			"chat_id":    chatID,
 			"text":       "✅ <b>pulsemon: test alert</b>\n<b>Sensor:</b> settings · <b>Target:</b> webhook-verify · <b>State:</b> <b>test</b> — your Telegram bot works.",
 			"parse_mode": "HTML",
@@ -1163,7 +1171,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		}
 		return true, "test email sent via " + p.Label + " (SMTP 250 OK)"
 	} else {
-		body = map[string]string{"text": "✅ *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
+		body = map[string]any{"text": "✅ *pulsemon: test alert*\n*Sensor*: settings\n*Target*: webhook-verify\n*State*: **test** — this message confirms your " + p.Label + " webhook works."}
 	}
 	// Single transport seam with postJSON (doWebhookPost): the shared
 	// hardened client, the capped drain, and the URL redaction live there.

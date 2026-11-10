@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"pulsemon/internal/store"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
@@ -140,6 +143,59 @@ func TestTestWebhookSurfacesChatIDReadError(t *testing.T) {
 		}
 		if n := atomic.LoadInt32(&reqCount); n != 0 {
 			t.Fatalf("endpoint received %d request(s); want 0 (the test must fail before any POST)", n)
+		}
+	})
+}
+
+// TestTestWebhookDiscordPayloadMatchesDelivery (review 2026-11-10 #8): the
+// discord test-alert payload must be structurally identical to the
+// production delivery payloads — deliverOne and deliverStormSummary both
+// send {"content", "allowed_mentions": {"parse": []}}. Pre-fix the test
+// button sent map[string]string{"content": ...} with no allowed_mentions:
+// no mention-injection risk (hardcoded text), but the test button is where
+// an operator verifies their webhook config, and a payload shape the
+// production path never sends is a weaker verification — a bridge that
+// chokes on allowed_mentions would pass the test and fail real alerts.
+func TestTestWebhookDiscordPayloadMatchesDelivery(t *testing.T) {
+	withPlainTransport(t, func() {
+		db := newTestDB(t)
+		_ = db.SetSetting("discord_enabled", "1")
+		var (
+			mu       sync.Mutex
+			captured []byte
+		)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			captured = b
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer srv.Close()
+		_ = db.SetSetting("discord_url", srv.URL)
+		pw := NewProbeWorker(db)
+
+		ok, msg := pw.TestWebhook(t.Context(), "discord")
+		if !ok {
+			t.Fatalf("TestWebhook discord: ok=false (%s)", msg)
+		}
+		mu.Lock()
+		body := captured
+		mu.Unlock()
+		var payload map[string]any
+		if err := json.Unmarshal(body, &payload); err != nil {
+			t.Fatalf("captured body is not a JSON object: %v (%q)", err, body)
+		}
+		if _, ok := payload["content"]; !ok {
+			t.Errorf("discord test payload missing 'content': %q", body)
+		}
+		am, ok := payload["allowed_mentions"].(map[string]any)
+		if !ok {
+			t.Fatalf("discord test payload missing the 'allowed_mentions' object (deliverOne and deliverStormSummary both send it): %q", body)
+		}
+		parse, ok := am["parse"].([]any)
+		if !ok || len(parse) != 0 {
+			t.Errorf("allowed_mentions.parse = %v, want an empty array (the production shape): %q", am["parse"], body)
 		}
 	})
 }
