@@ -1331,6 +1331,137 @@ func TestCheckUserLockActive(t *testing.T) {
 	}
 }
 
+// TestLoginThrottleSweepTriggerWatchesUserFails (review 2026-11-10) pins
+// the sweep-trigger fix: the opportunistic GC used to fire only when the
+// PER-IP map (fails) crossed throttleSweepThreshold, but userFails is keyed
+// by the raw request username — a small IP pool rotating random usernames
+// grows userFails while len(fails) stays tiny, so the sweep never ran and
+// userFails grew without bound. The trigger must watch len(userFails) too:
+// with a 1-entry per-IP map and a userFails map past the threshold, the
+// next beginAttempt must sweep (pruning the stale entries below).
+func TestLoginThrottleSweepTriggerWatchesUserFails(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+	origThreshold := throttleSweepThreshold
+	throttleSweepThreshold = 2
+	t.Cleanup(func() { throttleSweepThreshold = origThreshold })
+
+	now := time.Now()
+	// Tiny per-IP map (below the threshold on its own)…
+	a.loginThrottle.fails["ip1"] = []time.Time{now.Add(-time.Second)}
+	// …and a userFails map past it, holding STALE entries (outside the
+	// 60s window, no lockout) that only a sweep can prune.
+	for i := 0; i < 4; i++ {
+		a.loginThrottle.userFails[fmt.Sprintf("u%d", i)] = []time.Time{now.Add(-2 * loginFailWindow)}
+	}
+	a.loginThrottle.nextSweep = time.Time{}
+
+	if ok, _ := a.beginAttempt("ip2"); !ok {
+		t.Fatal("beginAttempt rejected a fresh IP")
+	}
+	for i := 0; i < 4; i++ {
+		if _, ok := a.loginThrottle.userFails[fmt.Sprintf("u%d", i)]; ok {
+			t.Errorf("stale userFails entry u%d survived beginAttempt — the sweep trigger must watch len(userFails), not just len(fails)", i)
+		}
+	}
+}
+
+// TestLoginThrottleUserFailsHardCapWipe (review 2026-11-10) pins the
+// hard-cap half: the emergency all-or-nothing wipe used to fire only when
+// the PER-IP map exceeded throttleHardCap. With a 1-entry per-IP map and a
+// userFails map past the cap (every entry fresh, so the sweep prunes
+// nothing), beginAttempt must wipe ALL four maps — bounding userFails at
+// the cap even under a pure random-username spray.
+func TestLoginThrottleUserFailsHardCapWipe(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+	origThreshold := throttleSweepThreshold
+	origHardCap := throttleHardCap
+	throttleSweepThreshold = 2
+	throttleHardCap = 3
+	t.Cleanup(func() {
+		throttleSweepThreshold = origThreshold
+		throttleHardCap = origHardCap
+	})
+
+	now := time.Now()
+	// 1 per-IP entry: below both thresholds on its own.
+	a.loginThrottle.fails["ip1"] = []time.Time{now.Add(-time.Second)}
+	// 5 userFails entries past the cap (3), all IN-WINDOW: a sweep prunes
+	// nothing, only the wipe can bound this.
+	for i := 0; i < 5; i++ {
+		a.loginThrottle.userFails[fmt.Sprintf("u%d", i)] = []time.Time{now.Add(-time.Second)}
+	}
+	a.loginThrottle.nextSweep = time.Time{}
+
+	if ok, _ := a.beginAttempt("ip2"); !ok {
+		t.Fatal("beginAttempt rejected a fresh IP after the hard-cap wipe")
+	}
+	if len(a.loginThrottle.userFails) != 0 {
+		t.Fatalf("userFails size = %d, want 0 (hard cap on len(userFails) must wipe the per-username maps)", len(a.loginThrottle.userFails))
+	}
+	if len(a.loginThrottle.userLock) != 0 {
+		t.Fatalf("userLock size = %d, want 0 (all-or-nothing wipe)", len(a.loginThrottle.userLock))
+	}
+	// The wipe is all-or-nothing: the per-IP map is reset too, and only the
+	// new attempt's entry survives.
+	if len(a.loginThrottle.fails) != 1 {
+		t.Fatalf("per-IP map size = %d, want 1 (only ip2)", len(a.loginThrottle.fails))
+	}
+	if _, ok := a.loginThrottle.fails["ip2"]; !ok {
+		t.Fatal("ip2 missing from the per-IP map after the wipe")
+	}
+}
+
+// TestLoginUnknownUserDoesNotRecordUserFail (review 2026-11-10) drives the
+// real handler: a failed login for a name with NO account must not grow
+// userFails — the username is attacker-chosen (no validation on the login
+// path, up to the 1 MiB body limit), so counting unknown names let a small
+// IP pool rotate random usernames and OOM the monitor. A failure for an
+// EXISTING account is still recorded (finding #11's per-username lockout
+// is preserved).
+func TestLoginUnknownUserDoesNotRecordUserFail(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	login := func(username, ip string) int {
+		body := fmt.Sprintf(`{"username":%q,"password":"wrong"}`, username)
+		req := httptest.NewRequest("POST", "/api/auth/login", strings.NewReader(body))
+		req.RemoteAddr = ip
+		rr := httptest.NewRecorder()
+		srv.handleAuthLogin(rr, req)
+		return rr.Code
+	}
+
+	// Five unknown usernames from five fresh IPs (well under every
+	// per-IP budget): all 401, and NONE of them may land in userFails.
+	for i := 0; i < 5; i++ {
+		if code := login(fmt.Sprintf("nouser%d", i), fmt.Sprintf("10.5.5.%d", i+1)); code != http.StatusUnauthorized {
+			t.Fatalf("unknown-user login %d: got %d, want 401", i, code)
+		}
+	}
+	srv.auth.loginThrottle.Lock()
+	n := len(srv.auth.loginThrottle.userFails)
+	srv.auth.loginThrottle.Unlock()
+	if n != 0 {
+		t.Fatalf("userFails size = %d after 5 unknown-user failures, want 0 (no account → nothing to protect)", n)
+	}
+
+	// An EXISTING account's failure IS recorded: the per-username lockout
+	// (finding #11) still works for real accounts.
+	if code := login("admin", "10.6.6.1"); code != http.StatusUnauthorized {
+		t.Fatalf("known-user failure: got %d, want 401", code)
+	}
+	srv.auth.loginThrottle.Lock()
+	_, ok := srv.auth.loginThrottle.userFails["admin"]
+	srv.auth.loginThrottle.Unlock()
+	if !ok {
+		t.Fatal("userFails[admin] missing after a failed login for an existing account")
+	}
+}
+
 // TestBcryptSemCapacity pins the bcrypt semaphore capacity to runtime.NumCPU()
 // (finding #11): the concurrency cap must match the box's core count so a
 // multi-IP burst can't drive more parallel KDFs than there are cores. A

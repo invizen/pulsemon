@@ -246,7 +246,10 @@ type AuthState struct {
 		// call made login O(n) and serialized all logins on an ever-
 		// growing full walk (O(n^2) total). At most one sweep per
 		// throttleSweepInterval now; memory is bounded by
-		// throttleHardCap below.
+		// throttleHardCap below. The sweep/wipe trigger watches BOTH
+		// fails and userFails: userFails is keyed by arbitrary request
+		// usernames, so a small IP pool rotating random names can grow it
+		// while the per-IP map stays tiny (review 2026-11-10).
 		nextSweep time.Time
 	}
 
@@ -993,22 +996,30 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	// spray keeps every entry in-window, so the sweep prunes nothing while
 	// costing a full walk per login; it only needs to run often enough to
 	// reclaim entries AS the window ages, not per call.
-	if len(a.loginThrottle.fails) > throttleSweepThreshold && !now.Before(a.loginThrottle.nextSweep) {
+	//
+	// The trigger watches BOTH maps: userFails is keyed by the raw request
+	// username (up to the 1 MiB body limit), so a small IP pool rotating
+	// random usernames grows userFails while len(fails) stays far below
+	// the threshold — gating the sweep on the per-IP map alone left
+	// userFails unbounded (review 2026-11-10).
+	if (len(a.loginThrottle.fails) > throttleSweepThreshold ||
+		len(a.loginThrottle.userFails) > throttleSweepThreshold) && !now.Before(a.loginThrottle.nextSweep) {
 		a.sweepThrottle(now)
 		a.loginThrottle.nextSweep = now.Add(throttleSweepInterval)
-		// Spray-proof memory bound: if a sweep still leaves the map huge
+		// Spray-proof memory bound: if a sweep still leaves a map huge
 		// (every entry fresh — a wide one-shot spray), drop ALL throttle
-		// state. This fail-OPENS the per-IP lockout only for an attacker
-		// already spread across >100k distinct sources, where per-IP
-		// lockout buys nothing anyway and unbounded map growth (plus the
-		// O(n) walks) would degrade monitoring and logins for everyone.
-		// Chosen bound: 131072 entries ≈ tens of MB worst case.
-		if len(a.loginThrottle.fails) > throttleHardCap {
+		// state. This fail-OPENS the lockout only for an attacker already
+		// spread across >100k distinct sources (per-IP) or rotating >100k
+		// distinct usernames (per-username), where lockout buys nothing
+		// anyway and unbounded map growth (plus the O(n) walks) would
+		// degrade monitoring and logins for everyone. Chosen bound:
+		// 131072 entries ≈ tens of MB worst case.
+		if len(a.loginThrottle.fails) > throttleHardCap || len(a.loginThrottle.userFails) > throttleHardCap {
 			a.loginThrottle.fails = map[string][]time.Time{}
 			a.loginThrottle.lockout = map[string]time.Time{}
 			// The per-username maps share the same fail-open bound: a wide
-			// spray that grows the per-IP map past the cap also resets the
-			// account budgets, so the wipe is all-or-nothing (finding #11).
+			// spray that grows EITHER map past the cap resets all budgets,
+			// so the wipe is all-or-nothing (finding #11).
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
 		}
@@ -1493,7 +1504,17 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		// Count the failure against the account (across all IPs) — the
 		// per-username layer the per-IP budget can't see (finding #11).
-		s.auth.recordUserFail(userKey)
+		// EXISTING accounts only: a failure for a name with no account
+		// protects nothing (the dummy-hash equalizer already hides the
+		// distinction from the client), and the username is
+		// attacker-chosen — counting it let a small IP pool rotate random
+		// names and grow userFails without bound (review 2026-11-10). The
+		// point query runs on the cold failure path (throttled + 200 ms
+		// delay), sub-millisecond against the KDF + delay, so it adds no
+		// timing oracle.
+		if s.auth.userExists(userKey) {
+			s.auth.recordUserFail(userKey)
+		}
 		// Constant-time-ish delay on rejection: equalizes response time across
 		// the unknown-user / wrong-password paths (closes the timing oracle)
 		// and caps an online attacker at ~5 guesses/second per IP. The
