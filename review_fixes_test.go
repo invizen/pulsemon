@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -211,6 +212,84 @@ func TestProbeHTTPRedirectRebindingClosed(t *testing.T) {
 	}
 	if atomic.LoadInt32(&rebindingHit) != 0 {
 		t.Fatal("probe dialed the rebinding loopback address — TOCTOU not closed")
+	}
+}
+
+// loopbackDialer dials every address to 127.0.0.1 (the httptest servers'
+// host), preserving the port and network. It lets a cross-host redirect hop
+// — whose pinned IP is a non-loopback RFC1918 address the redirect guard
+// requires — actually reach a loopback test server.
+type loopbackDialer struct{}
+
+func (loopbackDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort("127.0.0.1", port))
+}
+
+// TestProbeHTTPCrossHostRedirectKeepsHostname proves the cross-host redirect
+// fix end to end: a redirect hop to a DIFFERENT hostname must (a) dial the
+// checked IP (closing the DNS-rebinding TOCTOU) and (b) keep the hostname
+// for SNI and cert verification — a cert issued for the DNS name (no IP SAN)
+// verifies correctly. Pre-fix, CheckRedirect rewrote the URL to the IP, so
+// probeDialTLS saw an IP literal: Go blanked the SNI and verifyHTTPCert
+// judged the cert against the IP, failing this DNS-name cert (a permanent
+// loss for https://host → https://other.host redirects). The httptest servers
+// bind loopback — which the guard refuses for cross-host hops — so the test
+// stubs the resolver (target → RFC1918 IP) and the dialer (pinned IP →
+// loopback) to exercise the hop.
+func TestProbeHTTPCrossHostRedirectKeepsHostname(t *testing.T) {
+	const targetHost = "redirect-target.example.test"
+	cert := selfSignedTLSForHost(t, targetHost)
+
+	// TLS server on loopback serving the target-host cert; it REQUIRES the
+	// SNI to be the target hostname (proves the client sent it — pre-fix the
+	// SNI was blanked for the IP literal and the handshake would fail here).
+	var gotSNI atomic.Value
+	tlsSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	tlsSrv.TLS = &tls.Config{
+		GetCertificate: func(hi *tls.ClientHelloInfo) (*tls.Certificate, error) {
+			gotSNI.Store(hi.ServerName)
+			if hi.ServerName != targetHost {
+				return nil, fmt.Errorf("server requires SNI=%s, got %q", targetHost, hi.ServerName)
+			}
+			return &cert, nil
+		},
+	}
+	tlsSrv.StartTLS()
+	defer tlsSrv.Close()
+	targetPort := tlsSrv.Listener.Addr().(*net.TCPAddr).Port
+
+	// Origin server 302s to the target hostname (cross-host). The target
+	// resolves (fake DNS) to a non-loopback RFC1918 IP, so the redirect guard
+	// allows the hop and records a pin.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("https://%s:%d/", targetHost, targetPort), http.StatusFound)
+	}))
+	defer origin.Close()
+
+	// Fake DNS: every hostname → 10.99.99.50 (RFC1918, passes the guard).
+	startFakeDNS(t, "10.99.99.50")
+
+	// Fake dialer: pinned IP (or loopback) → 127.0.0.1, where the servers live.
+	oldDialer := probeDialer
+	probeDialer = loopbackDialer{}
+	t.Cleanup(func() { probeDialer = oldDialer })
+
+	res := probeHTTP(context.Background(), origin.URL, 5*time.Second)
+	if res.Lost {
+		t.Fatalf("cross-host redirect marked loss, want 200 (SNI/cert broken): %+v", res)
+	}
+	if res.Status == nil || *res.Status != 200 {
+		t.Fatalf("status = %v, want 200", res.Status)
+	}
+	if got, _ := gotSNI.Load().(string); got != targetHost {
+		t.Fatalf("SNI = %q, want %q (the dial must keep the hostname for SNI)", got, targetHost)
 	}
 }
 

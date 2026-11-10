@@ -104,12 +104,16 @@ const maxHTTPRedirects = 5
 // pass: LAN-to-LAN redirects are legitimate for monitoring.
 //
 // The check-then-dial TOCTOU is closed: redirectTargetAllowed returns the
-// checked IP, and CheckRedirect rewrites the request URL to that IP so the
-// transport dials it directly (no re-resolution). This is the same pattern
-// webhook.go's dialChecked uses — validate the IP at dial time, not before.
-// The initial target is NOT rewritten (it is the operator's own configured
-// sensor, admin privilege by design); only cross-host redirect hops are
-// pinned to the checked IP.
+// checked IP, and CheckRedirect records it in a per-probe pin map
+// (redirectPins) that the dial hooks (probeDial / probeDialTLS) consult at
+// dial time — the transport dials that IP directly, no re-resolution. This
+// is the same pattern webhook.go's dialChecked uses, except the pin is
+// recorded where the check already ran (CheckRedirect) and applied at dial
+// time, so the request URL keeps its hostname: SNI and cert verification
+// use the hostname (a DNS-name cert verifies correctly), and a later
+// relative hop's Host header stays the hostname, not the IP. The initial
+// target is NOT pinned (it is the operator's own configured sensor, admin
+// privilege by design); only cross-host redirect hops are.
 //
 // Security-review note (deliberate): allowing RFC1918/ULA cross-host
 // redirect hops is INTENTIONAL, not an oversight — the initial target is
@@ -173,12 +177,82 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) (net.IP, 
 	return addrs[0].IP, nil
 }
 
+// redirectPins is the per-probe map of cross-host redirect hops to the
+// checked IP that redirectTargetAllowed vetted them against. CheckRedirect
+// records a pin (lowercased host → IP) for every cross-host hop; the dial
+// hooks (probeDial / probeDialTLS) look it up and dial the checked IP
+// directly, closing the DNS-rebinding TOCTOU WITHOUT rewriting the request
+// URL. Keeping the URL hostname intact is the whole point over the old
+// URL-rewrite design: SNI and cert verification then use the hostname (a
+// cert issued for the DNS name — the normal case for a cross-host redirect
+// — verifies correctly, where the old rewrite fed an IP literal to both and
+// failed every DNS-name cert), and a later relative hop's Host header stays
+// the hostname, not the IP. The map is bounded by the redirect chain length
+// (≤ maxHTTPRedirects). Each probe gets its OWN map (created in probeHTTP),
+// so it is never shared across probes; the mutex guards the single
+// in-probe race where CheckRedirect (request goroutine) writes a pin and
+// the dial hook reads it.
+type redirectPins struct {
+	mu sync.Mutex
+	m  map[string]net.IP
+}
+
+// pinsKey is the context key for *redirectPins.
+type pinsKey struct{}
+
 // probeTLSHandshakeTimeout caps the TLS handshake inside probeDialTLS. The
 // transport's TLSHandshakeTimeout does not apply to a custom
 // DialTLSContext (it only governs the transport's own addTLS path), so the
 // handshake gets its own cap — the same 10s the old transport config used —
 // on top of the probe's context deadline.
 const probeTLSHandshakeTimeout = 10 * time.Second
+
+// tcpDialer dials a TCP connection. *net.Dialer satisfies it; tests inject
+// a fake to exercise pinned cross-host dials deterministically (the httptest
+// servers all bind loopback, which the redirect guard refuses for cross-host
+// hops — a fake dialer can map a pinned RFC1918 IP back onto the loopback
+// test server).
+type tcpDialer interface {
+	DialContext(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// probeDialer is the probe client's TCP dialer (a seam — see tcpDialer).
+// Production value is the default dialer.
+var probeDialer tcpDialer = &net.Dialer{}
+
+// splitPinnedAddr splits addr into its host and port and, if this host is a
+// pinned cross-host redirect hop (see redirectPins), returns the checked IP
+// as the dial target. host is ALWAYS the URL hostname (used for SNI and cert
+// verification — never the pinned IP); dialAddr is the pinned IP:port when a
+// pin exists, else addr unchanged (the usual resolution path).
+func splitPinnedAddr(ctx context.Context, addr string) (host, dialAddr string, err error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", "", err
+	}
+	if p, _ := ctx.Value(pinsKey{}).(*redirectPins); p != nil {
+		p.mu.Lock()
+		ip := p.m[strings.ToLower(host)]
+		p.mu.Unlock()
+		if ip != nil {
+			return host, net.JoinHostPort(ip.String(), port), nil
+		}
+	}
+	return host, addr, nil
+}
+
+// probeDial is the probe client's DialContext for plain-HTTP requests. It
+// mirrors probeDialTLS's pin lookup: a pinned cross-host redirect hop dials
+// the checked IP (closing the DNS-rebinding TOCTOU) while same-host and
+// initial targets dial the hostname as usual. No TLS here — the transport
+// runs the cleartext exchange on the returned conn.
+func probeDial(ctx context.Context, network, addr string) (net.Conn, error) {
+	_, dialAddr, err := splitPinnedAddr(ctx, addr)
+	if err != nil {
+		return nil, err
+	}
+	return probeDialer.DialContext(ctx, "tcp", dialAddr)
+}
 
 // probeDialTLS is the probe client's DialTLSContext: it dials, completes
 // the TLS handshake, and verifies the presented certificate BEFORE the
@@ -209,11 +283,14 @@ const probeTLSHandshakeTimeout = 10 * time.Second
 // HTTPS — probes are LAN targets dialed directly, the same posture as the
 // webhook path's dialChecked.
 func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
+	// host is the URL hostname (for SNI + cert verification — never the
+	// pinned IP); dialAddr is the pinned IP:port when this is a cross-host
+	// redirect hop, else addr (the usual resolution path).
+	host, dialAddr, err := splitPinnedAddr(ctx, addr)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	conn, err := probeDialer.DialContext(ctx, "tcp", dialAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -259,40 +336,43 @@ var httpClient = &http.Client{
 			return err
 		}
 		if checkedIP != nil {
-			// Pin the dial to the checked IP: rewrite the URL so the
-			// transport dials the IP directly, not the hostname. This
-			// closes the DNS-rebinding TOCTOU — the transport no longer
-			// re-resolves the hostname, so it cannot land on an address
-			// the check never saw (the same pattern webhook.go's
-			// dialChecked uses). The Host header keeps the original
-			// hostname for virtual hosting.
-			origHostname := req.URL.Hostname()
-			port := req.URL.Port()
-			if port == "" {
-				if req.URL.Scheme == "https" {
-					port = "443"
-				} else {
-					port = "80"
-				}
+			// Pin the dial to the checked IP WITHOUT rewriting the URL:
+			// record host → checkedIP in the per-probe pin map, and the
+			// dial hooks (probeDial / probeDialTLS) dial that IP directly,
+			// closing the DNS-rebinding TOCTOU (the transport no longer
+			// re-resolves the hostname). The URL keeps the hostname, so
+			// SNI and cert verification use it — a cert issued for the DNS
+			// name (the normal cross-host redirect case) verifies correctly,
+			// where the old URL rewrite fed an IP literal to both and failed
+			// every DNS-name cert — and a later relative hop's Host header
+			// stays the hostname, not the IP. The Host header is already the
+			// hostname (net/http derives it from the un-rewritten URL), so no
+			// req.Host override is needed.
+			if p, _ := req.Context().Value(pinsKey{}).(*redirectPins); p != nil {
+				p.mu.Lock()
+				p.m[strings.ToLower(req.URL.Hostname())] = checkedIP
+				p.mu.Unlock()
 			}
-			req.Host = origHostname
-			req.URL.Host = net.JoinHostPort(checkedIP.String(), port)
 		}
-		// Force a fresh connection on EVERY HTTPS hop: the transport
-		// pools idle conns per host for up to IdleConnTimeout (10 min),
-		// and a redirect hop that REUSES a pooled conn reports the cert
-		// from that conn's ORIGINAL handshake — a renewed cert stays
-		// invisible in the displayed expiry (and verifyHTTPCert judges
-		// the STALE cert, so a renewed-and-valid install can read as
-		// "expired") until the conn recycles. N4 covered only hops that
-		// CHANGE host or scheme; a SAME-host redirect (https://h/a →
-		// https://h/b) reused the pooled conn a previous probe's
-		// redirect hop left behind, because M5's first-hop Close never
-		// touches the redirect hops. Closing every HTTPS hop costs one
-		// handshake per such hop — redirects are rare, and M5 already
-		// accepts one handshake per probe on the first hop. Plain-HTTP
-		// hops carry no cert data, so they keep reusing pooled conns.
-		if req.URL.Scheme == "https" {
+		// Force a fresh connection on EVERY pinned or HTTPS redirect hop:
+		//   - Pinned hops (cross-host, any scheme) MUST get a fresh conn:
+		//     the pin is honored only at dial time, and a pooled conn was
+		//     dialed WITHOUT this pin (or with a different one), so reusing
+		//     it would bypass the DNS-rebinding protection.
+		//   - HTTPS hops need it for cert freshness: a pooled conn reports
+		//     the cert from its ORIGINAL handshake — a renewed cert stays
+		//     invisible in the displayed expiry (and verifyHTTPCert judges
+		//     the STALE cert, so a renewed-and-valid install can read as
+		//     "expired") until the conn recycles. N4 covered only hops that
+		//     CHANGE host or scheme; a SAME-host redirect (https://h/a →
+		//     https://h/b) reused the pooled conn a previous probe's
+		//     redirect hop left behind, because M5's first-hop Close never
+		//     touches the redirect hops.
+		// Closing such hops costs one handshake (HTTPS) / one TCP connect
+		// (HTTP) per hop — redirects are rare, and M5 already accepts one
+		// handshake per probe on the first hop. Unpinned plain-HTTP hops
+		// (same-host) keep reusing pooled conns.
+		if req.URL.Scheme == "https" || checkedIP != nil {
 			req.Close = true
 		}
 		return nil
@@ -307,7 +387,10 @@ var httpClient = &http.Client{
 		// nil — the transport's own TLS path, and its InsecureSkipVerify,
 		// are not used. TLSHandshakeTimeout is likewise moot (it only
 		// governs the transport's addTLS); probeDialTLS caps the
-		// handshake itself.
+		// handshake itself. DialContext (probeDial) serves the plain-HTTP
+		// path with the same pin lookup; HTTPS uses DialTLSContext, so the
+		// two never interfere.
+		DialContext:    probeDial,
 		DialTLSContext: probeDialTLS,
 	},
 }
@@ -493,6 +576,12 @@ type httpProbeResult struct {
 func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpProbeResult {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	// Per-probe redirect pin map: CheckRedirect records each cross-host
+	// hop's checked IP here, and the dial hooks (probeDial / probeDialTLS)
+	// dial that IP — closing the DNS-rebinding TOCTOU while the URL keeps
+	// its hostname for SNI and cert verification. A fresh map per probe so
+	// pins never leak across sensors.
+	ctx = context.WithValue(ctx, pinsKey{}, &redirectPins{m: make(map[string]net.IP)})
 
 	origScheme := ""
 	if u, err := url.Parse(target); err == nil {

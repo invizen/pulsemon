@@ -172,12 +172,19 @@ single-operator LAN tool: the person who can create a sensor owns the
 whole LAN's monitoring surface. See `TestRedirectTargetAllowed`
 ("LAN redirect stays allowed").
 
-**Known limitation (accepted):** resolution here has a TOCTOU window the
-webhook path closes by pinning its dial to the checked IPs. The probe
-dial (`probeDialTLS`) does not pin: the initial target is
-operator-configured, and redirect hops are vetted before their dial. A
-rebinding attacker would need DNS control on the LAN — the same threat
-the cert verification itself defends against.
+**TOCTOU (closed):** the webhook path closes its check-then-dial window by
+pinning its dial to the checked IPs (`dialChecked`). The probe path now does
+the same: `redirectTargetAllowed` returns the checked IP, `CheckRedirect`
+records it in a per-probe pin map (`redirectPins`), and the dial hooks
+(`probeDial` / `probeDialTLS`) dial that IP directly — no re-resolution. The
+pin is applied at DIAL time, not by rewriting the request URL, so the URL
+keeps its hostname: SNI and cert verification use the hostname (a DNS-name
+cert verifies correctly for a cross-host redirect — the old URL-rewrite
+design fed an IP literal to both and failed every DNS-name cert), and a
+later relative hop's Host header stays the hostname, not the IP. The initial
+target is NOT pinned (it is the operator's own configured sensor); only
+cross-host redirect hops are. A rebinding attacker would need DNS control on
+the LAN — the same threat the cert verification itself defends against.
 
 ## alert-gate (alerts.go `enqueueAlert`, `alertGateConsumer`)
 

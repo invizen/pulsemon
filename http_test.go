@@ -241,6 +241,36 @@ func testSelfSigned(t *testing.T, notAfter time.Time) tls.Certificate {
 	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 }
 
+// selfSignedTLSForHost builds a genuinely self-signed tls.Certificate
+// (issuer == subject) whose ONLY SAN is the DNS name host — no IP SAN —
+// expiring 48h out. The no-IP-SAN property is what makes it a clean
+// cross-host redirect test: verification against the pinned IP must fail,
+// verification against the hostname must succeed. (testSelfSigned is fixed
+// to 127.0.0.1/localhost; this one is parameterized by hostname.)
+func selfSignedTLSForHost(t *testing.T, host string) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkixName("pulsemon test self-signed"),
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(48 * time.Hour),
+		DNSNames:              []string{host},
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("self-signed cert: %v", err)
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
+}
+
 // TestProbeHTTPSelfSignedAccepted: a valid self-signed cert whose host
 // matches the target is ACCEPTED — the probe is UP and the expiry is
 // captured. This is the homelab self-signed web-UI case the feature targets.
