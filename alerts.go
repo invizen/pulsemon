@@ -425,10 +425,22 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	}
 }
 
+// setAlertState upserts a sensor's alert state. The INSERT is guarded by
+// SELECTing the sensor id: for a sensor deleted concurrently, the SELECT
+// yields no row and nothing is written, so alert state can never be
+// resurrected for a deleted sensor. The guard is explicit and
+// self-contained rather than relying on the alert_state FK — which IS
+// enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
+// store.NewStore), but only as a side effect whose violation the `_, _ =`
+// below would swallow silently (review 2026-11-10 #3). For a live sensor
+// the SELECT yields exactly one row: behavior is identical to a plain
+// upsert, and the statement is atomic, so there is no delete/upsert
+// TOCTOU.
 func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
-	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES (?, ?, ?)
+	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts)
+		SELECT id, ?, ? FROM sensors WHERE id = ?
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		id, status, store.FormatTS(ts))
+		status, store.FormatTS(ts), id)
 }
 
 // alertRetryAfter is how soon a re-alert is retried after every provider
