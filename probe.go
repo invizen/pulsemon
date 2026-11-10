@@ -571,7 +571,11 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 	pw.mu.Unlock()
 
-	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
+	// state is NOT selected: the WHERE clause filters to 'active', so every
+	// row is active and a paused sensor never reaches this loop (its loop is
+	// dropped by the vanished pass). Selecting it would invite a reader to
+	// assume paused rows get reconciled here.
+	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after
 		FROM sensors WHERE state = 'active'`)
 	if err != nil {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
@@ -580,7 +584,6 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	defer rows.Close() // top-level: closed on every return path, not just the happy one
 	type activeCfg struct {
 		sensorConfig
-		state string
 	}
 	var configs []activeCfg
 	// partial is true when the read could not be completed (a row failed to
@@ -591,7 +594,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	partial := false
 	for rows.Next() {
 		var c activeCfg
-		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
+		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter); err != nil {
 			log.Printf("ProbeWorker: skipping unreadable sensor row: %v", err)
 			partial = true
 			continue
@@ -647,10 +650,10 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		}
 		ps, ok := pw.sensors[c.id]
 		if !ok {
-			ps = &ProbeState{id: c.id, isPaused: c.state == "paused", kick: make(chan struct{}, 1)}
+			// state='active' (the query filter), so a newly-seen sensor is not
+			// paused; isPaused defaults to false.
+			ps = &ProbeState{id: c.id, kick: make(chan struct{}, 1)}
 			pw.sensors[c.id] = ps
-		} else {
-			ps.isPaused = c.state == "paused" // keep pause in sync with DB
 		}
 		if _, ok := pw.loops[c.id]; !ok {
 			// First spawn vs RESPAWN (see the spawnedIDs field): a
