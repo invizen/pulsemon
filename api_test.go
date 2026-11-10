@@ -296,8 +296,8 @@ func TestSettingsTestRejectsUnknownKind(t *testing.T) {
 // TestSensorNameXSSRejectedEndToEnd drives the real server: a sensor name
 // carrying a quote-breakout payload must be refused on both POST and PATCH,
 // and the stored name of a clean sensor must survive a round-trip. This is
-// the server-side half of the stored-XSS fix (the frontend escJs is the
-// other half).
+// the server-side half of the stored-XSS fix (the frontend strict CSP +
+// esc() HTML-escaping is the other half).
 func TestSensorNameXSSRejectedEndToEnd(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))

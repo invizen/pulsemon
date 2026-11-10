@@ -291,14 +291,6 @@ function severityRank(s) {
 // threw on any non-string (a future numeric JSON field would blank the view
 // with a bare console error; review nit 2026-10-24).
 function esc(v) { return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
-// escJs escapes a value for a JS string literal inside an inline HTML
-// attribute (onclick="setTag('...')"). The ORDER is load-bearing:
-// JS-escape FIRST (backslash, quote, CR, LF), then HTML-encode. If
-// esc() ran first, ' becomes &#39; and the quote-escape below matches
-// nothing — and the browser's HTML parser decodes &#39; back to a literal '
-// before the JS engine ever sees it, so a stored tag like x');alert(1);//
-// breaks out of the string and executes.
-function escJs(v) { return esc(String(v ?? '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\r/g,'\\r').replace(/\n/g,'\\n')); }
 
 // Sparkline bar colors: red > 200 ms (absolute — objectively slow), amber at
 // or above spikeMult × the window's own average (relative — a spike FOR THIS

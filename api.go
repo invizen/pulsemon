@@ -274,7 +274,7 @@ func (s *Server) authGate() http.Handler {
 		// 'self' with NO 'unsafe-inline' and no hashes — the theme, app, and
 		// custom CSS all live in files (web/theme.js, web/app.js, web/styles.css,
 		// web/vendor/tailwind.css), so an injected inline <script>/<style> is
-		// refused. That is defence in depth on top of the esc()/escJs() escaping:
+		// refused. That is defence in depth on top of the esc() HTML-escaping:
 		// if one interpolation were ever missed, a reflected payload has no
 		// script/style source to run from. object-src/base-uri/form-action are
 		// locked down; frame-ancestors 'none' keeps the clickjacking guard.
@@ -726,21 +726,19 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 }
 
 // validSensorName rejects sensor names that are empty, overlong, or contain
-// characters that would let a stored value escape its string context when the
-// dashboard interpolates it into an inline event handler or alert card.
-// Names are operator labels, not free text: no quotes, angle brackets,
-// backslash, or control characters. Belt-and-braces alongside the
-// frontend escJs() — it keeps the stored data clean for every consumer
-// (alert cards, logs, the inspector) and stops a malicious account from
-// planting a sensor whose name runs JS in other operators' browsers.
+// characters that would let a stored value escape its string context in a
+// consumer. Names are operator labels, not free text: no quotes, angle
+// brackets, backslash, or control characters.
 //
 // This is a defense-in-depth INPUT gate, NOT the primary XSS mitigation:
-// the frontend already does context-aware OUTPUT encoding — esc()
-// (index.html) HTML-escapes every name render site and escJs() escapes
-// names interpolated into JS string literals (the deleteSensor / setTag
-// inline handlers). Removing the input gate would leave those still safe,
-// but would let a malicious name through to the non-HTML consumers (alert
-// cards, logs, the inspector) where output encoding does not apply.
+// the dashboard's strict CSP (no 'unsafe-inline') plus esc() HTML-escaping
+// at every text render site is the primary layer, and the click handlers
+// read values from data-* attributes (there are no inline JS string
+// interpolations). The input gate keeps the stored data clean for the
+// non-HTML consumers (alert cards, logs, the inspector) where output
+// encoding does not apply, and stops a malicious account from planting a
+// sensor whose name runs JS in other operators' browsers if a render site
+// is ever missed.
 //
 // Why a blacklist and NOT the suggested whitelist (dismissed): a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
 // but a REGRESSION — it rejects legitimate operator labels this gate is
@@ -782,12 +780,11 @@ func validSensorName(name string) bool {
 
 // cleanTags trims, dedupes and caps sensor tags.
 //
-// Tags also pass the same string-escape gate as sensor names
-// (validSensorName): they are interpolated into JS string literals in inline
-// handlers (setTag / removeFormTag, index.html), so a tag like
-// x');alert(1);// must not be storable — the output escaping (escJs) is the
-// second layer, and the input gate keeps the non-HTML consumers (alert cards,
-// logs, inspector) clean too.
+// Tags pass the same string-escape gate as sensor names (validSensorName):
+// a tag like x');alert(1);// must not be storable. The gate keeps the
+// non-HTML consumers (alert cards, logs, inspector) clean and is
+// belt-and-braces on top of the CSP + esc() output escaping (see
+// validSensorName).
 func cleanTags(in []string) []string {
 	seen := map[string]bool{}
 	out := []string{}
