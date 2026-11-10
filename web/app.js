@@ -188,7 +188,12 @@ function flushDeferredRender() {
 document.addEventListener('mousedown', () => { mouseButtonsDown++; });
 document.addEventListener('mouseup', () => {
   mouseButtonsDown = Math.max(0, mouseButtonsDown - 1);
-  if (mouseButtonsDown === 0) flushDeferredRender();
+  if (mouseButtonsDown === 0) {
+    // Flush AFTER the click event that follows this mouseup: a synchronous
+    // flush would swap the grid between mouseup and click, and the click
+    // would then fire on the common ancestor, not the button (v1.1.3).
+    setTimeout(flushDeferredRender, 0);
+  }
 });
 document.addEventListener('mouseleave', e => {
   // released the button outside the window: reset the counter so polls
@@ -477,15 +482,15 @@ function cardHtml(s) {
     '</div>' +
 
     '<div class="flex items-end justify-between mt-auto pt-1.5 border-t border-surface-800/60">' +
-      '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
+      '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1.5 rounded text-slate-500 hover:text-ok transition"><i class="ph-bold ph-paper-plane-tilt text-[14px]"></i></button>' +
       // Mutation cluster (pause/edit/clone/delete) is admin-only — the
       // server 403s these for non-admin sessions (requireAdmin); the UI
       // just hides what a regular account can't use. Pulse Now stays.
       (meIsAdmin ? '<div class="flex items-center gap-0.5">' +
-        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
-        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
-        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
-        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
+        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + ' transition"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + ' text-[14px]"></i></button>' +
+        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400 transition"><i class="ph-bold ph-pencil-simple text-[14px]"></i></button>' +
+        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit transition"><i class="ph-bold ph-copy text-[14px]"></i></button>' +
+        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad transition" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash text-[14px]"></i></button>' +
       '</div>' : '') +
     '</div>' +
   '</div>';
@@ -530,13 +535,13 @@ function renderTable(list) {
       '<td class="py-2 px-3.5 text-right ' + (st && st.total ? (st.uptime_24h < 99 ? 'text-warn font-semibold' : 'text-ok') : 'text-slate-500') + '">' + up24 + '</td>' +
       '<td class="py-2 px-3.5 hidden lg:table-cell"><div class="flex items-end gap-[1.5px] h-5">' + (paused ? '<span class="text-[11px] text-slate-600">paused</span>' : miniSpark(st && st.recent)) + '</div></td>' +
       '<td class="py-2 px-3.5 text-right"><div class="flex items-center justify-end gap-1">' +
-        '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
+        '<button data-act="echoPing" ' + dataArgs(s.id) + ' title="Pulse Now" class="p-1.5 rounded text-slate-500 hover:text-ok"><i class="ph-bold ph-paper-plane-tilt"></i></button>' +
         // Admin-only mutation cluster (mirrors cardHtml); non-admins keep Pulse Now.
         (meIsAdmin ?
-        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
-        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
-        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
-        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' : '') +
+        '<button data-act="togglePause" ' + dataArgs(s.id) + ' title="' + (paused ? 'Resume' : 'Pause') + '" class="p-1.5 rounded ' + (paused ? 'text-warn' : 'text-slate-500 hover:text-warn') + '"><i class="ph-bold ' + (paused ? 'ph-play' : 'ph-pause') + '"></i></button>' +
+        '<button data-act="openSensorModal" ' + dataArgs(s.id) + ' title="Edit" class="p-1.5 rounded text-slate-500 hover:text-sky-400"><i class="ph-bold ph-pencil-simple"></i></button>' +
+        '<button data-act="cloneSensor" ' + dataArgs(s.id) + ' title="Clone" class="p-1.5 rounded text-slate-500 hover:text-jit"><i class="ph-bold ph-copy"></i></button>' +
+        '<button data-act="confirmInlineDelete" ' + dataArgs(s.id, s.name) + ' title="Delete" class="p-1.5 rounded text-slate-500 hover:text-bad" data-del="' + esc(s.id) + '"><i class="ph-bold ph-trash"></i></button>' : '') +
       '</div></td></tr>';
   }).join('');
 }
@@ -596,13 +601,15 @@ function armDeleteConfirm(btn) {
   if (btn.dataset.confirming === "true") return;
   btn.dataset.confirming = "true";
   btn.dataset.originalHtml = btn.innerHTML;
-  btn.innerHTML = '<span class="text-bad text-[10px] font-bold font-mono px-1">CONFIRM?</span>';
+  btn.innerHTML = '<span class="text-bad text-[11px] font-bold font-mono px-1.5">CONFIRM?</span>';
   btn.classList.add('bg-bad/10', 'border', 'border-bad/30');
+  btn.title = 'Click again to delete';
 }
 function resetDeleteBtn(btn) {
   btn.dataset.confirming = "false";
   if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
   btn.classList.remove('bg-bad/10', 'border', 'border-bad/30');
+  btn.title = 'Delete';
 }
 function clearPendingDelete() {
   if (pendingDeleteId) {
@@ -624,7 +631,7 @@ function confirmInlineDelete(id, name, btn) {
   pendingDeleteId = id;
   armDeleteConfirm(btn);
   if (pendingDeleteTimer) clearTimeout(pendingDeleteTimer);
-  pendingDeleteTimer = setTimeout(clearPendingDelete, 4000);
+  pendingDeleteTimer = setTimeout(clearPendingDelete, 8000);
 }
 // Re-arm after every render() so the armed state is visible across the poll.
 function rearmDeleteConfirm() {
@@ -636,8 +643,12 @@ function rearmDeleteConfirm() {
 // the id, and bubbling order is onclick handler first, then this listener).
 document.addEventListener('click', e => {
   if (!pendingDeleteId) return;
-  const t = e.target.closest && e.target.closest('[data-del]');
-  if (t && t.dataset.del === pendingDeleteId) return;
+  // composedPath() is snapshotted at dispatch time. Do NOT use
+  // e.target.closest('[data-del]'): arming the confirm replaces the button's
+  // innerHTML, which detaches the clicked <i> icon, so closest() returns null
+  // and the very click that armed the confirm disarms it again (v1.1.3).
+  const onArmed = e.composedPath().some(n => n.dataset && n.dataset.del === pendingDeleteId);
+  if (onArmed) return;
   clearPendingDelete();
   render();
 });
