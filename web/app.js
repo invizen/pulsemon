@@ -205,6 +205,7 @@ function fmtRtt(v) {
 }
 
 function typeLabel(s) {
+  if (s.type === 'tcp') return 'TCP';
   if (s.type !== 'http') return 'PING';
   return /^https:/i.test(s.target || '') ? 'HTTPS' : 'HTTP';
 }
@@ -765,7 +766,7 @@ function openSensorModal(id) {
     const s = SENSORS.find(x => x.id === id); if (!s) return;
     $('modal-title').textContent = 'Edit Sensor';
     $('f-id').value = s.id; $('f-name').value = s.name; $('f-target').value = s.target;
-    $('f-type').value = s.type === 'http' ? 'http' : 'icmp';
+    $('f-type').value = ['http', 'tcp'].includes(s.type) ? s.type : 'icmp';
     onFormTypeChange();
     formTagsCache = (s.tags || []).slice();
     renderFormTags(formTagsCache);
@@ -783,12 +784,20 @@ function openSensorModal(id) {
 }
 
 function onFormTypeChange() {
-  const isHttp = $('f-type').value === 'http';
-  $('f-target-hint').textContent = isHttp ? 'URL (http:// or https://)' : 'IP or hostname';
-  $('f-target').placeholder = isHttp ? 'https://example.com/health' : '10.0.0.1';
-  $('f-type-hint').textContent = isHttp
-    ? 'GETs URL — marks up on 2xx status code'
-    : 'pulses with ICMP echo — up when host replies';
+  const t = $('f-type').value;
+  if (t === 'http') {
+    $('f-target-hint').textContent = 'URL (http:// or https://)';
+    $('f-target').placeholder = 'https://example.com/health';
+    $('f-type-hint').textContent = 'GETs URL — marks up on 2xx status code';
+  } else if (t === 'tcp') {
+    $('f-target-hint').textContent = 'host:port';
+    $('f-target').placeholder = '10.0.0.5:5432';
+    $('f-type-hint').textContent = 'TCP-connects — up when the port accepts a connection';
+  } else {
+    $('f-target-hint').textContent = 'IP or hostname';
+    $('f-target').placeholder = '10.0.0.1';
+    $('f-type-hint').textContent = 'pulses with ICMP echo — up when host replies';
+  }
 }
 
 function closeModal() { $('modal-backdrop').classList.add('hidden'); }

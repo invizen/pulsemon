@@ -318,7 +318,8 @@ type sensorConfig struct {
 	id     string
 	name   string
 	target string
-	// probeType is the probe transport: "icmp" (default) or "http". It
+	// probeType is the probe transport: "icmp" (default), "http", or
+	// "tcp". It
 	// decides which probe probeTarget dispatches to; everything downstream
 	// (status derivation, loss/jitter, sparkline, alerts) is type-agnostic.
 	probeType string
@@ -1056,6 +1057,17 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 	if probeType == "http" {
 		r := probeHTTP(ctx, target, timeout)
 		o := probeOutcome{lost: r.Lost, ip: r.IP, httpCode: r.Status, certExpiry: r.CertExpiry}
+		if !r.Lost {
+			o.rttMs = r.Elapsed.Seconds() * 1000
+		}
+		return o
+	}
+	if probeType == "tcp" {
+		r := probeTCP(ctx, target, timeout)
+		o := probeOutcome{lost: r.Lost, ip: r.IP}
+		if r.DNS && r.Err != nil {
+			o.dnsErr = r.Err.Error()
+		}
 		if !r.Lost {
 			o.rttMs = r.Elapsed.Seconds() * 1000
 		}

@@ -13,6 +13,10 @@ pulsemon
 - **ICMP ping monitoring** — single shared ping socket with per-probe sequence
   dispatch (accurate RTTs even under load). See *ICMP & privileges* below for
   the access model.
+- **HTTP(S) endpoint monitoring** — one-shot GET probe with redirect
+  following (5-hop cap); up on 2xx, TLS cert-expiry advisory, TTFB RTT
+- **TCP port monitoring** — one-shot connect to `host:port` (Postgres, SSH,
+  SMTP, …); up when the port accepts a connection, RTT = connect time
 - **Single container** — static Go binary, `FROM scratch` image, SQLite storage
 - **Sensors with multiple tags** — group and filter however you like
 - **Per-sensor tuning** — interval, timeout, loss threshold, error-after count

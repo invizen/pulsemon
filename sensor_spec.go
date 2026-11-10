@@ -10,7 +10,7 @@ import "errors"
 type sensorSpec struct {
 	Name      string
 	Target    string
-	Type      string // "icmp" | "http" (normalized)
+	Type      string // "icmp" | "http" | "tcp" (normalized)
 	Tags      []string
 	IntervalS int
 	TimeoutMS int
@@ -80,6 +80,10 @@ func (s *sensorSpec) validateCrossField() error {
 	if s.Type == "http" {
 		if !validURL(s.Target) {
 			return errors.New("target must be an http:// or https:// URL (e.g. https://example.com/health)")
+		}
+	} else if s.Type == "tcp" {
+		if !validTCPTarget(s.Target) {
+			return errors.New("target must be host:port with an explicit port 1-65535 (e.g. 10.0.0.5:5432)")
 		}
 	} else if !validTarget(s.Target) {
 		return errors.New("target must be an IPv4 address or hostname")

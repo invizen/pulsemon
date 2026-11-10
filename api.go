@@ -40,7 +40,7 @@ type Sensor struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
 	Target    string   `json:"target"`
-	Type      string   `json:"type"` // "icmp" (default) | "http"
+	Type      string   `json:"type"` // "icmp" (default) | "http" | "tcp"
 	Tags      []string `json:"tags"`
 	IntervalS int      `json:"interval_s"`
 	TimeoutMS int      `json:"timeout_ms"`
@@ -2623,12 +2623,15 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 }
 
 // normalizeProbeType maps any incoming probe type to the canonical set:
-// "http" (case-insensitive) or "icmp" (the default for empty/unknown values,
-// so old dashboards that omit the field keep creating ICMP sensors).
+// "http", "tcp" (both case-insensitive), or "icmp" (the default for
+// empty/unknown values, so old dashboards that omit the field keep
+// creating ICMP sensors).
 func normalizeProbeType(t string) string {
 	switch strings.ToLower(strings.TrimSpace(t)) {
 	case "http":
 		return "http"
+	case "tcp":
+		return "tcp"
 	default:
 		return "icmp"
 	}
