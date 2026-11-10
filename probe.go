@@ -77,17 +77,17 @@ const rawWindowSecs = 3600
 //
 // The raw window is the UNION the DB read path returns at per-probe
 // resolution:
-//   - the 60-probe stats window keeps the LAST 60 probes even if a sensor's
-//     long interval pushes them past an hour (a 1h-interval sensor's 60 probes
-//     span 60h) — this is what `ORDER BY ts DESC LIMIT 60` reads;
-//   - the 1h window keeps everything within rawWindowSecs for the loss/avg/
-//     sparkline fields — what `ts >= now-1h` reads.
+// - the 60-probe stats window keeps the LAST 60 probes even if a sensor's
+// long interval pushes them past an hour (a 1h-interval sensor's 60 probes
+// span 60h) — this is what `ORDER BY ts DESC LIMIT 60` reads;
+// - the 1h window keeps everything within rawWindowSecs for the loss/avg/
+// sparkline fields — what `ts >= now-1h` reads.
 //
 // An entry is evicted from raw only when it is BOTH beyond the last 60 AND
 // older than the 1h cutoff; it then folds into a minute bucket (manual rows
 // are dropped — they never enter the buckets or the counters). Memory is thus
 // bounded at ~max(1h, 60) raw entries + 1440 minute buckets, not a full 24h of
-// raw probes (finding #8).
+// raw probes.
 func (ps *probeSeries) append(e probeEntry) {
 	if ps.rawStart > 0 && (ps.rawStart >= 4096 || ps.rawStart*2 >= len(ps.raw)) {
 		// Reclaim front space so future appends reuse the backing array
@@ -368,7 +368,7 @@ type ProbeWorker struct {
 	// isPaused) instead of spawning with a stale config. This replaces the
 	// old under-lock freshStates/freshConfig re-reads, which stalled every
 	// sensorLoop (pw.mu is touched twice per tick) + healthz up to the 15s
-	// busy_timeout (2026-11-05 finding #6). Guarded by mu; a nil map (bare
+	// busy_timeout. Guarded by mu; a nil map (bare
 	// test workers) is safe — bumpGen lazily creates it, range/read over a
 	// nil map are no-ops.
 	gens map[string]int64
@@ -446,7 +446,7 @@ type ProbeWorker struct {
 	// PUT /api/settings commit. Replaces the old per-read GetSetting calls
 	// (and the activeProviders db.Ping fallback): a DB hiccup between
 	// reloads no longer reads maintenance as off / scope as all, and the
-	// hot path makes zero settings queries (2026-11-05 finding #5).
+	// hot path makes zero settings queries.
 	alertCfg atomic.Pointer[alertSettings]
 
 	// Storm budget: a global cap on individual
@@ -513,7 +513,7 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	if _, err := getSharedConn(); err != nil {
 		log.Printf("ProbeWorker: ICMP socket init: %v", err)
 	}
-	// Enforce the 24h retention ONCE at startup (finding #9): the retention
+	// Enforce the 24h retention ONCE at startup: the retention
 	// ticker's first fire is 1h after start, so a process that restarts more
 	// often than hourly — crash loops, frequent updates — would never purge and
 	// the probes/events tables would grow without bound. Running it here (not
@@ -621,7 +621,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 		configs[i].tags = tagMap[configs[i].id]
 	}
 
-	// Reconcile under the lock with NO DB reads (finding #6): the generation
+	// Reconcile under the lock with NO DB reads: the generation
 	// fingerprint above replaces the old under-lock freshStates/freshConfig
 	// re-reads. pw.mu is the hot lock every sensorLoop touches twice per tick
 	// (plus healthz ActiveCount / LastHTTPStatus), so holding it across a
@@ -686,7 +686,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 
 // bumpGen increments the sensor's generation counter so an in-flight
 // syncSensors pass detects a config change that landed in its read→apply gap
-// (finding #6). Called under pw.mu by Restart and SetPaused. It lazily creates
+// . Called under pw.mu by Restart and SetPaused. It lazily creates
 // the map so bare test workers (&ProbeWorker{} with a nil gens) don't panic;
 // syncSensors' fingerprint copy and Remove's delete are safe on a nil map too.
 func (pw *ProbeWorker) bumpGen(id string) {
@@ -717,7 +717,7 @@ func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 		return
 	}
 	ps.isPaused = paused
-	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read (finding #6)
+	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read
 	if !paused && ps.kick != nil {
 		// Non-blocking: the buffer absorbs one pending kick; a second
 		// resume while the first is still queued is a no-op (the loop is
@@ -747,7 +747,7 @@ func (pw *ProbeWorker) Restart(id string) {
 		delete(pw.loops, id)
 	}
 	delete(pw.sensors, id)
-	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read (finding #6)
+	pw.bumpGen(id) // invalidate an in-flight syncSensors pass's stale read
 	pw.mu.Unlock()
 	// Request an IMMEDIATE sync pass: Run's select runs it on the next
 	// iteration and respawns with the post-commit config, so a config
@@ -921,7 +921,7 @@ func (pw *ProbeWorker) safeProbe(ctx context.Context, c sensorConfig) {
 // code documented that tradeoff in its own doc string).
 const pingNowTimeout = time.Second
 
-// dbWriteTimeout bounds a single probe-record write (review 2026-10-24):
+// dbWriteTimeout bounds a single probe-record write:
 // SQLite's busy_timeout is 15s — longer than the shutdown drain budget —
 // so probe-path writes carry their own smaller cap instead of parking on
 // a stalled writer for the full busy_timeout.
@@ -980,7 +980,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		rttVal = o.rttMs
 	}
 	ts := time.Now().UTC()
-	// Bounded write (review 2026-10-24): a bare Exec can sit on the
+	// Bounded write: a bare Exec can sit on the
 	// 15s busy_timeout — longer than the ~10s shutdown drain budget —
 	// and using the REQUEST ctx would wrongly discard a completed probe
 	// when the browser closes the tab. A fresh capped context bounds the
@@ -1090,7 +1090,7 @@ var probeTarget = func(ctx context.Context, probeType, target string, timeout ti
 }
 
 func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
-	// timeout_ms<=0 fallback for a legacy zeroed row (review 2026-10-24):
+	// timeout_ms<=0 fallback for a legacy zeroed row:
 	// the API's create default is 1000ms and PingNow falls back to the
 	// same value (pingNowTimeout). Without this, a zeroed row reads 100%
 	// loss on EVERY scheduled tick while Pulse Now on the same sensor
@@ -1118,7 +1118,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 
 	now := time.Now().UTC()
-	// Bounded write (review 2026-10-24): the probe ctx is correct here —
+	// Bounded write: the probe ctx is correct here —
 	// it is already cancelled-and-checked above (a cancelled probe drops
 	// its result), and it lets shutdown interrupt a write parked on the
 	// 15s busy_timeout instead of outrunning the drain budget.
@@ -1323,15 +1323,15 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 // validTarget accepts only well-formed probe targets (all SQL is parameterized; this is input hygiene).
 //
 // A target is one of:
-//   - an IPv4 address (range-checked via net.ParseIP), or
-//   - a dotted hostname: one or more RFC 1123 labels ending in an
-//     alphabetic TLD (targetRe), or
-//   - a BARE single-label hostname (validSingleLabel): "nas", "pve",
-//     "router". These resolve on most home LANs via the resolver's
-//     search domain (resolv.conf "search") — the same names HTTP
-//     targets have always used. A label made purely of digits is
-//     rejected: net.ParseIP has already taken real IPv4s, so a bare
-//     numeric label is a truncated-IP typo, not a hostname.
+// - an IPv4 address (range-checked via net.ParseIP), or
+// - a dotted hostname: one or more RFC 1123 labels ending in an
+// alphabetic TLD (targetRe), or
+// - a BARE single-label hostname (validSingleLabel): "nas", "pve",
+// "router". These resolve on most home LANs via the resolver's
+// search domain (resolv.conf "search") — the same names HTTP
+// targets have always used. A label made purely of digits is
+// rejected: net.ParseIP has already taken real IPv4s, so a bare
+// numeric label is a truncated-IP typo, not a hostname.
 //
 // Save-time validation is FORMAT hygiene, not a resolvability promise:
 // a target that doesn't resolve on this box simply probes down with a
@@ -1372,7 +1372,7 @@ func validTarget(t string) bool {
 	if t == "" {
 		return false
 	}
-	// Length bound (review 2026-10-24): names cap at 60 and tags at 30,
+	// Length bound: names cap at 60 and tags at 30,
 	// but target had NO cap — a 1 MiB body-cap string was accepted, then
 	// echoed on every poll response and into every alert body. 253 is the
 	// RFC 1035 max for a fully-qualified domain name (labels are already

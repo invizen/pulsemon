@@ -45,12 +45,12 @@ import (
 // explicit disable action, so a typo can't silently open the dashboard.
 //
 // Login is throttled per-IP (loginFailMax failures in a rolling window →
-// lockout) AND per-account (finding #11): a second, per-USERNAME layer
+// lockout) AND per-account: a second, per-USERNAME layer
 // accumulates failures for one account across ALL source IPs, so a multi-IP
 // botnet can't dodge the per-IP budget. The per-account layer would let a
 // single LAN host lock the operator out (7 bad guesses for admin → 429 for
 // 5 minutes, even for the CORRECT password), so a previously-successful IP
-// bucket is EXEMPT from it (review 2026-11-10 #4): the operator's own IP
+// bucket is EXEMPT from it: the operator's own IP
 // always gets through, while a new-IP attacker is still hard-locked (and
 // still capped by the per-IP budget, which the exemption does not touch).
 // Plus a constant-time delay on every 401, so an internet-reachable install
@@ -88,7 +88,7 @@ const (
 	// (restarts clear it) — the threat model is "don't let an attacker spray
 	// passwords", not "survive a restart mid-attack".
 	//
-	// Why in-memory and NOT persisted to the settings table (dismissed): an attacker who can force a process restart — the
+	// Why in-memory and NOT persisted to the settings table: an attacker who can force a process restart — the
 	// only way to reset the lockout — already has host/docker access, at
 	// which point brute-forcing the dashboard is moot (they can read the
 	// SQLite DB or change the password directly), OR a pre-existing remote
@@ -109,7 +109,7 @@ const (
 	loginSlowDown = 200 * time.Millisecond
 
 	// knownGoodTTL bounds how long a previously-successful IP bucket stays
-	// exempt from the per-username lockout (review 2026-11-10 #4). It matches
+	// exempt from the per-username lockout. It matches
 	// the session TTL: the operator's IP stays exempt for as long as a session
 	// would be valid, so a regularly-active operator is never locked out by a
 	// LAN host, while an IP that hasn't logged in in a month expires (and is
@@ -145,7 +145,7 @@ var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
 // weaker KDF than real hashes — a timing oracle.
 var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost))
 
-// bcryptSem bounds the number of CONCURRENT bcrypt KDFs (finding #11). The
+// bcryptSem bounds the number of CONCURRENT bcrypt KDFs. The
 // per-IP throttle caps a single source at ~loginFailMax in-flight KDFs, but a
 // multi-IP burst (an IPv6 /48 is 65k distinct /64 buckets) can drive
 // NumCPU-or-more parallel CompareHashAndPassword calls and saturate every
@@ -158,8 +158,8 @@ var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcf
 // (real + dummy hash paths, so the unknown-user equalizer keeps its constant
 // time AND its concurrency cap) and GenerateFromPassword (AddUserMode /
 // SetUserPassword — setup mode is an UNAUTHENTICATED surface, so without the
-// cap concurrent bootstrap POSTs would drive NumCPU-or-more parallel KDFs;
-// review 2026-11-10 #4). Acquire is ctx-aware (acquireBcryptSem): a client
+// cap concurrent bootstrap POSTs would drive NumCPU-or-more parallel KDFs).
+// Acquire is ctx-aware (acquireBcryptSem): a client
 // that disconnected while queued stops waiting instead of burning a core for
 // a response nobody reads.
 var bcryptSem = make(chan struct{}, runtime.NumCPU())
@@ -168,8 +168,7 @@ var bcryptSem = make(chan struct{}, runtime.NumCPU())
 // Returns false (no slot taken) when ctx completes first — the caller must
 // then skip the KDF entirely. The select makes the wait cancellable: a
 // multi-IP burst whose clients time out no longer parks handlers on the
-// semaphore (and burns CPU on the queued KDFs) after the flood stops
-// (review 2026-11-10 #4).
+// semaphore (and burns CPU on the queued KDFs) after the flood stops.
 func acquireBcryptSem(ctx context.Context) bool {
 	select {
 	case bcryptSem <- struct{}{}:
@@ -202,7 +201,7 @@ type authSession struct {
 	// browser-side expiry.
 	cookieIssued time.Time
 	// cookieSecure pins the Secure decision made when the session was
-	// minted (review nit 2026-10-24): renewals re-issue the cookie on a
+	// minted: renewals re-issue the cookie on a
 	// LATER request, whose HTTPS-ness may differ (a TLS-terminating proxy
 	// that misses X-Forwarded-Proto on one hop used to re-issue the same
 	// token WITHOUT Secure — downgrading the very protection the login
@@ -216,7 +215,7 @@ type AuthState struct {
 	db *store.Store
 
 	// nextSweepSessions rate-limits the session-map GC (see
-	// sweepExpiredSessions / CreateSession; review nit 2026-10-24).
+	// sweepExpiredSessions / CreateSession).
 	// Guarded by a.mu.
 	nextSweepSessions time.Time
 
@@ -270,7 +269,7 @@ type AuthState struct {
 		fails   map[string][]time.Time
 		lockout map[string]time.Time
 		// userFails / userLock are a PER-USERNAME layer on top of the per-IP
-		// maps (finding #11): the per-IP throttle is keyed by source address,
+		// maps: the per-IP throttle is keyed by source address,
 		// so a multi-IP attacker (an IPv6 /48 is 65k distinct /64 buckets)
 		// hammering ONE account never exhausts any single IP's budget. The
 		// per-username counter accumulates failures for that account across
@@ -288,7 +287,7 @@ type AuthState struct {
 		// is still subject to the hard lockout (and to the per-IP budget,
 		// which the exemption does NOT touch). Bounded by sweepThrottle.
 		knownGood map[string]time.Time
-		// nextSweep rate-limits the O(n) map GC (review 2026-10-24 nit):
+		// nextSweep rate-limits the O(n) map GC:
 		// once a multi-IP spray pushes the map past the threshold, every
 		// entry is in-window so the sweep deletes nothing — running it per
 		// call made login O(n) and serialized all logins on an ever-
@@ -297,7 +296,7 @@ type AuthState struct {
 		// throttleHardCap below. The sweep/wipe trigger watches BOTH
 		// fails and userFails: userFails is keyed by arbitrary request
 		// usernames, so a small IP pool rotating random names can grow it
-		// while the per-IP map stays tiny (review 2026-11-10).
+		// while the per-IP map stays tiny.
 		nextSweep time.Time
 	}
 
@@ -549,14 +548,14 @@ func (a *AuthState) AddUserMode(ctx context.Context, username, password string, 
 		// single-shot, so with any account already present this request
 		// is guaranteed to lose the in-tx bootstrap check below. Without
 		// it, unauthenticated setup mode is an unlimited bcrypt-CPU
-		// endpoint (review 2026-10-24). The authoritative check stays in
+		// endpoint. The authoritative check stays in
 		// the tx (a pre-check alone cannot close the race); a failed
 		// count just falls through to it.
 		if n, err := a.db.UserCount(); err == nil && n > 0 {
 			return errBootstrappedEarly
 		}
 	}
-	// Same bcrypt semaphore as VerifyUser (review 2026-11-10 #4): setup
+	// Same bcrypt semaphore as VerifyUser: setup
 	// mode is an unauthenticated surface, so without the cap concurrent
 	// bootstrap POSTs would run NumCPU-or-more parallel KDFs. A canceled
 	// ctx (client gone) skips the KDF — it never ran, so the caller's
@@ -709,7 +708,7 @@ func (a *AuthState) SetUserPassword(ctx context.Context, username, password, kee
 	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
-	// Same bcrypt semaphore as VerifyUser (review 2026-11-10 #4): this is
+	// Same bcrypt semaphore as VerifyUser: this is
 	// a KDF too — a session holder (or a throttled spray) must not drive
 	// NumCPU-or-more parallel GenerateFromPassword calls on top of the
 	// login-path KDFs.
@@ -741,10 +740,10 @@ func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (
 		// two paths ALWAYS run at the same KDF cost and can never diverge into
 		// a timing oracle if bcryptCost is ever raised. It is precomputed (see
 		// dummyBcryptHash) so a failed lookup doesn't re-format the string.
-		// Both paths go through bcryptSem (finding #11): the dummy path is the
+		// Both paths go through bcryptSem: the dummy path is the
 		// one an unknown-username spray drives, so it needs the concurrency cap
 		// too — capping only the real-hash path would leave the spray unbounded.
-		// The acquire is ctx-aware (review 2026-11-10 #4): a client that
+		// The acquire is ctx-aware: a client that
 		// disconnected while queued skips the KDF — no core burned for a
 		// response nobody reads. ctx cancel only skips work for a GONE client,
 		// so the live-client timing equalizer is untouched.
@@ -809,7 +808,7 @@ func (a *AuthState) CreateSession(ctx context.Context, username, password string
 	// only once the map is large enough that abandoned sessions are the
 	// likely cause (mirrors sweepThrottle for the login-throttle maps) —
 	// and rate-limited to once per sweep interval for the same reason the
-	// throttle GC is (review nit): past the threshold a full walk per
+	// throttle GC is: past the threshold a full walk per
 	// login is O(n^2) for a fleet of shared-credential devices.
 	if len(a.sessions) > 64 && now.After(a.nextSweepSessions) {
 		a.sweepExpiredSessions(now)
@@ -1000,7 +999,7 @@ func (a *AuthState) trustedIP(p net.IP) bool {
 // them is an individually assigned, individually trusted peer — exactly
 // like RFC1918 space — so the login throttle buckets it PER-IP. (/24
 // bucketing there collaterally locked up to 256 tailnet devices behind one
-// peer's bad guesses; review 2026-10-24.) A public-internet attacker never
+// peer's bad guesses.) A public-internet attacker never
 // presents a 100.64/x source address: carrier NAT is invisible past the
 // carrier's public egress.
 var cgnetRange = func() *net.IPNet {
@@ -1044,7 +1043,7 @@ func (a *AuthState) ensureThrottleMaps() {
 	}
 }
 
-// Throttle GC tuning (review 2026-10-24 nit). Vars, not consts, so tests
+// Throttle GC tuning. Vars, not consts, so tests
 // can exercise the cap paths without 100k-entry seeding.
 var (
 	throttleSweepThreshold = 1024
@@ -1071,7 +1070,7 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
-	// Opportunistic GC: see sweepThrottle. Rate-limited (review nit): a
+	// Opportunistic GC: see sweepThrottle. Rate-limited: a
 	// spray keeps every entry in-window, so the sweep prunes nothing while
 	// costing a full walk per login; it only needs to run often enough to
 	// reclaim entries AS the window ages, not per call.
@@ -1080,7 +1079,7 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	// username (up to the 1 MiB body limit), so a small IP pool rotating
 	// random usernames grows userFails while len(fails) stays far below
 	// the threshold — gating the sweep on the per-IP map alone left
-	// userFails unbounded (review 2026-11-10).
+	// userFails unbounded.
 	if (len(a.loginThrottle.fails) > throttleSweepThreshold ||
 		len(a.loginThrottle.userFails) > throttleSweepThreshold) && !now.Before(a.loginThrottle.nextSweep) {
 		a.sweepThrottle(now)
@@ -1098,7 +1097,7 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 			a.loginThrottle.lockout = map[string]time.Time{}
 			// The per-username maps share the same fail-open bound: a wide
 			// spray that grows EITHER map past the cap resets all budgets,
-			// so the wipe is all-or-nothing (finding #11).
+			// so the wipe is all-or-nothing.
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
 			// knownGood shares the same fail-open bound (review
@@ -1140,21 +1139,21 @@ func (a *AuthState) loginSuccess(ip string) {
 	a.ensureThrottleMaps()
 	delete(a.loginThrottle.fails, ip)
 	delete(a.loginThrottle.lockout, ip)
-	// Mark this IP bucket known-good (review 2026-11-10 #4): a successful
+	// Mark this IP bucket known-good: a successful
 	// login is the signal that this is the operator (or a trusted client),
 	// so the per-username lockout must not block them on a later attempt.
 	a.loginThrottle.knownGood[ip] = time.Now()
 }
 
 // checkUserLock reports whether username is locked out by the per-username
-// fail counter (finding #11) — a multi-IP attacker that has exhausted the
+// fail counter — a multi-IP attacker that has exhausted the
 // account's budget. Returns (false, how-long-until-the-lockout-lifts) when
 // locked; the caller answers 429 + Retry-After. An elapsed lockout is
 // cleared here so the next attempt starts fresh.
 //
 // ipBucket is the request's throttle bucket (throttleKey of the client IP).
 // A bucket that has logged in successfully within knownGoodTTL is EXEMPT from
-// the per-username lockout (review 2026-11-10 #4): the per-ACCOUNT layer
+// the per-username lockout: the per-ACCOUNT layer
 // exists to stop a MULTI-IP botnet, but as a side effect it let a single LAN
 // host lock the operator out — 7 bad guesses for admin → 429 for 5 minutes,
 // even for the CORRECT password. Exempting a previously-successful IP keeps
@@ -1279,7 +1278,7 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 		delete(a.loginThrottle.fails, ip)
 		delete(a.loginThrottle.lockout, ip)
 	}
-	// Per-username layer (finding #11): same drop rule — no in-window failure
+	// Per-username layer: same drop rule — no in-window failure
 	// and no active account lockout.
 	for u, ts := range a.loginThrottle.userFails {
 		recent := false
@@ -1298,7 +1297,7 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 		delete(a.loginThrottle.userFails, u)
 		delete(a.loginThrottle.userLock, u)
 	}
-	// Known-good IP buckets (review 2026-11-10 #4): drop entries older than
+	// Known-good IP buckets: drop entries older than
 	// knownGoodTTL, so a stale IP stops being exempt from the per-username
 	// lockout.
 	for ip, t := range a.loginThrottle.knownGood {
@@ -1522,7 +1521,7 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 
 // handleAuthLogin is the only unauthenticated credential-checking endpoint,
 // so its DoS surface is the per-IP throttle PLUS the per-username account
-// budget (finding #11), not a global concurrency cap.
+// budget, not a global concurrency cap.
 //
 // Security-review note (deliberate, do NOT "fix" with a NON-BLOCKING in-flight
 // bcrypt semaphore): the single-attacker vector is already closed — beginAttempt
@@ -1534,8 +1533,8 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 // be rotated to dodge the lockout. The residual is a MULTI-source-IP botnet —
 // the classic per-IP-limit bypass — which is OUT of this tool's threat model
 // (single-operator LAN dashboard, not an anonymous internet endpoint; see the
-// file header). For the internet-facing case, finding #11 adds the two
-// hardenings that note below calls for: (1) a BLOCKING bcrypt semaphore
+// file header). For the internet-facing case, this adds the two hardenings
+// that note below calls for: (1) a BLOCKING bcrypt semaphore
 // (bcryptSem, capacity runtime.NumCPU) that QUEUES excess KDFs rather than
 // rejecting them — the operator's login waits for a free core instead of
 // failing, which is the exact regression a non-blocking (select/default ->
@@ -1595,7 +1594,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Per-username lockout (finding #11): the per-IP throttle above can't see
+	// Per-username lockout: the per-IP throttle above can't see
 	// a multi-IP attacker hammering one account, so this second gate checks
 	// the account's own failure budget. It runs AFTER the per-IP gate so a
 	// single locked IP gets its 429 first (no extra KDF, no account counter
@@ -1614,8 +1613,8 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 
 	tok, ok := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
-		// Client already gone (disconnected while queued on bcryptSem —
-		// review 2026-11-10 #4): a disconnect is not a failed password
+		// Client already gone (disconnected while queued on bcryptSem): a
+		// disconnect is not a failed password
 		// attempt, so it must not burn the account's failure budget, and
 		// the rejection delay buys nothing for a response nobody reads.
 		// Live clients take the full path below, so the timing equalizer
@@ -1624,12 +1623,12 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Count the failure against the account (across all IPs) — the
-		// per-username layer the per-IP budget can't see (finding #11).
+		// per-username layer the per-IP budget can't see.
 		// EXISTING accounts only: a failure for a name with no account
 		// protects nothing (the dummy-hash equalizer already hides the
 		// distinction from the client), and the username is
 		// attacker-chosen — counting it let a small IP pool rotate random
-		// names and grow userFails without bound (review 2026-11-10). The
+		// names and grow userFails without bound. The
 		// point query runs on the cold failure path (throttled + 200 ms
 		// delay), sub-millisecond against the KDF + delay, so it adds no
 		// timing oracle.
@@ -1703,7 +1702,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// requireAuth wraps this route (see routes()). The FULL roster
 		// (every username/created_at/is_admin) is admin-facing data — the
 		// users panel that consumes it is admin-gated, and the client
-		// hiding the panel was never a server gate (review 2026-10-24).
+		// hiding the panel was never a server gate.
 		// A non-admin session sees only its own row.
 		users, err := s.db.ListUsers()
 		if err != nil {
@@ -1761,7 +1760,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusForbidden, "admin only")
 			return
 		}
-		// Throttle the setup path (review 2026-10-24): an unauthenticated
+		// Throttle the setup path: an unauthenticated
 		// setup POST pays a bcrypt KDF on every admitted request, so an
 		// install left unclaimed was an unlimited-KDF-CPU endpoint for any
 		// LAN host. Same bucket machinery as login, on a dedicated
@@ -1782,8 +1781,8 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := s.auth.AddUserMode(r.Context(), req.Username, req.Password, setup); err != nil {
-			// Client gone while queued on bcryptSem (review 2026-11-10
-			// #4): the KDF never ran, so refund the setup attempt and
+			// Client gone while queued on bcryptSem: the KDF never ran, so
+			// refund the setup attempt and
 			// drop the response (the write would be a no-op anyway).
 			if r.Context().Err() != nil {
 				if setup {
@@ -1889,7 +1888,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Per-username lockout (mirror of /api/auth/login, finding #11): the
+	// Per-username lockout (mirror of /api/auth/login): the
 	// per-IP gate above can't see a multi-IP holder of a valid session
 	// (stolen cookie, unlocked browser — the session is a bearer token,
 	// usable from any number of sources) spraying current_password, so
@@ -1908,14 +1907,14 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 	}
 
 	if _, ok := s.auth.VerifyUser(r.Context(), user, req.Current); !ok {
-		// Client gone while queued on bcryptSem (review 2026-11-10 #4):
+		// Client gone while queued on bcryptSem:
 		// a disconnect is not a failed current_password attempt — skip
 		// the failure budget and the rejection delay.
 		if r.Context().Err() != nil {
 			return
 		}
 		// Count the failure against the account (across all IPs) — the
-		// same shared budget login uses (review 2026-11-10). The caller
+		// same shared budget login uses. The caller
 		// holds a live session, so the account exists by construction —
 		// no userExists gate needed (unlike the login path, where the
 		// username is attacker-chosen).
@@ -1935,7 +1934,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		keep = c.Value
 	}
 	if err := s.auth.SetUserPassword(r.Context(), user, req.Password, keep); err != nil {
-		// Client gone while queued on bcryptSem (review 2026-11-10 #4):
+		// Client gone while queued on bcryptSem:
 		// nothing left to tell.
 		if r.Context().Err() != nil {
 			return

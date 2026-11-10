@@ -122,7 +122,7 @@ func respondInternal(w http.ResponseWriter, what string, err error) {
 // "delete tag "+tag); SQL is parameterized everywhere, but the LOG is a
 // sink of its own: CR/LF forges a fake entry, other control characters
 // corrupt terminals and shippers, and an unbounded value lets any session
-// write arbitrarily long log lines (review 2026-10-24 nit). Sanitizing
+// write arbitrarily long log lines. Sanitizing
 // HERE covers every current and future call site in one place.
 func logSafe(s string) string {
 	const max = 120
@@ -299,7 +299,7 @@ func (s *Server) authGate() http.Handler {
 		// with no Origin (curl, server-to-server) cannot be a browser
 		// CSRF and passes. A reverse proxy must preserve the original
 		// Host header (Caddy does by default) for the comparison to
-		// match. (valid finding.)
+		// match.
 		//
 		// Sec-Fetch-Site is the second arm: modern browsers send it on
 		// every request (fetch, XHR, form POST) and compute it from the
@@ -358,8 +358,7 @@ func (s *Server) authGate() http.Handler {
 			// POST /api/auth/users (the first account). Everything else
 			// (sensor create/pulse, settings, TLS upload, user list) is 403
 			// until an account exists, so an unauthenticated LAN host can't
-			// use the fresh-install window for SSRF or internal port scanning
-			// (valid finding).
+			// use the fresh-install window for SSRF or internal port scanning.
 			//
 			// ACCEPTED LIMITATION: the first-user bootstrap itself is open to
 			// any LAN host — whoever POSTs /api/auth/users first wins it, and
@@ -457,8 +456,7 @@ func (s *Server) authGate() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
-	// GET /api/update-check is intentionally NOT requireAdmin-gated
-	// (re-adjudicated 2026-10-30 after a second review re-flag): the
+	// GET /api/update-check is intentionally NOT requireAdmin-gated: the
 	// check is read-only, its response (running/latest versions) is
 	// non-secret — rendered in the header pill for every user — it hits
 	// a fixed upstream URL (no SSRF), and ?refresh=1 is throttled to
@@ -473,7 +471,7 @@ func (s *Server) routes() {
 	// session (non-admins are viewers + manual-pulse operators); every
 	// sensor MUTATION — create, edit (incl. pause/resume + target
 	// repoint), delete, clone, per-sensor history wipe — is admin-only
-	// (review 2026-10-28: a lower-trust account must not administer
+	// (a lower-trust account must not administer
 	// sensors or erase per-sensor events rows, which the requireAdmin-
 	// gated DELETE /api/events exists to protect). requireAdmin stands
 	// down with the auth gate, so the "auth off = fully open" contract
@@ -740,7 +738,7 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // sensor whose name runs JS in other operators' browsers if a render site
 // is ever missed.
 //
-// Why a blacklist and NOT the suggested whitelist (dismissed): a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
+// Why a blacklist and NOT the suggested whitelist: a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
 // but a REGRESSION — it rejects legitimate operator labels this gate is
 // meant to allow: non-ASCII names (ÜberNAS) and benign punctuation
 // (wifi:guest, nas/01, camera@front), all pinned VALID in
@@ -1320,8 +1318,8 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // deleted. The table/where strings are fixed call-site literals, never
 // user input.
 //
-// The `id IN (SELECT id …)` shape is optimal as written (review 2026-10-24,
-// verified by EXPLAIN QUERY PLAN): both probes.id and events.id are
+// The `id IN (SELECT id …)` shape is optimal as written (verified by
+// EXPLAIN QUERY PLAN): both probes.id and events.id are
 // INTEGER PRIMARY KEY — i.e. rowid aliases — so the outer delete already
 // seeks by rowid (SEARCH … USING INTEGER PRIMARY KEY (rowid=?)) and the
 // sensor_id-filtered subquery is a covering-index seek
@@ -1336,7 +1334,7 @@ func deleteRowsBatched(ctx context.Context, db *store.Store, table, where string
 	}
 	q := "DELETE FROM " + table + " WHERE id IN (SELECT id FROM " + table + w + " LIMIT ?)"
 	// The argument slice is built ONCE per call, not per batch iteration
-	// (review 2026-11-10 #7): a full-table wipe loops 1.7M/purgeBatchSize
+	//: a full-table wipe loops 1.7M/purgeBatchSize
 	// times, and the old in-loop append(append([]any{}, args...),
 	// purgeBatchSize) allocated a fresh slice every iteration. ExecContext
 	// only reads the args, so the hoisted slice is safe to reuse.
@@ -1368,7 +1366,7 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	}
 	var probes, events int64
 	// Batched large deletes + atomic small steps: see
-	// handleSensorClearHistory for the reasoning (review 2026-10-24). At
+	// handleSensorClearHistory for the reasoning. At
 	// 100 sensors @ 5s the probes table holds ~1.7M rows — this wipe was
 	// the worst single-statement write lock holder in the app, exactly the
 	// class purgeOld was rewritten for.
@@ -1608,7 +1606,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	case http.MethodDelete:
 		// Destructive and fleet-wide: strips the tag from EVERY sensor
 		// and respawns every affected probe loop. Admin-only for
-		// consistency with DELETE /api/history (review 2026-10-24) —
+		// consistency with DELETE /api/history —
 		// per-sensor edits stay operator-scoped; all-sensors rewrites
 		// are admin surface.
 		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
@@ -1666,8 +1664,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		// per syncSensors cycle, so it's bounded to ~1, not N) and the
 		// final state is correct. A RestartMany batch (one lock + one
 		// signal) would save at most that one rare extra pass for a rare
-		// operation (tag delete) — not worth the added surface
-		// (2026-10-24 review finding #10).
+		// operation (tag delete) — not worth the added surface.
 		for _, id := range tagged {
 			s.probeWorker.Restart(id)
 		}
@@ -1942,7 +1939,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// It must therefore be changeable ONLY while an account exists (auth on):
 	// with auth off, requireAdmin/requireAuth stand down, so without this guard
 	// any LAN host could PUT {"allow_unauth_update":true} and then POST
-	// /api/update (finding 4, 2026-11-05). The stored VALUE is untouched — an
+	// /api/update. The stored VALUE is untouched — an
 	// install that already has it on keeps working; only the CHANGE is gated.
 	// A save that does NOT send the field (the general "save alerts" flow) is
 	// unaffected.
@@ -2081,7 +2078,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback() // no-op after Commit succeeds
-	// Pin the write lock BEFORE anything reads (review 2026-10-24): a
+	// Pin the write lock BEFORE anything reads: a
 	// SQLite deferred transaction takes a read snapshot on its first
 	// SELECT (the smtp tls_mode guard below), and upgrading that to a
 	// write AFTER another writer committed fails fast with
@@ -2154,8 +2151,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// Swap the alert settings snapshot on EVERY path that got this far: the
 	// settings are committed, so the in-memory snapshot must follow —
 	// including the two maintenance-tx 500 paths below, which return before
-	// the explicit reload this handler used to end with (review 2026-11-10
-	// #6). Without the defer, a PUT that committed provider/routing/
+	// the explicit reload this handler used to end with. Without the defer,
+	// a PUT that committed provider/routing/
 	// realert_min changes but 500'd on the maintenance transaction left
 	// pw.alertCfg stale until the next successful PUT or a restart. A
 	// failed maintenance tx leaves the DB's maintenance flag as the
@@ -2164,7 +2161,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// resolveDestinations) reads this snapshot lock-free, so a transient DB
 	// lock mid-probe can no longer read maintenance_mode as "0" and fire
 	// alerts during maintenance — the bug the per-call GetSetting reads had
-	// (2026-11-05 finding #5). reloadAlertSettings keeps the last good
+	//. reloadAlertSettings keeps the last good
 	// snapshot on a read error, so a hiccup here never installs a half-read
 	// state; it just leaves the previous (still-correct) snapshot in place
 	// until the next successful save.
@@ -2179,7 +2176,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				log.Printf("API: maintenance mode already ON (snapshot preserved)")
 			} else {
 				// Entering maintenance (off→on): the snapshot is read
-				// INSIDE the pause transaction (review nit 2026-10-24) —
+				// INSIDE the pause transaction —
 				// the read above is only the 400 pre-check; a sensor
 				// activated between that read and this transaction used to
 				// escape the pause and keep probing under mode=ON.
@@ -2412,8 +2409,8 @@ func (s *Server) storedProviderExtra(kind string) map[string]string {
 var errSMTPNoneWithCreds = errors.New("smtp tls_mode=none cannot use credentials (clear username/password)")
 
 // guardSMTPNoCredsOverTLSInTx re-applies the tls_mode=none + credentials
-// rule against the LIVE in-tx settings snapshot (review 2026-10-24, found
-// independently by two review streams): the handler's pre-flight guard
+// rule against the LIVE in-tx settings snapshot (found independently by two
+// review streams): the handler's pre-flight guard
 // evaluated the EFFECTIVE state against a PRE-BeginTx read, so two
 // concurrent admin PUTs — one setting tls_mode=none, one storing
 // credentials — each passed against the pre-other-commit snapshot and
@@ -2488,7 +2485,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		return err
 	}
 	if kind == "smtp" {
-		// In-tx effective-state re-check (TOCTOU, review 2026-10-24): the
+		// In-tx effective-state re-check (TOCTOU): the
 		// handler's guard ran on a pre-BeginTx snapshot; this one sees the
 		// serialized write state, so two racing admin PUTs can no longer
 		// jointly commit tls_mode=none over credentials.
@@ -2622,8 +2619,8 @@ func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	// (static_etag.go, v0.3.17): the one-time sha256 of the ~110KB
 	// index.html measures ~54µs, paid once, not per request. The remaining
 	// per-request cost is the in-memory embed copy (~6.5µs). DO NOT add a
-	// pre-read ETag fast path to skip that copy on 304 (re-flagged
-	// 2026-10-24): the dashboard revalidates every ~5s, so the copy is a
+	// pre-read ETag fast path to skip that copy on 304: the dashboard
+	// revalidates every ~5s, so the copy is a
 	// young-gen ~110KB alloc — ~1.8 GB/day of short-lived garbage the GC
 	// reclaims for ~112 ms/day of CPU (0.00013% of a core) — and the 200
 	// path needs the read for the body anyway, so a separate

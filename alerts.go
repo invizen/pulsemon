@@ -111,7 +111,7 @@ func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time
 	for {
 		select {
 		case job := <-ch:
-			// Per-job recover (review 2026-10-24): a panicking delivery
+			// Per-job recover: a panicking delivery
 			// used to crash the monitor AND take this sensor's alerting
 			// down with it (consumer dies → FIFO fills → alertMu blocks
 			// for every sensor). Sacrifice the job, keep the loop alive.
@@ -153,7 +153,7 @@ func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time
 // delivery then read it lock-free, with ZERO per-probe / per-alert DB
 // queries.
 //
-// Why a snapshot (2026-11-05 finding #5): GetSetting maps a read error to
+// Why a snapshot: GetSetting maps a read error to
 // "", so a transient DB lock mid-probe made maintenance_mode read as "0"
 // (alerts ENABLED) and alert_scope read as "" (scope "all") — a DB hiccup
 // during maintenance fired alerts for every sensor, and each errored probe /
@@ -314,7 +314,7 @@ func (pw *ProbeWorker) alertSettings() *alertSettings {
 // alertsEnabled reports whether any alert may fire: maintenance mode
 // silences everything. It reads the SNAPSHOT, not the DB: a transient DB
 // lock between reloads must never read maintenance_mode as "0" and fire
-// alerts during maintenance (2026-11-05 finding #5).
+// alerts during maintenance.
 func (pw *ProbeWorker) alertsEnabled() bool {
 	return !pw.alertSettings().maintenance
 }
@@ -362,7 +362,7 @@ func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, oldStatus, newStatus strin
 // PUT /api/settings commit, so a routing change takes effect on the next
 // transition with zero staleness AND zero per-decision DB reads — a DB
 // hiccup can no longer read alert_scope as "" (scope "all") and alert every
-// sensor (2026-11-05 finding #5).
+// sensor.
 func (pw *ProbeWorker) shouldAlert(id string, tags []string) bool {
 	s := pw.alertSettings()
 	if s.scope == "all" {
@@ -432,7 +432,7 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 // self-contained rather than relying on the alert_state FK — which IS
 // enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
 // store.NewStore), but only as a side effect whose violation the `_, _ =`
-// below would swallow silently (review 2026-11-10 #3). For a live sensor
+// below would swallow silently. For a live sensor
 // the SELECT yields exactly one row: behavior is identical to a plain
 // upsert, and the statement is atomic, so there is no delete/upsert
 // TOCTOU.
@@ -468,7 +468,7 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 // realertMin returns the re-alert interval in minutes from the SNAPSHOT.
 // 0 means alert once only (no re-alerts). Default 30. Lock-free: a DB
 // hiccup can no longer read realert_min as "" and reset the interval to the
-// 30-min default mid-storm (2026-11-05 finding #5).
+// 30-min default mid-storm.
 func (pw *ProbeWorker) realertMin() int {
 	return pw.alertSettings().realertMin
 }
@@ -767,7 +767,7 @@ func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
 	if due < 0 {
 		due = 0
 	}
-	// Track the flush in alertWG from ARM time (review 2026-10-24): the
+	// Track the flush in alertWG from ARM time: the
 	// arming caller is an alert path that already holds a launchAlert
 	// count (sendWebhook runs inside launchAlert), so this Add can never
 	// be the "Add called concurrently with Wait" case at counter 0 — an
@@ -843,7 +843,7 @@ func (pw *ProbeWorker) flushStorm() {
 // disturb a sensor's per-sensor ordering guarantee (F4).
 func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	// Re-check each entry's status immediately before building the summary
-	// (finding #10): flushStorm's filter ran earlier, and this delivery is
+	//: flushStorm's filter ran earlier, and this delivery is
 	// async (launchAlert) — a sensor that recovered in the gap would otherwise
 	// be listed as "error" in a summary that lands AFTER its recovery alert
 	// (which is ordered on the per-sensor gate the summary bypasses). The
@@ -1138,7 +1138,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		return false, "no " + p.Label + " webhook URL configured"
 	}
 	// map[string]any, not map[string]string: the discord payload nests
-	// allowed_mentions (review 2026-11-10 #8) — the test-alert body must be
+	// allowed_mentions — the test-alert body must be
 	// structurally identical to the production delivery payloads
 	// (deliverOne / deliverStormSummary), so the test button verifies the
 	// exact shape the real alerts send.
@@ -1224,7 +1224,7 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 // process exits right after this returns, so a lingering waiter is moot; in
 // tests it is a short-lived bounded goroutine (Go tests do not fail on it).
 // There is no clean way to avoid it without redesigning the delivery
-// tracking (2026-10-24 review finding #9).
+// tracking.
 func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
