@@ -931,8 +931,13 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 		// tokens neutralized (2026-10-24 review n2 + markdown). The TARGET is
 		// a URL/hostname and stays VERBATIM: mdEscape would inject backslashes
 		// into _ and ~ in the path and break the clickable link (2026-10-28
-		// review n4). The emphasis markers come from the format string.
-		b.WriteString("*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + alertTarget(e.target) + ")*\n")
+		// review n4) — but it IS mention-neutralized, exactly like the
+		// per-sensor discordCard/discordCardRe: this summary goes to Discord
+		// (case "discord" in deliverStormSummary), and a target path like
+		// https://example.com/@everyone would mass-ping the channel on
+		// clients/bridges that ignore allowed_mentions.parse = [] (review
+		// 2026-11-10 #5). The emphasis markers come from the format string.
+		b.WriteString("*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + discordMentionSafe(alertTarget(e.target)) + ")*\n")
 	}
 	return b.String()
 }

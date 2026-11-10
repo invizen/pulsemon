@@ -716,6 +716,44 @@ func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
 	}
 }
 
+// TestStormSummaryMarkdownTargetMentionNeutralized (2026-11-10 review #5):
+// the storm summary goes to Discord (case "discord" in
+// deliverStormSummary). The payload's allowed_mentions.parse = [] covers
+// compliant clients, but the codebase neutralizes mention tokens in the
+// Markdown text for bridges/clients that ignore the field — the per-sensor
+// discordCard/discordCardRe do this for the name AND the target. The
+// summary's target used to slip past: a target path like
+// https://example.com/@everyone would mass-ping the channel. The target
+// stays verbatim w.r.t. mdEscape (n4) and the non-Markdown paths are
+// untouched — only the mention tokens are neutralized.
+func TestStormSummaryMarkdownTargetMentionNeutralized(t *testing.T) {
+	const zwsp = "\u200b"
+	entries := []stormEntry{
+		{id: "a", name: "nas", target: "https://example.com/@everyone", oldState: "up", state: "error"},
+		{id: "b", name: "cam", target: "https://user:pass@nas.lan/@here", oldState: "up", state: "error"},
+	}
+	md := stormSummaryMarkdown(entries)
+	// The target path's @everyone is neutralized (ZWSP right after the @).
+	if !strings.Contains(md, "https://example.com/@"+zwsp+"everyone") {
+		t.Errorf("storm markdown must neutralize the target's @everyone: %q", md)
+	}
+	// No RAW mention token remains anywhere in the markdown.
+	if strings.Contains(md, "@everyone") || strings.Contains(md, "@here") {
+		t.Errorf("storm markdown must not carry a raw mention token: %q", md)
+	}
+	// Credentials are still stripped (F22) and the rest of the URL verbatim.
+	if !strings.Contains(md, "https://nas.lan/@"+zwsp+"here") {
+		t.Errorf("target credentials must be stripped, mention neutralized: %q", md)
+	}
+	// Non-Markdown paths are untouched (no ZWSP — email/Telegram stay clean).
+	if p := stormSummaryPlain(entries); strings.Contains(p, zwsp) {
+		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
+	}
+	if h := stormSummaryHTML(entries); strings.Contains(h, zwsp) {
+		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
+	}
+}
+
 // TestMarkdownEscapesEmphasisChars (2026-10-24 review, refined 2026-10-28
 // n4): sensor names may legally contain * _ ~ (underscores are common in
 // service names), and a raw one in the Discord / Google Chat Markdown
