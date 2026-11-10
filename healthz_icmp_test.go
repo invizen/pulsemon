@@ -111,10 +111,14 @@ func TestHealthzIcmpMode(t *testing.T) {
 	resetSharedEngine(t, "", nil)
 }
 
-// TestHealthzVersionGated pins that /api/healthz reveals the exact version only
-// to an authenticated session: an unauthenticated LAN host polling healthz must
-// not be told the precise version (a targeting signal for known bugs), while a
-// logged-in operator still sees it.
+// TestHealthzVersionGated pins the /api/healthz version-disclosure rule:
+//   - auth enabled + unauthenticated: version ABSENT (a targeting signal for
+//     known bugs is not leaked to any unauthenticated LAN host),
+//   - auth enabled + a valid session: version PRESENT (the logged-in operator
+//     sees it),
+//   - auth disabled (no users): version PRESENT — there is no session to gate
+//     on and the whole dashboard is open to the LAN anyway, so blanking it
+//     would leave the dashboard's version pill empty.
 func TestHealthzVersionGated(t *testing.T) {
 	// handleHealthz reads EngineMode()/EngineDead(), which join the shared
 	// engine's sync.Once. Rewind + restore the state so a later icmp test
@@ -122,42 +126,58 @@ func TestHealthzVersionGated(t *testing.T) {
 	// (done, nil, nil) state this test would otherwise leave behind.
 	resetSharedEngine(t, "", nil)
 
-	db, err := store.NewStore(t.TempDir() + "/hzver.db")
-	if err != nil {
-		t.Fatalf("store.NewStore: %v", err)
+	newServer := func(t *testing.T) *Server {
+		t.Helper()
+		db, err := store.NewStore(t.TempDir() + "/hz.db")
+		if err != nil {
+			t.Fatalf("store.NewStore: %v", err)
+		}
+		t.Cleanup(func() { db.Close() })
+		if err := db.InitSchema(); err != nil {
+			t.Fatalf("InitSchema: %v", err)
+		}
+		return NewServer(db, NewProbeWorker(db))
 	}
-	defer db.Close()
-	if err := db.InitSchema(); err != nil {
-		t.Fatalf("InitSchema: %v", err)
+	healthz := func(t *testing.T, s *Server, tok string) map[string]any {
+		t.Helper()
+		req := httptest.NewRequest("GET", "/api/healthz", nil)
+		if tok != "" {
+			req.AddCookie(&http.Cookie{Name: authSessionName, Value: tok})
+		}
+		rr := httptest.NewRecorder()
+		s.handleHealthz(rr, req)
+		var hz map[string]any
+		if err := json.NewDecoder(rr.Result().Body).Decode(&hz); err != nil {
+			t.Fatalf("decode healthz: %v", err)
+		}
+		return hz
 	}
-	s := NewServer(db, NewProbeWorker(db))
 
-	// Unauthenticated: version must be absent.
-	rr := httptest.NewRecorder()
-	s.handleHealthz(rr, httptest.NewRequest("GET", "/api/healthz", nil))
-	var hz map[string]any
-	if err := json.NewDecoder(rr.Result().Body).Decode(&hz); err != nil {
-		t.Fatalf("decode unauth healthz: %v", err)
-	}
-	if _, present := hz["version"]; present {
-		t.Fatalf("unauthenticated healthz leaked version %v", hz["version"])
-	}
+	t.Run("auth enabled, unauthenticated: version absent", func(t *testing.T) {
+		s := newServer(t)
+		if err := s.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+			t.Fatalf("AddUser: %v", err)
+		}
+		if _, present := healthz(t, s, "")["version"]; present {
+			t.Fatal("unauthenticated healthz (auth enabled) leaked the version")
+		}
+	})
 
-	// Authenticated (a valid session cookie for an existing user): version
-	// must be present.
-	if err := s.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
-		t.Fatalf("AddUser: %v", err)
-	}
-	s.auth.sessions["hzver-tok"] = authSession{user: "admin", expiry: time.Now().Add(time.Hour), created: time.Now()}
-	req := httptest.NewRequest("GET", "/api/healthz", nil)
-	req.AddCookie(&http.Cookie{Name: authSessionName, Value: "hzver-tok"})
-	rr2 := httptest.NewRecorder()
-	s.handleHealthz(rr2, req)
-	var hz2 map[string]any
-	if err := json.NewDecoder(rr2.Result().Body).Decode(&hz2); err != nil {
-		t.Fatalf("decode auth healthz: %v", err)
-	}
-	if hz2["version"] != Version {
-		t.Fatalf("authenticated healthz version = %v, want %q", hz2["version"], Version)
-	}
+	t.Run("auth enabled, authenticated: version present", func(t *testing.T) {
+		s := newServer(t)
+		if err := s.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+			t.Fatalf("AddUser: %v", err)
+		}
+		s.auth.sessions["tok"] = authSession{user: "admin", expiry: time.Now().Add(time.Hour), created: time.Now()}
+		if v := healthz(t, s, "tok")["version"]; v != Version {
+			t.Fatalf("authenticated healthz version = %v, want %q", v, Version)
+		}
+	})
+
+	t.Run("auth disabled (no users): version present", func(t *testing.T) {
+		s := newServer(t) // no user added: auth is disabled, no session to gate on
+		if v := healthz(t, s, "")["version"]; v != Version {
+			t.Fatalf("auth-disabled healthz version = %v, want %q (the dashboard's version pill would be blank)", v, Version)
+		}
+	})
 }

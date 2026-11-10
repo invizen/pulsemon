@@ -557,8 +557,12 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	// The exact version is a targeting signal for known bugs: reveal it only to
 	// an authenticated session, not to any unauthenticated LAN host polling
-	// /api/healthz.
-	if c, rerr := r.Cookie(authSessionName); rerr == nil {
+	// /api/healthz. When auth is disabled there is no session to check (and the
+	// whole dashboard is open to the LAN anyway), so reveal it — otherwise the
+	// dashboard's version pill is blank on auth-disabled installs.
+	if !s.auth.Enabled() {
+		hz["version"] = Version
+	} else if c, rerr := r.Cookie(authSessionName); rerr == nil {
 		if _, ok := s.auth.SessionUser(c.Value); ok {
 			hz["version"] = Version
 		}
