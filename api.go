@@ -15,6 +15,7 @@ import (
 	"pulsemon/internal/store"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -175,6 +176,11 @@ type Server struct {
 	// tlsCert memoizes the parsed cert for tlsPayload (2026-10-24
 	// review n3); see tlsCertCached in tls_settings.go.
 	tlsCert tlsCertMemo
+	// sensorCountCache memoizes the healthz sensor count for a short window
+	// so frequent unauthenticated health checks don't do a DB COUNT per hit.
+	sensorCountMu    sync.Mutex
+	sensorCountCache int
+	sensorCountAt    time.Time
 }
 
 func NewServer(db *store.Store, pw *ProbeWorker) *Server {
@@ -530,8 +536,12 @@ func (s *Server) routes() {
 
 // handleHealthz is a real check: DB must be reachable (SPEC §8, fix #5).
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	var n int
-	if err := s.db.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
+	// The sensor count is a liveness signal, not a precise gauge: cache it for
+	// ~2s so frequent unauthenticated health checks don't do a DB COUNT per hit.
+	// A DB that goes down is detected on the next (uncached) query, up to 2s
+	// later.
+	n, err := s.cachedSensorCount(r.Context())
+	if err != nil {
 		// 503, not 500: the API process is healthy, the DB is down. Keep
 		// the "db unreachable" wording (operators and health checks read
 		// it) and log the driver detail instead of leaking it.
@@ -545,7 +555,14 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		"probing": s.probeWorker.ActiveCount(),
 		"time":    time.Now().UTC().Format(time.RFC3339),
 	}
-	hz["version"] = Version
+	// The exact version is a targeting signal for known bugs: reveal it only to
+	// an authenticated session, not to any unauthenticated LAN host polling
+	// /api/healthz.
+	if c, rerr := r.Cookie(authSessionName); rerr == nil {
+		if _, ok := s.auth.SessionUser(c.Value); ok {
+			hz["version"] = Version
+		}
+	}
 	// ICMP availability: the probe worker warms the shared engine at startup,
 	// so by the time healthz is reachable the outcome is known. Reporting it
 	// here closes the silent-failure mode: when BOTH transports fail
@@ -564,6 +581,29 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		hz["probe_error"] = e
 	}
 	respondWithJSON(w, http.StatusOK, hz)
+}
+
+// cachedSensorCount returns the sensor count, re-querying only when the cached
+// value is older than ~2s (see handleHealthz for the why). A query error is
+// NOT cached, so a transient DB blip is retried on the next call.
+func (s *Server) cachedSensorCount(ctx context.Context) (int, error) {
+	s.sensorCountMu.Lock()
+	if time.Since(s.sensorCountAt) < 2*time.Second {
+		n := s.sensorCountCache
+		s.sensorCountMu.Unlock()
+		return n, nil
+	}
+	s.sensorCountMu.Unlock()
+
+	var n int
+	if err := s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM sensors").Scan(&n); err != nil {
+		return 0, err
+	}
+	s.sensorCountMu.Lock()
+	s.sensorCountCache = n
+	s.sensorCountAt = time.Now()
+	s.sensorCountMu.Unlock()
+	return n, nil
 }
 
 func (s *Server) fetchSensors(ctx context.Context) []Sensor {

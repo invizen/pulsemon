@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"pulsemon/internal/store"
 	"sync"
 	"testing"
+	"time"
 )
 
 // resetSharedEngine rewinds the process-wide engine state so a test can
@@ -94,4 +97,49 @@ func TestHealthzIcmpMode(t *testing.T) {
 
 	// Leave a clean state for any other test that warms the engine.
 	resetSharedEngine(t, "", nil)
+}
+
+// TestHealthzVersionGated pins that /api/healthz reveals the exact version only
+// to an authenticated session: an unauthenticated LAN host polling healthz must
+// not be told the precise version (a targeting signal for known bugs), while a
+// logged-in operator still sees it.
+func TestHealthzVersionGated(t *testing.T) {
+	db, err := store.NewStore(t.TempDir() + "/hzver.db")
+	if err != nil {
+		t.Fatalf("store.NewStore: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+	s := NewServer(db, NewProbeWorker(db))
+
+	// Unauthenticated: version must be absent.
+	rr := httptest.NewRecorder()
+	s.handleHealthz(rr, httptest.NewRequest("GET", "/api/healthz", nil))
+	var hz map[string]any
+	if err := json.NewDecoder(rr.Result().Body).Decode(&hz); err != nil {
+		t.Fatalf("decode unauth healthz: %v", err)
+	}
+	if _, present := hz["version"]; present {
+		t.Fatalf("unauthenticated healthz leaked version %v", hz["version"])
+	}
+
+	// Authenticated (a valid session cookie for an existing user): version
+	// must be present.
+	if err := s.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	s.auth.sessions["hzver-tok"] = authSession{user: "admin", expiry: time.Now().Add(time.Hour), created: time.Now()}
+	req := httptest.NewRequest("GET", "/api/healthz", nil)
+	req.AddCookie(&http.Cookie{Name: authSessionName, Value: "hzver-tok"})
+	rr2 := httptest.NewRecorder()
+	s.handleHealthz(rr2, req)
+	var hz2 map[string]any
+	if err := json.NewDecoder(rr2.Result().Body).Decode(&hz2); err != nil {
+		t.Fatalf("decode auth healthz: %v", err)
+	}
+	if hz2["version"] != Version {
+		t.Fatalf("authenticated healthz version = %v, want %q", hz2["version"], Version)
+	}
 }
