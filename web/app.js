@@ -174,6 +174,33 @@ async function api(path, opts) {
   return r.json();
 }
 
+// The 5s poll re-renders the grid (and inspector) from innerHTML. If that
+// swap lands between the user's mousedown and mouseup, the browser never
+// synthesizes the click (it needs both on the same node) — mutation buttons
+// (trash, pause, edit, clone) look dead intermittently (v1.1.2: click-
+// swallow race). Defer poll re-renders while a button is held; flush on
+// release.
+let mouseButtonsDown = 0;
+let renderDeferred = false;
+function flushDeferredRender() {
+  if (renderDeferred) { renderDeferred = false; render(); if (inspectId) loadInspector(); }
+}
+document.addEventListener('mousedown', () => { mouseButtonsDown++; });
+document.addEventListener('mouseup', () => {
+  mouseButtonsDown = Math.max(0, mouseButtonsDown - 1);
+  if (mouseButtonsDown === 0) flushDeferredRender();
+});
+document.addEventListener('mouseleave', e => {
+  // released the button outside the window: reset the counter so polls
+  // don't stay deferred forever
+  if (e.buttons === 0 && mouseButtonsDown > 0) { mouseButtonsDown = 0; flushDeferredRender(); }
+});
+function pollRender() {
+  if (mouseButtonsDown > 0) { renderDeferred = true; return; }
+  render();
+  if (inspectId) loadInspector();
+}
+
 async function refresh() {
   if (authBlocking()) return;
   try {
@@ -195,7 +222,7 @@ async function refresh() {
     } else {
       banner.classList.add('hidden');
     }
-    render();
+    pollRender();
   } catch (err) { console.error('refresh failed', err); }
 }
 
@@ -1626,7 +1653,11 @@ function startPolling() {
   // immediate refresh so the data is fresh the moment the tab is shown again.
   setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
   let _sparkRt; window.addEventListener('resize', () => { clearTimeout(_sparkRt); _sparkRt = setTimeout(layoutSparklines, 120); });
-  setInterval(() => { if (document.visibilityState === 'visible' && inspectId) loadInspector(); }, 5000);
+  setInterval(() => {
+    if (document.visibilityState !== 'visible' || !inspectId) return;
+    if (mouseButtonsDown > 0) { renderDeferred = true; return; }
+    loadInspector();
+  }, 5000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       refresh();

@@ -1,18 +1,20 @@
-# pulsemon v1.1.1
+# pulsemon v1.1.2
 
 Patch release for the dashboard.
 
-## Fixed: stuck "CONFIRM?" on sensor delete
+## Fixed: intermittent dead clicks on sensor buttons (trash, pause, edit, clone)
 
-The delete button uses a two-click confirm: click the trash icon, the
-button flips to "CONFIRM?" for 4 seconds, click it again to delete.
-When the 4 seconds expired (or you clicked elsewhere), the logical
-state cleared but the button stayed painted "CONFIRM?" until the next
-5s poll re-rendered — and clicking that stuck button did nothing, so
-the delete appeared broken.
+The 5s background poll re-renders the sensor grid from scratch. When
+that re-render landed in the few milliseconds between your mousedown
+and mouseup, the browser never fired the click at all (a click needs
+both events on the same DOM node) — so the button looked dead. Whether
+a given click was swallowed was pure timing luck, which is why it
+worked sometimes and not others.
 
-The disarm now resets the button back to the trash icon, so the visual
-state always matches the armed state. Verified end-to-end in the
-browser: arm → timer expiry → icon restored → re-arm → delete.
+Poll re-renders now defer while a mouse button is held and flush the
+moment its released, so the node under your cursor cant be swapped
+out mid-click. Verified in the browser: a re-render fired mid-press
+no longer replaces the button, the deferred render runs on release,
+and delete/pause flows are unaffected.
 
-No backend changes — the delete API path was never affected.
+No backend changes.
