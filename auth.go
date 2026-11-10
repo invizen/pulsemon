@@ -44,13 +44,22 @@ import (
 // removed through the user-management endpoints — that is reserved for the
 // explicit disable action, so a typo can't silently open the dashboard.
 //
-// No per-ACCOUNT brute-force lockout (a typo'd password won't lock the
-// operator out), but the login endpoint DOES apply a per-IP failure
-// throttle (loginFailMax failures in a rolling window → lockout) plus a
-// constant-time delay on every 401, so an internet-reachable install is
-// not a free online password-cracking target against the 8-char minimum.
-// The threat model is "a public URL must not expose the dashboard", not
-// "an anonymous internet scanner must not probe it".
+// Login is throttled per-IP (loginFailMax failures in a rolling window →
+// lockout) AND per-account (finding #11): a second, per-USERNAME layer
+// accumulates failures for one account across ALL source IPs, so a multi-IP
+// botnet can't dodge the per-IP budget. The per-account layer would let a
+// single LAN host lock the operator out (7 bad guesses for admin → 429 for
+// 5 minutes, even for the CORRECT password), so a previously-successful IP
+// bucket is EXEMPT from it (review 2026-11-10 #4): the operator's own IP
+// always gets through, while a new-IP attacker is still hard-locked (and
+// still capped by the per-IP budget, which the exemption does not touch).
+// Plus a constant-time delay on every 401, so an internet-reachable install
+// is not a free online password-cracking target against the 8-char minimum.
+// If the operator IS locked out (a new device, a DHCP change), the recovery
+// path is the CLI: `pulsemon auth-user` (add/remove/change-password) runs
+// out-of-band and is not subject to the login throttle. The threat model is
+// "a public URL must not expose the dashboard", not "an anonymous internet
+// scanner must not probe it".
 
 const (
 	authSessionName = "pulsemon_session"
@@ -98,6 +107,14 @@ const (
 	// login (401) so the response time doesn't depend on which path ran, and
 	// an online attacker gets at most ~5 guesses/second per IP.
 	loginSlowDown = 200 * time.Millisecond
+
+	// knownGoodTTL bounds how long a previously-successful IP bucket stays
+	// exempt from the per-username lockout (review 2026-11-10 #4). It matches
+	// the session TTL: the operator's IP stays exempt for as long as a session
+	// would be valid, so a regularly-active operator is never locked out by a
+	// LAN host, while an IP that hasn't logged in in a month expires (and is
+	// recoverable via the CLI — see the file header).
+	knownGoodTTL = authSessionTTL
 
 	// enabledTTL bounds how long the "is auth enabled?" (user count > 0)
 	// cache is trusted before re-reading the DB. In-app user mutations
@@ -263,6 +280,14 @@ type AuthState struct {
 		// operator who typos once from two devices doesn't self-lock.
 		userFails map[string][]time.Time
 		userLock  map[string]time.Time
+		// knownGood: IP bucket → last successful login time (review
+		// 2026-11-10 #4). A previously-successful client is EXEMPT from the
+		// per-username lockout, so a single LAN host hammering the account
+		// can't lock the operator out: the operator's own (known-good) IP
+		// always gets through the per-ACCOUNT layer, while a new-IP attacker
+		// is still subject to the hard lockout (and to the per-IP budget,
+		// which the exemption does NOT touch). Bounded by sweepThrottle.
+		knownGood map[string]time.Time
 		// nextSweep rate-limits the O(n) map GC (review 2026-10-24 nit):
 		// once a multi-IP spray pushes the map past the threshold, every
 		// entry is in-window so the sweep deletes nothing — running it per
@@ -1014,6 +1039,9 @@ func (a *AuthState) ensureThrottleMaps() {
 	if a.loginThrottle.userLock == nil {
 		a.loginThrottle.userLock = map[string]time.Time{}
 	}
+	if a.loginThrottle.knownGood == nil {
+		a.loginThrottle.knownGood = map[string]time.Time{}
+	}
 }
 
 // Throttle GC tuning (review 2026-10-24 nit). Vars, not consts, so tests
@@ -1073,6 +1101,10 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 			// so the wipe is all-or-nothing (finding #11).
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
+			// knownGood shares the same fail-open bound (review
+			// 2026-11-10 #4): a wide spray that grows the maps past the
+			// cap resets ALL throttle state, so the wipe is all-or-nothing.
+			a.loginThrottle.knownGood = map[string]time.Time{}
 		}
 	}
 	if until, ok := a.loginThrottle.lockout[ip]; ok {
@@ -1108,6 +1140,10 @@ func (a *AuthState) loginSuccess(ip string) {
 	a.ensureThrottleMaps()
 	delete(a.loginThrottle.fails, ip)
 	delete(a.loginThrottle.lockout, ip)
+	// Mark this IP bucket known-good (review 2026-11-10 #4): a successful
+	// login is the signal that this is the operator (or a trusted client),
+	// so the per-username lockout must not block them on a later attempt.
+	a.loginThrottle.knownGood[ip] = time.Now()
 }
 
 // checkUserLock reports whether username is locked out by the per-username
@@ -1115,11 +1151,28 @@ func (a *AuthState) loginSuccess(ip string) {
 // account's budget. Returns (false, how-long-until-the-lockout-lifts) when
 // locked; the caller answers 429 + Retry-After. An elapsed lockout is
 // cleared here so the next attempt starts fresh.
-func (a *AuthState) checkUserLock(username string) (bool, time.Duration) {
+//
+// ipBucket is the request's throttle bucket (throttleKey of the client IP).
+// A bucket that has logged in successfully within knownGoodTTL is EXEMPT from
+// the per-username lockout (review 2026-11-10 #4): the per-ACCOUNT layer
+// exists to stop a MULTI-IP botnet, but as a side effect it let a single LAN
+// host lock the operator out — 7 bad guesses for admin → 429 for 5 minutes,
+// even for the CORRECT password. Exempting a previously-successful IP keeps
+// the operator's own device always able to get through while a new-IP
+// attacker is still hard-locked. The exemption does NOT touch the per-IP
+// budget (beginAttempt), so a known-good IP is still capped at loginFailMax
+// fails/60s. If the operator's IP is unknown (new device, a DHCP change),
+// the recovery path is the CLI: `pulsemon auth-user` runs out-of-band and is
+// not subject to the login throttle (see the file header).
+func (a *AuthState) checkUserLock(username, ipBucket string) (bool, time.Duration) {
 	a.loginThrottle.Lock()
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
+	// Known-good IP bucket: exempt from the per-username lockout.
+	if t, ok := a.loginThrottle.knownGood[ipBucket]; ok && now.Sub(t) < knownGoodTTL {
+		return true, 0
+	}
 	if until, ok := a.loginThrottle.userLock[username]; ok {
 		if now.Before(until) {
 			return false, until.Sub(now)
@@ -1244,6 +1297,14 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 		}
 		delete(a.loginThrottle.userFails, u)
 		delete(a.loginThrottle.userLock, u)
+	}
+	// Known-good IP buckets (review 2026-11-10 #4): drop entries older than
+	// knownGoodTTL, so a stale IP stops being exempt from the per-username
+	// lockout.
+	for ip, t := range a.loginThrottle.knownGood {
+		if now.Sub(t) > knownGoodTTL {
+			delete(a.loginThrottle.knownGood, ip)
+		}
 	}
 }
 
@@ -1541,7 +1602,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// touched). A locked account gets a 429 too — the KDF is skipped, so the
 	// account counter is not incremented by the rejection.
 	userKey := strings.ToLower(req.Username)
-	if ok, wait := s.auth.checkUserLock(userKey); !ok {
+	if ok, wait := s.auth.checkUserLock(userKey, key); !ok {
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1
@@ -1836,7 +1897,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 	// the per-IP gate so a single locked IP gets its 429 first; the KDF
 	// is skipped on the 429, so the account counter is not incremented
 	// by the rejection.
-	if ok, wait := s.auth.checkUserLock(user); !ok {
+	if ok, wait := s.auth.checkUserLock(user, key); !ok {
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1

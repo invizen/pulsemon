@@ -1303,7 +1303,8 @@ func TestCheckUserLockClearsElapsed(t *testing.T) {
 	a.loginThrottle.userFails["admin"] = []time.Time{time.Now().Add(-2 * time.Minute)}
 
 	// checkUserLock should return "not locked" and clear the entries.
-	ok, _ := a.checkUserLock("admin")
+	// "" is the IP bucket (no known-good entry): the non-exempt path.
+	ok, _ := a.checkUserLock("admin", "")
 	if !ok {
 		t.Fatal("checkUserLock returned locked for an elapsed lockout")
 	}
@@ -1324,12 +1325,126 @@ func TestCheckUserLockActive(t *testing.T) {
 	// Set an active lockout (2 minutes from now).
 	a.loginThrottle.userLock["admin"] = time.Now().Add(2 * time.Minute)
 
-	ok, remaining := a.checkUserLock("admin")
+	ok, remaining := a.checkUserLock("admin", "")
 	if ok {
 		t.Fatal("checkUserLock returned not-locked for an active lockout")
 	}
 	if remaining < time.Minute || remaining > 2*time.Minute {
 		t.Fatalf("remaining = %v, want between 1m and 2m", remaining)
+	}
+}
+
+// TestKnownGoodIPExemptFromUserLock (review 2026-11-10 #4) pins the
+// known-good exemption: an IP bucket that has logged in successfully within
+// knownGoodTTL is EXEMPT from the per-username lockout, so a single LAN host
+// hammering the account can't lock the operator out. A new (never-seen) IP
+// bucket is NOT exempt — it is subject to the hard lockout.
+func TestKnownGoodIPExemptFromUserLock(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	// An ACTIVE per-username lockout for "admin".
+	a.loginThrottle.userLock["admin"] = time.Now().Add(5 * time.Minute)
+
+	// A known-good IP bucket (logged in recently): EXEMPT.
+	a.loginThrottle.knownGood["10.1.1.5"] = time.Now()
+	if ok, _ := a.checkUserLock("admin", "10.1.1.5"); !ok {
+		t.Fatal("a known-good IP must be exempt from the per-username lockout")
+	}
+	// A NEW IP bucket (never logged in): subject to the lockout.
+	if ok, _ := a.checkUserLock("admin", "10.1.1.99"); ok {
+		t.Fatal("a new IP must be subject to the per-username lockout")
+	}
+	// The empty bucket (no known-good entry): subject to the lockout.
+	if ok, _ := a.checkUserLock("admin", ""); ok {
+		t.Fatal("the empty bucket must be subject to the per-username lockout")
+	}
+}
+
+// TestKnownGoodExemptionExpires (review 2026-11-10 #4): a known-good IP
+// bucket stops being exempt once knownGoodTTL elapses from its last
+// successful login — a stale IP (a device that hasn't logged in in a month)
+// must not keep a permanent pass on the per-username lockout.
+func TestKnownGoodExemptionExpires(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	a.loginThrottle.userLock["admin"] = time.Now().Add(5 * time.Minute)
+	// A known-good entry OLDER than knownGoodTTL.
+	a.loginThrottle.knownGood["10.1.1.5"] = time.Now().Add(-knownGoodTTL - time.Hour)
+	if ok, _ := a.checkUserLock("admin", "10.1.1.5"); ok {
+		t.Fatal("a known-good IP past its TTL must NOT be exempt")
+	}
+}
+
+// TestLoginKnownGoodIPExemptFromAccountLockout (review 2026-11-10 #4) is the
+// end-to-end proof of the finding's fix: the operator's IP logs in
+// successfully (becoming known-good), a LAN host (a fresh IP) then hammers
+// the account to the per-username lockout, and the operator's own IP can
+// STILL log in with the correct password — while the LAN host (a new IP, not
+// known-good) gets 429. Without the exemption the operator's IP would also
+// 429 (the self-DoS the finding describes).
+func TestLoginKnownGoodIPExemptFromAccountLockout(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	const operatorIP = "10.1.1.50"
+	// 1. The operator logs in from their own IP: success, and their IP
+	//    bucket becomes known-good.
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, operatorIP)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("operator login: got %d, want 200", resp.StatusCode)
+	}
+	srv.auth.loginThrottle.Lock()
+	_, isKnownGood := srv.auth.loginThrottle.knownGood[throttleKey(operatorIP)]
+	srv.auth.loginThrottle.Unlock()
+	if !isKnownGood {
+		t.Fatal("the operator's IP must be recorded known-good after a successful login")
+	}
+
+	// 2. A LAN host (a fresh IP, not known-good) hammers the account to the
+	//    per-username lockout: loginFailMax failures across fresh IPs.
+	//    Private IPs are bucketed per host (/32), so no single IP trips the
+	//    per-IP lockout — only the per-username counter does.
+	for i := 0; i < loginFailMax; i++ {
+		r := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, fmt.Sprintf("10.2.2.%d", i+1))
+		r.Body.Close()
+		if r.StatusCode != 401 {
+			t.Fatalf("LAN-host failure %d: got %d, want 401", i, r.StatusCode)
+		}
+	}
+
+	// 3. A NEW-IP attacker (not known-good) is locked out: 429 even for the
+	//    correct password. This MUST run before the operator's successful
+	//    login below (a success clears the per-username counter via
+	//    clearUserFail, which would unlock the account).
+	r := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "10.2.2.99")
+	body, _ := io.ReadAll(r.Body)
+	r.Body.Close()
+	if r.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("new-IP attacker during account lockout: got %d, want 429 (body %s)", r.StatusCode, body)
+	}
+	if ra := r.Header.Get("Retry-After"); ra == "" {
+		t.Fatal("new-IP attacker 429 must carry a Retry-After header")
+	}
+
+	// 4. The operator's own IP (known-good) can STILL log in with the
+	//    correct password — the exemption. Without it this is a 429.
+	//    (This success also clears the account's failure budget, but that is
+	//    the final assertion.)
+	resp = loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, operatorIP)
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("operator login during account lockout: got %d, want 200 (known-good exemption; body %s)", resp.StatusCode, body)
 	}
 }
 
