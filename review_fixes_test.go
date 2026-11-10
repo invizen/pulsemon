@@ -542,3 +542,68 @@ func TestCertFreshnessReusesConn(t *testing.T) {
 		t.Errorf("stale cert not re-read: entry=%v, want recent", thirdRead)
 	}
 }
+
+// TestCertReadKeyIsOriginalTarget pins the redirect cert-cache key: for an
+// HTTPS target that redirects, the cert read is recorded under the ORIGINAL
+// target (req.URL, the first hop) — the same key probeHTTP reads — not the
+// final hop. Pre-fix it was keyed on the final hop, so read and write used
+// different keys and a redirecting target forced a fresh handshake on every
+// probe.
+func TestCertReadKeyIsOriginalTarget(t *testing.T) {
+	const targetHost = "certkey-target.example.test"
+	cert := selfSignedTLSForHost(t, targetHost)
+
+	tlsSrv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	tlsSrv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	tlsSrv.StartTLS()
+	defer tlsSrv.Close()
+	targetPort := tlsSrv.Listener.Addr().(*net.TCPAddr).Port
+
+	// Origin 302s to the cross-host TLS target.
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, fmt.Sprintf("https://%s:%d/", targetHost, targetPort), http.StatusFound)
+	}))
+	defer origin.Close()
+
+	startFakeDNS(t, "10.99.99.50") // target → RFC1918 (passes the redirect guard)
+	oldDialer := probeDialer
+	probeDialer = loopbackDialer{}
+	t.Cleanup(func() { probeDialer = oldDialer })
+
+	// Clear the map so we can assert exactly which key the probe writes.
+	certReadMu.Lock()
+	oldMap := certReadTimes
+	certReadTimes = make(map[string]time.Time)
+	certReadMu.Unlock()
+	t.Cleanup(func() {
+		certReadMu.Lock()
+		certReadTimes = oldMap
+		certReadMu.Unlock()
+	})
+
+	originKey := "http://" + origin.Listener.Addr().String()
+
+	res := probeHTTP(context.Background(), origin.URL, 5*time.Second)
+	if res.Lost {
+		t.Fatalf("probe lost, want 200: %+v", res)
+	}
+	if res.CertExpiry == nil {
+		t.Fatal("no cert captured (the TLS hop was not reached)")
+	}
+	certReadMu.Lock()
+	_, origOK := certReadTimes[originKey]
+	var keys []string
+	for k := range certReadTimes {
+		keys = append(keys, k)
+	}
+	_, finalOK := certReadTimes["https://"+fmt.Sprintf("%s:%d", targetHost, targetPort)]
+	certReadMu.Unlock()
+	if !origOK {
+		t.Fatalf("certReadTimes not keyed under the original target %q; got %v", originKey, keys)
+	}
+	if finalOK {
+		t.Errorf("certReadTimes keyed under the final hop (pre-fix behavior)")
+	}
+}

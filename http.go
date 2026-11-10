@@ -691,11 +691,12 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		certExp = &na
 		// Record the cert read so the next probe can reuse the pooled
 		// connection (and its cert) instead of forcing a fresh handshake.
-		// Use the final request's URL (after redirects) for the host key.
+		// Key on the ORIGINAL target (req.URL, before redirects) — the same
+		// key probeHTTP reads above — so a redirecting HTTPS target does not
+		// force a fresh handshake on every probe, and the map stays bounded
+		// by the sensor count (not the number of redirect hops). Go's Client
+		// does not mutate req.URL across redirects, so this is stable.
 		hostKey := req.URL.Scheme + "://" + req.URL.Host
-		if resp.Request != nil {
-			hostKey = resp.Request.URL.Scheme + "://" + resp.Request.URL.Host
-		}
 		certReadMu.Lock()
 		certReadTimes[hostKey] = time.Now()
 		certReadMu.Unlock()
