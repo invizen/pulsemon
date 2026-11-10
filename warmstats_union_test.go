@@ -10,39 +10,39 @@ import (
 	"time"
 )
 
-// TestWarmStatsUNIONDedupAndOrder locks the warmStats fetch semantics the
-// "use UNION ALL" review finding misdiagnosed, and proves its proposed fix is
-// a regression. Ground truth (verified on Go 1.26 / modernc sqlite):
+// TestWarmStatsUNIONDedupAndOrder locks the warmStats fetch invariant: each
+// sensor's series must load WITHOUT duplicating rows and in ts order, and a
+// sensor whose 60-probe window straddles the 24h boundary must still get its
+// full last-60 tail.
 //
-//   - The trailing "ORDER BY sensor_id, ts" sorts the WHOLE UNION result, so
-//     each sensor's rows arrive ts-ascending (oldest first) — the order
-//     probeSeries.append() relies on. "UNION reorders rows" is false.
-//   - The two UNION branches OVERLAP BY DESIGN: branch A (last 60 probes per
-//     sensor) and branch B (all probes in the 24h window) both contain every
-//     probe within the last 24h. The deduping UNION collapses that overlap, so
-//     each probe lands once. probeSeries has NO internal dedup (probe.go:80-102
-//     just appends + evicts from the front), so switching to UNION ALL — the
-//     review's "fix" — would feed a duplicate copy of the overlap into every
-//     series, corrupting loss%, the 60-probe window, and the sparkline. The
-//     UNION is load-bearing, not a bug.
+// The current warm query (stats.go) is two phases:
+//
+//	Phase 1: the full 24h retention window for every sensor (a plain index
+//	range scan — no window function, no dedupe). Gives correct 24h counters
+//	for every sensor.
+//	Phase 2: for the few SLOW sensors (fewer than 60 probes in 24h, so their
+//	60-probe inspector window spans past the 24h cutoff), a per-sensor
+//	LIMIT 60 backfill of the last 60 probes. The last-60 is a superset of the
+//	24h rows, so it REPLACES the phase-1 series (no dedupe).
+//
+// The PRE-FIX query ran ROW_NUMBER() over every sensor's full history plus a
+// deduping UNION (a temp B-tree over the whole 24h set). Part (2) below keeps
+// a record of WHY that dedupe was load-bearing (a UNION ALL emitted the
+// overlapping recent rows twice) so the invariant isn't re-broken if the two
+// windows are ever recombined.
 //
 // Seed: one sensor with probes split across the 24h boundary, ANCHORED TO THE
 // WALL CLOCK (not testNowUnix) so the REAL warmStats() — which cuts its 24h
-// window at time.Now() — actually sees both branches overlap:
-//   - 30 recent probes  (within the last 24h)  -> in BOTH branches
-//   - 40 old probes     (older than 24h)       -> last-60 branch only
+// window at time.Now() — actually sees the split:
+//   - 30 recent probes  (within the last 24h)
+//   - 40 old probes     (older than 24h)
 //
-// The real warmStats() then loads:
-//   - branch A (last 60 per sensor) = 30 recent + 30 newest-old = 60 rows
-//   - branch B (all in 24h)         = 30 recent
-//   - the deduped UNION             = 60 unique (branch B's 30 are a subset)
-//
-// probeSeries has NO internal dedup, so if warmStats used UNION ALL the 30
-// recent probes would each land twice -> 90 rows with 30 duplicate timestamps.
+// The real warmStats() then loads (phase 2, since 30 < 60): the last 60 per
+// sensor = 30 recent + 30 newest-old = 60 unique rows.
 // Part (1) drives the REAL warmStats() and asserts the series is deduped +
-// ascending (catches a production UNION->UNION ALL edit). Part (2) runs the
-// EXACT production query text as UNION vs UNION ALL to show the 0-dup vs 60-dup
-// difference directly.
+// ascending (catches any edit that duplicates or reorders the tail). Part (2)
+// runs the old UNION vs UNION ALL query to show the 0-dup vs 60-dup difference
+// directly.
 func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	db, err := store.NewStore(filepath.Join(t.TempDir(), "warmstats-union.db"))
 	if err != nil {
@@ -87,8 +87,8 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 
 	// (1) The REAL warmStats(): the series must be deduplicated + ts-ascending.
 	// warmStats only touches db + statsCache (+ statsMu), so a minimal worker
-	// suffices. With UNION the 30 recent probes (in both branches) land once;
-	// with UNION ALL they'd land twice -> duplicate ts in the series.
+	// suffices. The sensor is slow (30 < 60 in 24h), so phase 2 backfills its
+	// last 60; a duplicated tail would show up as duplicate ts in the series.
 	pw := &ProbeWorker{db: db, statsCache: make(map[string]*probeSeries)}
 	pw.warmStats(context.Background())
 	series, ok := pw.statsCache[id]
@@ -112,10 +112,11 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 		}
 	}
 
-	// (2) The EXACT production query (verbatim from probe.go:411-419), run as
-	//     UNION (current) vs UNION ALL (the review's "fix"): the overlap between
-	//     the two branches dedups to 0 under UNION and to 60 dups under UNION
-	//     ALL. This is the evidence that the "fix" injects duplicates.
+	// (2) The PRE-FIX production query (ROW_NUMBER + UNION), run as
+	//     UNION (deduping) vs UNION ALL: the overlap between the two branches
+	//     dedups to 0 under UNION and to 60 dups under UNION ALL. This records
+	//     why the old dedupe was load-bearing — the evidence that naively
+	//     recombining the two windows would inject duplicates.
 	ids := []string{id}
 	ph := make([]string, len(ids))
 	for i := range ph {

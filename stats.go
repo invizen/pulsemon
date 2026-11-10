@@ -134,69 +134,64 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 		log.Printf("stats warm: sensor list ended early: %v", err)
 	}
 
-	// One batched fetch for all sensors (never a per-sensor query in a loop —
-	// same pool-starvation rule as SensorTagsFor), oldest-first, so each
-	// series is built in append order. The load is the UNION of the two
-	// windows the stats read: the last 60 probes PER sensor (a slow-interval
-	// sensor's window can span >24h) plus the full 24h retention — matching
-	// exactly what the live series will hold, so a fresh process serves the
-	// same window the DB path would have.
+	// The warm-up is two phases, matching exactly what the live series holds
+	// (the 24h window + the last-60 inspector tail):
 	//
-	// Branch 1 (last 60 per sensor, ROW_NUMBER) must be UNRESTRICTED by the
-	// 24h cutoff: the "last 60" window is the 60 most recent probes
-	// OVERALL, and for a sensor whose recent probes are fewer than 60 it
-	// reaches back past the cutoff. The 24h branch then overlaps it, so the
-	// two branches are combined with a deduping UNION — a UNION ALL would
-	// emit the overlapping recent rows twice and grow the series past 60
-	// (warmstats_union_test.go pins this). The dedupe cost is a one-time
-	// startup expense; the alternative (a disjoint split) is inexpressible,
-	// because how far back the last-60 window reaches depends on each
-	// sensor's own row counts (the UNION ALL "fix" was reverted for breaking this contract).
-	// The query has two IN-clauses (last-60 part + 24h part), so the id list
-	// appears twice, followed by the 24h cutoff. It runs in store.InQueryChunk
-	// batches (see db.go): 2*store.InQueryChunk+1 params per chunk stays far under
-	// the driver's 32,766 host-parameter limit, so a very large fleet can't
-	// fail the warm-up with "too many SQL variables". Partitioning by sensor
-	// id keeps each sensor's rows in exactly one chunk, so per-sensor order is
-	// preserved. The closure defers the cursor close per chunk — top-level
-	// defer, not a bare close below a loop — so no pooled connection is held
-	// across chunks.
+	//   Phase 1: the full 24h retention window for every sensor — a plain
+	//   index range scan on idx_probes_sensor_ts (no window function, no
+	//   dedupe). This is the bulk of the data and gives correct 24h counters
+	//   for EVERY sensor (the 24h counters count exactly the 24h rows).
+	//
+	//   Phase 2: for the few SLOW sensors (fewer than 60 probes in 24h —
+	//   long-interval ones whose 60-probe inspector window spans past the
+	//   24h cutoff), a per-sensor LIMIT 60 backfill of their last 60 probes.
+	//   The last-60 is a superset of the sensor's 24h rows, so it REPLACES
+	//   the phase-1 series (no dedupe). A fast sensor's last 60 are all
+	//   inside 24h, so phase 1 already covers it and it is skipped.
+	//
+	// The old query ran ROW_NUMBER() over every sensor's full history plus a
+	// deduping UNION — a temp B-tree over the whole 24h set (~1.7M rows at
+	// 100 sensors / 5s). Splitting it this way drops both the window function
+	// and the dedupe; phase 2 is a handful of small per-sensor queries (only
+	// the slow sensors need it), so a large fleet of fast sensors pays just
+	// the phase-1 scan.
+	//
+	// manual MUST be selected: warmed Pulse-Now rows default to manual=false
+	// otherwise and re-enter the aggregates + status derivation as scheduled
+	// probes for up to 24h after every restart — the exact class the
+	// 2026-10-23 manual-exclusion batch closed on the live and DB paths.
+	//
+	// Phase 1 runs in store.InQueryChunk batches (see db.go): one IN-clause
+	// per chunk stays far under the driver's 32,766 host-parameter limit, so
+	// a very large fleet can't fail the warm-up with "too many SQL variables".
+	// Partitioning by sensor id keeps each sensor's rows in exactly one chunk,
+	// so per-sensor order is preserved. The closure defers the cursor close
+	// per chunk — top-level defer, not a bare close below a loop — so no
+	// pooled connection is held across chunks.
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	type acc struct {
 		series *probeSeries
+		n24    int // rows loaded from phase 1 (drives the slow-sensor split)
 	}
 	byID := make(map[string]*acc, len(idList))
-	var built int
-	fetchChunk := func(chunk []string) {
+
+	// Phase 1: the 24h window for all sensors (batched, no window function).
+	fetchChunk24 := func(chunk []string) {
 		q := make([]string, len(chunk))
 		for i := range q {
 			q[i] = "?"
 		}
-		args := make([]any, 0, len(chunk)*2+1)
-		for _, id := range chunk {
-			args = append(args, id)
-		}
+		args := make([]any, 0, len(chunk)+1)
 		for _, id := range chunk {
 			args = append(args, id)
 		}
 		args = append(args, store.FormatTS(cutoff))
-		// manual MUST be selected: warmed Pulse-Now rows default to
-		// manual=false otherwise and re-enter the aggregates + status
-		// derivation as scheduled probes for up to 24h after every
-		// restart — the exact class the 2026-10-23 manual-exclusion
-		// batch closed on the live and DB paths.
 		rows, err := pw.db.QueryContext(ctx,
-			`SELECT sensor_id, ts, rtt_ms, manual FROM (
-				SELECT sensor_id, ts, rtt_ms, manual,
-				       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
-				FROM probes WHERE sensor_id IN (`+strings.Join(q, ",")+`)
-			) WHERE rn <= 60
-			UNION
-			SELECT sensor_id, ts, rtt_ms, manual FROM probes
+			`SELECT sensor_id, ts, rtt_ms, manual FROM probes
 			WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
 			ORDER BY sensor_id, ts`, args...)
 		if err != nil {
-			log.Printf("stats warm: chunk fetch failed: %v", err)
+			log.Printf("stats warm: 24h chunk fetch failed: %v", err)
 			return
 		}
 		defer rows.Close()
@@ -218,24 +213,82 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 				e.rtt = float32(*rtt)
 			}
 			a.series.append(e)
-			built++
+			a.n24++
 		}
 		if err := rows.Err(); err != nil {
-			log.Printf("stats warm: chunk read ended early: %v", err)
+			log.Printf("stats warm: 24h chunk read ended early: %v", err)
 		}
 	}
 	for i := 0; i < len(idList); i += store.InQueryChunk {
 		if ctx.Err() != nil {
-			log.Printf("stats warm: aborted after %d probes (shutdown)", built)
+			log.Printf("stats warm: aborted during 24h phase (shutdown)")
 			return
 		}
 		end := i + store.InQueryChunk
 		if end > len(idList) {
 			end = len(idList)
 		}
-		fetchChunk(idList[i:end])
+		fetchChunk24(idList[i:end])
+	}
+
+	// Phase 2: backfill the last 60 for the slow sensors. A sensor with fewer
+	// than 60 probes in 24h (including zero — it may still have older history)
+	// has a 60-probe inspector window that spans past the 24h cutoff, so phase
+	// 1 alone under-fills it. The per-sensor LIMIT 60 is a superset of the 24h
+	// rows, so it replaces the phase-1 series (no dedupe).
+	var slow []string
+	for _, id := range idList {
+		if a, ok := byID[id]; !ok || a.n24 < 60 {
+			slow = append(slow, id)
+		}
+	}
+	backfillLast60 := func(id string) {
+		rows, err := pw.db.QueryContext(ctx,
+			`SELECT ts, rtt_ms, manual FROM probes
+			WHERE sensor_id = ? ORDER BY ts DESC LIMIT 60`, id)
+		if err != nil {
+			log.Printf("stats warm: last-60 backfill failed for %s: %v", id, err)
+			return
+		}
+		defer rows.Close()
+		type row struct {
+			ts   time.Time
+			rtt  *float64
+			mRaw int
+		}
+		var got []row
+		for rows.Next() {
+			var r row
+			if err := rows.Scan(&r.ts, &r.rtt, &r.mRaw); err != nil {
+				continue
+			}
+			got = append(got, r)
+		}
+		if err := rows.Err(); err != nil {
+			log.Printf("stats warm: last-60 backfill read ended early for %s: %v", id, err)
+		}
+		if len(got) == 0 {
+			return // no history: leave the sensor out of the cache
+		}
+		s := &probeSeries{}
+		for i := len(got) - 1; i >= 0; i-- { // append oldest-first
+			e := probeEntry{ts: got[i].ts.UTC().Unix(), rtt: float32(math.NaN()), manual: got[i].mRaw == 1}
+			if got[i].rtt != nil {
+				e.rtt = float32(*got[i].rtt)
+			}
+			s.append(e)
+		}
+		byID[id] = &acc{series: s, n24: 60}
+	}
+	for _, id := range slow {
+		if ctx.Err() != nil {
+			log.Printf("stats warm: aborted during last-60 phase (shutdown)")
+			return
+		}
+		backfillLast60(id)
 	}
 	pw.statsMu.Lock()
+	built := 0
 	for sid, a := range byID {
 		// Don't clobber a live write that landed DURING the warm read:
 		// recordProbe (probe loop or API PingNow) may have appended a
@@ -247,11 +300,11 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 			for _, e := range old.snapshot() {
 				if e.ts > newest {
 					a.series.append(e)
-					built++
 				}
 			}
 		}
 		pw.statsCache[sid] = a.series
+		built += a.series.len()
 	}
 	pw.statsMu.Unlock()
 	log.Printf("stats warm: loaded %d probes for %d sensors", built, len(byID))
