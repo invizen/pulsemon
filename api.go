@@ -973,10 +973,10 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		patchErr = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			ctx := r.Context()
 			var txType, txTarget string
-			var txIntervalS, txTimeoutMS int
+			var txIntervalS, txTimeoutMS, txDownAfter int
 			if err := c.QueryRowContext(ctx,
-				"SELECT type, target, interval_s, timeout_ms FROM sensors WHERE id = ?", id).
-				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS); err != nil {
+				"SELECT type, target, interval_s, timeout_ms, down_after FROM sensors WHERE id = ?", id).
+				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS, &txDownAfter); err != nil {
 				return errPatchSensorGone
 			}
 			freshType := txType
@@ -995,11 +995,16 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			if req.TimeoutMS != nil {
 				feffTimeoutMS = *req.TimeoutMS
 			}
+			feffDownAfter := txDownAfter
+			if req.DownAfter != nil {
+				feffDownAfter = *req.DownAfter
+			}
 			crossField := sensorSpec{
 				Target:    freshTarget,
 				Type:      freshType,
 				IntervalS: feffIntervalS,
 				TimeoutMS: feffTimeoutMS,
+				DownAfter: feffDownAfter,
 			}
 			if err := crossField.validateCrossField(); err != nil {
 				if strings.Contains(err.Error(), "URL") {
@@ -1007,6 +1012,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				}
 				if strings.Contains(err.Error(), "timeout") {
 					return errPatchTimeoutExceedsInterval
+				}
+				if strings.Contains(err.Error(), "down_after") {
+					return errPatchDownAfterExceedsRetention
 				}
 				return errPatchTargetInvalid
 			}
@@ -1041,6 +1049,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
 		case errors.Is(patchErr, errPatchTimeoutExceedsInterval):
 			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
+		case errors.Is(patchErr, errPatchDownAfterExceedsRetention):
+			respondWithError(w, http.StatusBadRequest, "down_after × interval_s must not exceed 24h (probe retention)")
 		case errors.Is(patchErr, errPatchNameConflict):
 			respondWithError(w, http.StatusConflict, "sensor name already exists")
 		case patchErr != nil:
@@ -1412,11 +1422,12 @@ const cloneMaxAttempts = 5
 // handler (the response can't be written from inside the closure without
 // tangling the commit/rollback path).
 var (
-	errPatchSensorGone             = errors.New("sensor not found")
-	errPatchTargetNotURL           = errors.New("target must be a URL")
-	errPatchTargetInvalid          = errors.New("target is invalid for the probe type")
-	errPatchTimeoutExceedsInterval = errors.New("timeout exceeds interval")
-	errPatchNameConflict           = errors.New("sensor name already exists")
+	errPatchSensorGone                = errors.New("sensor not found")
+	errPatchTargetNotURL              = errors.New("target must be a URL")
+	errPatchTargetInvalid             = errors.New("target is invalid for the probe type")
+	errPatchTimeoutExceedsInterval    = errors.New("timeout exceeds interval")
+	errPatchDownAfterExceedsRetention = errors.New("down_after × interval_s exceeds probe retention")
+	errPatchNameConflict              = errors.New("sensor name already exists")
 )
 
 // handleSensorClone creates a copy of a sensor with a new unique name

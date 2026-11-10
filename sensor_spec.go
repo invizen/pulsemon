@@ -91,6 +91,14 @@ func (s *sensorSpec) validateCrossField() error {
 	if s.TimeoutMS > s.IntervalS*1000 {
 		return errors.New("timeout_ms must not exceed interval_s*1000")
 	}
+	// down_after × interval_s beyond the 24h probe-retention window can never
+	// accumulate down_after consecutive losses (purgeOld keeps only 24h of
+	// probes, so the max observable run is 24h/interval_s). A 100%-dead sensor
+	// would then sit in warning forever and never reach error — and warnings
+	// are never alerted. Reject the combination at write time.
+	if int64(s.DownAfter)*int64(s.IntervalS) > retentionSeconds {
+		return errors.New("down_after × interval_s must not exceed 24h (probe retention)")
+	}
 	return nil
 }
 
@@ -130,6 +138,13 @@ func (s *sensorSpec) clamp() {
 	// probes can never complete back-to-back. Clamp the timeout down.
 	if s.TimeoutMS > s.IntervalS*1000 {
 		s.TimeoutMS = s.IntervalS * 1000
+	}
+	// Cross-field: down_after × interval_s beyond the 24h retention window
+	// can never reach down_after consecutive losses, so a dead sensor would
+	// sit in warning forever and never alert. Floor down_after to what fits
+	// the retention window (clone path: adjust, don't reject).
+	if maxDown := retentionSeconds / int64(s.IntervalS); int64(s.DownAfter) > maxDown {
+		s.DownAfter = int(maxDown)
 	}
 }
 
