@@ -483,7 +483,7 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 	// 16 misses we fall through and take the next counter value unconditionally.
 	seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
 	key := mkKey(seq, dst)
-	p := &pendingPing{dst: dst, start: time.Now(), ch: make(chan time.Duration, 1)}
+	p := &pendingPing{dst: dst, ch: make(chan time.Duration, 1)}
 	tries := 0
 	for ; tries < 16; tries++ {
 		pendingMu.Lock()
@@ -511,6 +511,11 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 		pendingMu.Unlock()
 	}()
 
+	// Stamp the start ONLY now — after the (seq,dst) slot-claim loop and the
+	// defer setup — so the measured RTT excludes local bookkeeping and covers
+	// the send + reply wait. Stamping it in the struct literal (before the
+	// slot loop) folded a few µs of local work into every RTT.
+	p.start = time.Now()
 	if err := e.send(dst, seq); err != nil {
 		if isBrokenSendErr(err) {
 			probeErrCount.Add(1)

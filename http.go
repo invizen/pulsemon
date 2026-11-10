@@ -319,6 +319,24 @@ func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	return tlsConn, nil
 }
 
+// probeUserAgent identifies pulsemon probes in target access logs. Without
+// it, every probe shows up as the default "Go-http-client/1.1", indistinguish-
+// able from any other Go program polling the host.
+var probeUserAgent = "pulsemon/" + Version
+
+// uaRoundTripper stamps probeUserAgent on every request it forwards (including
+// redirect hops — the client calls RoundTrip for each one). It only sets the
+// header when the caller hasn't already, so a test that pins its own UA is
+// respected.
+type uaRoundTripper struct{ base http.RoundTripper }
+
+func (u uaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", probeUserAgent)
+	}
+	return u.base.RoundTrip(req)
+}
+
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -377,7 +395,7 @@ var httpClient = &http.Client{
 		}
 		return nil
 	},
-	Transport: &http.Transport{
+	Transport: uaRoundTripper{base: &http.Transport{
 		MaxIdleConns:          100,
 		MaxIdleConnsPerHost:   32,
 		IdleConnTimeout:       10 * time.Minute,
@@ -392,7 +410,7 @@ var httpClient = &http.Client{
 		// two never interfere.
 		DialContext:    probeDial,
 		DialTLSContext: probeDialTLS,
-	},
+	}},
 }
 
 // certFreshness is the maximum age of a cached cert reading before

@@ -137,6 +137,11 @@ func (db *Store) InitSchema() error {
 
 	CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts ON probes(sensor_id, ts);
 	CREATE INDEX IF NOT EXISTS idx_events_sensor_ts ON events(sensor_id, ts);
+	-- /api/events sorts the whole feed by e.ts (across all sensors), which the
+	-- composite (sensor_id, ts) index above cannot serve. The table is 24h-
+	-- bounded so this is cheap insurance, not a hot path — but the index is
+	-- free, so the event feed's ORDER BY e.ts uses it instead of a full sort.
+	CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
 	CREATE TABLE IF NOT EXISTS settings (
 		setting_key TEXT PRIMARY KEY,
