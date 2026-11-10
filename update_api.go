@@ -77,6 +77,13 @@ var isContainerInstall = func() bool {
 //	client must have its answer first. The UI then polls /api/healthz for
 //	the new version and reloads.
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
+	// The self-update can run ~60s (download + verify + install), longer than
+	// the server-level WriteTimeout (30s): extend THIS connection's write
+	// deadline to 90s so it is not cut off mid-install. A client that never
+	// reads the response is bounded by this 90s, not the 30s server default.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(90 * time.Second))
+	}
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "use POST /api/update")
 		return

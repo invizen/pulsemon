@@ -7,14 +7,16 @@ import (
 )
 
 // m1: pin the production server timeouts — slowloris protection
-// (read/idle/header caps) WITHOUT a server-level WriteTimeout, which
-// would cut off the ~60s POST /api/update self-update stream.
+// (read/idle/header caps) plus a server-level WriteTimeout that bounds a
+// client that never reads its response. The ~60s POST /api/update self-update
+// is the one slow writer; it extends its own deadline (see handleUpdate), so
+// the 30s server default does not cut it off mid-install.
 func TestNewHTTPServerTimeouts(t *testing.T) {
 	h := http.NewServeMux()
 	srv := newHTTPServer(h)
 
 	if srv.Handler != h {
-		t.Fatalf("Handler = %v, want the given handler", srv.Handler)
+		t.Fatalf("Handler = %v, want the given handler", h)
 	}
 	if srv.ReadHeaderTimeout != 5*time.Second {
 		t.Errorf("ReadHeaderTimeout = %v, want 5s", srv.ReadHeaderTimeout)
@@ -28,7 +30,7 @@ func TestNewHTTPServerTimeouts(t *testing.T) {
 	if srv.MaxHeaderBytes != 64<<10 {
 		t.Errorf("MaxHeaderBytes = %d, want %d", srv.MaxHeaderBytes, 64<<10)
 	}
-	if srv.WriteTimeout != 0 {
-		t.Errorf("WriteTimeout = %v, want 0 (POST /api/update runs ~60s)", srv.WriteTimeout)
+	if srv.WriteTimeout != 30*time.Second {
+		t.Errorf("WriteTimeout = %v, want 30s (handleUpdate extends its own deadline to 90s)", srv.WriteTimeout)
 	}
 }

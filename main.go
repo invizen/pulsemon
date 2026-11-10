@@ -205,12 +205,16 @@ func tlsKeyPairOK(cert, key string) error {
 	return err
 }
 
-// newHTTPServer builds the production HTTP server: the read/idle timeouts
-// and header cap that protect the listener from slowloris-style abuse.
+// newHTTPServer builds the production HTTP server: the read/idle/write
+// timeouts and header cap that protect the listener from slowloris-style
+// abuse.
 //
-// There is deliberately NO server-level WriteTimeout: POST /api/update
-// (self-update) runs up to ~60s (download + verify + install) and a
-// server write deadline would cut it off mid-install.
+// The server-level WriteTimeout (30s) bounds how long any handler may take
+// to write its response: a client that never reads would otherwise pin the
+// connection (and its goroutine) indefinitely. The one slow writer —
+// POST /api/update, which downloads + verifies + installs for up to ~60s —
+// extends its own connection's deadline to 90s via http.ResponseController
+// (see handleUpdate), so it is not cut off mid-install.
 //
 // Factored out of runServer so a test can pin the exact values.
 func newHTTPServer(handler http.Handler) *http.Server {
@@ -218,6 +222,7 @@ func newHTTPServer(handler http.Handler) *http.Server {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
 	}
