@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"pulsemon/internal/store"
@@ -209,5 +211,33 @@ func TestSetupModeAllowedHostsUnset(t *testing.T) {
 	srv := NewServer(db, NewProbeWorker(db))
 	if c := setupBootstrapPost(t, srv, "rebind.example:9299"); c != http.StatusOK {
 		t.Fatalf("bootstrap with no allowlist: %d, want 200", c)
+	}
+}
+
+// TestSetupModeRejectsBeforeBcrypt: setup-mode account creation rejects with
+// errBootstrapped BEFORE paying bcrypt once any user exists (a cheap pre-count;
+// the authoritative in-tx check stays). Without it, unauthenticated setup mode
+// is an unlimited bcrypt-CPU endpoint once a user exists.
+func TestSetupModeRejectsBeforeBcrypt(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if err := a.AddUserMode(context.Background(), "first", "bootstrap-pw-1", true); err != nil {
+		t.Fatalf("bootstrap AddUserMode: %v", err)
+	}
+	// With a user present, setup mode is guaranteed to lose the in-tx
+	// race — the pre-check must return the same errBootstrapped verdict
+	// WITHOUT hashing, and must not add the account.
+	// errBootstrappedEarly (setup throttle) WRAPS errBootstrapped so the
+	// handler can refund a never-paid KDF attempt; the verdict identity is
+	// errors.Is, not ==.
+	if err := a.AddUserMode(context.Background(), "second", "another-pw-2", true); !errors.Is(err, errBootstrapped) {
+		t.Fatalf("setup-mode with existing user: err = %v, want errBootstrapped", err)
+	}
+	if n, err := a.db.UserCount(); err != nil || n != 1 {
+		t.Fatalf("user count = %d (err %v), want 1 — loser must not be created", n, err)
+	}
+	// Non-setup path unaffected: a normal admin add still works.
+	if err := a.AddUserMode(context.Background(), "helper", "helper-pw-3", false); err != nil {
+		t.Fatalf("non-setup AddUserMode: %v", err)
 	}
 }
