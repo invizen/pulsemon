@@ -855,7 +855,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 			// alerts) — a paused sensor is not being watched.
 			nextDelay = interval
 		} else if fast {
-			nextDelay = min(errorRetryInterval, interval) // never faster than the user's pace
+			nextDelay = min(errorRetryInterval(), interval) // never faster than the user's pace
 		} else {
 			nextDelay = interval
 		}
@@ -863,6 +863,16 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 
 		if !paused {
 			pw.safeProbe(ctx, c)
+			// The probe may have just flipped this sensor to error
+			// (fastRetry=true); the timer was armed above from the pre-probe
+			// value, so without this re-arm the first 30s recheck would not
+			// happen until a full interval later. Re-arming when already fast
+			// is a harmless no-op (same cadence).
+			pw.mu.Lock()
+			if p, ok := pw.sensors[c.id]; ok && p.fastRetry {
+				timer.Reset(min(errorRetryInterval(), interval))
+			}
+			pw.mu.Unlock()
 		}
 	}
 }
@@ -1248,7 +1258,17 @@ func (pw *ProbeWorker) rememberStatus(id, status string) {
 // interval, so the fast path is never faster than the user's pace and a
 // total outage adds no load beyond the normal probe rate for sub-30s
 // sensors (longer-interval sensors re-check at 30s — the only increase).
-const errorRetryInterval = 30 * time.Second
+// Atomic (not a plain var) because a test may shorten it while sensorLoop
+// goroutines are running; production only ever reads it after init.
+var errorRetryIntervalNano = int64(30 * time.Second)
+
+// errorRetryInterval returns the current fast-retry cadence.
+func errorRetryInterval() time.Duration {
+	return time.Duration(atomic.LoadInt64(&errorRetryIntervalNano))
+}
+
+// setErrorRetryInterval updates the fast-retry cadence (test seam).
+func setErrorRetryInterval(d time.Duration) { atomic.StoreInt64(&errorRetryIntervalNano, int64(d)) }
 
 // purgeBatchSize caps the rows deleted per statement in purgeOld. Each batch
 // is its own short write transaction, so probe INSERTs can take the write

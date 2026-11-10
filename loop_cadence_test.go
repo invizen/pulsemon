@@ -227,3 +227,99 @@ func TestSensorLoopFastRetryMatchesInterval(t *testing.T) {
 		t.Fatalf("fast-retry gap = %v, want ~%ds (min(30s, interval)) — ~10s is the removed floor slowing a 5s sensor's recovery detection", gap, intervalS)
 	}
 }
+
+// TestSensorLoopFirstFastRetryNotDelayed pins the FIRST-recheck timing of a
+// long-interval sensor that just flipped to ERROR. The probe that flips it
+// runs AFTER the timer is armed from the pre-probe (fast=false) value, so
+// without the post-probe re-arm the first fast recheck would not happen until
+// a full interval later. A 10s sensor (fast cadence shortened to 2s via the
+// errorRetryInterval var) must re-check ~2s after the flip, not ~10s. Fails
+// on the old code (gap ~10s).
+func TestSensorLoopFirstFastRetryNotDelayed(t *testing.T) {
+	dir := t.TempDir()
+	db, err := store.NewStore(filepath.Join(dir, "first-fast.db"))
+	if err != nil {
+		t.Fatalf("store.NewStore: %v", err)
+	}
+	lctx, lcancel := context.WithCancel(context.Background())
+	defer db.Close()
+	defer lcancel()
+	if err := db.InitSchema(); err != nil {
+		t.Fatalf("InitSchema: %v", err)
+	}
+
+	// Shorten the fast cadence so the 10s-vs-2s difference is observable in
+	// a few seconds.
+	origFast := errorRetryInterval()
+	setErrorRetryInterval(2 * time.Second)
+	defer func() { setErrorRetryInterval(origFast) }()
+
+	const intervalS = 10
+	// Walk deterministic ids to a small stagger phase so the first tick is
+	// quick (fnv is deterministic, so this is stable).
+	id := ""
+	for i := 0; ; i++ {
+		candidate := fmt.Sprintf("firstfast-sensor-%d", i)
+		p := staggerPhase(candidate, time.Duration(intervalS)*time.Second)
+		if p >= 500*time.Millisecond && p < 1500*time.Millisecond {
+			id = candidate
+			break
+		}
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES (?, ?, '127.0.0.1', 'icmp', ?, 200, 25, 2, 3, 'active', 'up', ?)`,
+		id, id, intervalS, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("insert sensor: %v", err)
+	}
+
+	// The sensor is DOWN — every probe is lost, so the first live probe makes
+	// the (seeded all-loss) window error -> fastRetry=true.
+	var mu sync.Mutex
+	var stamps []time.Time
+	origTarget := probeTarget
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
+		mu.Lock()
+		stamps = append(stamps, time.Now())
+		mu.Unlock()
+		return probeOutcome{lost: true}
+	}
+	defer func() { probeTarget = origTarget }()
+
+	pw := NewProbeWorker(db)
+	pw.syncSensors(lctx)
+
+	// Seed 8 prior losses so the first live probe makes the window all-loss.
+	for i := 1; i <= 8; i++ {
+		ts := time.Now().UTC().Add(-time.Duration(i) * 10 * time.Second)
+		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, NULL, ?, NULL, 0)`,
+			id, store.FormatTS(ts), "127.0.0.1"); err != nil {
+			t.Fatalf("seed loss %d: %v", i, err)
+		}
+	}
+
+	// Two ticks are enough to measure the first-recheck gap.
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		mu.Lock()
+		n := len(stamps)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("only %d tick(s) in 15s with interval=%ds — expected >= 2", n, intervalS)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mu.Lock()
+	got := stamps
+	mu.Unlock()
+	lcancel()
+
+	// The gap between the flip probe (tick 1) and the recheck (tick 2) must
+	// be the fast cadence (~2s), not the full interval (~10s).
+	gap := got[1].Sub(got[0])
+	if gap < 1200*time.Millisecond || gap > 6*time.Second {
+		t.Fatalf("first fast-retry gap = %v, want ~%v (min(fast, interval)) — ~%ds is the full interval: the pre-probe timer arm delayed the first recheck", gap, errorRetryInterval(), intervalS)
+	}
+}
