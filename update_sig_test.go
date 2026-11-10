@@ -44,11 +44,10 @@ func serveSig(t *testing.T, sig []byte) *httptest.Server {
 
 func TestVerifyReleaseSignature_Valid(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
-	sig := ed25519.Sign(priv, binBytes)
-	srv := serveSig(t, sig)
+	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 
-	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err != nil {
-		t.Fatalf("valid signature rejected: %v", err)
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
+		t.Fatalf("valid manifest signature rejected: %v", err)
 	}
 }
 
@@ -56,12 +55,10 @@ func TestVerifyReleaseSignature_WrongKey(t *testing.T) {
 	// The embedded trusted key is the one from sigTestSetup; a signature from
 	// a DIFFERENT key must be refused.
 	_, _, binBytes := sigTestSetup(t)
-	otherPub, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
-	_ = otherPub
-	sig := ed25519.Sign(otherPriv, binBytes)
-	srv := serveSig(t, sig)
+	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
+	srv := serveSig(t, signManifest(t, otherPriv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 
-	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
 		t.Fatal("signature from an untrusted key was accepted")
 	}
 }
@@ -76,12 +73,12 @@ func TestVerifyReleaseSignature_MissingSig(t *testing.T) {
 
 func TestVerifyReleaseSignature_CorruptSig(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
-	sig := ed25519.Sign(priv, binBytes)
+	sig := signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes)
 	// Flip a bit: a valid-length signature that verifies against nothing.
 	sig[0] ^= 0xff
 	srv := serveSig(t, sig)
 
-	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
 		t.Fatal("a corrupted signature was accepted")
 	}
 }
@@ -107,9 +104,8 @@ func TestVerifyReleaseSignature_Rotation(t *testing.T) {
 
 	binBytes := []byte("binary signed during a rotation window")
 	for name, priv := range map[string]ed25519.PrivateKey{"A": privA, "B": privB} {
-		sig := ed25519.Sign(priv, binBytes)
-		srv := serveSig(t, sig)
-		if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err != nil {
+		srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
+		if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
 			t.Fatalf("rotation: signature from key %s rejected: %v", name, err)
 		}
 	}
@@ -136,7 +132,6 @@ func TestParseReleasePubkeys(t *testing.T) {
 // End-to-end: a signed binary whose SHA matches is accepted.
 func TestVerifyDownloadedAsset_Signed(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
-	sig := ed25519.Sign(priv, binBytes)
 	sum := sha256.Sum256(binBytes)
 	shaHex := hex.EncodeToString(sum[:])
 
@@ -144,9 +139,9 @@ func TestVerifyDownloadedAsset_Signed(t *testing.T) {
 	if err := os.WriteFile(tmp, binBytes, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	srv := serveSig(t, sig)
+	srv := serveSig(t, signManifest(t, priv, "v0.4.5", targetAsset(), binBytes))
 
-	got, err := verifyDownloadedAsset(srv.Client(), releaseSelection{sigURL: srv.URL, sha: shaHex}, tmp)
+	got, err := verifyDownloadedAsset(srv.Client(), releaseSelection{sigURL: srv.URL, sha: shaHex, tag: "v0.4.5", asset: targetAsset()}, tmp)
 	if err != nil {
 		t.Fatalf("signed + matching-SHA release rejected: %v", err)
 	}

@@ -1300,11 +1300,11 @@ func fetchReleaseSignature(client *http.Client, url string) ([]byte, error) {
 // linux-arm64) is refused too. The format is versioned (line 1) so a
 // future field can be added without silently re-keying old signatures.
 //
-// Pre-manifest releases (v0.4.4 and earlier) signed the RAW BINARY BYTES
-// instead; verifyReleaseSignature falls back to that form so the first
-// release carrying the manifest verifier can itself be installed by
-// v0.4.4-era clients (it is cut with a legacy signature — see
-// docs/DECISIONS.md → release-signing, "Transition").
+// The raw-bytes form (v0.4.4 and earlier) signed the RAW BINARY BYTES
+// instead; it is no longer accepted by verifyReleaseSignature (it bound
+// nothing but the bytes, leaving a replay hole — see the comment there). It
+// is retained in the `sign` maintainer tool (2/4-arg forms) for historical
+// verification only.
 func releaseManifestMessage(tag, asset, sha256Hex string) []byte {
 	return []byte(fmt.Sprintf("pulsemon-release-v1\n%s\n%s\n%s\n", tag, asset, sha256Hex))
 }
@@ -1316,11 +1316,14 @@ func releaseManifestMessage(tag, asset, sha256Hex string) []byte {
 // foreign-signed release must never install. This is the authenticity root
 // the SHA-256 check cannot provide.
 //
-// The signature is checked against the MANIFEST (tag + asset + sha256)
-// first, then against the legacy raw-binary-bytes form (pre-manifest
-// releases — see releaseManifestMessage). The two forms are mutually
-// exclusive (different messages → a signature verifies under at most one),
-// so trying both is unambiguous.
+// The signature is checked against the MANIFEST (tag + asset + sha256) —
+// the only form accepted. The legacy raw-binary-bytes form (pre-manifest
+// releases — see releaseManifestMessage) is no longer a fallback: it bound
+// the signature to the bytes only, so a compromised release account (no
+// signing key) could replay an old signed binary under a newer-looking tag.
+// The one transition release that needed it is long past, and no client on
+// this verifier can self-update to a pre-manifest release (downgrades are
+// floor-refused), so dropping it closes the replay hole with no stranding.
 func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes []byte) error {
 	if sel.sigURL == "" {
 		return errors.New("release has no .sig signature asset — refusing to install an unsigned release")
@@ -1336,18 +1339,27 @@ func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes 
 	if err != nil {
 		return err
 	}
-	sum := sha256.Sum256(binBytes)
-	if sel.tag != "" && sel.asset != "" {
-		msg := releaseManifestMessage(sel.tag, sel.asset, hex.EncodeToString(sum[:]))
-		for _, pub := range keys {
-			if ed25519.Verify(pub, msg, sig) {
-				return nil
-			}
-		}
+	// The signature must verify against the MANIFEST (tag + asset + sha256).
+	// The legacy raw-bytes form (pre-manifest releases, v0.4.4 and earlier)
+	// is NO LONGER accepted: it bound the signature to the bytes only, so a
+	// compromised release account (no signing key) could re-upload an old
+	// signed binary under a newer-looking tag and the signature would still
+	// verify — a replay the anti-downgrade floor cannot catch, because the
+	// tag is attacker-chosen (it sits above the floor). The fallback existed
+	// for ONE transition release (the first carrying this manifest verifier,
+	// cut v0.4.4→v0.4.5 era) so v0.4.4-era clients could install it; that is
+	// long past (VERSION is well beyond it), and no client running this
+	// verifier can self-update to a pre-manifest release anyway (downgrades
+	// are refused by the floor), so the fallback was dead weight that
+	// re-opened the replay hole. Fail closed if the binding fields are
+	// missing — a signature with no tag/asset to bind to is unverifiable.
+	if sel.tag == "" || sel.asset == "" {
+		return errors.New("release signature: missing tag or asset — the manifest-bound signature cannot be verified")
 	}
+	sum := sha256.Sum256(binBytes)
+	msg := releaseManifestMessage(sel.tag, sel.asset, hex.EncodeToString(sum[:]))
 	for _, pub := range keys {
-		if ed25519.Verify(pub, binBytes, sig) {
-			log.Printf("update: release %s verified under the LEGACY raw-bytes signature form (pre-manifest)", sel.tag)
+		if ed25519.Verify(pub, msg, sig) {
 			return nil
 		}
 	}

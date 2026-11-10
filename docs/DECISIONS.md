@@ -478,12 +478,19 @@ signature still verifies (same bytes, same key), and v2's tag looks newer
 than anything real, so every install "upgrades" to the old (vulnerable)
 build and can sit pinned there. The manifest closes that: a v1 signature
 cannot verify as v2, and a linux-amd64 `.sig` cannot verify for the
-arm64 asset. **Transition:** `verifyReleaseSignature` checks the manifest
-first and falls back to the legacy raw-bytes form (the messages differ, so
-a signature verifies under at most one form — unambiguous). The pipeline
-signs with `RELEASE_SIGN_FORMAT=legacy` (the default is `manifest`) for
-ONE release only — the first one carrying the manifest verifier — so
-v0.4.4-era clients can install it; the next cut reverts to the default.
+arm64 asset. **Transition (now complete):** the legacy raw-bytes form was
+accepted as a fallback ONLY during the transition — the pipeline signed the
+first release carrying the manifest verifier with `RELEASE_SIGN_FORMAT=legacy`
+(the default is `manifest`) so v0.4.4-era clients could install it, and the
+next cut reverted to the default. That transition is long past, so
+`verifyReleaseSignature` now accepts the MANIFEST form only: the raw-bytes
+fallback is removed because it bound the signature to the bytes alone, letting
+a compromised release account (no signing key) replay an old signed binary
+under a newer-looking tag — a replay the anti-downgrade floor can't catch
+(the tag is attacker-chosen, so it sits above the floor). No client on this
+verifier can self-update to a pre-manifest release anyway (downgrades are
+floor-refused), so dropping the fallback strands nothing. Pinned by
+`TestVerifyReleaseSignature_RawBytesReplayRejected`.
 
 **Anti-downgrade floor (2026-11-05):** the manifest binds a signature to a
 tag, but a compromised PIPELINE (which holds the signing key) can still sign
@@ -544,9 +551,9 @@ WrongKey,MissingSig,CorruptSig,WrongLength,Rotation}`,
 foreign-signed binary with a MATCHING SHA is refused — the whole point);
 `update_manifest_test.go` — the manifest form: `TestVerifyReleaseSignature_{
 ManifestValid,ManifestReplayWrongTag,ManifestWrongAsset,ManifestWrongSHA,
-LegacyFallback,ManifestNotLegacy,ManifestExactBytes}` and the end-to-end
-`TestVerifyDownloadedAsset_ManifestReplay` (a v0.3.11 signature served as
-v9.9.9 is refused); `update_downgrade_test.go` — the floor:
+RawBytesReplayRejected,MissingBindingRefused,ManifestExactBytes}` and the
+end-to-end `TestVerifyDownloadedAsset_ManifestReplay` (a v0.3.11 signature
+served as v9.9.9 is refused); `update_downgrade_test.go` — the floor:
 `TestDowngradeGuard` (decision table), `TestBumpMaxVersionSeen` (monotonic,
 dev-safe), `TestRunUpdate_{RefusesDowngradeBelowMaxSeen,
 AllowDowngradePassesGuard}` (CLI end-to-end) and
@@ -554,7 +561,9 @@ AllowDowngradePassesGuard}` (CLI end-to-end) and
 ExplicitPinBypassesDowngradeGuard}` (dashboard 409 / pin opt-out). A
 sabotage that drops the authenticity gate makes `_Unsigned` and `_ForeignSig`
 fail; one that drops the manifest binding makes `_ManifestReplayWrongTag`
-fail; one that drops the floor makes `_RefusesDowngradeBelowMaxSeen` fail.
+fail; one that re-adds the legacy raw-bytes fallback makes
+`_RawBytesReplayRejected` fail; one that drops the floor makes
+`_RefusesDowngradeBelowMaxSeen` fail.
 
 ## package-structure (repo-wide) — CLOSED, decision 2026-10-30 (pilot shipped)
 

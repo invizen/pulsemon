@@ -207,7 +207,7 @@ func servePinnedReleaseVerified(t *testing.T, tag string) string {
 	bin := []byte("fake pulsemon binary payload\n")
 	real := sha256.Sum256(bin)
 	realHex := hex.EncodeToString(real[:])
-	sigHex := signFixture(t, bin)
+	sigHex := signFixture(t, bin, tag, targetAsset())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/releases/tags/"+tag, func(w http.ResponseWriter, r *http.Request) {

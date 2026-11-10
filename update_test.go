@@ -45,12 +45,15 @@ func tempLeakAfter(before map[string]bool) []string {
 	return leaked
 }
 
-// signFixture signs bin with a fresh ed25519 test key, points the embedded
-// trusted-key set (releasePubkeys) at that key for the test's duration
-// (restored in t.Cleanup), and returns the hex signature. Inline fixtures that
-// build their own release (rather than using serveRelease) use this to satisfy
-// the fail-closed authenticity gate in verifyDownloadedAsset.
-func signFixture(t *testing.T, bin []byte) string {
+// signFixture signs bin's release MANIFEST (tag + asset + sha256 of bin)
+// with a fresh ed25519 test key, points the embedded trusted-key set
+// (releasePubkeys) at that key for the test's duration (restored in
+// t.Cleanup), and returns the hex signature. Inline fixtures that build their
+// own release (rather than using serveRelease) use this to satisfy the
+// fail-closed authenticity gate in verifyDownloadedAsset. tag and asset MUST
+// match the releaseSelection the update path verifies against — a manifest
+// signature binds to one (tag, asset, sha) triple, so a mismatch is a refusal.
+func signFixture(t *testing.T, bin []byte, tag, asset string) string {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -59,7 +62,8 @@ func signFixture(t *testing.T, bin []byte) string {
 	oldPubkeys := releasePubkeys
 	releasePubkeys = []byte(hex.EncodeToString(pub) + "\n")
 	t.Cleanup(func() { releasePubkeys = oldPubkeys })
-	return hex.EncodeToString(ed25519.Sign(priv, bin))
+	sum := sha256.Sum256(bin)
+	return hex.EncodeToString(ed25519.Sign(priv, releaseManifestMessage(tag, asset, hex.EncodeToString(sum[:]))))
 }
 
 // serveRelease spins up a fake GitHub releases API that hands out one asset.
@@ -82,7 +86,7 @@ func serveRelease(t *testing.T, tag, digest string) (string, string) {
 	realHex := hex.EncodeToString(real[:])
 
 	// Sign the payload (see signFixture) so the authenticity gate passes.
-	sigHex := signFixture(t, bin)
+	sigHex := signFixture(t, bin, tag, targetAsset())
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
@@ -363,7 +367,7 @@ func captureStderr(t *testing.T, fn func() int) (int, string) {
 // deliberately advertises a wrong digest).
 func TestRunUpdateSidecarViaAPIURL(t *testing.T) {
 	bin := "sidecar-path binary payload\n"
-	sigHex := signFixture(t, []byte(bin))
+	sigHex := signFixture(t, []byte(bin), "v9.9.9", targetAsset())
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/releases/latest"):
@@ -416,7 +420,7 @@ func TestRunUpdateSidecarViaAPIURL(t *testing.T) {
 // exit 1 with a formatted diagnostic naming the missing sidecar asset — not
 // the old "sidecar fetch failed: HTTP 404" from a munged URL.
 func TestRunUpdateNoSidecarRefused(t *testing.T) {
-	sigHex := signFixture(t, []byte("payload\n"))
+	sigHex := signFixture(t, []byte("payload\n"), "v9.9.9", targetAsset())
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/releases/latest") {
 			json.NewEncoder(w).Encode(ghRelease{TagName: "v9.9.9", Assets: []releaseAsset{
@@ -635,7 +639,7 @@ func TestFetchReleaseSendsUserAgent(t *testing.T) {
 func TestRunUpdateSendsUserAgentOnAllRequests(t *testing.T) {
 	var mu sync.Mutex
 	seenUA := map[string]string{} // path -> User-Agent
-	sigHex := signFixture(t, []byte("binary bytes\n"))
+	sigHex := signFixture(t, []byte("binary bytes\n"), "v9.9.9", targetAsset())
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		seenUA[r.URL.Path] = r.Header.Get("User-Agent")
@@ -759,7 +763,7 @@ func TestRunUpdateUppercaseSidecarAccepted(t *testing.T) {
 	bin := "uppercase sidecar binary payload\n"
 	other := sha256.Sum256([]byte("some other payload\n"))
 	upperHex := strings.ToUpper(hex.EncodeToString(other[:]))
-	sigHex := signFixture(t, []byte(bin))
+	sigHex := signFixture(t, []byte(bin), "v9.9.9", targetAsset())
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {

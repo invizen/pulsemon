@@ -70,27 +70,34 @@ func TestVerifyReleaseSignature_ManifestWrongSHA(t *testing.T) {
 	}
 }
 
-// TestVerifyReleaseSignature_LegacyFallback pins the transition: a
-// pre-manifest RAW-BYTES signature (v0.4.4 and earlier) still verifies when
-// tag+asset are set — the form the first release carrying the manifest
-// verifier is cut in, so v0.4.4-era clients can install it.
-func TestVerifyReleaseSignature_LegacyFallback(t *testing.T) {
+// TestVerifyReleaseSignature_RawBytesReplayRejected is the replay attack the
+// legacy fallback left open: a RAW-BYTES signature (pre-manifest form) that
+// is genuinely valid for the bytes must NOT verify for a release published
+// under a tag. The raw-bytes form bound nothing but the bytes, so a
+// compromised release account (no signing key) could re-upload an old signed
+// binary under a newer-looking tag and the signature would still verify — a
+// replay the anti-downgrade floor can't catch (the tag is attacker-chosen).
+// The manifest is now the ONLY accepted form, so a raw-bytes .sig over a tag
+// is refused. (The one transition release that needed the raw-bytes fallback
+// is long past; see verifyReleaseSignature.)
+func TestVerifyReleaseSignature_RawBytesReplayRejected(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
+	// A raw-bytes signature: valid for the bytes, bound to no tag/asset.
 	srv := serveSig(t, ed25519.Sign(priv, binBytes))
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
-		t.Fatalf("legacy raw-bytes signature rejected (transition path broken): %v", err)
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v9.9.9", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
+		t.Fatal("a raw-bytes (pre-manifest) signature was accepted for a tagged release — replay hole not closed")
 	}
 }
 
-// TestVerifyReleaseSignature_ManifestNotLegacy pins the other direction of
-// mutual exclusivity: a MANIFEST signature must not pass the legacy
-// raw-bytes check (verification with no tag/asset). The two forms sign
-// different messages, so neither can masquerade as the other.
-func TestVerifyReleaseSignature_ManifestNotLegacy(t *testing.T) {
+// TestVerifyReleaseSignature_MissingBindingRefused pins the fail-closed
+// behavior on missing binding fields: a signature (even a valid manifest
+// one) is refused when the selection carries no tag/asset to bind it to —
+// a signature with nothing to bind to is unverifiable.
+func TestVerifyReleaseSignature_MissingBindingRefused(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err == nil {
-		t.Fatal("a manifest signature was accepted under the legacy raw-bytes check")
+		t.Fatal("a signature was accepted with no tag/asset to bind it to")
 	}
 }
 
