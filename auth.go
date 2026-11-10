@@ -1710,7 +1710,11 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 // real owner was permanently locked out (account takeover). The check
 // runs through the login throttle (beginAttempt, same per-IP bucketing)
 // with the same constant rejection delay, so the endpoint is not a free
-// online-guessing channel for the current password either.
+// online-guessing channel for the current password either — and through
+// the SAME per-username failure budget as /api/auth/login (review
+// 2026-11-10): a session holder spraying current_password across many
+// IPs (/64 buckets) locks the account just like a login spray, and a
+// locked account 429s on BOTH endpoints (shared userFails/userLock maps).
 func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1755,7 +1759,31 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Per-username lockout (mirror of /api/auth/login, finding #11): the
+	// per-IP gate above can't see a multi-IP holder of a valid session
+	// (stolen cookie, unlocked browser — the session is a bearer token,
+	// usable from any number of sources) spraying current_password, so
+	// the account's shared failure budget applies here too. Runs AFTER
+	// the per-IP gate so a single locked IP gets its 429 first; the KDF
+	// is skipped on the 429, so the account counter is not incremented
+	// by the rejection.
+	if ok, wait := s.auth.checkUserLock(user); !ok {
+		secs := int((wait + time.Second - 1) / time.Second)
+		if secs < 1 {
+			secs = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+		respondWithError(w, http.StatusTooManyRequests, "too many failed attempts — try again in a few minutes")
+		return
+	}
+
 	if _, ok := s.auth.VerifyUser(user, req.Current); !ok {
+		// Count the failure against the account (across all IPs) — the
+		// same shared budget login uses (review 2026-11-10). The caller
+		// holds a live session, so the account exists by construction —
+		// no userExists gate needed (unlike the login path, where the
+		// username is attacker-chosen).
+		s.auth.recordUserFail(user)
 		// Constant-time-ish delay on rejection, same as a rejected login:
 		// caps an online attacker at ~5 guesses/second per IP. The attempt
 		// was already counted by beginAttempt before the KDF.
@@ -1764,6 +1792,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.auth.loginSuccess(key)
+	s.auth.clearUserFail(user) // success resets the account's budget
 
 	keep := ""
 	if c, err := r.Cookie(authSessionName); err == nil {

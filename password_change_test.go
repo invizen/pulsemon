@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -154,5 +156,137 @@ func TestChangePasswordThrottled(t *testing.T) {
 	}
 	if locked == 0 {
 		t.Fatalf("no 429 after %d wrong-current attempts — the endpoint is not throttled", loginFailMax)
+	}
+}
+
+// TestChangePasswordPerUsernameLockout (review 2026-11-10) pins the
+// per-username layer on the password endpoint: the per-IP throttle
+// (beginAttempt) can't see a session holder spraying current_password
+// across many IPs — the session is a BEARER token, usable from any
+// number of sources — so the account's shared failure budget (the same
+// userFails/userLock maps /api/auth/login locks, finding #11) must apply
+// here too. Phase A: loginFailMax wrong currents spread across 3 IPs (no
+// single IP reaches its per-IP budget) lock the account — the next
+// attempt from a FRESH IP is a fast 429 + Retry-After (KDF skipped), and
+// a CORRECT login from a fresh IP 429s as well (shared budget). Phase B:
+// a successful change CLEARS the budget.
+func TestChangePasswordPerUsernameLockout(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	// Trust loopback XFF so the test can vary the SOURCE IP per request
+	// (the session is a bearer token — the same cookie from many IPs,
+	// exactly the attacker shape). Same trick as TestLoginThrottlePerUsername.
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	// The "attacker" holds a legitimate session for the account (the
+	// stolen cookie) and plays it from any number of source IPs.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login: %d", code)
+	}
+	pw := func(xff, current string) (int, string) {
+		body := fmt.Sprintf(`{"current_password":%q,"password":"newpass99"}`, current)
+		req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/users/admin/password", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ra := resp.Header.Get("Retry-After")
+		resp.Body.Close()
+		return resp.StatusCode, ra
+	}
+
+	// Phase A: 7 wrong currents across 3 IPs (3/3/1) — under every
+	// per-IP budget, over the shared per-username budget.
+	for i, ip := range []string{"10.1.1.10", "10.1.1.11", "10.1.1.12"} {
+		for j := 0; j < []int{3, 3, 1}[i]; j++ {
+			if code, _ := pw(ip, "wrongpw"); code != http.StatusForbidden {
+				t.Fatalf("IP %s attempt %d: got %d, want 403 (before account lockout)", ip, j, code)
+			}
+		}
+	}
+	// Fresh IP, same session: fast 429 + Retry-After (per-username
+	// lockout; the KDF was skipped, the counter untouched).
+	if code, ra := pw("10.1.1.20", "wrongpw"); code != http.StatusTooManyRequests {
+		t.Fatalf("fresh IP after %d cross-IP failures: got %d, want 429 (per-username lockout)", loginFailMax, code)
+	} else if ra == "" {
+		t.Error("429 without a Retry-After header")
+	}
+	// The budget is SHARED with /api/auth/login: a CORRECT login from a
+	// fresh IP also 429s while the account is locked.
+	bare := &http.Client{}
+	lreq, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/login",
+		strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lreq.Header.Set("X-Forwarded-For", "10.1.1.30")
+	lresp, err := bare.Do(lreq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lresp.Body.Close()
+	if lresp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("correct login while the account is locked: got %d, want 429 (shared per-username budget)", lresp.StatusCode)
+	}
+
+	// Phase B (fresh server): a successful change CLEARS the budget —
+	// typos that eventually succeed don't accumulate.
+	db2 := newTestDB(t)
+	srv2 := NewServer(db2, NewProbeWorker(db2))
+	srv2.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv2 := httptest.NewServer(srv2.authGate())
+	defer httpSrv2.Close()
+	if err := srv2.auth.AddUser("admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	jar2, _ := cookiejar.New(nil)
+	client2 := &http.Client{Jar: jar2}
+	if code := postJSONStatus(t, client2, httpSrv2.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login (phase B): %d", code)
+	}
+	pw2 := func(xff, current string) (int, string) {
+		body := fmt.Sprintf(`{"current_password":%q,"password":"newpass99"}`, current)
+		req, err := http.NewRequest(http.MethodPost, httpSrv2.URL+"/api/auth/users/admin/password", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		resp, err := client2.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ra := resp.Header.Get("Retry-After")
+		resp.Body.Close()
+		return resp.StatusCode, ra
+	}
+	if code, _ := pw2("10.2.2.1", "wrongpw"); code != http.StatusForbidden {
+		t.Fatalf("pre-success failure: got %d, want 403", code)
+	}
+	if code, _ := pw2("10.2.2.2", "secretpw"); code != http.StatusOK {
+		t.Fatalf("success with correct current: got %d, want 200", code)
+	}
+	srv2.auth.loginThrottle.Lock()
+	nf, nl := len(srv2.auth.loginThrottle.userFails), len(srv2.auth.loginThrottle.userLock)
+	srv2.auth.loginThrottle.Unlock()
+	if nf != 0 || nl != 0 {
+		t.Fatalf("after a successful change: userFails=%d userLock=%d, want 0/0 (success must clear the account budget)", nf, nl)
 	}
 }
