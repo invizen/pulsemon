@@ -1328,9 +1328,15 @@ func deleteRowsBatched(ctx context.Context, db *store.Store, table, where string
 		w = " WHERE " + where
 	}
 	q := "DELETE FROM " + table + " WHERE id IN (SELECT id FROM " + table + w + " LIMIT ?)"
+	// The argument slice is built ONCE per call, not per batch iteration
+	// (review 2026-11-10 #7): a full-table wipe loops 1.7M/purgeBatchSize
+	// times, and the old in-loop append(append([]any{}, args...),
+	// purgeBatchSize) allocated a fresh slice every iteration. ExecContext
+	// only reads the args, so the hoisted slice is safe to reuse.
+	qArgs := append(append([]any{}, args...), purgeBatchSize)
 	var total int64
 	for {
-		res, err := db.ExecContext(ctx, q, append(append([]any{}, args...), purgeBatchSize)...)
+		res, err := db.ExecContext(ctx, q, qArgs...)
 		if err != nil {
 			return total, err
 		}

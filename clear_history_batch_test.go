@@ -11,8 +11,11 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"pulsemon/internal/store"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,5 +112,79 @@ func TestDeleteRowsBatchedAllAndEmpty(t *testing.T) {
 	total, err = deleteRowsBatched(context.Background(), db, "probes", "", nil)
 	if err != nil || total != 0 {
 		t.Errorf("empty-table delete = (%d, %v), want (0, nil)", total, err)
+	}
+}
+
+// TestDeleteRowsBatchedArgSliceBuiltOnce (review 2026-11-10 #7): the
+// argument slice (args + purgeBatchSize) is built ONCE per call, not per
+// batch iteration — a full-table wipe loops 1.7M/purgeBatchSize times, and
+// the old in-loop append(append([]any{}, args...), purgeBatchSize)
+// allocated a fresh []any on every iteration. The allocation delta per
+// EXTRA batch must therefore stay at the driver's per-statement baseline
+// (database/sql builds its own arg slice per ExecContext): measured 5.9
+// post-fix vs 6.9 pre-fix on the gate box, both with and without -race.
+// The Mallocs counter is exact and the GC runs before each measurement, so
+// the numbers are deterministic on a given driver — if a driver change
+// moves the baseline, re-measure both sides and re-center the threshold
+// (it sits midway between them). The batch spread is 2 vs 7 deliberately:
+// at a 2-batch spread the 1-alloc-per-batch difference is inside the
+// measurement's ±1 noise.
+func TestDeleteRowsBatchedArgSliceBuiltOnce(t *testing.T) {
+	db := clearBatchFixture(t, "bulk", purgeBatchSize+1)
+	reseed := func(rows int) {
+		tx, err := db.Begin()
+		if err != nil {
+			t.Fatalf("begin reseed: %v", err)
+		}
+		if _, err := tx.Exec("DELETE FROM probes WHERE sensor_id = 'bulk'"); err != nil {
+			t.Fatalf("reseed clear: %v", err)
+		}
+		base := time.Now().UTC().Add(-24 * time.Hour)
+		// Multi-row INSERT chunks: per-row Exec calls made the re-seed the
+		// test's runtime (42s under -race); chunked statements are ~100x
+		// fewer driver round-trips and the wipe itself stays the measured
+		// work.
+		const chunk = 500
+		for start := 0; start < rows; start += chunk {
+			end := start + chunk
+			if end > rows {
+				end = rows
+			}
+			var sb strings.Builder
+			sb.WriteString("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES ")
+			for i := start; i < end; i++ {
+				if i > start {
+					sb.WriteString(",")
+				}
+				fmt.Fprintf(&sb, "('bulk', '%s', 5.0, '127.0.0.1')", base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano))
+			}
+			if _, err := tx.Exec(sb.String()); err != nil {
+				t.Fatalf("reseed %d-%d: %v", start, end, err)
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("reseed commit: %v", err)
+		}
+	}
+	measure := func(rows, runs int) float64 {
+		var total uint64
+		for i := 0; i < runs; i++ {
+			reseed(rows) // outside the measured window
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			if _, err := deleteRowsBatched(context.Background(), db, "probes", "", nil); err != nil {
+				t.Fatalf("wipe: %v", err)
+			}
+			runtime.ReadMemStats(&after)
+			total += after.Mallocs - before.Mallocs
+		}
+		return float64(total) / float64(runs)
+	}
+	small := measure(purgeBatchSize+1, 3) // 2 batches
+	big := measure(purgeBatchSize*6+1, 3) // 7 batches
+	perBatch := (big - small) / 5
+	if perBatch > 6.50 {
+		t.Errorf("per-extra-batch allocations = %.2f, want <= 6.50 (driver baseline ~5.9; the old in-loop slice append measured ~6.9)", perBatch)
 	}
 }
