@@ -568,10 +568,23 @@ let pendingDeleteTimer = null;
 function armDeleteConfirm(btn) {
   if (btn.dataset.confirming === "true") return;
   btn.dataset.confirming = "true";
+  btn.dataset.originalHtml = btn.innerHTML;
   btn.innerHTML = '<span class="text-bad text-[10px] font-bold font-mono px-1">CONFIRM?</span>';
   btn.classList.add('bg-bad/10', 'border', 'border-bad/30');
 }
+function resetDeleteBtn(btn) {
+  btn.dataset.confirming = "false";
+  if (btn.dataset.originalHtml) btn.innerHTML = btn.dataset.originalHtml;
+  btn.classList.remove('bg-bad/10', 'border', 'border-bad/30');
+}
 function clearPendingDelete() {
+  if (pendingDeleteId) {
+    // The 4s timer (or an outside click) can disarm the confirm while the
+    // button is still painted "CONFIRM?" — reset it so the visual state
+    // matches the logical one (v1.1.1: stuck-CONFIRM delete trap).
+    const btn = document.querySelector('[data-del="' + pendingDeleteId + '"]');
+    if (btn && btn.dataset.confirming === "true") resetDeleteBtn(btn);
+  }
   pendingDeleteId = null;
   if (pendingDeleteTimer) { clearTimeout(pendingDeleteTimer); pendingDeleteTimer = null; }
 }
