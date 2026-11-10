@@ -1,6 +1,9 @@
 package main
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // sensorSpec is the validated, default-applied form of a sensor's tunable
 // fields. Every sensor write path (POST, PATCH, clone) funnels through
@@ -17,6 +20,25 @@ type sensorSpec struct {
 	LossWarn  int
 	DownAfter int
 	SpikeMult int
+}
+
+// sensorBounds is the single source of truth for each numeric sensor field's
+// [min, max] range. validate, clamp, and validateSensorRange all derive from
+// it, so a bound change is one edit. (The old code carried the ranges in all
+// three, and the error text hardcoded "interval_s must be 5-3600" even though
+// the code used minIntervalS — the table makes the message track the bound.)
+var sensorBounds = map[string][2]int{
+	"interval_s": {minIntervalS, 3600},
+	"timeout_ms": {100, 30000},
+	"loss_warn":  {1, 100},
+	"down_after": {1, 100},
+	"spike_mult": {2, 10},
+}
+
+// sensorBound returns a field's [min, max], or ok=false for an unknown field.
+func sensorBound(field string) ([2]int, bool) {
+	b, ok := sensorBounds[field]
+	return b, ok
 }
 
 // applyDefaults fills zero-valued fields with their defaults. Called on
@@ -54,20 +76,19 @@ func (s *sensorSpec) validate() error {
 	if err := s.validateCrossField(); err != nil {
 		return err
 	}
-	if s.IntervalS < minIntervalS || s.IntervalS > 3600 {
-		return errors.New("interval_s must be 5-3600")
-	}
-	if s.TimeoutMS < 100 || s.TimeoutMS > 30000 {
-		return errors.New("timeout_ms must be 100-30000")
-	}
-	if s.LossWarn < 1 || s.LossWarn > 100 {
-		return errors.New("loss_warn must be 1-100")
-	}
-	if s.DownAfter < 1 || s.DownAfter > 100 {
-		return errors.New("down_after must be 1-100")
-	}
-	if s.SpikeMult < 2 || s.SpikeMult > 10 {
-		return errors.New("spike_mult must be 2-10")
+	for _, f := range []struct {
+		field string
+		value int
+	}{
+		{"interval_s", s.IntervalS},
+		{"timeout_ms", s.TimeoutMS},
+		{"loss_warn", s.LossWarn},
+		{"down_after", s.DownAfter},
+		{"spike_mult", s.SpikeMult},
+	} {
+		if b, ok := sensorBound(f.field); ok && (f.value < b[0] || f.value > b[1]) {
+			return fmt.Errorf("%s must be %d-%d", f.field, b[0], b[1])
+		}
 	}
 	return nil
 }
@@ -109,31 +130,11 @@ func (s *sensorSpec) clamp() {
 	if s.Type == "" {
 		s.Type = "icmp"
 	}
-	if s.IntervalS < minIntervalS {
-		s.IntervalS = minIntervalS
-	} else if s.IntervalS > 3600 {
-		s.IntervalS = 3600
-	}
-	if s.TimeoutMS < 100 {
-		s.TimeoutMS = 100
-	} else if s.TimeoutMS > 30000 {
-		s.TimeoutMS = 30000
-	}
-	if s.LossWarn < 1 {
-		s.LossWarn = 1
-	} else if s.LossWarn > 100 {
-		s.LossWarn = 100
-	}
-	if s.DownAfter < 1 {
-		s.DownAfter = 1
-	} else if s.DownAfter > 100 {
-		s.DownAfter = 100
-	}
-	if s.SpikeMult < 2 {
-		s.SpikeMult = 2
-	} else if s.SpikeMult > 10 {
-		s.SpikeMult = 10
-	}
+	s.IntervalS = clampToBound(s.IntervalS, "interval_s")
+	s.TimeoutMS = clampToBound(s.TimeoutMS, "timeout_ms")
+	s.LossWarn = clampToBound(s.LossWarn, "loss_warn")
+	s.DownAfter = clampToBound(s.DownAfter, "down_after")
+	s.SpikeMult = clampToBound(s.SpikeMult, "spike_mult")
 	// Cross-field: a probe timeout longer than the interval means two
 	// probes can never complete back-to-back. Clamp the timeout down.
 	if s.TimeoutMS > s.IntervalS*1000 {
@@ -148,31 +149,31 @@ func (s *sensorSpec) clamp() {
 	}
 }
 
+// clampToBound floors/ceils v into a field's [min, max] from sensorBounds.
+func clampToBound(v int, field string) int {
+	b, ok := sensorBound(field)
+	if !ok {
+		return v
+	}
+	if v < b[0] {
+		return b[0]
+	}
+	if v > b[1] {
+		return b[1]
+	}
+	return v
+}
+
 // validateSensorRange checks a single numeric field's range (the PATCH
 // path: only the fields the request supplies are validated). Returns a
 // user-facing error message, or nil.
 func validateSensorRange(field string, value int) error {
-	switch field {
-	case "interval_s":
-		if value < minIntervalS || value > 3600 {
-			return errors.New("interval_s must be 5-3600")
-		}
-	case "timeout_ms":
-		if value < 100 || value > 30000 {
-			return errors.New("timeout_ms must be 100-30000")
-		}
-	case "loss_warn":
-		if value < 1 || value > 100 {
-			return errors.New("loss_warn must be 1-100")
-		}
-	case "down_after":
-		if value < 1 || value > 100 {
-			return errors.New("down_after must be 1-100")
-		}
-	case "spike_mult":
-		if value < 2 || value > 10 {
-			return errors.New("spike_mult must be 2-10")
-		}
+	b, ok := sensorBound(field)
+	if !ok {
+		return nil
+	}
+	if value < b[0] || value > b[1] {
+		return fmt.Errorf("%s must be %d-%d", field, b[0], b[1])
 	}
 	return nil
 }
