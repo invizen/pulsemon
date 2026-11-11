@@ -292,3 +292,65 @@ func TestChangePasswordPerUsernameLockout(t *testing.T) {
 		t.Fatalf("after a successful change: userFails=%d userLock=%d, want 0/0 (success must clear the account budget)", nf, nl)
 	}
 }
+
+// TestChangePasswordLockout429RefundsFreshIP is the password endpoint's
+// mirror of TestLoginThrottleAccountLockoutRefundsFreshIP (review
+// 2026-11-11): the per-username lockout 429 runs BEFORE the KDF, so it
+// must refund the per-IP admission. A session holder on a fresh IP that
+// fires loginFailMax+ password changes while the account is locked must
+// not trip its own per-IP lockout — those requests ran zero KDFs.
+func TestChangePasswordLockout429RefundsFreshIP(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login: %d", code)
+	}
+	pw := func(xff, current, newpw string) int {
+		body := fmt.Sprintf(`{"current_password":%q,"password":%q}`, current, newpw)
+		req, err := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/users/admin/password", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if xff != "" {
+			req.Header.Set("X-Forwarded-For", xff)
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	// Lock the account: 7 wrong currents spread across 3 IPs.
+	for i, ip := range []string{"10.1.1.10", "10.1.1.11", "10.1.1.12"} {
+		for j := 0; j < []int{3, 3, 1}[i]; j++ {
+			if code := pw(ip, "wrongpw", "newpass99"); code != http.StatusForbidden {
+				t.Fatalf("IP %s attempt %d: got %d, want 403 (before account lockout)", ip, j, code)
+			}
+		}
+	}
+	// Fresh IP, valid session, WHILE the account is locked: every attempt
+	// fast-429s (KDF skipped) and refunds its per-IP admission.
+	for j := 0; j < loginFailMax+2; j++ {
+		if code := pw("10.2.2.40", "secretpw", "newpass99"); code != http.StatusTooManyRequests {
+			t.Fatalf("locked-account change attempt %d from fresh IP: got %d, want 429", j, code)
+		}
+	}
+	// Lift the account lockout: the valid change from the fresh IP must
+	// go through. Pre-fix the 429-only requests had accumulated past
+	// loginFailMax and beginAttempt's IP lockout answers 429 here.
+	srv.auth.clearUserFail("admin")
+	if code := pw("10.2.2.40", "secretpw", "newpass99"); code != http.StatusOK {
+		t.Fatalf("valid change from fresh IP after lockout lifted = %d, want 200: 429-only requests burned the IP's budget", code)
+	}
+}

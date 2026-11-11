@@ -2705,3 +2705,51 @@ func TestIsAdminInvalidatedOnPromotion(t *testing.T) {
 		t.Fatal("bob is not admin immediately after the last admin's removal — the promotion must clear his cached non-admin")
 	}
 }
+
+// TestLoginThrottleAccountLockoutRefundsFreshIP pins the 429 refund
+// (review 2026-11-11): the per-username lockout rejection runs BEFORE the
+// KDF, so it must REFUND the per-IP admission beginAttempt appended.
+// Pre-fix, an attacker who locked the account (IP A, 7 real failures)
+// also locked out every fresh-IP client — new device, DHCP change, no
+// known-good exemption — that retried loginFailMax times while staring
+// at the 429: requests that never ran a bcrypt KDF burned that IP's
+// budget and tripped its own 5-minute per-IP lockout, persisting past
+// the account lockout's expiry.
+func TestLoginThrottleAccountLockoutRefundsFreshIP(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	// Lock the account: 7 failures spread across 3 IPs (no single IP
+	// nears its per-IP budget; the shared per-username budget trips).
+	for i, ip := range []string{"10.1.1.10", "10.1.1.11", "10.1.1.12"} {
+		for j := 0; j < []int{3, 3, 1}[i]; j++ {
+			resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"wrongpw"}`, ip)
+			resp.Body.Close()
+		}
+	}
+	// Fresh IP retries WHILE the account is locked: every attempt must
+	// fast-429 (KDF skipped) and refund its per-IP admission.
+	for j := 0; j < loginFailMax+2; j++ {
+		resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "10.1.1.40")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusTooManyRequests {
+			t.Fatalf("locked-account attempt %d from fresh IP: got %d, want 429", j, resp.StatusCode)
+		}
+	}
+	// Lift the account lockout: the fresh IP must be fully usable — it
+	// paid zero KDF cost, so it owes zero per-IP budget. Pre-fix the
+	// 429-only requests had accumulated past loginFailMax and the IP
+	// lockout answers 429 here.
+	srv.auth.clearUserFail("admin")
+	resp := loginPost(t, httpSrv.URL, `{"username":"admin","password":"secretpw"}`, "10.1.1.40")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("correct login from fresh IP after lockout lifted = %d, want 200: 429-only requests burned the IP's budget (body %s)", resp.StatusCode, body)
+	}
+}

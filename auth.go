@@ -1619,6 +1619,17 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	// account counter is not incremented by the rejection.
 	userKey := strings.ToLower(req.Username)
 	if ok, wait := s.auth.checkUserLock(userKey, key); !ok {
+		// Refund the per-IP admission beginAttempt appended (review
+		// 2026-11-11): the account lockout rejects BEFORE the KDF, so no
+		// cost was paid — the same refund contract the setup-bootstrap path
+		// already honors ("throttling is for KDF cost"). Without it, an
+		// attacker who locks the account from IP A also locks out every
+		// fresh-IP client (new device / DHCP change — no known-good
+		// exemption) that clicks "Sign In" loginFailMax times while
+		// staring at the 429: the requests that never ran a KDF burn that
+		// IP's budget and trip its own 5-minute lockout. refundAttempt's
+		// n6 arm also clears a lockout the appends already tripped.
+		s.auth.refundAttempt(key)
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1
@@ -1914,6 +1925,11 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 	// is skipped on the 429, so the account counter is not incremented
 	// by the rejection.
 	if ok, wait := s.auth.checkUserLock(user, key); !ok {
+		// Refund the per-IP admission: no KDF ran (review 2026-11-11,
+		// mirror of the login path) — 429-only requests must not burn the
+		// caller's per-IP budget and self-lock a fresh IP holding a valid
+		// session.
+		s.auth.refundAttempt(key)
 		secs := int((wait + time.Second - 1) / time.Second)
 		if secs < 1 {
 			secs = 1
