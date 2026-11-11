@@ -11,6 +11,40 @@ import (
 	"time"
 )
 
+// TestPingNowCancelledRecordsNothing pins the m3 fix (review 2026-11-10):
+// PingNow probes on the REQUEST ctx, so a browser that closes the tab
+// mid-pulse leaves the outcome a pure cancellation artifact. Pre-fix,
+// PingNow — unlike doProbe — had no post-probe ctx guard, so every
+// abandoned pulse recorded a phantom manual LOSS row in the inspector
+// tail. probeTarget is stubbed so the probe "fails instantly" exactly
+// as a cancelled ctx makes it.
+func TestPingNowCancelledRecordsNothing(t *testing.T) {
+	db := fcDB(t)
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('pcancel','pcancel','192.0.2.1',15,8000,25,1,3,'active','up','2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	pw := NewProbeWorker(db)
+	orig := probeTarget
+	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
+		return probeOutcome{lost: true, ip: "192.0.2.1"}
+	}
+	t.Cleanup(func() { probeTarget = orig })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := pw.PingNow(ctx, "pcancel"); err == nil {
+		t.Fatal("PingNow on a cancelled ctx = nil error, want a cancellation error")
+	}
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "pcancel").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("probe rows recorded after a cancelled pulse = %d, want 0", n)
+	}
+}
+
 // TestEchoNowProbeRowCount drives the real handler against a live worker and
 // asserts the sample is recorded: the probes row count increases by one, the
 // row is a lost probe (rtt_ms NULL), and the sensor status is unchanged.

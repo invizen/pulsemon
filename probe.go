@@ -987,6 +987,15 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		timeout = pingNowTimeout
 	}
 	o := probeTarget(ctx, probeType, target, timeout)
+	// Cancelled-pulse guard (review 2026-11-10 m3): ctx is the REQUEST
+	// ctx, so a browser that closes the tab mid-pulse makes probeTarget
+	// fail instantly — o is then a pure cancellation artifact, not a
+	// measurement. doProbe has this same guard after its probe; without
+	// it, PingNow recorded a phantom manual loss row in the inspector
+	// tail on every abandoned pulse.
+	if err := ctx.Err(); err != nil {
+		return probeOutcome{}, err
+	}
 
 	var rttVal any
 	if !o.lost {
