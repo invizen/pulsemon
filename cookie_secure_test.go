@@ -33,10 +33,10 @@ func TestCookieSecurePinAcrossRenewal(t *testing.T) {
 	age(secureTok)
 	age(plainTok)
 
-	if due, pin := a.CookieRenewalDue(secureTok); !due || !pin {
+	if due, pin, _ := a.CookieRenewalDue(secureTok); !due || !pin {
 		t.Fatalf("Secure-minted session lost its pin: due=%v pin=%v", due, pin)
 	}
-	if due, pin := a.CookieRenewalDue(plainTok); !due || pin {
+	if due, pin, _ := a.CookieRenewalDue(plainTok); !due || pin {
 		t.Fatalf("plain session wrongly reported a Secure pin: due=%v pin=%v", due, pin)
 	}
 }

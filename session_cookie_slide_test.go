@@ -135,3 +135,107 @@ func TestFix_SessionCookieSlides(t *testing.T) {
 		t.Errorf("SessionUser did not slide expiry to now+TTL: got %v, want ~ %v", after, want)
 	}
 }
+
+// TestFix_RenewalCookieCappedByMaxAge (review 2026-11-11 #8): the re-issue
+// lifetime is min(authSessionTTL, created + authSessionMaxAge − now).
+// Uncapped, a renewal on day 29.x handed the browser a fresh Max-Age=7d
+// cookie for a session the server rejects within a day — the browser kept
+// sending a cookie it believed was a week young while every request 401d
+// at the absolute cap. Capped, the browser drops the cookie when the
+// session actually dies; a session at/past the cap gets no renewal at all.
+//
+// Method-level: CookieRenewalDue's third return is the capped lifetime
+// (full TTL for a young session, ≈1d at day 29, 0/due=false at the cap).
+// Gate-level: the Set-Cookie on a day-29 renewal carries Max-Age ≈ 1d —
+// NOT the full 7d — and the value is the same token.
+func TestFix_RenewalCookieCappedByMaxAge(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	age := func(tok string, created time.Time, issued time.Time) {
+		srv.auth.mu.Lock()
+		s := srv.auth.sessions[tok]
+		s.created = created
+		s.cookieIssued = issued
+		// Keep the sliding expiry comfortably alive: the renewal question
+		// is the ABSOLUTE cap, not the idle window.
+		s.expiry = time.Now().Add(authSessionTTL)
+		srv.auth.sessions[tok] = s
+		srv.auth.mu.Unlock()
+	}
+
+	// Method level: young session → full TTL on renewal.
+	tok, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	if !ok {
+		t.Fatal("CreateSession failed")
+	}
+	age(tok, time.Now().Add(-10*24*time.Hour), time.Now().Add(-authSessionTTL/2))
+	if due, _, maxAge := srv.auth.CookieRenewalDue(tok); !due || maxAge != authSessionTTL {
+		t.Fatalf("day-10 renewal: due=%v maxAge=%v, want due + full %v", due, maxAge, authSessionTTL)
+	}
+	// Day 29 + 1h (→ ~23h remaining): renewal due, lifetime capped to the
+	// remaining absolute lifetime, not the full TTL.
+	age(tok, time.Now().Add(-29*24*time.Hour-time.Hour), time.Now().Add(-authSessionTTL/2))
+	if due, _, maxAge := srv.auth.CookieRenewalDue(tok); !due || maxAge > 24*time.Hour || maxAge < 22*time.Hour {
+		t.Fatalf("day-29 renewal: due=%v maxAge=%v, want due + ~23h cap (not the full %v)", due, maxAge, authSessionTTL)
+	}
+	// At/past the cap: no renewal (the session is dead to validation
+	// anyway; advertising any cookie life would be a lie).
+	age(tok, time.Now().Add(-30*24*time.Hour-time.Hour), time.Now().Add(-authSessionTTL/2))
+	if due, _, maxAge := srv.auth.CookieRenewalDue(tok); due || maxAge != 0 {
+		t.Fatalf("past-cap renewal: due=%v maxAge=%v, want no renewal", due, maxAge)
+	}
+
+	// Gate level: real login, age to day 29 (+1d → ~1d remaining), one
+	// authenticated request must re-issue with Max-Age ≈ 1d.
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	resp, err := client.Post(httpSrv.URL+"/api/auth/login", "application/json", strings.NewReader(`{"username":"admin","password":"secretpw"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("login: %d", resp.StatusCode)
+	}
+	u, _ := url.Parse(httpSrv.URL)
+	var tok2 string
+	for _, c := range jar.Cookies(u) {
+		if c.Name == authSessionName {
+			tok2 = c.Value
+		}
+	}
+	if tok2 == "" {
+		t.Fatal("no session cookie in jar")
+	}
+	age(tok2, time.Now().Add(-29*24*time.Hour), time.Now().Add(-authSessionTTL/2))
+	resp, err = client.Get(httpSrv.URL + "/api/sensors")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("sensors at day 29: %d", resp.StatusCode)
+	}
+	var reissued *http.Cookie
+	for _, c := range resp.Cookies() {
+		if c.Name == authSessionName {
+			reissued = c
+		}
+	}
+	if reissued == nil {
+		t.Fatal("day-29 aged cookie got no re-issue")
+	}
+	if reissued.Value != tok2 {
+		t.Errorf("re-issue rotated the token: %q", reissued.Value)
+	}
+	wantMax := int((24 * time.Hour).Seconds())
+	if reissued.MaxAge <= 0 || reissued.MaxAge > wantMax {
+		t.Errorf("re-issue Max-Age = %d, want ≈ %d (capped to the remaining absolute lifetime, NOT the full %d)", reissued.MaxAge, wantMax, int(authSessionTTL.Seconds()))
+	}
+}

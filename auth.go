@@ -1409,22 +1409,39 @@ func (a *AuthState) SessionUser(tok string) (string, bool) {
 // behavior). The gate calls this after ValidSession and re-issues the
 // SAME token (no rotation) when it returns true — at most one Set-Cookie
 // per half-TTL of activity, never per request.
-func (a *AuthState) CookieRenewalDue(tok string) (bool, bool) {
+//
+// The third return is the renewed cookie's lifetime: the full TTL, capped
+// at the session's REMAINING absolute lifetime (created +
+// authSessionMaxAge − now) — review 2026-11-11. Uncapped, a renewal near
+// the 30-day cap handed the browser a Max-Age=7d cookie for a session the
+// server rejects within a day: no security bypass (ValidSession/
+// SessionUser enforce the cap server-side), but the client believed it
+// held a fresh week-long session while every request was about to 401.
+// Capped, the browser drops the cookie when the session actually dies. A
+// session at/past the cap gets no renewal at all.
+func (a *AuthState) CookieRenewalDue(tok string) (due bool, pinSecure bool, maxAge time.Duration) {
 	if tok == "" {
-		return false, false
+		return false, false, 0
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	s, ok := a.sessions[tok]
 	if !ok || !time.Now().Before(s.expiry) {
-		return false, false
+		return false, false, 0
+	}
+	maxAge = authSessionTTL
+	if rem := s.created.Add(authSessionMaxAge).Sub(time.Now()); rem < maxAge {
+		maxAge = rem
+	}
+	if maxAge <= 0 {
+		return false, s.cookieSecure, 0
 	}
 	if time.Since(s.cookieIssued) < authSessionTTL/2 {
-		return false, s.cookieSecure
+		return false, s.cookieSecure, maxAge
 	}
 	s.cookieIssued = time.Now()
 	a.sessions[tok] = s
-	return true, s.cookieSecure
+	return true, s.cookieSecure, maxAge
 }
 
 // DropSession removes one session (logout).
@@ -2074,8 +2091,16 @@ func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 // an existing session pass false and the attribute is computed from this
 // request alone.
 func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string, pinSecure bool) {
-	expires := time.Now().Add(authSessionTTL)
-	maxAge := int(authSessionTTL.Seconds())
+	s.setAuthCookieLifetime(w, r, value, pinSecure, authSessionTTL)
+}
+
+// setAuthCookieLifetime is setAuthCookie with an explicit cookie lifetime:
+// session-cookie RENEWALS pass the CookieRenewalDue-capped lifetime so a
+// renewal near the absolute session cap cannot advertise a full-TTL cookie
+// for a session about to die (review 2026-11-11).
+func (s *Server) setAuthCookieLifetime(w http.ResponseWriter, r *http.Request, value string, pinSecure bool, lifetime time.Duration) {
+	expires := time.Now().Add(lifetime)
+	maxAge := int(lifetime.Seconds())
 	if value == "" {
 		expires = time.Unix(0, 0) // past: delete the cookie
 		maxAge = 0                // Max-Age=0: delete NOW. (Not -1 — a

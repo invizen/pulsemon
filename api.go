@@ -409,16 +409,19 @@ func (s *Server) authGate() http.Handler {
 			if user, ok := s.auth.SessionUser(c.Value); ok {
 				r = r.WithContext(context.WithValue(r.Context(), authUserCtxKeyVal, user))
 				// Sliding cookie: the login cookie carries a fixed
-				// Max-Age=30d, so without a re-issue the browser would
-				// delete it exactly 30 days after login even though
-				// ValidSession slides the in-memory expiry on every use —
-				// the sliding-session design was defeated by the cookie's
-				// fixed expiry. Re-issue the
-				// SAME token once the cookie ages past half the TTL: at
-				// most one Set-Cookie per ~15 days of activity, never per
-				// 5s poll.
-				if due, pinSecure := s.auth.CookieRenewalDue(c.Value); due {
-					s.setAuthCookie(w, r, c.Value, pinSecure)
+				// Max-Age=authSessionTTL (7d), so without a re-issue
+				// the browser would delete it exactly one TTL after
+				// login even though ValidSession slides the in-memory
+				// expiry on every use — the sliding-session design was
+				// defeated by the cookie's fixed expiry. Re-issue the
+				// SAME token once the cookie ages past half the TTL:
+				// at most one Set-Cookie per ~3.5 days of activity,
+				// never per 5s poll. The re-issue lifetime is the
+				// CookieRenewalDue-capped one: a renewal near the
+				// 30-day absolute cap expires with the session, not a
+				// week past it.
+				if due, pinSecure, renewAge := s.auth.CookieRenewalDue(c.Value); due {
+					s.setAuthCookieLifetime(w, r, c.Value, pinSecure, renewAge)
 				}
 				s.mux.ServeHTTP(w, r)
 				return
