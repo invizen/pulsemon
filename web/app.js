@@ -254,8 +254,13 @@ function httpStatusBadge(s) {
 
 function certNote(s) {
   if (s.type !== 'http' || !s.cert_expiry) return '';
-  const days = Math.floor((new Date(s.cert_expiry).getTime() - Date.now()) / 86400000);
-  if (days < 0) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expired ' + Math.abs(days) + 'd ago</div>';
+  // Round asymmetrically (review 2026-11-10 m6): REMAINING time rounds up
+  // (a cert with 12h left is "1d" away, not the unreadable "0d" floor
+  // gave); ELAPSED time counts whole days (floor, clamped to >=1) so a
+  // cert expired 10 days + 1s is "10d ago", not "11d".
+  const ms = new Date(s.cert_expiry).getTime() - Date.now();
+  if (ms < 0) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expired ' + Math.max(1, Math.floor(-ms / 86400000)) + 'd ago</div>';
+  const days = Math.ceil(ms / 86400000);
   if (days <= 7) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
   if (days <= 30) return '<div class="text-[11px] font-mono text-warn flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expires in ' + days + 'd</div>';
   return '';
