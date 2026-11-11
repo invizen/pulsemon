@@ -212,8 +212,15 @@ func FuzzSmtpEnvelopeAddr(f *testing.F) {
 
 func FuzzParseRetryAfter(f *testing.F) {
 	now := time.Now()
-	if d := parseRetryAfter("45", now); d != 45*time.Second {
-		f.Errorf("parseRetryAfter(45) = %v", d)
+	if d := parseRetryAfter("5", now); d != 5*time.Second {
+		f.Errorf("parseRetryAfter(5) = %v, want 5s (below the cap: pass-through)", d)
+	}
+	// 45 s sits ABOVE the in-band cap (review 2026-11-11: maxAlertRetryAfter
+	// 60s -> 10s so one 429-with-Retry-After job cannot hold a sensor's alert
+	// FIFO for 150s; see docs/DECISIONS.md -> alert-retry-budget), so it
+	// clamps like any longer request.
+	if d := parseRetryAfter("45", now); d != maxAlertRetryAfter {
+		f.Errorf("parseRetryAfter(45) = %v, want cap %v", d, maxAlertRetryAfter)
 	}
 	if d := parseRetryAfter("999999", now); d != maxAlertRetryAfter {
 		f.Errorf("parseRetryAfter(999999) not capped: %v", d)

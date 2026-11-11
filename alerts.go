@@ -1479,6 +1479,18 @@ func discordCardRe(state, name, target string, rttMs float64) string {
 
 // alertRetryDelays are the pauses between delivery attempts: 3 attempts total
 // (now, +2s, +10s). A var so tests can shrink or clear it.
+//
+// Alert-retry-budget invariant (docs/DECISIONS.md → alert-retry-budget):
+// these sleeps and the maxAlertRetryAfter cap run INSIDE the sensor's 8-slot
+// alert-FIFO consumer (alertGateConsumer drains serially), so the worst-case
+// single job — 3 webhook attempts × 10s client timeout + the two in-band
+// sleeps, each max(alertRetryDelays[i], maxAlertRetryAfter) per retryAlert
+// = 50s — must stay under recoveryRetryDelay (60s).
+// Above it, a degraded provider's sustained re-alert arrivals (1/min per
+// error sensor) outrun FIFO completions, the queue saturates, and a dropped
+// recovery's scheduleRecoveryRetry re-finds a full queue one minute later —
+// the second drop loses the notification permanently.
+// Pinned by TestInFifoRetryBudgetUnderRecoveryRetryDelay.
 var alertRetryDelays = []time.Duration{2 * time.Second, 10 * time.Second}
 
 // redactErr strips the request URL out of a net/http error. url.Error.Error()
@@ -1494,8 +1506,17 @@ func redactErr(err error) error {
 }
 
 // maxAlertRetryAfter caps a provider's Retry-After so one hostile or buggy
-// header can't park a delivery goroutine (and DrainAlerts) for hours.
-const maxAlertRetryAfter = 60 * time.Second
+// header can't park a delivery goroutine (and DrainAlerts) for hours. The cap
+// is deliberately SHORT (review 2026-11-11): in-band retries run on the
+// sensor's alert-FIFO consumer, so every second slept here lengthens the
+// drain of EVERY later alert queued for that sensor — a 60s cap let one
+// 429-with-Retry-After job hold the FIFO for 150s (see the alertRetryDelays
+// budget note: worst job must stay under recoveryRetryDelay, 60s). When a
+// provider asks for a longer backoff than the in-band cap allows, the job
+// fails fast and the OUTER retry (scheduleAlertRetry / scheduleRecoveryRetry,
+// ~1 min) re-offers it on a delay that respects the provider's window far
+// better than a second in-FIFO sleep that also congests eight queued alerts.
+const maxAlertRetryAfter = 10 * time.Second
 
 // retryAlert runs try until it succeeds, reports a non-retryable failure, or
 // the delays are exhausted. It stops sleeping the moment shutdown begins.
