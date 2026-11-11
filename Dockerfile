@@ -3,7 +3,10 @@
 # Plain `docker compose up -d --build` on an amd64 box builds an amd64 image;
 # on a Jetson/Pi it builds an arm64 image — no cross-tooling needed because
 # pulsemon is pure Go (CGO_ENABLED=0).
-FROM golang:1.26-alpine AS builder
+# Go pin MUST track go.mod's `toolchain` (go1.27.4, 2026-11-11): a family pin here is a
+# fourth place the toolchain can drift behind a Go security release, and GOTOOLCHAIN=auto
+# inside the builder silently downloads a second toolchain per image build.
+FROM golang:1.27-alpine AS builder
 # F10 (2026-10-19 review): WITHOUT this ARG declaration, BuildKit leaves
 # ${TARGETARCH} EMPTY even for `docker buildx build --platform linux/arm64`,
 # so the `:-amd64` fallback silently shipped an AMD64 binary in an arm64

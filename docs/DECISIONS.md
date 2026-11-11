@@ -954,31 +954,45 @@ addition — a tightening, not a bug fix.
 3. **Graph lock encapsulation (api.go/probe.go/stats.go):** handleSensorGraph reached into probeWorker.statsMu/statsCache. Added ProbeWorker.Graph(id, bucket, range), which takes the RLock inside the worker; the handler only maps nil -> empty. Parity with the direct graphPoints call pinned by TestWorkerGraphMethodParity.
 4. **CI pinning + vuln gate (.github/workflows/):** actions pinned by full commit SHA (checkout v4.4.0 = 11d5960…, setup-go v5.6.0 = 40f1582…; same pins in windows-release.yml), tags kept as provenance comments. govulncheck added as a plain go-install step (no third-party action, keeps the pinned trust chain two entries deep) against the public OSV API.
 **Tests:** nits_20261111_test.go (5 tests, RED: prune-loop removal FAILs the prune test; UA-stamp removal FAILs both UA tests with Go-http-client on the hop; Graph stub FAILs parity). Full -race green.
-## go-toolchain-127 (go.mod + workflows, 2026-11-11)
-**Decision:** build/scan toolchain moves to **go1.27.4** (exact pin in ci.yml +
-windows-release.yml, `toolchain` in go.mod) while the **language directive stays
-`go 1.26.0`**. The two knobs are deliberately separated: `toolchain` decides which
-compiler + stdlib ships (security + perf); `go` decides language semantics and the
-GODEBUG compatibility defaults (behavior). Bumping only the toolchain takes the
-net/http security fixes (GO-2026-6859/CVE-2026-97054 fixed in 1.26.11 and 1.27.4)
-with zero semantic change to the shipped binary.
+## go-toolchain-127 (go.mod + workflows + Dockerfile, 2026-11-11)
+**Decision:** full migration to **go1.27.4** — toolchain + the **`go 1.27.0` language
+directive** — with exact pins in ci.yml + windows-release.yml, and the container builder
+base `golang:1.26-alpine` → **`golang:1.27-alpine`** (a THIRD Go pin the family-pin drift
+hid; the zentest deploy path is `docker compose up -d --build`, so it had to move with the
+rest). Deps raised in the same pass: x/net v0.60.0→**v0.62.0**, x/crypto
+v0.57.0→**v0.59.0**, x/sys v0.48.0→v0.50.0.
+The two knobs stay conceptually separate and were gated separately: `toolchain` decides
+which compiler + stdlib ships (security + perf), `go` decides language semantics and the
+GODEBUG compatibility defaults (behavior). Toolchain-only first (bbbc42a/6d16f04, green),
+then the directive flip.
 **Why 1.27.4 over staying on 1.26.11:** Go security-fixes only the two newest majors, so
 1.26.x goes out of support at 1.28 (~2027-02) — staying there buys ~3 months and then
 forces an unplanned jump. 1.27.4 is 4 patches into its series (released 2026-11-10) and
 is the newest security line. Decided pre-tag: v1.1.9 was untagged, so the toolchain was
 still an open choice for the artifact lineage (the tag is the immutability boundary).
-**Rejected (for now): `go 1.27.0` directive bump + x/net→v0.62.0 / x/crypto bumps.** The
-directive flip is the part that can change behavior (generic methods, encoding/json/v2,
-`stdversion` vet check now default under `go test`, net/http HTTP/1 body auto-drain,
-HTTP/2 RFC-9218 client priority). It gets its own green gate as its own change, post
-release, not bundled into a release commit.
+**Behavior deltas reviewed before the directive flip** (all judged safe here): generic
+methods and `encoding/json/v2` are additive — nothing in this change adopts them;
+`stdversion` vet now runs by default under `go test`, a guardrail, green as-is; net/http
+HTTP/1 `Response.Body` auto-drains on close (our probes `io.ReadAll` before Close, so this
+is perf, not behavior); the HTTP/2 server now honors RFC 9218 client priority (knob
+`Server.DisableClientPriority` if round-robin is ever wanted).
+**Adopted later, not here:** `Server.MaxHeaderValueCount` as a hardening knob beside the
+existing `MaxHeaderBytes: 64<<10`.
 **1.27 items checked against this codebase:** `asynctimerchan` removal (time channels
 always unbuffered) is a **no-op** — go.mod already declares ≥1.23, so the unbuffered
 semantics are in force today; matters because the probe/alert/ping loops have 14
-ticker/timer select sites, 7 with drop-tick `default:` arms. `Server.MaxHeaderValueCount`
-is a new hardening knob worth adopting beside `MaxHeaderBytes: 64<<10` (noted, not taken
-here). Runtime: ~1% faster small allocations, ~+60 KB binary.
-**Tests:** gate on zentest under `GOTOOLCHAIN=go1.27.4` — `go vet . ./internal/...`
-clean; linux/amd64 + windows/amd64 builds OK (19.4 MB / 19.9 MB, PE32+ verified); full
-`go test -race -count=1` ok (pulsemon 329.441s, internal/store 4.248s). govulncheck
-clean on the 1.26.11 build; 1.27.4 is in the advisory's fixed range.
+ticker/timer select sites, 7 with drop-tick `default:` arms. Runtime: ~1% faster small
+allocations, ~+60 KB binary.
+**Tests:** gated TWICE on zentest. (1) Toolchain-only, `go` directive still 1.26.0: vet
+clean, linux/amd64 + windows/amd64 builds OK (19.4 / 19.9 MB, PE32+ verified), full
+`-race` ok (329.441s + 4.248s). (2) Directive flip + dep bumps, in the mig-127 scratch
+tree (`go mod tidy`/`./...` cannot run in the deploy dir: `data/` is zen-owned 700):
+gofmt clean, vet clean, all three builds OK, full `-race` ok (326.398s + 4.317s),
+govulncheck **0 findings** — the x/net + x/crypto raises cleared the 3 module-level
+advisories the gate had been tolerating as uncalled.
+**Pitfall this migration exposed:** a `govulncheck` built BY go1.26 cannot scan a module
+declaring `go 1.27.0` — it dies on stdlib sources with `file requires newer Go version
+go1.27 (application built with go1.26)`. CI is immune (setup-go installs 1.27.4 before
+`go install govulncheck@latest`), but on the gate box it must be rebuilt:
+`GOTOOLCHAIN=go1.27.4 go install golang.org/x/vuln/cmd/govulncheck@latest`. Same drift
+class as the family pin — the SCANNER has a Go version too, not just the build.

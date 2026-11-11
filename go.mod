@@ -1,15 +1,15 @@
 module pulsemon
 
-go 1.26.0
+go 1.27.0
 
 toolchain go1.27.4
 
 require (
 	github.com/google/uuid v1.6.0
-	golang.org/x/crypto v0.57.0
-	golang.org/x/net v0.60.0
+	golang.org/x/crypto v0.59.0
+	golang.org/x/net v0.62.0
 	golang.org/x/sync v0.18.0
-	golang.org/x/sys v0.48.0
+	golang.org/x/sys v0.50.0
 	modernc.org/sqlite v1.29.1
 )
 
