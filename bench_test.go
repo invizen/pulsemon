@@ -14,13 +14,17 @@ import (
 // review F15). They are NOT part of the normal test gate: `go test` and the
 // CI `go test -race ./...` do not run them. Run them explicitly:
 //
-//	go test -run=^$ -bench='BenchmarkPurgeOld|BenchmarkComputeSensorStats' -benchtime=1x .
+//	go test -run=^$ -bench='BenchmarkPurgeOld|BenchmarkComputeSensorStats|BenchmarkProbeWrites' -benchtime=1x .
 //
 // -benchtime=1x is recommended for BenchmarkPurgeOld: the purge DELETES its
 // target rows, so it cannot be looped without re-seeding (which would dominate
 // the measurement) — one representative run of the full-scale purge is the
 // honest measure of the hourly retention job. BenchmarkComputeSensorStats is a
 // pure read and loops cleanly, so it can use the default -benchtime.
+//
+// The file also hosts TestProbeWriteSoakFleetCadence — the bounded fleet-scale
+// write soak (external review #10) — because it shares this file's fleet
+// harness. It IS part of the gate (it is a test, not a bench).
 
 // benchPurgeSensors x benchPurgeRowsPerSensor = 1M old rows — the reviewer's
 // scale, close to the real steady-state table (100 sensors @ 5s @ 24h ≈ 1.7M).
