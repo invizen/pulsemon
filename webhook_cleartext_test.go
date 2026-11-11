@@ -83,6 +83,61 @@ func TestDialCheckedCleartextStillBlocksLoopback(t *testing.T) {
 	}
 }
 
+// recordingDialer builds a tcpDialer seam that records the context it
+// dials with, so a test can prove dialCheckedCleartext dials on a LIVE
+// context.
+func recordingDialer(conn net.Conn) *recordedDial {
+	return &recordedDial{conn: conn}
+}
+
+type recordedDial struct {
+	conn   net.Conn
+	ctxErr error // ctx.Err() observed at dial time
+	called bool
+}
+
+func (d *recordedDial) DialContext(ctx context.Context, _, _ string) (net.Conn, error) {
+	d.called = true
+	d.ctxErr = ctx.Err()
+	return d.conn, nil
+}
+
+// TestDialCheckedCleartextDialsOnLiveContext pins the C1 fix (review
+// 2026-11-10): the 5s lookup bound must cover ONLY the lookup — the old
+// code cancelled the derived context and then handed that dead child to
+// DialContext, so every cleartext delivery died with "context canceled"
+// before a SYN left the box. The suite stayed green because every
+// cleartext test asserts a REFUSAL, and the one "dial" test expected a
+// connection error anyway — the success path is only observable through
+// the dialer seam.
+func TestDialCheckedCleartextDialsOnLiveContext(t *testing.T) {
+	withFakeResolver(t, map[string][]net.IP{
+		"lan.example": {net.ParseIP("10.0.0.5")},
+	})
+	c1, c2 := net.Pipe()
+	defer c2.Close()
+	d := recordingDialer(c1)
+	orig := webhookDialer
+	webhookDialer = d
+	t.Cleanup(func() { webhookDialer = orig })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	conn, err := dialCheckedCleartext(ctx, "tcp", "lan.example:8080")
+	if err != nil {
+		t.Fatalf("private cleartext dial failed: %v", err)
+	}
+	if conn != c1 {
+		t.Fatal("dialer result not plumbed through")
+	}
+	if !d.called {
+		t.Fatal("dialer was never called")
+	}
+	if d.ctxErr != nil {
+		t.Fatalf("dial ran on a dead context: %v", d.ctxErr)
+	}
+}
+
 func TestDialCheckedCleartextPrivateDials(t *testing.T) {
 	// All-private resolution passes the policy; the dial itself goes to an
 	// unroutable TEST-NET address and fails on connectivity (NOT on a

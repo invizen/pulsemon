@@ -35,7 +35,14 @@ import (
 //     connects to the very IP it checked (dialChecked), so the connection
 //     cannot land on an address the check never saw — not even one that
 //     flips between two lookups microseconds apart.
-var webhookDialer = &net.Dialer{KeepAlive: 30 * time.Second}
+//
+// webhookDialer is the dialer seam (tcpDialer — see http.go) used by both
+// checked dial paths. Production value is the default dialer; tests inject a
+// fake to exercise the cleartext SUCCESS path, which a real dial can never
+// reach through the SSRF guard (loopback is refused, TEST-NET never
+// connects) — that blind spot is exactly how the cancelled-context dial
+// (review 2026-11-10 C1) stayed green.
+var webhookDialer tcpDialer = &net.Dialer{KeepAlive: 30 * time.Second}
 
 // dialChecked resolves host (or parses a literal IP), enforces the webhook
 // blocklist on every resolved address, and then dials one of the CHECKED
@@ -72,8 +79,13 @@ func dialCheckedCleartext(ctx context.Context, network, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	ips, err := webhookResolver.LookupIP(ctx, "ip", host)
+	// The 5s bound covers the LOOKUP only (review 2026-11-10 C1): the old
+	// code shadowed ctx with this child, cancelled it, then handed the dead
+	// child to DialContext — DialContext checks ctx.Err() first, so every
+	// cleartext delivery failed with "context canceled" before a SYN left
+	// the box. The dial runs on the transport-provided parent ctx.
+	lookCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	ips, err := webhookResolver.LookupIP(lookCtx, "ip", host)
 	cancel()
 	if err != nil {
 		return nil, fmt.Errorf("resolve %q: %w", host, err)
