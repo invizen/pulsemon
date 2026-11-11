@@ -76,7 +76,10 @@ func TestInQueryChunking(t *testing.T) {
 	for i := range allIDs {
 		allIDs[i] = "s" + itoa(i)
 	}
-	tagMap := db.SensorTagsFor(allIDs)
+	tagMap, err := db.SensorTagsFor(context.Background(), allIDs)
+	if err != nil {
+		t.Fatalf("SensorTagsFor: %v", err)
+	}
 	if len(tagMap) != n {
 		t.Fatalf("SensorTagsFor returned %d sensors, want %d (chunking dropped some)", len(tagMap), n)
 	}

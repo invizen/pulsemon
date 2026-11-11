@@ -240,7 +240,7 @@ func TestFix_M7_PatchInvalidFieldDoesNotPersistTags(t *testing.T) {
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("PATCH {tags, interval_s:0}: %d, want 400: %s", rr.Code, rr.Body.String())
 	}
-	if tags := db.SensorTags(id); len(tags) != 0 {
+	if tags, _ := db.SensorTags(context.Background(), id); len(tags) != 0 {
 		t.Errorf("tags persisted after a 400 PATCH: %v — the tag write must not happen before validation", tags)
 	}
 
@@ -252,7 +252,7 @@ func TestFix_M7_PatchInvalidFieldDoesNotPersistTags(t *testing.T) {
 	if rr.Code != http.StatusOK {
 		t.Fatalf("PATCH valid tags: %d, want 200: %s", rr.Code, rr.Body.String())
 	}
-	tags := db.SensorTags(id)
+	tags, _ := db.SensorTags(context.Background(), id)
 	if len(tags) != 2 || tags[0] != "ok" || tags[1] != "sneaky" {
 		t.Errorf("tags after valid PATCH = %v, want [ok sneaky]", tags)
 	}

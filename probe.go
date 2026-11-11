@@ -619,7 +619,15 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	for i := range configs {
 		ids[i] = configs[i].id
 	}
-	tagMap := pw.db.SensorTagsFor(ids)
+	tagMap, err := pw.db.SensorTagsFor(ctx, ids)
+	if err != nil {
+		// Background reconcile: keep the 2026-10-24 tradeoff (affected
+		// sensors route as untagged this pass; the next sync re-reads),
+		// now with the store-level log moved to the caller and the error
+		// no longer swallowed inside the store.
+		log.Printf("probe: sensor tag batch query failed for %d sensors (treated as untagged for alert routing): %v", len(ids), err)
+		tagMap = map[string][]string{}
+	}
 	for i := range configs {
 		configs[i].tags = tagMap[configs[i].id]
 	}

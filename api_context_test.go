@@ -278,3 +278,83 @@ func TestSensorExistenceCheckDistinguishesErrors(t *testing.T) {
 		}
 	}
 }
+
+// TestFix_SettingsAndTagsReadsFailLoudly pins review 2026-11-11 #5: the
+// last swallow-to-default reads on the request path — handleTags GET
+// (AllTags), handleSensorByID GET (SensorTags), fetchSensors
+// (SensorTagsFor) — now carry the request ctx AND surface DB errors, and
+// handleSettingsGet fails loud (500) on a settings read failure instead
+// of rendering a 200 of fabricated defaults. The settings shape is the
+// dangerous one: the dashboard's alerts form seeds itself from
+// GET /api/settings and PUTs those fields back on save, so a swallowed
+// read failure (alert_scope "all", realert_min 30, maintenance off) can
+// be written back as operator intent, overwriting the real settings.
+//
+// Deterministic injections (same pool-level fast-fail the 2026-10-30
+// pins established): a canceled ctx fails AllTags/SensorTags/
+// SensorTagsFor at the pool, and a closed store fails the settings reads
+// with "database is closed". The closed-store check runs last so the
+// other phases keep a live store.
+func TestFix_SettingsAndTagsReadsFailLoudly(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('ctx-t1', 'ctx-t1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensor_tags (sensor_id, tag) VALUES ('ctx-t1', 'loudtag')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Live ctx: 200s with real payloads.
+	req := httptest.NewRequest("GET", "/api/tags", nil)
+	rr := httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "loudtag") {
+		t.Fatalf("tags GET live ctx: %d %s, want 200 with loudtag", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest("GET", "/api/settings", nil)
+	rr = httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("settings GET live ctx: %d, want 200", rr.Code)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// Dead ctx: the tag reads must fail fast with an error (method-level
+	// pin covers the mid-handler window for the calls that a dead-ctx
+	// request can no longer reach, per the 2026-10-30 #5 pattern).
+	if _, err := db.AllTags(ctx); err == nil {
+		t.Error("AllTags with canceled ctx returned no error — the ctx was ignored")
+	}
+	if _, err := db.SensorTags(ctx, "ctx-t1"); err == nil {
+		t.Error("SensorTags with canceled ctx returned no error — the ctx was ignored")
+	}
+	if _, err := db.SensorTagsFor(ctx, []string{"ctx-t1"}); err == nil {
+		t.Error("SensorTagsFor with canceled ctx returned no error — the ctx was ignored")
+	}
+	// Handler-level: AllTags is the FIRST DB call on this path, so a
+	// dead-ctx GET reaches it directly and must answer 500, not 200 {}.
+	req = httptest.NewRequest("GET", "/api/tags", nil).WithContext(ctx)
+	rr = httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("tags GET with dead request ctx: %d, want 500 (the query result IS the payload; a failure must not render as an empty tag fleet)", rr.Code)
+	}
+
+	// Closed store: settings GET must 500 — pre-fix the GetSetting
+	// swallows turned the failure into a 200 of concrete defaults the
+	// alerts form would later PUT back over the real settings.
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req = httptest.NewRequest("GET", "/api/settings", nil)
+	rr = httptest.NewRecorder()
+	srv.Mux().ServeHTTP(rr, req)
+	if rr.Code != http.StatusInternalServerError {
+		t.Errorf("settings GET with a failing settings read: %d, want 500 (a read failure must not render as 200 of defaults: body=%s)", rr.Code, rr.Body.String())
+	}
+}

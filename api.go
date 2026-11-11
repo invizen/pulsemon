@@ -646,7 +646,14 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 	for i := range out {
 		ids[i] = out[i].ID
 	}
-	tagMap := s.db.SensorTagsFor(ids)
+	tagMap, err := s.db.SensorTagsFor(ctx, ids)
+	if err != nil {
+		// Nil sentinel: the handler 500s. Returning the fleet with the
+		// tags silently missing would render partial data as complete
+		// (2026-11-11 review).
+		log.Printf("API: sensor tag batch query failed: %v", err)
+		return nil
+	}
 	for i := range out {
 		out[i].Tags = tagMap[out[i].ID]
 	}
@@ -861,7 +868,13 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		sn.Tags = s.db.SensorTags(id)
+		sn.Tags, err = s.db.SensorTags(r.Context(), id)
+		if err != nil {
+			// A failed tag read is not "sensor has no tags" — fail the
+			// request instead of rendering the swallow as truth (2026-11-11).
+			respondInternal(w, "get sensor tags "+id, err)
+			return
+		}
 		v := SensorView{Sensor: sn}
 		if sn.State == "active" {
 			v.Stats = s.probeWorker.GetStats(id)
@@ -1496,7 +1509,11 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	src.Tags = s.db.SensorTags(id)
+	src.Tags, err = s.db.SensorTags(r.Context(), id)
+	if err != nil {
+		respondInternal(w, "clone sensor tags "+id, err)
+		return
+	}
 
 	// The clone is a NEW write, so it must honor the CURRENT new-write
 	// floors/caps — the same ones the create and PATCH paths enforce
@@ -1656,7 +1673,14 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		respondWithJSON(w, http.StatusOK, s.db.AllTags())
+		tags, err := s.db.AllTags(r.Context())
+		if err != nil {
+			// The query result IS the payload: a failure must surface as a
+			// 500, not render as an empty tag fleet (2026-11-11 review).
+			respondInternal(w, "list tags", err)
+			return
+		}
+		respondWithJSON(w, http.StatusOK, tags)
 		return
 	case http.MethodDelete:
 		// Destructive and fleet-wide: strips the tag from EVERY sensor
@@ -1899,35 +1923,65 @@ func webhookMasked(raw string) string {
 	return u.Scheme + "://" + u.Host + "/***" // path/query is the credential for every provider here
 }
 
-// settingsPayload is the shared GET/PUT response shape for /api/settings.
-func (s *Server) settingsPayload() map[string]any {
-	scope := s.db.GetSetting("alert_scope")
+// settingsPayload assembles the GET /api/settings body (and the PUT
+// response echo). All settings reads go through GetSettingErr (2026-11-11
+// review): the swallow-to-"" shape made a transient DB failure render as
+// CONCRETE DEFAULTS (alert_scope "all", realert_min 30, maintenance off)
+// with a 200 — and the dashboard's alerts form seeds itself from this
+// payload and PUTs the fields back on save, so a swallowed read could be
+// written back as the operator's intent, overwriting the real settings.
+// A read failure is now an error: the handlers 500 and the UI shows
+// "Failed to load settings" instead of an editable form of fabrications.
+func (s *Server) settingsPayload() (map[string]any, error) {
+	scope, err := s.db.GetSettingErr("alert_scope")
+	if err != nil {
+		return nil, fmt.Errorf("read alert_scope: %w", err)
+	}
 	if scope == "" {
 		scope = "all"
 	}
 	filter := []string{}
-	if f := s.db.GetSetting("alert_filter"); f != "" {
+	f, err := s.db.GetSettingErr("alert_filter")
+	if err != nil {
+		return nil, fmt.Errorf("read alert_filter: %w", err)
+	}
+	if f != "" {
 		_ = json.Unmarshal([]byte(f), &filter)
 	}
 	if filter == nil {
 		filter = []string{}
 	}
 	realert := 30
-	if v := s.db.GetSetting("realert_min"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1440 {
+	rv, err := s.db.GetSettingErr("realert_min")
+	if err != nil {
+		return nil, fmt.Errorf("read realert_min: %w", err)
+	}
+	if rv != "" {
+		if n, err := strconv.Atoi(rv); err == nil && n >= 0 && n <= 1440 {
 			realert = n
 		}
 	}
 	// Legacy single-webhook fields stay for backward compat with older
 	// dashboards (and the env-configured Google Chat URL, which has no
 	// settings row). The multi-provider "providers" array is the real data.
-	chatURL := s.db.GetSetting("google_chat_url")
+	chatURL, err := s.db.GetSettingErr("google_chat_url")
+	if err != nil {
+		return nil, fmt.Errorf("read google_chat_url: %w", err)
+	}
 	chatSource := "none"
 	if chatURL != "" {
 		chatSource = "dashboard"
 	} else if os.Getenv("GOOGLE_CHAT_WEBHOOK_URL") != "" {
 		chatURL = os.Getenv("GOOGLE_CHAT_WEBHOOK_URL")
 		chatSource = "env"
+	}
+	maint, err := s.db.GetSettingErr("maintenance_mode")
+	if err != nil {
+		return nil, fmt.Errorf("read maintenance_mode: %w", err)
+	}
+	unauth, err := s.db.GetSettingErr("allow_unauth_update")
+	if err != nil {
+		return nil, fmt.Errorf("read allow_unauth_update: %w", err)
 	}
 	return map[string]any{
 		"webhook_url":         webhookMasked(chatURL),
@@ -1937,10 +1991,10 @@ func (s *Server) settingsPayload() map[string]any {
 		"alert_scope":         scope,
 		"alert_filter":        filter,
 		"realert_min":         realert,
-		"maintenance_mode":    s.db.GetSetting("maintenance_mode") == "1",
-		"allow_unauth_update": s.db.GetSetting("allow_unauth_update") == "1",
+		"maintenance_mode":    maint == "1",
+		"allow_unauth_update": unauth == "1",
 		"tls":                 s.tlsPayload(),
-	}
+	}, nil
 }
 
 func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
@@ -1948,7 +2002,12 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	respondWithJSON(w, http.StatusOK, s.settingsPayload())
+	payload, err := s.settingsPayload()
+	if err != nil {
+		respondInternal(w, "settings payload", err)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, payload)
 }
 
 // enterMaintenance / setMaintenanceMode: the two maintenance-mode store
@@ -2315,7 +2374,15 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Printf("API: settings updated (scope=%s filter=%d realert=%dm)", scopeLog, filterLog, realertLog)
-	respondWithJSON(w, http.StatusOK, s.settingsPayload())
+	echo, err := s.settingsPayload()
+	if err != nil {
+		// The save committed; only the read-back echo failed. Say so with
+		// a 500 (the write IS durable) rather than echoing fabricated
+		// defaults the UI would adopt as truth (2026-11-11 review).
+		respondInternal(w, "settings echo", err)
+		return
+	}
+	respondWithJSON(w, http.StatusOK, echo)
 }
 
 // validateProviderUpdate checks one provider update WITHOUT writing

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -136,8 +137,8 @@ func TestPoolDoesNotDrainUnderProbeLoad(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iterations; i++ {
 				c := sensorConfig{id: "p" + string(rune('a'+(seed+i)%nSensors)), downAfter: 4}
-				_ = pw.deriveStatus(c, "up")               // opens + must close a cursor each call
-				_ = db.SensorTagsFor([]string{"pa", "pb"}) // batched cursor
+				_ = pw.deriveStatus(c, "up")                     // opens + must close a cursor each call
+				_ = sensorTagsForQuiet(db, []string{"pa", "pb"}) // batched cursor
 			}
 		}(w)
 	}
@@ -174,4 +175,11 @@ func TestPoolDoesNotDrainUnderProbeLoad(t *testing.T) {
 	if settled > 5 {
 		t.Errorf("pool did not settle: %d open after idle (base=%d, after-burst=%d)", settled, base, after)
 	}
+}
+
+// sensorTagsForQuiet adapts the (map, error) SensorTagsFor to the cursor
+// counting call sites that only care about the pooled-cursor leak.
+func sensorTagsForQuiet(db *store.Store, ids []string) map[string][]string {
+	m, _ := db.SensorTagsFor(context.Background(), ids)
+	return m
 }

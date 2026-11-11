@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"pulsemon/internal/store"
@@ -87,7 +88,7 @@ func TestFix_PostAndCloneTagsAtomic(t *testing.T) {
 	if err := db.QueryRow("SELECT id FROM sensors WHERE name = 'oktag'").Scan(&okID); err != nil {
 		t.Fatal(err)
 	}
-	if tags := db.SensorTags(okID); len(tags) != 1 || tags[0] != "good" {
+	if tags, _ := db.SensorTags(context.Background(), okID); len(tags) != 1 || tags[0] != "good" {
 		t.Errorf("tags after valid POST = %v, want [good]", tags)
 	}
 }

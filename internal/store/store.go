@@ -375,11 +375,15 @@ func (db *Store) migrateUserAdminColumn() error {
 	return nil
 }
 
-// SensorTags returns the sorted tag list for a sensor.
-func (db *Store) SensorTags(id string) []string {
-	rows, err := db.Query("SELECT tag FROM sensor_tags WHERE sensor_id = ? ORDER BY tag", id)
+// SensorTags returns the sorted tag list for a sensor. ctx + error follow
+// the request-context contract (2026-11-11 review): the old swallow-to-
+// empty shape made a dead client ctx or a transient DB failure look like
+// "sensor has no tags" — for handleSensorByID / handleSensorClone that is a
+// lie rendered to the operator, so they surface the error (500) now.
+func (db *Store) SensorTags(ctx context.Context, id string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "SELECT tag FROM sensor_tags WHERE sensor_id = ? ORDER BY tag", id)
 	if err != nil {
-		return []string{}
+		return nil, err
 	}
 	defer rows.Close()
 	out := []string{}
@@ -390,13 +394,11 @@ func (db *Store) SensorTags(id string) []string {
 		}
 	}
 	if err := rows.Err(); err != nil {
-		// Mid-stream iteration error (Store file I/O failure): same contract
-		// as the query error above — empty list — plus a log so the
-		// failure is visible.
-		log.Printf("db: sensor tag query failed mid-stream: %v", err)
-		return []string{}
+		// Mid-stream iteration error (Store file I/O failure): same
+		// contract as the query error above — the caller decides.
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 // InQueryChunk is the max number of ids per IN(...) chunk for batch queries.
@@ -416,30 +418,32 @@ const InQueryChunk = 500
 // not run a per-row SensorTags() inside a rows.Next() loop: the outer
 // iteration holds a pooled connection, and per-row queries starve the pool
 // under concurrent load. Empty ids → empty map; ids are internal UUIDs (no
-// user string injection).
-func (db *Store) SensorTagsFor(ids []string) map[string][]string {
+// user string injection). ctx + error (2026-11-11 review): the chunk-query
+// error is now RETURNED, not logged-and-skipped — a silently-skipped chunk
+// made the affected sensors route alerts as if they had NO tags. Each caller
+// owns the failure policy: request callers (fetchSensors) fail the request;
+// the background reconcile (syncSensors) logs with the old message and
+// keeps reconciling (the documented untagged-routing tradeoff survives,
+// visibly). Corrupt rows are still skipped with a log.
+func (db *Store) SensorTagsFor(ctx context.Context, ids []string) (map[string][]string, error) {
 	out := make(map[string][]string, len(ids))
 	if len(ids) == 0 {
-		return out
+		return out, nil
 	}
 	// Closure per chunk: defer closes this chunk's cursor when the chunk
 	// finishes, before the next chunk's query runs — top-level defer, not a
 	// bare close below a loop, so no pooled connection is held across chunks.
-	fetchChunk := func(chunk []string) {
+	fetchChunk := func(chunk []string) error {
 		q := make([]string, len(chunk))
 		args := make([]any, len(chunk))
 		for j, id := range chunk {
 			q[j] = "?"
 			args[j] = id
 		}
-		rows, err := db.Query("SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
+		rows, err := db.QueryContext(ctx, "SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
 			strings.Join(q, ",")+") ORDER BY tag", args...)
 		if err != nil {
-			// A silently-skipped chunk made the affected sensors route
-			// alerts as if they had NO tags — the
-			// mid-stream path below already logs; do the same here.
-			log.Printf("db: sensor tag batch query failed for %d sensors (treated as untagged for alert routing): %v", len(chunk), err)
-			return
+			return err
 		}
 		defer rows.Close()
 		for rows.Next() {
@@ -450,22 +454,18 @@ func (db *Store) SensorTagsFor(ids []string) map[string][]string {
 			}
 			out[id] = append(out[id], tag)
 		}
-		if err := rows.Err(); err != nil {
-			// Mid-stream chunk failure: log and keep the rows already read
-			// — the function has no error channel, and a Store file I/O
-			// failure this deep is visible in the service log.
-			log.Printf("db: sensor tag batch query failed mid-stream: %v", err)
-			return
-		}
+		return rows.Err()
 	}
 	for i := 0; i < len(ids); i += InQueryChunk {
 		end := i + InQueryChunk
 		if end > len(ids) {
 			end = len(ids)
 		}
-		fetchChunk(ids[i:end])
+		if err := fetchChunk(ids[i:end]); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
 
 // SetSensorTags atomically replaces a sensor's tags: DELETE then INSERTs in
@@ -610,10 +610,14 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 }
 
 // AllTags returns each distinct tag with the number of sensors using it.
-func (db *Store) AllTags() map[string]int {
-	rows, err := db.Query(`SELECT tag, COUNT(DISTINCT sensor_id) FROM sensor_tags GROUP BY tag ORDER BY tag`)
+// ctx + error (2026-11-11 review): GET /api/tags renders this query's
+// result as the whole payload, so a dead ctx or transient failure must
+// surface as a 500 — the old swallow-to-empty map rendered a failure as
+// "the fleet has no tags".
+func (db *Store) AllTags(ctx context.Context) (map[string]int, error) {
+	rows, err := db.QueryContext(ctx, `SELECT tag, COUNT(DISTINCT sensor_id) FROM sensor_tags GROUP BY tag ORDER BY tag`)
 	if err != nil {
-		return map[string]int{}
+		return nil, err
 	}
 	defer rows.Close()
 	out := map[string]int{}
@@ -626,11 +630,10 @@ func (db *Store) AllTags() map[string]int {
 	}
 	if err := rows.Err(); err != nil {
 		// Mid-stream iteration error: same contract as the query error
-		// above — empty map — plus a log.
-		log.Printf("db: all-tags query failed mid-stream: %v", err)
-		return map[string]int{}
+		// above — the caller decides.
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 // ImmediateTx runs fn inside a BEGIN IMMEDIATE transaction on a pinned
@@ -749,9 +752,10 @@ func (db *Store) GetSetting(key string) string {
 }
 
 // GetSettingErr is GetSetting that surfaces real Store errors: an absent key is
-// ("", nil), any other failure ("", err). GetSetting's 83 call sites keep
+// ("", nil), any other failure ("", err). GetSetting's call sites keep
 // their swallow-to-"" contract; this exists for paths where "unset" and
-// "read failed" must not look the same — alert delivery.
+// "read failed" must not look the same — alert delivery and the
+// settings GET/PUT payload (settingsPayload, 2026-11-11).
 func (db *Store) GetSettingErr(key string) (string, error) {
 	var v string
 	err := db.QueryRow("SELECT value FROM settings WHERE setting_key = ?", key).Scan(&v)

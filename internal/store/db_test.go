@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"path/filepath"
 	"testing"
 )
@@ -32,7 +33,10 @@ func TestSensorTagsFor(t *testing.T) {
 	}
 	// c intentionally has no tags.
 
-	got := db.SensorTagsFor([]string{"a", "b", "c"})
+	got, err := db.SensorTagsFor(context.Background(), []string{"a", "b", "c"})
+	if err != nil {
+		t.Fatalf("SensorTagsFor: %v", err)
+	}
 	if len(got) != 2 {
 		t.Fatalf("len(map) = %d, want 2 (untagged sensor absent)", len(got))
 	}
@@ -44,11 +48,11 @@ func TestSensorTagsFor(t *testing.T) {
 	}
 
 	// Empty input: no query, empty map.
-	if m := db.SensorTagsFor(nil); len(m) != 0 {
+	if m, _ := db.SensorTagsFor(context.Background(), nil); len(m) != 0 {
 		t.Errorf("nil input: got %v, want empty map", m)
 	}
 	// Unknown ids: empty map entries, no error.
-	if m := db.SensorTagsFor([]string{"nope"}); len(m) != 0 {
+	if m, _ := db.SensorTagsFor(context.Background(), []string{"nope"}); len(m) != 0 {
 		t.Errorf("unknown id: got %v, want empty map", m)
 	}
 }
@@ -105,7 +109,10 @@ func TestSetSensorTagsAtomic(t *testing.T) {
 		t.Fatal("SetSensorTags with failing insert: expected an error")
 	}
 
-	got := db.SensorTags("a")
+	got, err2 := db.SensorTags(context.Background(), "a")
+	if err2 != nil {
+		t.Fatalf("SensorTags: %v", err2)
+	}
 	if !equalTags(got, original) {
 		t.Errorf("after rolled-back replacement, tags = %v, want original %v (must not be empty or partial)", got, original)
 	}
@@ -114,7 +121,7 @@ func TestSetSensorTagsAtomic(t *testing.T) {
 	if err := db.SetSensorTags("a", []string{"three", "four"}); err != nil {
 		t.Fatalf("post-rollback SetSensorTags: %v", err)
 	}
-	if got := db.SensorTags("a"); !equalTags(got, []string{"four", "three"}) {
+	if got, _ := db.SensorTags(context.Background(), "a"); !equalTags(got, []string{"four", "three"}) {
 		t.Errorf("replacement tags = %v, want [four three] (sorted)", got)
 	}
 }
