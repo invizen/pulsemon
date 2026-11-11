@@ -326,10 +326,13 @@ func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 // able from any other Go program polling the host.
 var probeUserAgent = "pulsemon/" + Version
 
-// uaRoundTripper stamps probeUserAgent on every request it forwards (including
-// redirect hops — the client calls RoundTrip for each one). It only sets the
-// header when the caller hasn't already, so a test that pins its own UA is
-// respected.
+// uaRoundTripper routes requests between the probe client's two transports.
+// The name predates its UA duty: stamping the header in a RoundTripper
+// mutates the caller's request, which the RoundTripper contract forbids
+// ("should not modify the request"), so it is now routing-only. probeHTTP —
+// the request's creator — stamps probeUserAgent on the request it builds,
+// and Client's header-copy carries it onto every redirect hop (RoundTrip is
+// called per hop).
 //
 // Invariant: a request flagged req.Close is routed to the no-reuse transport.
 // req.Close is the probe's "must dial" signal (stale-cert probes, flagged
@@ -343,9 +346,6 @@ var probeUserAgent = "pulsemon/" + Version
 type uaRoundTripper struct{ base, fresh http.RoundTripper }
 
 func (u uaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Header.Get("User-Agent") == "" {
-		req.Header.Set("User-Agent", probeUserAgent)
-	}
 	if req.Close {
 		return u.fresh.RoundTrip(req)
 	}
@@ -459,8 +459,11 @@ const certFreshness = 10 * time.Minute
 // by scheme://host (the same key the transport uses for connection
 // pooling). probeHTTP consults it before deciding whether to force a
 // fresh handshake; a successful probe with cert data updates it. The map
-// is bounded by the number of unique HTTPS hosts (≤ sensor count), so no
-// cleanup is needed.
+// is pruned on every write: an entry older than certFreshness carries no
+// information (its only reader treats "stale" exactly like "absent" — both
+// force a fresh handshake), so dropping stale entries at write time is
+// loss-free and keeps the map bounded by the set of LIVE sensor hosts.
+// Without the prune, edited or deleted sensor targets accumulate forever.
 var (
 	certReadMu    sync.Mutex
 	certReadTimes = make(map[string]time.Time)
@@ -679,6 +682,12 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		// this; a loss row with the error is the honest fallback.
 		return httpProbeResult{Lost: true, IP: resolved, Err: err}
 	}
+	// Probe identity stamped at the request's creator, NOT in the transport
+	// wrapper: the RoundTripper contract forbids mutating the caller's
+	// request. Client copies the initial request's headers onto every
+	// redirect hop, so all hops carry it (TestProbeHTTPStampsUserAgent,
+	// TestProbeHTTPRedirectHopsCarryUA).
+	req.Header.Set("User-Agent", probeUserAgent)
 	if req.URL.Scheme == "https" {
 		// Reuse the pooled connection when the cert is fresh
 		// (< certFreshness): the transport's IdleConnTimeout is 10 min,
@@ -751,6 +760,11 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		hostKey := req.URL.Scheme + "://" + req.URL.Host
 		certReadMu.Lock()
 		certReadTimes[hostKey] = time.Now()
+		for k, v := range certReadTimes {
+			if time.Since(v) > certFreshness {
+				delete(certReadTimes, k)
+			}
+		}
 		certReadMu.Unlock()
 	}
 	if resp.Request == nil || !resp.Request.Close {

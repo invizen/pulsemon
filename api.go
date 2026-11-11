@@ -1812,14 +1812,9 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	// newest probe) and the `manual = 0` exclusion (graphPoints skips
 	// manual rows). A sensor not in the cache (added after boot, before
 	// its first probe) has no series and serves an empty graph — the same
-	// as a zero-probe window.
-	s.probeWorker.statsMu.RLock()
-	ser, ok := s.probeWorker.statsCache[id]
-	var points []GraphPoint
-	if ok {
-		points = ser.graphPoints(bucketSecs, rangeSecs, time.Now().Unix())
-	}
-	s.probeWorker.statsMu.RUnlock()
+	// as a zero-probe window. The cache lock lives inside ProbeWorker.Graph
+	// (nit: handlers must not touch statsMu/statsCache directly).
+	points := s.probeWorker.Graph(id, bucketSecs, rangeSecs)
 	if points == nil {
 		points = []GraphPoint{}
 	}

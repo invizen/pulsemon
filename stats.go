@@ -609,3 +609,18 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 	}
 	return &st
 }
+
+// Graph returns sensorID's graph buckets (same contract as
+// probeSeries.graphPoints) under the cache lock, so API handlers never
+// reach into statsMu/statsCache (2026-11-11 nit: the series lock discipline
+// lives inside the worker). nil means no series — an unknown sensor, or one
+// added after boot that has not been probed yet.
+func (pw *ProbeWorker) Graph(sensorID string, bucketSecs, rangeSecs int) []GraphPoint {
+	pw.statsMu.RLock()
+	defer pw.statsMu.RUnlock()
+	ser, ok := pw.statsCache[sensorID]
+	if !ok {
+		return nil
+	}
+	return ser.graphPoints(bucketSecs, rangeSecs, time.Now().Unix())
+}
