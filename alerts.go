@@ -1335,7 +1335,7 @@ var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "
 // there is nothing to strip.
 func alertTarget(target string) string {
 	u, err := neturl.Parse(target)
-	if err != nil || u.Scheme == "" || u.User == nil {
+	if err != nil || u.User == nil {
 		return target
 	}
 	// Strip ONLY the userinfo, from the RAW string. u.String() would
@@ -1344,15 +1344,35 @@ func alertTarget(target string) string {
 	// show literal %3C… to the reader instead of the escaped markup the
 	// target really is (telegram_test.go pins both halves: & -> &amp; and
 	// <b> -> &lt;b&gt;, with the card's own tags intact).
-	// userinfo is the run between "scheme://" and the first '@' that
-	// precedes any path/query/fragment separator.
-	if i := strings.Index(target, "://"); i >= 0 {
-		rest := target[i+3:]
-		at := strings.IndexByte(rest, '@')
-		firstSep := strings.IndexAny(rest, "/?#")
-		if at >= 0 && (firstSep < 0 || at < firstSep) {
-			return target[:i+3] + rest[at+1:]
+	//
+	// The authority runs from after "scheme://" (or after a leading "//"
+	// for a scheme-relative URL) to the first path/query/fragment
+	// separator, and userinfo ENDS AT THE LAST '@' in it — net/url's
+	// validUserinfo permits a raw '@', so the cut MUST mirror net/url's
+	// boundary (2026-11-11 review): cutting at the FIRST '@' of
+	// https://admin:p@ss@nas.lan/health left "ss@nas.lan" in the card —
+	// a password fragment shipped to Discord/Telegram/SMTP, and the
+	// scheme-relative form leaked the whole credential verbatim.
+	prefix := -1
+	if u.Scheme != "" {
+		// The scheme ends at the first ':' in the string, so the first
+		// "://" is exactly the authority boundary url.Parse used.
+		if i := strings.Index(target, "://"); i >= 0 {
+			prefix = i + 3
 		}
+	} else if strings.HasPrefix(target, "//") {
+		prefix = 2
+	}
+	if prefix < 0 {
+		return target
+	}
+	rest := target[prefix:]
+	end := strings.IndexAny(rest, "/?#")
+	if end < 0 {
+		end = len(rest)
+	}
+	if at := strings.LastIndexByte(rest[:end], '@'); at >= 0 {
+		return target[:prefix] + rest[at+1:]
 	}
 	return target
 }

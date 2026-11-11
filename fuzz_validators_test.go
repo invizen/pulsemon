@@ -181,11 +181,25 @@ func FuzzAlertTarget(f *testing.F) {
 	if got := alertTarget("https://admin:secret@nas.lan/health"); got != "https://nas.lan/health" {
 		f.Errorf("alertTarget: %q", got)
 	}
+	// net/url ends userinfo at the LAST '@' of the authority, so a raw '@'
+	// in the password must not survive the strip (2026-11-11 review: the
+	// old first-'@' cut left "ss@nas.lan" — a password fragment — in the
+	// card).
+	if got := alertTarget("https://admin:***@ss@nas.lan/health"); got != "https://nas.lan/health" {
+		f.Errorf("alertTarget with '@' in the password: %q, want the WHOLE userinfo stripped", got)
+	}
+	if got := alertTarget("//admin:secret@nas.lan/health"); got != "//nas.lan/health" {
+		f.Errorf("alertTarget on a scheme-relative URL: %q, want the userinfo stripped", got)
+	}
 	if got := alertTarget("192.168.1.10"); got != "192.168.1.10" {
 		f.Errorf("alertTarget on a bare IP: %q", got)
 	}
 	for _, seed := range []string{
 		"https://admin:secret@nas.lan/health",
+		"https://admin:p@ss@nas.lan/health",
+		"//admin:secret@nas.lan/health",
+		"https://u@h@h2:8443/p",
+		"https://a:b@A:80/x?q=1#f",
 		"192.168.1.10",
 		"https://user@host:8443/path?q=1#frag",
 		"not a url",
@@ -194,7 +208,29 @@ func FuzzAlertTarget(f *testing.F) {
 		f.Add(seed)
 	}
 	f.Fuzz(func(t *testing.T, s string) {
-		_ = alertTarget(s) // must not panic
+		got := alertTarget(s) // must not panic
+		u, err := url.Parse(s)
+		if err != nil || u.User == nil {
+			return
+		}
+		// The fuzz-sound form of "the output never contains
+		// u.User.String()": the card must carry NO userinfo under
+		// net/url's own parser, and the strip must not eat the host.
+		// (Raw containment is not sound: "https://ab:ab@ab:ab/x"
+		// legitimately strips to host "ab:ab", which EQUALS the userinfo
+		// string — a containment hit on the host is not a leak. Parsing
+		// the output asks the same parser the probe uses, so any
+		// userinfo-shaped leak — "ss@nas.lan" included — trips it.)
+		g, gerr := url.Parse(got)
+		if gerr != nil {
+			t.Fatalf("alertTarget(%q) = %q, which does not parse: %v", s, got, gerr)
+		}
+		if g.User != nil {
+			t.Errorf("alertTarget(%q) = %q leaks userinfo %q", s, got, g.User.String())
+		}
+		if g.Host != u.Host {
+			t.Errorf("alertTarget(%q) = %q: host %q, want %q", s, got, g.Host, u.Host)
+		}
 	})
 }
 
