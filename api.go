@@ -465,8 +465,18 @@ func (s *Server) authGate() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
-	// GET /api/update-check is intentionally NOT requireAdmin-gated: the
-	// check is read-only, its response (running/latest versions) is
+	// Authorization rule for the whole API surface (external review #8):
+	// EVERY /api/ route carries an explicit session wrapper — requireAuth
+	// for the authed-user surface, requireAdmin for the admin surface —
+	// except the four public endpoints (healthz, auth/status, auth/login,
+	// auth/logout) that must be reachable sessionless by definition. The
+	// gate (authGate) enforces sessions on /api/ as well, so the wrappers
+	// are defense-in-depth, not the primary line: a handler must never
+	// depend on the gate having run to be safe on its own (the
+	// sessionFrom contract). api_routes_auth_test.go audits this rule at
+	// the source level.
+	// GET /api/update-check is requireAuth, NOT requireAdmin: the result is
+	// read-only, its response (running/latest versions) is
 	// non-secret — rendered in the header pill for every user — it hits
 	// a fixed upstream URL (no SSRF), and ?refresh=1 is throttled to
 	// one outbound fetch per 60s globally. A viewer (or any LAN host on
@@ -474,7 +484,7 @@ func (s *Server) routes() {
 	// most degrade the version readout for ≤1h. The admin gate belongs
 	// on POST /api/update, where the action is downloading + executing
 	// new code. docs/DECISIONS.md → update-check-refresh-throttle.
-	s.mux.HandleFunc("GET /api/update-check", s.handleUpdateCheck)
+	s.mux.HandleFunc("GET /api/update-check", s.requireAuth(s.handleUpdateCheck))
 	s.mux.HandleFunc("POST /api/update", s.requireAdmin(s.handleUpdate))
 	// Sensor routes: reads and Pulse Now are open to EVERY authenticated
 	// session (non-admins are viewers + manual-pulse operators); every
@@ -482,18 +492,19 @@ func (s *Server) routes() {
 	// repoint), delete, clone, per-sensor history wipe — is admin-only
 	// (a lower-trust account must not administer
 	// sensors or erase per-sensor events rows, which the requireAdmin-
-	// gated DELETE /api/events exists to protect). requireAdmin stands
-	// down with the auth gate, so the "auth off = fully open" contract
-	// is unchanged.
-	s.mux.HandleFunc("GET /api/sensors", s.handleSensors)
+	// gated DELETE /api/events exists to protect). The GET/ping routes are
+	// wrapped in requireAuth explicitly (rule above), not left to the gate.
+	// requireAuth/requireAdmin stand down with the auth gate, so the
+	// "auth off = fully open" contract is unchanged.
+	s.mux.HandleFunc("GET /api/sensors", s.requireAuth(s.handleSensors))
 	s.mux.HandleFunc("POST /api/sensors", s.requireAdmin(s.handleSensors))
-	s.mux.HandleFunc("GET /api/sensors/{id}", s.handleSensorByID)
+	s.mux.HandleFunc("GET /api/sensors/{id}", s.requireAuth(s.handleSensorByID))
 	s.mux.HandleFunc("PATCH /api/sensors/{id}", s.requireAdmin(s.handleSensorByID))
 	s.mux.HandleFunc("DELETE /api/sensors/{id}", s.requireAdmin(s.handleSensorByID))
-	s.mux.HandleFunc("POST /api/sensors/{id}/ping", s.handleSensorPing)
+	s.mux.HandleFunc("POST /api/sensors/{id}/ping", s.requireAuth(s.handleSensorPing))
 	s.mux.HandleFunc("POST /api/sensors/{id}/clone", s.requireAdmin(s.handleSensorClone))
-	s.mux.HandleFunc("GET /api/sensors/{id}/history", s.handleSensorHistory)
-	s.mux.HandleFunc("GET /api/sensors/{id}/graph", s.handleSensorGraph)
+	s.mux.HandleFunc("GET /api/sensors/{id}/history", s.requireAuth(s.handleSensorHistory))
+	s.mux.HandleFunc("GET /api/sensors/{id}/graph", s.requireAuth(s.handleSensorGraph))
 	s.mux.HandleFunc("DELETE /api/sensors/{id}/history", s.requireAdmin(s.handleSensorClearHistory))
 	s.mux.HandleFunc("DELETE /api/history", s.requireAdmin(s.handleClearAllHistory))
 	// /api/tags and /api/events intentionally use BARE (method-less)
@@ -503,14 +514,14 @@ func (s *Server) routes() {
 	// 404, regressing the handler's JSON 405. The handler switches on
 	// r.Method; that is the correct form under this architecture. Do
 	// not "fix" to method-prefixed (docs/DECISIONS.md → bare-routes).
-	// requireAuth (defense-in-depth, like handleAuthUsers): the GET
-	// branches of handleTags/handleEvents carry no session check of their
-	// own, so their authorization must not rest on authGate having run
-	// (the sessionFrom contract — "a route registered without the gate,
-	// or a future gate change, must not silently widen authorization").
-	// The inline admin check in each DELETE branch is unchanged;
-	// requireAuth only adds the session requirement the GET branch was
-	// missing. The routes stay BARE (the 405 annotation above).
+	// requireAuth per the rule above (the pattern these GET branches were
+	// written for): the GET branches of handleTags/handleEvents carry no
+	// session check of their own, so their authorization must not rest on
+	// authGate having run (the sessionFrom contract — "a route registered
+	// without the gate, or a future gate change, must not silently widen
+	// authorization"). The inline admin check in each DELETE branch is
+	// unchanged; requireAuth only adds the session requirement the GET
+	// branch was missing. The routes stay BARE (the 405 annotation above).
 	s.mux.HandleFunc("/api/tags", s.requireAuth(s.handleTags))
 	s.mux.HandleFunc("/api/events", s.requireAuth(s.handleEvents))
 	// Settings READS are admin-only too: the payload carries operator
