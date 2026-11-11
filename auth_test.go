@@ -2753,3 +2753,83 @@ func TestLoginThrottleAccountLockoutRefundsFreshIP(t *testing.T) {
 		t.Fatalf("correct login from fresh IP after lockout lifted = %d, want 200: 429-only requests burned the IP's budget (body %s)", resp.StatusCode, body)
 	}
 }
+
+// TestLoginThrottleSweepTriggerWatchesKnownGood (review 2026-11-11) is the
+// knownGood mirror of TestLoginThrottleSweepTriggerWatchesUserFails:
+// loginSuccess DELETES the ip from fails and inserts it into knownGood, so
+// successful logins from rotating source buckets (IPv6 /64s, XFF rotation
+// behind a trusted proxy — the shape a script or compromised viewer
+// credential drives) grow knownGood while fails and userFails hover near
+// zero. A trigger watching only those two maps never fires, and the
+// 30-day-TTL map grows without bound. With a 1-entry per-IP map and a
+// knownGood map past the threshold, the next beginAttempt must sweep
+// (pruning the expired entries below).
+func TestLoginThrottleSweepTriggerWatchesKnownGood(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+	origThreshold := throttleSweepThreshold
+	throttleSweepThreshold = 2
+	t.Cleanup(func() { throttleSweepThreshold = origThreshold })
+
+	now := time.Now()
+	// Tiny per-IP map (below the threshold on its own)…
+	a.loginThrottle.fails["ip1"] = []time.Time{now.Add(-time.Second)}
+	// …and a knownGood map past it, holding EXPIRED entries (older than
+	// knownGoodTTL, no lockout) that only a sweep can prune.
+	for i := 0; i < 4; i++ {
+		a.loginThrottle.knownGood[fmt.Sprintf("2001:db8::%x", i)] = now.Add(-2 * knownGoodTTL)
+	}
+	a.loginThrottle.nextSweep = time.Time{}
+
+	if ok, _ := a.beginAttempt("ip2"); !ok {
+		t.Fatal("beginAttempt rejected a fresh IP")
+	}
+	for i := 0; i < 4; i++ {
+		if _, ok := a.loginThrottle.knownGood[fmt.Sprintf("2001:db8::%x", i)]; ok {
+			t.Errorf("expired knownGood entry %d survived beginAttempt — the sweep trigger must watch len(knownGood), not just fails/userFails", i)
+		}
+	}
+}
+
+// TestLoginThrottleKnownGoodHardCapWipe (review 2026-11-11) is the
+// hard-cap half of the same class: with a 1-entry per-IP map and a
+// knownGood map past throttleHardCap — every entry FRESH, so the sweep
+// prunes nothing — beginAttempt must wipe ALL throttle maps, bounding
+// knownGood at the cap under a pure successful-login spray.
+func TestLoginThrottleKnownGoodHardCapWipe(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+	origThreshold := throttleSweepThreshold
+	origHardCap := throttleHardCap
+	throttleSweepThreshold = 2
+	throttleHardCap = 3
+	t.Cleanup(func() {
+		throttleSweepThreshold = origThreshold
+		throttleHardCap = origHardCap
+	})
+
+	now := time.Now()
+	// 1 per-IP entry: below both thresholds on its own.
+	a.loginThrottle.fails["ip1"] = []time.Time{now.Add(-time.Second)}
+	// 5 knownGood entries past the cap (3), all FRESH: a sweep prunes
+	// nothing, only the wipe can bound this.
+	for i := 0; i < 5; i++ {
+		a.loginThrottle.knownGood[fmt.Sprintf("2001:db8::%x", i)] = now
+	}
+	a.loginThrottle.nextSweep = time.Time{}
+
+	if ok, _ := a.beginAttempt("ip2"); !ok {
+		t.Fatal("beginAttempt rejected a fresh IP after the hard-cap wipe")
+	}
+	if len(a.loginThrottle.knownGood) != 0 {
+		t.Fatalf("knownGood size = %d, want 0 (hard cap on len(knownGood) must wipe it)", len(a.loginThrottle.knownGood))
+	}
+	// The wipe stays all-or-nothing: the per-IP maps reset too, and only
+	// the new attempt's entry survives.
+	if len(a.loginThrottle.fails) != 1 {
+		t.Fatalf("per-IP map size = %d, want 1 (only ip2)", len(a.loginThrottle.fails))
+	}
+	if _, ok := a.loginThrottle.fails["ip2"]; !ok {
+		t.Fatal("ip2 missing from the per-IP map after the wipe")
+	}
+}

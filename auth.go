@@ -1092,13 +1092,19 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	// costing a full walk per login; it only needs to run often enough to
 	// reclaim entries AS the window ages, not per call.
 	//
-	// The trigger watches BOTH maps: userFails is keyed by the raw request
-	// username (up to the 1 MiB body limit), so a small IP pool rotating
-	// random usernames grows userFails while len(fails) stays far below
-	// the threshold — gating the sweep on the per-IP map alone left
-	// userFails unbounded.
+	// The trigger watches ALL THREE maps: userFails is keyed by the raw
+	// request username (up to the 1 MiB body limit), so a small IP pool
+	// rotating random usernames grows userFails while len(fails) stays far
+	// below the threshold — gating the sweep on the per-IP map alone left
+	// userFails unbounded. knownGood is the same class (review 2026-11-11):
+	// loginSuccess DELETES the ip from fails and inserts it into knownGood,
+	// so successful logins from rotating source buckets (IPv6 /64s, XFF
+	// rotation behind a trusted proxy) grow knownGood while fails AND
+	// userFails hover near zero — the sweep never fired, and the 30-day-TTL
+	// map grew without bound.
 	if (len(a.loginThrottle.fails) > throttleSweepThreshold ||
-		len(a.loginThrottle.userFails) > throttleSweepThreshold) && !now.Before(a.loginThrottle.nextSweep) {
+		len(a.loginThrottle.userFails) > throttleSweepThreshold ||
+		len(a.loginThrottle.knownGood) > throttleSweepThreshold) && !now.Before(a.loginThrottle.nextSweep) {
 		a.sweepThrottle(now)
 		a.loginThrottle.nextSweep = now.Add(throttleSweepInterval)
 		// Spray-proof memory bound: if a sweep still leaves a map huge
@@ -1109,7 +1115,8 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		// anyway and unbounded map growth (plus the O(n) walks) would
 		// degrade monitoring and logins for everyone. Chosen bound:
 		// 131072 entries ≈ tens of MB worst case.
-		if len(a.loginThrottle.fails) > throttleHardCap || len(a.loginThrottle.userFails) > throttleHardCap {
+		if len(a.loginThrottle.fails) > throttleHardCap || len(a.loginThrottle.userFails) > throttleHardCap ||
+			len(a.loginThrottle.knownGood) > throttleHardCap {
 			a.loginThrottle.fails = map[string][]time.Time{}
 			a.loginThrottle.lockout = map[string]time.Time{}
 			// The per-username maps share the same fail-open bound: a wide
