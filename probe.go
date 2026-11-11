@@ -1218,10 +1218,18 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	// error -> up).
 	if pw.shouldAlertNow(c, oldStatus, newStatus) {
 		pw.launchAlert(func() {
-			// Every provider failed after retries: for an error alert, make the
-			// re-alert path try again soon instead of waiting a full interval.
-			if !pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) && newStatus == "error" {
+			if pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) {
+				return
+			}
+			// Every provider failed (or the FIFO dropped the job): give
+			// BOTH directions a second chance. The error direction is
+			// rewound so the re-alert path fires in ~1m; recovery has no
+			// re-alert path (state is already stamped), so it gets a
+			// dedicated delayed re-offer (review 2026-11-10 M1).
+			if newStatus == "error" {
 				pw.scheduleAlertRetry(c.id, newStatus)
+			} else {
+				pw.scheduleRecoveryRetry(c.id, c.name, c.target, oldStatus, newStatus, rttMs)
 			}
 		})
 	}

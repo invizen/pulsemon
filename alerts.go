@@ -465,6 +465,55 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 		store.FormatTS(time.Now().UTC().Add(-back)), id, status)
 }
 
+// recoveryRetryDelay is how long to wait before re-offering a recovery
+// alert whose first delivery failed (review 2026-11-10 M1). It mirrors
+// alertRetryAfter (the error direction re-alerts ~1m later), so both
+// directions get their second chance on the same cadence. A var so tests
+// can shorten it.
+var recoveryRetryDelay = time.Minute
+
+// scheduleRecoveryRetry re-offers a recovery / partial-recovery alert
+// (error -> up, error -> warning) whose first delivery failed — dropped on
+// a full per-sensor FIFO during provider degradation, or every provider
+// down (review 2026-11-10 M1). The error direction self-heals through
+// scheduleAlertRetry + the re-alert tick; recovery has NO such path:
+// setAlertState has already stamped "up", and maybeRealert only runs on
+// sustained-error ticks — so a dropped recovery was permanently lost, and
+// the chat's last word for a sensor that is UP stayed "error".
+//
+// Contract:
+//   - Called from inside a launchAlert goroutine (the caller holds an
+//     alertWG count), so this Add is never the counter-0 Add-concurrent-
+//     with-Wait case — same discipline as armStormFlushLocked.
+//   - The delay is watched on stopCtx, so StopAlerts aborts a pending
+//     retry immediately and DrainAlerts never waits out the full delay.
+//   - Guarded at FIRE time by currentStatus: a sensor that flapped back
+//     into error during the delay must not receive a stale "recovered"
+//     line after its fresh error alert (the per-sensor FIFO orders the
+//     queue, not the delayed re-entry). A deleted sensor reads as an
+//     error from currentStatus and is skipped the same way.
+//   - Exactly one retry. A second failure is logged: the sensor's state
+//     rows are correct, only the notification is lost, and an endless
+//     retry loop against a dead provider is worse.
+func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newStatus string, rttMs float64) {
+	pw.launchAlert(func() {
+		select {
+		case <-time.After(recoveryRetryDelay):
+		case <-pw.stopCtx.Done():
+			return
+		}
+		if cur, err := pw.currentStatus(id); err != nil || cur != newStatus {
+			return // flapped back (or deleted): the newer transition owns the chat
+		}
+		if !pw.alertsEnabled() {
+			return // maintenance began during the delay: stay silenced
+		}
+		if !pw.sendAlert(id, name, target, oldStatus, newStatus, rttMs) {
+			log.Printf("alert: recovery retry for sensor %s failed again; notification dropped (state rows are correct)", id)
+		}
+	})
+}
+
 // realertMin returns the re-alert interval in minutes from the SNAPSHOT.
 // 0 means alert once only (no re-alerts). Default 30. Lock-free: a DB
 // hiccup can no longer read realert_min as "" and reset the interval to the
