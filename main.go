@@ -354,50 +354,80 @@ func listenTLS(srv *http.Server, addr, cert, key string) error {
 	return <-errCh
 }
 
+// certFingerprint is the change-detector fingerprint for the cert/key pair.
+// mtime alone is NOT enough: an in-place writer (acme.sh deploy, cp >) can
+// finish writing within the SAME coarse mtime tick (the kernel stamps mtime
+// from the ~1-4ms coarse clock) as the mid-write stat, so an mtime-only
+// fingerprint can permanently pin a failed reload. Size catches the common
+// half-written file (short read → short stat); the same-size-same-tick race
+// that size cannot see is bounded by certReloadRetry, which re-attempts the
+// reload on a backoff even when the fingerprint is unchanged.
+type certFingerprint struct {
+	certMT, keyMT time.Time
+	certSz, keySz int64
+}
+
+// certReloadRetry bounds how long a failed reload may go un-retried while the
+// fingerprint stays unchanged (the coarse-mtime-tick in-place-write race).
+// A var (not const) so tests can shorten it.
+var certReloadRetry = 10 * time.Second
+
 // hotReloadCert returns a tls.Config.GetCertificate that serves the pair at
-// (certPath, keyPath), re-loading it whenever either file's mtime changes.
-// A failed reload (half-written file, transient mismatch) keeps the LAST
-// GOOD pair instead of failing every handshake, and records the (broken)
-// mtimes so it is NOT re-parsed + re-logged on every handshake for as long
-// as the files stay broken — the reload is retried only when a file's mtime
-// changes again. The initial load failure surfaces as a handshake error (the
+// (certPath, keyPath), re-loading it whenever either file's (mtime, size)
+// fingerprint changes. A failed reload (half-written file, transient mismatch)
+// keeps the LAST GOOD pair instead of failing every handshake. While the files
+// stay broken it is NOT re-parsed + re-logged on every handshake: the failure
+// is logged once per fingerprint change, and re-attempts run on the
+// certReloadRetry backoff — so a permanently broken pair costs one log line,
+// while a repair that lands inside the same mtime tick as the half-written
+// state (in-place write, coarse timestamp granularity) is still picked up
+// within the backoff instead of pinning the old pair forever.
+// The initial load failure surfaces as a handshake error (the
 // pair was already validated by tlsKeyPairOK before serve starts, so this
 // only bites on a genuinely broken file at runtime).
 func hotReloadCert(certPath, keyPath string) func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 	var (
-		mu     sync.Mutex
-		cached *tls.Certificate
-		certMT time.Time
-		keyMT  time.Time
+		mu      sync.Mutex
+		cached  *tls.Certificate
+		seen    certFingerprint
+		due     bool // a failed reload is due for a backoff re-attempt
+		retryAt time.Time
 	)
-	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		var cMT, kMT time.Time
+	statFP := func() certFingerprint {
+		var fp certFingerprint
 		if fi, err := os.Stat(certPath); err == nil {
-			cMT = fi.ModTime()
+			fp.certMT, fp.certSz = fi.ModTime(), fi.Size()
 		}
 		if fi, err := os.Stat(keyPath); err == nil {
-			kMT = fi.ModTime()
+			fp.keyMT, fp.keySz = fi.ModTime(), fi.Size()
 		}
+		return fp
+	}
+	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
+		fp := statFP()
 		mu.Lock()
 		defer mu.Unlock()
-		if cached != nil && cMT.Equal(certMT) && kMT.Equal(keyMT) {
+		if cached != nil && fp == seen && (!due || time.Now().Before(retryAt)) {
 			return cached, nil
 		}
 		pair, err := tls.LoadX509KeyPair(certPath, keyPath)
 		if err != nil {
 			if cached != nil {
-				// Record the (broken) mtimes so the next handshakes take the
-				// fast cached path instead of re-parsing + re-logging on every
-				// handshake for as long as the files stay broken. The reload is
-				// retried only when a file's mtime changes again.
-				certMT, keyMT = cMT, kMT
-				log.Printf("tls: cert reload from %s/%s failed (%v) — keeping the previous pair", certPath, keyPath, err)
+				// Log once per fingerprint change, not once per
+				// (re)attempt: the backoff re-attempt of the SAME
+				// broken fingerprint stays silent.
+				if fp != seen {
+					log.Printf("tls: cert reload from %s/%s failed (%v) — keeping the previous pair", certPath, keyPath, err)
+				}
+				seen = fp
+				due, retryAt = true, time.Now().Add(certReloadRetry)
 				return cached, nil
 			}
 			return nil, err
 		}
 		cached = &pair
-		certMT, keyMT = cMT, kMT
+		seen = fp
+		due = false
 		return cached, nil
 	}
 }
