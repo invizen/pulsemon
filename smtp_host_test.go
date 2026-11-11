@@ -1,6 +1,24 @@
 package main
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
+
+// TestValidateSMTPHostTrims pins the m5 fix (review 2026-11-10): the
+// shape check trimmed its copy while the resolver was handed the RAW
+// value, so a row stored as " mail.example " (legacy/CLI write) passed
+// the shape check and then died as cannot resolve smtp host
+// " mail.example ". The fake resolver maps ONLY the trimmed name, so
+// the raw-value path fails this test.
+func TestValidateSMTPHostTrims(t *testing.T) {
+	withFakeResolver(t, map[string][]net.IP{
+		"mail.example": {net.ParseIP("10.0.0.25")},
+	})
+	if err := validateSMTPHost("  mail.example  "); err != nil {
+		t.Fatalf(`validateSMTPHost("  mail.example  ") = %v, want nil`, err)
+	}
+}
 
 // TestValidateSMTPHostIP locks the M1 fix: an SMTP mail-server host that is an
 // IP literal must be judged against the same reserved-range blocklist the

@@ -494,16 +494,24 @@ func validateSMTPHostNoDNS(host string) error {
 }
 
 func validateSMTPHost(host string) error {
+	// Trim ONCE up front (review 2026-11-10 m5): the NoDNS pass trimmed
+	// its own copy, so a row stored as " mail.lan " passed the shape
+	// check and then died as cannot resolve smtp host " mail.lan " —
+	// the resolver must see the same name the shape check judged.
+	host = strings.TrimSpace(host)
 	if err := validateSMTPHostNoDNS(host); err != nil {
 		return err
 	}
-	if net.ParseIP(strings.TrimSpace(host)) != nil {
+	if net.ParseIP(host) != nil {
 		return nil // IP literal: fully judged by the NoDNS pass.
 	}
-	// 5s deadline — context.Background() alone never times out.
+	// 5s deadline — context.Background() alone never times out. Resolved
+	// through the webhookResolver seam (production = the system
+	// resolver), the same seam the webhook SSRF checks use, so the
+	// resolved-answer path is testable without live DNS.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", host)
+	ips, err := webhookResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
 		return fmt.Errorf("cannot resolve smtp host %q: %v", host, err)
 	}
