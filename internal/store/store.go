@@ -35,8 +35,29 @@ func NewID() string {
 	return uuid.NewString()
 }
 
+// ProbeWriteTimeout is the busy_timeout of the dedicated probe-write handle
+// (NewStore). It is the REAL bound on a sensor-loop stall: modernc.org/sqlite
+// v1.29.1 does not preempt a write parked on the write lock with a context
+// deadline — the busy handler sleeps out the full busy_timeout (empirically
+// verified on Go 1.26: a parked write with a 300ms ctx deadline returns
+// SQLITE_BUSY after 15.05s). So the cap on the park is a per-connection
+// pragma, not context.WithTimeout; the ctx bound (dbWriteTimeout) covers
+// pool/queue waits and long statements. A var (not const) so tests can
+// shorten it; read at NewStore time, before opening the handle.
+var ProbeWriteTimeout = 8 * time.Second
+
 type Store struct {
 	*sql.DB
+	// probeDB is a second handle on the same file whose busy_timeout is
+	// ProbeWriteTimeout. Probe-path writes run on it so a stalled writer
+	// parks a sensor loop for the cap, not the main pool's 15s.
+	probeDB *sql.DB
+}
+
+// Close closes both handles. Shadows the embedded sql.DB.Close so callers
+// that only know about Store release the probe handle too.
+func (db *Store) Close() error {
+	return errors.Join(db.DB.Close(), db.probeDB.Close())
 }
 
 func NewStore(dsn string) (*Store, error) {
@@ -61,12 +82,7 @@ func NewStore(dsn string) (*Store, error) {
 	// where a missing '?' caused a fresh seed-Store to be created beside the real
 	// one). Verified against the live 22-sensor Store: all three path forms with
 	// the '?' return sensors=22, busy_timeout=15000, journal_mode=wal.
-	fullDSN := dsn
-	if strings.Contains(dsn, "?") {
-		fullDSN += "&_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
-	} else {
-		fullDSN += "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(15000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
-	}
+	fullDSN := dsnWithPragmas(dsn, 15000)
 
 	db, err := sql.Open("sqlite", fullDSN)
 	if err != nil {
@@ -94,7 +110,38 @@ func NewStore(dsn string) (*Store, error) {
 	if _, err := db.Exec("SELECT 1"); err != nil {
 		return nil, err
 	}
-	return &Store{db}, nil
+	// Probe-write handle: the same file, busy_timeout = ProbeWriteTimeout.
+	// That pragma — not a ctx deadline — is the real cap on a sensor loop
+	// parked by a stalled writer (see ProbeWriteTimeout). MaxOpenConns(1):
+	// probe writes across all sensor loops serialize on one connection, so
+	// surplus waits queue in database/sql's Conn(ctx) pool-wait — which IS
+	// ctx-aware — instead of parking in the driver's busy handler; shutdown
+	// cancel aborts a probe waiting to write, and the driver bounds one
+	// already parked.
+	probeDB, err := sql.Open("sqlite", dsnWithPragmas(dsn, int64(ProbeWriteTimeout/time.Millisecond)))
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+	probeDB.SetMaxOpenConns(1)
+	probeDB.SetMaxIdleConns(1)
+	probeDB.SetConnMaxIdleTime(0)
+	if _, err := probeDB.Exec("SELECT 1"); err != nil {
+		db.Close()
+		probeDB.Close()
+		return nil, err
+	}
+	return &Store{DB: db, probeDB: probeDB}, nil
+}
+
+// dsnWithPragmas appends the per-connection pragmas to dsn with the given
+// busy_timeout in ms. The '?' semantics are the ones documented in NewStore.
+func dsnWithPragmas(dsn string, busyMs int64) string {
+	q := fmt.Sprintf("_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)", busyMs)
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + q
+	}
+	return dsn + "?" + q
 }
 
 func (db *Store) InitSchema() error {
@@ -647,7 +694,24 @@ func (db *Store) AllTags(ctx context.Context) (map[string]int, error) {
 // return and rolls back on error. The connection goes back to the pool
 // when the function returns.
 func (db *Store) ImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error {
-	conn, err := db.Conn(ctx)
+	return immediateTx(ctx, db.DB, fn)
+}
+
+// ProbeImmediateTx is ImmediateTx on the capped probe-write handle (see
+// NewStore / ProbeWriteTimeout): a stalled writer parks the sensor loop for
+// ProbeWriteTimeout, not the main pool's 15s busy_timeout.
+func (db *Store) ProbeImmediateTx(ctx context.Context, fn func(c *sql.Conn) error) error {
+	return immediateTx(ctx, db.probeDB, fn)
+}
+
+// ProbeExecContext runs one statement on the capped probe-write handle.
+// Same capping rationale as ProbeImmediateTx.
+func (db *Store) ProbeExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	return db.probeDB.ExecContext(ctx, query, args...)
+}
+
+func immediateTx(ctx context.Context, gdb *sql.DB, fn func(c *sql.Conn) error) error {
+	conn, err := gdb.Conn(ctx)
 	if err != nil {
 		return err
 	}

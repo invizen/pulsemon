@@ -942,10 +942,13 @@ func (pw *ProbeWorker) safeProbe(ctx context.Context, c sensorConfig) {
 // code documented that tradeoff in its own doc string).
 const pingNowTimeout = time.Second
 
-// dbWriteTimeout bounds a single probe-record write:
-// SQLite's busy_timeout is 15s — longer than the shutdown drain budget —
-// so probe-path writes carry their own smaller cap instead of parking on
-// a stalled writer for the full busy_timeout.
+// dbWriteTimeout bounds PingNow's manual-probe write context. It pairs with
+// store.ProbeWriteTimeout, the driver-level busy_timeout of the probe-write
+// handle that actually caps a write parked on the lock: a ctx deadline does
+// NOT preempt a busy-parked write in modernc.org/sqlite v1.29.1 (empirically
+// verified — 300ms ctx on a parked write returns SQLITE_BUSY at 15.05s).
+// The ctx bound covers what contexts CAN govern: the queue-wait for the
+// single probe-write conn, and a long-running statement's step boundaries.
 const dbWriteTimeout = 8 * time.Second
 
 // errPulseCoolingDown is returned by PingNow when a manual pulse arrives
@@ -1010,18 +1013,21 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		rttVal = o.rttMs
 	}
 	ts := time.Now().UTC()
-	// Bounded write: a bare Exec can sit on the
-	// 15s busy_timeout — longer than the ~10s shutdown drain budget —
-	// and using the REQUEST ctx would wrongly discard a completed probe
-	// when the browser closes the tab. A fresh capped context bounds the
-	// write without inheriting either problem.
+	// Write on the capped probe handle (see doProbe's write comment). The
+	// fresh Background context, not the request ctx: closing the browser
+	// tab mid-pulse must not discard a completed probe's row; the
+	// dbWriteTimeout ctx bound caps the queue-wait for the probe-write
+	// conn, and the handle's busy_timeout (store.ProbeWriteTimeout) caps a
+	// write parked on the lock — ctx deadlines cannot (v1.29.1, empirically
+	// verified), which is why the old "15s busy_timeout outruns the drain
+	// budget" concern is bounded at the driver here.
 	writeCtx, cancelWrite := context.WithTimeout(context.Background(), dbWriteTimeout)
 	defer cancelWrite()
 	var dnsErrVal any
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}
-	if _, err := pw.db.ExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error, manual) VALUES (?, ?, ?, ?, ?, ?, 1)",
+	if _, err := pw.db.ProbeExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error, manual) VALUES (?, ?, ?, ?, ?, ?, 1)",
 		id, store.FormatTS(ts), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
@@ -1148,15 +1154,20 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 
 	now := time.Now().UTC()
-	// Bounded write: the probe ctx is correct here —
-	// it is already cancelled-and-checked above (a cancelled probe drops
-	// its result), and it lets shutdown interrupt a write parked on the
-	// 15s busy_timeout instead of outrunning the drain budget.
+	// Write on the capped probe handle: a stalled writer parks this loop
+	// for at most store.ProbeWriteTimeout, not the main pool's 15s. The
+	// loop ctx is correct alongside it — already cancelled-and-checked
+	// above (a cancelled probe drops its result), and it aborts a probe
+	// QUEUED for the single probe-write conn (database/sql pool-wait is
+	// ctx-aware). It cannot preempt a write already parked on the lock —
+	// modernc.org/sqlite v1.29.1 sleeps out busy_timeout in its busy
+	// handler, ctx deadline ignored (empirically verified) — which is why
+	// the cap lives in the handle's pragma, not in a context.
 	var dnsErrVal any
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}
-	if _, err := pw.db.ExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error) VALUES (?, ?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
+	if _, err := pw.db.ProbeExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error) VALUES (?, ?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -1213,7 +1224,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	if newStatus == "up" {
 		note = "recovered" // first transition back to up after warning/error
 	}
-	err = pw.db.ImmediateTx(ctx, func(conn *sql.Conn) error {
+	err = pw.db.ProbeImmediateTx(ctx, func(conn *sql.Conn) error {
 		if _, err := conn.ExecContext(ctx, "UPDATE sensors SET status = ? WHERE id = ?", newStatus, c.id); err != nil {
 			return err
 		}
