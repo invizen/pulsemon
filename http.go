@@ -263,6 +263,8 @@ func probeDial(ctx context.Context, network, addr string) (net.Conn, error) {
 // the full request (incl. an Authorization: Basic header derived from a
 // user:pass@ target's userinfo) before the cert was judged.
 //
+// Invariant: never return a conn that has not passed verifyHTTPCert.
+//
 // Why a dial-time hook and not tls.Config.VerifyConnection (the natural
 // spot): on Go 1.26 the client's ConnectionState.ServerName is the SNI
 // name, and hostnameInSNI (crypto/tls, RFC 6066 §3) blanks IP literals —
