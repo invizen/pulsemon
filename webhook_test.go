@@ -177,6 +177,11 @@ func TestLegacyWebhookMigration(t *testing.T) {
 		t.Fatalf("reopen legacy: %v", err)
 	}
 	defer db2.Close()
+	// Versioned regime (finding #9): the reopen is the first boot of the
+	// new binary on a pre-versioning DB (user_version 0 → full replay).
+	if _, err := db2.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	if err := db2.InitSchema(); err != nil {
 		t.Fatalf("re-InitSchema: %v", err)
 	}

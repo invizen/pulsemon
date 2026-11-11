@@ -65,8 +65,13 @@ func TestLegacyTokenMigratesOnRetry(t *testing.T) {
 	if db.GetSetting("auth_token") == "" {
 		t.Fatalf("token cleared despite failed migration")
 	}
-	// Recovery: users table back (InitSchema is idempotent and re-runs the
-	// helper, exactly like a reboot after the fault clears).
+	// Recovery: users table back. Versioned regime (finding #9): the
+	// fixture's InitSchema already stamped head, so the retry boot is
+	// simulated by resetting the stamp — the helper then runs and the kept
+	// token migrates.
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema retry: %v", err)
 	}

@@ -158,7 +158,14 @@ func TestStatusRenameMigration(t *testing.T) {
 		t.Fatalf("seed alert_state: %v", err)
 	}
 
-	// Re-running InitSchema (as a fresh process start would) applies the rename.
+	// Versioned migrations (finding #9): InitSchema skips the migration
+	// list once user_version is at the head, so a boot against a
+	// legacy-shaped DB is simulated by resetting the stamp — the state
+	// every real pre-versioning DB is in on its first boot of the new
+	// binary. Re-running InitSchema then applies the rename.
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("re-InitSchema: %v", err)
 	}
@@ -214,7 +221,11 @@ func TestStatusRenameMigration(t *testing.T) {
 	check("alert_state", "status", "s1", "error")
 	check("alert_state", "status", "s2", "warning")
 
-	// Idempotency: a second pass must not error or double-translate.
+	// Idempotency: a second pass must not error or double-translate
+	// (replay from 0 over renamed rows is a no-op by the WHERE filters).
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("second re-InitSchema: %v", err)
 	}
@@ -271,7 +282,11 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 
 	// FIRST re-run: the migration must actually do work (rename the legacy
 	// rows). This guards that adding the WHERE didn't accidentally skip the
-	// real migration.
+	// real migration. Versioned regime (finding #9): the replay is
+	// requested by resetting the stamp, as a pre-versioning DB boots with.
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	before, err := changes()
 	if err != nil {
 		t.Fatalf("total_changes: %v", err)
@@ -295,9 +310,13 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 		t.Fatalf("after migration s1 = %q, want error", st1)
 	}
 
-	// SECOND re-run (a boot on an already-migrated Store): must write ZERO rows.
-	// Old unfiltered code rewrites every row here (delta > 0) — this is the
-	// regression the fix eliminates.
+	// SECOND re-run (a boot on an already-migrated Store): must write ZERO
+	// rows. Old unfiltered code rewrites every row here (delta > 0) — this
+	// is the regression the fix eliminates. The stamp is reset so the
+	// UPDATEs genuinely run (a versioned boot would skip the list whole).
+	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
+		t.Fatalf("reset user_version: %v", err)
+	}
 	before2, err := changes()
 	if err != nil {
 		t.Fatalf("total_changes: %v", err)

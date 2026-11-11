@@ -223,177 +223,284 @@ func (db *Store) InitSchema() error {
 	if err != nil {
 		return err
 	}
-	// One-time migration: legacy single-tag column → sensor_tags table.
-	var tagCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'tag'`).Scan(&tagCol); err == nil && tagCol > 0 {
-		if _, err := db.Exec(`INSERT OR IGNORE INTO sensor_tags (sensor_id, tag)
-			SELECT id, tag FROM sensors WHERE tag IS NOT NULL AND TRIM(tag) <> ''`); err != nil {
-			return err
-		}
-		if _, err := db.Exec(`ALTER TABLE sensors DROP COLUMN tag`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: add the per-sensor latency-spike multiplier
-	// column. LIVE (dashboard-only): sparkline bars at/above
-	// spike_mult × the window's average RTT render amber (absolute
-	// red >200 ms is unchanged). The probe engine never reads it —
-	// status derivation is unaffected — so it is a display tuning
-	// knob, editable per sensor in the dashboard modal.
-	var spikeCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'spike_mult'`).Scan(&spikeCol); err == nil && spikeCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN spike_mult INTEGER NOT NULL DEFAULT 5`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: record what each probe resolved to (diagnoses
-	// "sensors that never respond" — a NULL/absent resolved_ip means the
-	// DNS lookup never returned, the leading cause of a stalled sensor).
-	var resolvedCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'resolved_ip'`).Scan(&resolvedCol); err == nil && resolvedCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN resolved_ip TEXT`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: record the HTTP status code for HTTP sensors
-	// (NULL for ICMP probes and any probe that got no response). Lets the
-	// card show "HTTP 503" vs "no response" for the same loss row.
-	var httpStatusCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'http_status'`).Scan(&httpStatusCol); err == nil && httpStatusCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN http_status INTEGER`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: tag "Pulse Now" manual probes (manual=1). Manual
-	// rows stay in history — sparkline, graph, inspector — but are EXCLUDED
-	// from status derivation (recentFromDB/recentFromCache filter them),
-	// honoring the documented contract that a manual pulse never affects
-	// status or alerts (before the tag, one
-	// lost manual pulse + one lost scheduled probe tripped the
-	// down_after=2 consecutive-loss test into an "error" alert). Existing
-	// rows are all scheduled probes, so DEFAULT 0 is exactly right.
-	var manualCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'manual'`).Scan(&manualCol); err == nil && manualCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: record the name-resolution failure for ICMP
-	// probes lost BEFORE a target IP could be determined (NULL for packet
-	// losses and HTTP probes). The homelab resolver (Pi-hole/AdGuard) is
-	// itself a monitored sensor: its death used to flip every hostname
-	// sensor to "error" at once — one root cause, an N-sensor storm that
-	// read as "N hosts down" — because a DNS loss was indistinguishable
-	// from a packet loss.
-	var dnsErrCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'dns_error'`).Scan(&dnsErrCol); err == nil && dnsErrCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE probes ADD COLUMN dns_error TEXT`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: sensor probe type. Existing sensors default to
-	// 'icmp' (the original and only type), so this is a no-op data-wise; it
-	// just lets the probe worker dispatch the right probe.
-	var typeCol int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'type'`).Scan(&typeCol); err == nil && typeCol == 0 {
-		if _, err := db.Exec(`ALTER TABLE sensors ADD COLUMN type TEXT NOT NULL DEFAULT 'icmp'`); err != nil {
-			return err
-		}
-	}
-	// One-time migration: normalize legacy empty probe type
-	// to 'icmp'. The type column was added with DEFAULT 'icmp', but rows
-	// created before the column existed have type=''. The read paths used
-	// to normalize ''→'icmp' in 6 places; this migration makes the DB the
-	// single source of truth, so those normalizations are removed.
-	if _, err := db.Exec(`UPDATE sensors SET type = 'icmp' WHERE type = ''`); err != nil {
-		return err
-	}
-	// One-time migration (v0.1.13): rename stored statuses. "down" was the
-	// old name for error and "degraded" for warning; without this, the first
-	// probe after upgrade would log a spurious transition and fire a one-time
-	// alert on every already-affected sensor.
+	// Numbered, transactional schema migrations (external review #9):
+	// each step runs in its OWN transaction and advances PRAGMA
+	// user_version inside that same transaction, so a crash can never
+	// leave a half-applied step (the tag migration used to straddle
+	// INSERT … SELECT and DROP COLUMN across two implicit transactions,
+	// safe on replay only because INSERT OR IGNORE deduped the copy).
 	//
-	// Each UPDATE is filtered to the legacy rows it actually rewrites. An
-	// unfiltered `UPDATE ... SET col = CASE ... ELSE col END` matches EVERY
-	// row and, in SQLite, re-assigns+re-writes each one even where the value
-	// is unchanged — so on a fully-migrated Store this forced a full-table WAL
-	// write on every boot, churning pages and blocking active probe writes
-	// (WAL has a single writer). With the WHERE, a no-op boot touches zero
-	// rows, so this is a true one-time migration.
-	if _, err := db.Exec(`UPDATE sensors SET status = CASE status
-		WHEN 'down' THEN 'error'
-		WHEN 'degraded' THEN 'warning'
-		ELSE status END
-		WHERE status IN ('down', 'degraded')`); err != nil {
+	// Replay model: every pre-versioned DB (fleet and test fixtures)
+	// reads user_version = 0, so its first boot after upgrade runs the
+	// whole list once and stamps the head. That is why each step keeps
+	// its pragma/data guards INSIDE the tx: they make every step a
+	// no-op on an already-migrated DB, which is what makes replay from
+	// 0 safe. Subsequent boots read the version and skip the list.
+	ver, err := db.schemaVersion()
+	if err != nil {
 		return err
 	}
-	if _, err := db.Exec(`UPDATE events SET from_status = CASE from_status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE from_status END
-		WHERE from_status IN ('down', 'degraded')`); err != nil {
+	for v := ver; v < len(schemaMigrations); v++ {
+		if err := db.applyMigration(v+1, schemaMigrations[v]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// schemaMigration is one numbered step of the schema history: a human
+// label plus a body that runs inside the step's transaction. The body
+// gets the Store too (two Go-side steps reuse Store helpers and run on
+// pool connections; their transactions are read-only, so no lock
+// interplay). Bodies KEEP their idempotency guards: user_version makes
+// the common path a skip, the guards make replay safe.
+type schemaMigration struct {
+	name string
+	run  func(db *Store, tx *sql.Tx) error
+}
+
+// schemaMigrations is the append-only migration history; the 1-based
+// index is the PRAGMA user_version value. NEVER renumber or edit an
+// applied step — fleet DBs are stamped by position; add the next one.
+var schemaMigrations = []schemaMigration{
+	{
+		// 1: legacy single-tag column → sensor_tags table. Atomic now:
+		// copy + DROP land in ONE transaction. INSERT OR IGNORE stays as
+		// the replay guard for DBs that half-applied this step under
+		// the old non-transactional regime.
+		name: "sensors.tag -> sensor_tags",
+		run: func(db *Store, tx *sql.Tx) error {
+			var tagCol int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('sensors') WHERE name = 'tag'`).Scan(&tagCol); err != nil {
+				return err
+			}
+			if tagCol == 0 {
+				return nil
+			}
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO sensor_tags (sensor_id, tag)
+				SELECT id, tag FROM sensors WHERE tag IS NOT NULL AND TRIM(tag) <> ''`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`ALTER TABLE sensors DROP COLUMN tag`); err != nil {
+				return err
+			}
+			log.Println("schema: migrated sensors.tag -> sensor_tags")
+			return nil
+		},
+	},
+	{
+		// 2: per-sensor latency-spike multiplier. LIVE (dashboard-only):
+		// sparkline bars at/above spike_mult × the window's average RTT
+		// render amber (absolute red >200 ms unchanged). The probe engine
+		// never reads it — status derivation is unaffected — so it is a
+		// display tuning knob, editable per sensor in the dashboard modal.
+		name: "sensors.spike_mult",
+		run:  addColumnIfMissing("sensors", "spike_mult", `ALTER TABLE sensors ADD COLUMN spike_mult INTEGER NOT NULL DEFAULT 5`),
+	},
+	{
+		// 3: record what each probe resolved to (diagnoses "sensors that
+		// never respond" — a NULL/absent resolved_ip means the DNS lookup
+		// never returned, the leading cause of a stalled sensor).
+		name: "probes.resolved_ip",
+		run:  addColumnIfMissing("probes", "resolved_ip", `ALTER TABLE probes ADD COLUMN resolved_ip TEXT`),
+	},
+	{
+		// 4: HTTP status code for HTTP sensors (NULL for ICMP probes and
+		// no-response probes), so a card can show "HTTP 503" vs
+		// "no response" for the same loss row.
+		name: "probes.http_status",
+		run:  addColumnIfMissing("probes", "http_status", `ALTER TABLE probes ADD COLUMN http_status INTEGER`),
+	},
+	{
+		// 5: tag "Pulse Now" manual probes (manual=1). Manual rows stay in
+		// history — sparkline, graph, inspector — but are EXCLUDED from
+		// status derivation (recentFromDB/recentFromCache filter them),
+		// honoring the contract that a manual pulse never affects status
+		// or alerts (before the tag, one lost manual pulse + one lost
+		// scheduled probe tripped the down_after=2 consecutive-loss test
+		// into an "error" alert). Existing rows are all scheduled probes,
+		// so DEFAULT 0 is exactly right.
+		name: "probes.manual",
+		run:  addColumnIfMissing("probes", "manual", `ALTER TABLE probes ADD COLUMN manual INTEGER NOT NULL DEFAULT 0`),
+	},
+	{
+		// 6: name-resolution failure for ICMP probes lost BEFORE a target
+		// IP could be determined (NULL for packet losses and HTTP probes).
+		// The homelab resolver (Pi-hole/AdGuard) is itself a monitored
+		// sensor: its death used to flip every hostname sensor to "error"
+		// at once — one root cause, an N-sensor storm that read as "N
+		// hosts down" — because a DNS loss was indistinguishable from a
+		// packet loss.
+		name: "probes.dns_error",
+		run:  addColumnIfMissing("probes", "dns_error", `ALTER TABLE probes ADD COLUMN dns_error TEXT`),
+	},
+	{
+		// 7: sensor probe type. Existing sensors default to 'icmp' (the
+		// original and only type), so this is a no-op data-wise; it lets
+		// the probe worker dispatch the right probe.
+		name: "sensors.type",
+		run:  addColumnIfMissing("sensors", "type", `ALTER TABLE sensors ADD COLUMN type TEXT NOT NULL DEFAULT 'icmp'`),
+	},
+	{
+		// 8: normalize legacy empty probe type to 'icmp'. The type column
+		// was added with DEFAULT 'icmp', but rows created before the
+		// column existed have type=''. The read paths used to normalize
+		// ''→'icmp' in 6 places; this migration makes the DB the single
+		// source of truth, so those normalizations are removed.
+		name: "sensors.type '' -> icmp",
+		run: func(db *Store, tx *sql.Tx) error {
+			_, err := tx.Exec(`UPDATE sensors SET type = 'icmp' WHERE type = ''`)
+			return err
+		},
+	},
+	{
+		// 9: rename stored statuses (v0.1.13): "down" was the old name
+		// for error and "degraded" for warning; without this, the first
+		// probe after upgrade would log a spurious transition and fire a
+		// one-time alert on every already-affected sensor.
+		//
+		// Each UPDATE is filtered to the legacy rows it actually
+		// rewrites. An unfiltered `UPDATE ... SET col = CASE ... ELSE col
+		// END` matches EVERY row and, in SQLite, re-assigns+re-writes
+		// each one even where the value is unchanged — so on a
+		// fully-migrated Store this forced a full-table WAL write on
+		// every boot, churning pages and blocking active probe writes
+		// (WAL has a single writer). With the WHERE, a no-op replay
+		// touches zero rows.
+		name: "status rename down/degraded -> error/warning",
+		run: func(db *Store, tx *sql.Tx) error {
+			stmts := []string{
+				`UPDATE sensors SET status = CASE status
+					WHEN 'down' THEN 'error'
+					WHEN 'degraded' THEN 'warning'
+					ELSE status END
+					WHERE status IN ('down', 'degraded')`,
+				`UPDATE events SET from_status = CASE from_status
+					WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE from_status END
+					WHERE from_status IN ('down', 'degraded')`,
+				`UPDATE events SET to_status = CASE to_status
+					WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE to_status END
+					WHERE to_status IN ('down', 'degraded')`,
+				`UPDATE alert_state SET status = CASE status
+					WHEN 'down' THEN 'error'
+					WHEN 'degraded' THEN 'warning'
+					ELSE status END
+					WHERE status IN ('down', 'degraded')`,
+				// Cosmetic: old event notes read "up -> degraded" / "down -> up".
+				`UPDATE events SET note = replace(replace(replace(note, 'degraded', 'warning'), 'down', 'error'), 'warning -> up', 'recovered') WHERE note LIKE '%degraded%' OR note LIKE '%down%'`,
+			}
+			for _, s := range stmts {
+				if _, err := tx.Exec(s); err != nil {
+					return err
+				}
+			}
+			return nil
+		},
+	},
+	{
+		// 10: per-provider alert keys (v0.1.14). The single legacy
+		// "webhook_url" was the Google Chat URL, so move it to
+		// google_chat_url and mark the provider enabled (a fresh install
+		// has no legacy row, so it leaves both unset → off). Without
+		// this, existing installs would silently lose their configured
+		// alert webhook on upgrade.
+		//
+		// INSERT OR IGNORE: the NOT EXISTS guard only checks for a
+		// NON-EMPTY google_chat_url, so an install whose operator later
+		// CLEARED the Google Chat URL (row exists, value = '') re-ran
+		// this INSERT and hit the settings.setting_key PRIMARY KEY
+		// constraint — InitSchema failed and runServer log.Fatalf'd,
+		// crash-looping the service. OR IGNORE makes the re-insert a
+		// no-op: a cleared provider stays cleared.
+		name: "webhook_url -> google_chat settings",
+		run: func(db *Store, tx *sql.Tx) error {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO settings (setting_key, value, updated_at)
+				SELECT 'google_chat_url', value, COALESCE(updated_at, datetime('now'))
+				FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
+				AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_url' AND TRIM(value) <> '')`); err != nil {
+				return err
+			}
+			_, err := tx.Exec(`INSERT OR REPLACE INTO settings (setting_key, value, updated_at)
+				SELECT 'google_chat_enabled', '1', COALESCE(updated_at, datetime('now'))
+				FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
+				AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_enabled')`)
+			return err
+		},
+	},
+	{
+		// 11: auth pivoted from a single settings token to the users
+		// table. Runs on Store methods (deliberate log-and-continue
+		// deferral semantics: a failed migration KEEPS the legacy token
+		// and retries next boot — it must never fail InitSchema), so its
+		// own transaction stays read-only and carries only the stamp.
+		name: "legacy auth_token -> admin user",
+		run: func(db *Store, tx *sql.Tx) error {
+			return MigrateLegacyAuthToken(db)
+		},
+	},
+	{
+		// 12: users.is_admin + promote the oldest user when no admin
+		// exists (the account panel is admin-gated; an existing install
+		// must never boot with zero admins). Runs AFTER the legacy token
+		// migration so the migrated 'admin' account (inserted without
+		// the flag) gets promoted. Idempotent by its own guards.
+		name: "users.is_admin + oldest-admin promotion",
+		run: func(db *Store, tx *sql.Tx) error {
+			return db.migrateUserAdminColumn()
+		},
+	},
+}
+
+// schemaVersionHead is the applied-migration count a fully-migrated DB
+// carries in PRAGMA user_version.
+var schemaVersionHead = len(schemaMigrations)
+
+// addColumnIfMissing builds the standard guarded-ALTER body: the pragma
+// probe is the replay guard (no-op once the column exists).
+func addColumnIfMissing(table, column, ddl string) func(*Store, *sql.Tx) error {
+	return func(db *Store, tx *sql.Tx) error {
+		var col int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('` + table + `') WHERE name = '` + column + `'`).Scan(&col); err != nil {
+			return err
+		}
+		if col > 0 {
+			return nil
+		}
+		_, err := tx.Exec(ddl)
 		return err
 	}
-	if _, err := db.Exec(`UPDATE events SET to_status = CASE to_status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE to_status END
-		WHERE to_status IN ('down', 'degraded')`); err != nil {
+}
+
+// schemaVersion reads PRAGMA user_version (0 = pre-versioning, every
+// existing DB before this scheme).
+func (db *Store) schemaVersion() (int, error) {
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return 0, err
+	}
+	return v, nil
+}
+
+// applyMigration runs one numbered step inside its own transaction and
+// stamps user_version inside the SAME transaction: the step and its
+// stamp commit atomically, so a crash mid-step replays the step whole on
+// the next boot (never a half-step, never a stamped half-step).
+func (db *Store) applyMigration(v int, m schemaMigration) error {
+	tx, err := db.Begin()
+	if err != nil {
 		return err
 	}
-	if _, err := db.Exec(`UPDATE alert_state SET status = CASE status
-		WHEN 'down' THEN 'error' WHEN 'degraded' THEN 'warning' ELSE status END
-		WHERE status IN ('down', 'degraded')`); err != nil {
-		return err
+	defer tx.Rollback() // no-op after a successful Commit
+	if err := m.run(db, tx); err != nil {
+		return fmt.Errorf("schema migration %d (%s): %w", v, m.name, err)
 	}
-	// Cosmetic: old event notes read "up -> degraded" / "down -> up".
-	if _, err := db.Exec(`UPDATE events SET note = replace(replace(replace(note, 'degraded', 'warning'), 'down', 'error'), 'warning -> up', 'recovered') WHERE note LIKE '%degraded%' OR note LIKE '%down%'`); err != nil {
-		return err
+	if _, err := tx.Exec(fmt.Sprintf("PRAGMA user_version = %d", v)); err != nil {
+		return fmt.Errorf("schema migration %d (%s): stamp: %w", v, m.name, err)
 	}
-	// One-time migration (v0.1.14): the settings table gained per-provider
-	// keys. The single legacy "webhook_url" was the Google Chat URL, so move
-	// it to google_chat_url (idempotent — skipped if a google_chat_url is
-	// already set). Without this, existing installs would silently lose their
-	// configured alert webhook on upgrade.
-	//
-	// INSERT OR IGNORE: the NOT EXISTS guard only
-	// checks for a NON-EMPTY google_chat_url, so an install whose operator
-	// later CLEARED the Google Chat URL (row exists, value = '') re-ran this
-	// INSERT on the next boot and hit the settings.setting_key PRIMARY KEY
-	// constraint — InitSchema failed and runServer log.Fatalf'd, crash-
-	// looping the service. OR IGNORE makes the re-insert a no-op: a cleared
-	// provider stays cleared.
-	if _, err := db.Exec(`INSERT OR IGNORE INTO settings (setting_key, value, updated_at)
-		SELECT 'google_chat_url', value, COALESCE(updated_at, datetime('now'))
-		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
-		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_url' AND TRIM(value) <> '')`); err != nil {
-		return err
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("schema migration %d (%s): commit: %w", v, m.name, err)
 	}
-	// Mark the migrated Google Chat provider explicitly enabled, so the new
-	// per-provider toggle reflects the pre-existing active config (and a
-	// fresh install, which has no legacy row, leaves it unset → off).
-	if _, err := db.Exec(`INSERT OR REPLACE INTO settings (setting_key, value, updated_at)
-		SELECT 'google_chat_enabled', '1', COALESCE(updated_at, datetime('now'))
-		FROM settings WHERE setting_key = 'webhook_url' AND TRIM(value) <> ''
-		AND NOT EXISTS (SELECT 1 FROM settings WHERE setting_key = 'google_chat_enabled')`); err != nil {
-		return err
-	}
-	// One-time migration: auth pivoted from a single settings token to the
-	// users table (username/password). If a legacy auth_token row exists
-	// AND no users exist yet, it becomes the "admin" account (the hash is
-	// already bcrypt, so it verifies exactly as before). The row is then
-	// cleared either way — the users table is the source of truth.
-	if err := MigrateLegacyAuthToken(db); err != nil {
-		return err
-	}
-	// One-time migration: the users table gained is_admin (the account
-	// panel — add/remove user, disable auth — is admin-gated; the first
-	// bootstrapped user is the admin). Old DBs get the column added, and
-	// the OLDEST user is promoted when no admin exists yet, so an existing
-	// install never boots with zero admins (that would lock every
-	// account-management endpoint). Idempotent: on a fresh Store the column
-	// exists and first accounts are created with the flag, so both
-	// statements no-op. Runs AFTER the legacy token migration above so the
-	// migrated 'admin' account (inserted without the flag) gets promoted.
-	if err := db.migrateUserAdminColumn(); err != nil {
-		return err
-	}
+	log.Printf("schema: applied migration %d (%s)", v, m.name)
 	return nil
 }
 
