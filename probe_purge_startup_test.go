@@ -20,10 +20,14 @@ func TestRunPurgesAtStartup(t *testing.T) {
 	// spawned (nothing else writes probe rows during the test) — the startup
 	// sweep is the only thing that can remove the old rows.
 	fcSensor(t, db, "purge1", "purge1", "paused")
-	// Old rows (25h ago) that the retention sweep must remove.
+	// Old rows at 25h..94h ago — 70 of them, deliberately BEYOND the
+	// per-sensor 60-row tail exemption (finding #6), so the sweep has rows
+	// it MUST remove: survivors = the newest 60 (the 1 recent row + the 59
+	// newest old rows), the 11 oldest old rows are deleted. Hour spacing
+	// keeps EVERY seeded old row unambiguously past the 24h cutoff.
 	oldBase := time.Now().Add(-25 * time.Hour)
-	for i := 0; i < 5; i++ {
-		fcProbe(t, db, "purge1", oldBase.Add(time.Duration(i)*time.Minute), nil)
+	for i := 0; i < 70; i++ {
+		fcProbe(t, db, "purge1", oldBase.Add(-time.Duration(i)*time.Hour), nil)
 	}
 	// A recent row (1h ago), inside the 24h window, that must survive.
 	fcProbe(t, db, "purge1", time.Now().Add(-1*time.Hour), 12.5)
@@ -43,15 +47,21 @@ func TestRunPurgesAtStartup(t *testing.T) {
 	<-done
 
 	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
-	var oldCount, recentCount int
+	var oldCount, recentCount, total int
 	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1' AND ts < ?`, cutoff).Scan(&oldCount); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1' AND ts >= ?`, cutoff).Scan(&recentCount); err != nil {
 		t.Fatal(err)
 	}
-	if oldCount != 0 {
-		t.Errorf("old rows after startup = %d, want 0 (finding #9: retention must run at startup, not only after 1h)", oldCount)
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1'`).Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	// 71 rows seeded; the startup sweep must have removed exactly the 11
+	// oldest (everything past the 60-row tail).
+	if total != seriesTailProbes || oldCount != seriesTailProbes-1 {
+		t.Errorf("after startup purge: total=%d old=%d, want total=%d old=%d (finding #9: retention must run at startup, not only after 1h; finding #6: the newest 60 are exempt)",
+			total, oldCount, seriesTailProbes, seriesTailProbes-1)
 	}
 	if recentCount != 1 {
 		t.Errorf("recent rows after startup = %d, want 1 (the 24h window must survive the sweep)", recentCount)

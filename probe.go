@@ -70,6 +70,15 @@ func (ps *probeSeries) lastTs() int64 {
 // span more than an hour.
 const rawWindowSecs = 3600
 
+// seriesTailProbes is the count rule of the raw tier: the last 60 probes are
+// kept at full resolution (the inspector window) even when rawWindowSecs
+// pushes them further back for slow-interval sensors. purgeOld EXEMPTS exactly
+// this per-sensor tail from 24h retention so the DB keeps everything the live
+// series can hold: warmStats phase 2 (the same LIMIT 60) can rebuild the tail
+// after a restart, and a slow sensor's inspector window survives a deploy
+// (invariant: DB rows ⊇ live series contents).
+const seriesTailProbes = 60
+
 // append adds a new (newest) entry. It lands in the raw tier; raw entries that
 // age out of the raw window — max(1h, last 60) — are folded into per-minute
 // buckets (each entry folds exactly once); minute buckets older than the 24h
@@ -123,7 +132,7 @@ func (ps *probeSeries) append(e probeEntry) {
 	if i < ps.rawStart {
 		i = ps.rawStart
 	}
-	c := n - 60
+	c := n - seriesTailProbes
 	if c < ps.rawStart {
 		c = ps.rawStart
 	}
@@ -518,8 +527,11 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	// often than hourly — crash loops, frequent updates — would never purge and
 	// the probes/events tables would grow without bound. Running it here (not
 	// just on the hourly tick) guarantees a sweep on every boot. It goes BEFORE
-	// warmStats so the warm query reads an already-trimmed 24h window instead
-	// of a stale backlog. It is idempotent and bounded (per-sensor batches), so
+	// warmStats so the warm query reads an already-trimmed window instead of a
+	// stale backlog; for probes the trim is 24h PLUS each sensor's newest
+	// seriesTailProbes tail (purgeOld exemption), so the warm phases load
+	// exactly what the live series would have held. It is idempotent and
+	// bounded (per-sensor batches), so
 	// the one-time startup cost is a few milliseconds on a healthy DB.
 	pw.purgeOld(ctx)
 	// Populate the stats cache from the DB so the first dashboard poll after a
@@ -1316,7 +1328,11 @@ func setErrorRetryInterval(d time.Duration) { atomic.StoreInt64(&errorRetryInter
 const purgeBatchSize = 5000
 
 // purgeOld enforces 24-hour retention on probes/events (SPEC §3). 24h is the
-// longest window the dashboard reads, so nothing on screen needs older data.
+// longest TIME window the dashboard reads; probes additionally keep each
+// sensor's newest seriesTailProbes rows (the raw-tier tail the live series
+// keeps for slow-interval sensors, exempted in the DELETE below) so the DB
+// always contains everything warmStats can load and a restart never shrinks
+// the 60-probe inspector window.
 //
 // ts is compared as a string. That is exact because every writer uses the
 // fixed-width store.FormatTS layout (lexicographic order == chronological order). Rows
@@ -1360,8 +1376,26 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 					return
 				default:
 				}
-				res, err := pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
+				// probes: 24h retention EXEMPTS each sensor's newest
+				// seriesTailProbes rows (the raw-tier tail the live
+				// series keeps) — without the exemption the startup
+				// purge deletes the tail warmStats phase 2 promises to
+				// rebuild, so a slow sensor's inspector window would
+				// shrink across every restart. The subquery reads the
+				// tail off idx_probes_sensor_ts (sensor_id, ts) —
+				// ~60 index probes per batch. events need no exemption
+				// (transitions are sparse; nothing mirrors a tail).
+				var res sql.Result
+				var err error
+				if table == "probes" {
+					res, err = pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
+					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ?
+					AND id NOT IN (SELECT id FROM `+table+` WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?)
+					LIMIT ?)`, id, cutoff, id, seriesTailProbes, purgeBatchSize)
+				} else {
+					res, err = pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
 					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
+				}
 				if err != nil {
 					log.Printf("retention: failed to purge %s for sensor %s: %v", table, id, err)
 					break

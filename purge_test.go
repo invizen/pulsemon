@@ -102,6 +102,13 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 	far := seed(-6 * time.Hour)        // well past the boundary -> must be DELETED
 	justOld := seed(-10 * time.Second) // just past the boundary -> must be DELETED
 	young := seed(1 * time.Hour)       // well inside the window -> must be KEPT
+	// 60 in-window filler rows (finding #6): the purge exempts each sensor's
+	// newest 60 rows, so the two past-boundary rows must fall OUTSIDE that
+	// tail to be deletion candidates. Every filler is newer than `young`,
+	// so the tail is exactly the fillers and far/justOld are outside it.
+	for i := 2; i <= 61; i++ {
+		seed(time.Duration(i) * time.Hour)
+	}
 
 	pw := &ProbeWorker{db: db}
 	pw.purgeOld(context.Background())
@@ -202,19 +209,24 @@ func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = 'b'").Scan(&nB); err != nil {
 		t.Fatalf("count b: %v", err)
 	}
-	if nA != 50 {
-		t.Fatalf("sensor 'a': %d rows left, want exactly the 50 in-window ones (12,000 past-boundary rows must all be purged across multiple batches)", nA)
+	// Tail exemption (finding #6): 'a' keeps the 50 in-window rows PLUS its
+	// 10 newest past-boundary rows (the 60-row per-sensor tail; 'a' has
+	// 12,000 old rows, so exactly 50 of them fall outside the tail and purge).
+	if nA != seriesTailProbes {
+		t.Fatalf("sensor 'a': %d rows left, want the 50 in-window + 10 newest past-boundary (tail exemption), with the other 11,990 purged across multiple batches", nA)
 	}
 	if nB != 100 {
 		t.Fatalf("sensor 'b': %d rows left, want 100 (an all-young sensor must be untouched)", nB)
 	}
-	// And every survivor of 'a' is a young row (no early-deletion at scale).
+	// The 10 survivors beyond the window are the NEWEST old rows — no
+	// early-deletion at scale: survivors = 50 young + old rows i=11990..11999,
+	// so MIN(ts) is the 10th-newest old row, i=11990.
 	var oldest string
 	if err := db.QueryRow("SELECT MIN(ts) FROM probes WHERE sensor_id = 'a'").Scan(&oldest); err != nil {
 		t.Fatalf("min ts: %v", err)
 	}
-	if !strings.HasPrefix(oldest, youngBase.Format("2006-01-02T15:04")) {
-		t.Fatalf("sensor 'a' oldest survivor %q is not an in-window row", oldest)
+	if !strings.HasPrefix(oldest, oldBase.Add(11990*time.Second).Format("2006-01-02T15:04")) {
+		t.Fatalf("sensor 'a' oldest survivor %q is not the 10th-newest old row (the exempted tail must be the newest rows)", oldest)
 	}
-	t.Logf("purgeOld multi-batch: 'a' 12,050 -> 50, 'b' 100 -> 100")
+	t.Logf("purgeOld multi-batch: 'a' 12,050 -> 60 (50 in-window + 10 tail), 'b' 100 -> 100")
 }

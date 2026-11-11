@@ -55,15 +55,44 @@ func TestFix_TS_PurgeDeletesOnlyOldRowsIncludingLegacyFormat(t *testing.T) {
 	pw := NewProbeWorker(db)
 	old := time.Now().Add(-25 * time.Hour)
 	young := time.Now().Add(-23 * time.Hour)
-	fcProbe(t, db, "a", old, 1.0)
+	// Seed BEYOND the per-sensor 60-row tail exemption (finding #6): 65 old
+	// + 2 young = 67 rows, so the sweep deletes exactly the 7 oldest. Hour
+	// spacing keeps every old row unambiguously past the 24h cutoff. The
+	// two legacy variable-width OLD rows are seeded as the oldest, so the
+	// deleted set provably includes them (the point of this test: legacy
+	// rows are purged by string comparison despite the variable width).
+	for i := 0; i < 63; i++ {
+		fcProbe(t, db, "a", old.Add(-time.Duration(i)*time.Hour), 1.0)
+	}
+	legacyOld1 := old.Add(-64 * time.Hour).UTC().Format(time.RFC3339)
+	legacyOld2 := old.Add(-65 * time.Hour).UTC().Format(time.RFC3339Nano)
+	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyOld1)
+	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyOld2)
 	fcProbe(t, db, "a", young, 1.0)
-	// legacy variable-width rows written by older versions
-	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, old.UTC().Format(time.RFC3339Nano))
-	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, young.UTC().Format(time.RFC3339Nano))
+	// legacy variable-width young row (integer-second form, like pre-
+	// FormatTS writers: trailing zeros trimmed, so it cannot collide with
+	// the nanosecond-precision fcProbe rows in the ts IN/= lookups)
+	legacyYoung := young.Truncate(time.Second).UTC().Format(time.RFC3339Nano)
+	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyYoung)
+
 	pw.purgeOld(context.Background())
-	var n int
+
+	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
+	var n, oldLeft, legacyOldLeft, legacyYoungLeft int
 	db.QueryRow(`SELECT COUNT(*) FROM probes`).Scan(&n)
-	if n != 2 {
-		t.Fatalf("%d rows left, want exactly the 2 young ones", n)
+	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts < ?`, cutoff).Scan(&oldLeft)
+	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts IN (?, ?)`, legacyOld1, legacyOld2).Scan(&legacyOldLeft)
+	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts = ?`, legacyYoung).Scan(&legacyYoungLeft)
+	if n != 60 {
+		t.Fatalf("%d rows left, want 60 (24h window + 60-row tail exemption)", n)
+	}
+	if oldLeft != 58 {
+		t.Errorf("%d old rows left, want 58 (the 58 newest old rows are inside the tail)", oldLeft)
+	}
+	if legacyOldLeft != 0 {
+		t.Errorf("%d legacy-format OLD rows left, want 0 (purge must delete variable-width legacy rows)", legacyOldLeft)
+	}
+	if legacyYoungLeft != 1 {
+		t.Errorf("legacy-format young row missing (want 1, got %d)", legacyYoungLeft)
 	}
 }

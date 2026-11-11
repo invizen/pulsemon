@@ -238,14 +238,14 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// rows, so it replaces the phase-1 series (no dedupe).
 	var slow []string
 	for _, id := range idList {
-		if a, ok := byID[id]; !ok || a.n24 < 60 {
+		if a, ok := byID[id]; !ok || a.n24 < seriesTailProbes {
 			slow = append(slow, id)
 		}
 	}
 	backfillLast60 := func(id string) {
 		rows, err := pw.db.QueryContext(ctx,
 			`SELECT ts, rtt_ms, manual FROM probes
-			WHERE sensor_id = ? ORDER BY ts DESC LIMIT 60`, id)
+			WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?`, id, seriesTailProbes)
 		if err != nil {
 			log.Printf("stats warm: last-60 backfill failed for %s: %v", id, err)
 			return

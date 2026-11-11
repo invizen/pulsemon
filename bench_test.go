@@ -58,7 +58,7 @@ func BenchmarkPurgeOld(b *testing.B) {
 	if err := db.QueryRow("SELECT COUNT(*) FROM probes").Scan(&young); err != nil {
 		b.Fatalf("count survivors: %v", err)
 	}
-	want := benchPurgeSensors * 10 // the 10 in-window rows per sensor
+	want := benchPurgeSensors * seriesTailProbes // per sensor: the 10 in-window rows + 50 exempted newest-old tail rows (finding #6)
 	b.Logf("purged %d old rows across %d sensors; %d young rows survived (want %d)",
 		benchPurgeSensors*benchPurgeRowsPerSensor, benchPurgeSensors, young, want)
 	if young != want {

@@ -4,7 +4,7 @@ import "testing"
 
 // TestValidateDownAfterRetention pins finding #3: a down_after × interval_s
 // product beyond the 24h probe-retention window can never accumulate
-// down_after consecutive losses (purgeOld keeps only 24h of probes, so the
+// down_after consecutive losses (purgeOld keeps 24h plus each sensor's newest 60-row tail, so the
 // longest observable loss run is 24h/interval_s). A 100%-dead sensor with
 // such a combination sits in warning forever and never reaches error — and
 // warnings are never alerted. The write path must reject it.
