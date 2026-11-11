@@ -1482,7 +1482,18 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
 		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
 	if err != nil {
-		respondWithError(w, http.StatusNotFound, "sensor not found")
+		// Existence-check contract (2026-11-03, pinned by
+		// TestSensorExistenceCheckDistinguishesErrors): only sql.ErrNoRows
+		// means "sensor not found". A canceled ctx, SQLITE_BUSY, or I/O
+		// failure is a transient server error — it must not read as
+		// "the sensor was deleted", and must reach the service log.
+		// (The same handler's later queries already answered these with
+		// respondInternal; this was the last collapsed site of the class.)
+		if errors.Is(err, sql.ErrNoRows) {
+			respondWithError(w, http.StatusNotFound, "sensor not found")
+		} else {
+			respondInternal(w, "clone sensor "+id, err)
+		}
 		return
 	}
 	src.Tags = s.db.SensorTags(id)

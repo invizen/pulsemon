@@ -207,6 +207,9 @@ func TestFix_MaintenanceAndTagDeleteHonorRequestContext(t *testing.T) {
 // else to a 500. A canceled client ctx (disconnected) must now surface as
 // a 500 (a transient server error), while a genuinely-missing sensor (live
 // ctx) stays a 404 — a locked DB must not read as "the sensor was deleted".
+// The clone route joins the case list (review 2026-11-11): handleSensorClone's
+// source-row read was the last site of this class left unconverted — its
+// own later queries already answered transient failures with 500.
 //
 // The test routes through srv.Mux() (not the handler methods directly) so
 // r.PathValue("id") is populated; the fresh test DB has no users, so auth
@@ -232,6 +235,7 @@ func TestSensorExistenceCheckDistinguishesErrors(t *testing.T) {
 		{"GET", "/api/sensors/{id}/history"},
 		{"GET", "/api/sensors/{id}/graph?range=1h"},
 		{"DELETE", "/api/sensors/{id}/history"},
+		{"POST", "/api/sensors/{id}/clone"},
 	}
 
 	// 1. Dead request ctx (client disconnected before the DB call) → 500,
@@ -259,13 +263,18 @@ func TestSensorExistenceCheckDistinguishesErrors(t *testing.T) {
 		}
 	}
 
-	// 3. Existing sensor (live ctx) → 200 (happy path intact).
+	// 3. Existing sensor (live ctx) → 200 (happy path intact); the clone
+	// route creates a resource, so its happy path is 201.
 	for _, c := range cases {
+		want := http.StatusOK
+		if c.method == http.MethodPost {
+			want = http.StatusCreated
+		}
 		req := httptest.NewRequest(c.method, strings.ReplaceAll(c.path, "{id}", "exist-s1"), nil)
 		rr := httptest.NewRecorder()
 		srv.Mux().ServeHTTP(rr, req)
-		if rr.Code != http.StatusOK {
-			t.Errorf("%s %s for an existing sensor: %d, want 200 (%s)", c.method, c.path, rr.Code, rr.Body.String())
+		if rr.Code != want {
+			t.Errorf("%s %s for an existing sensor: %d, want %d (%s)", c.method, c.path, rr.Code, want, rr.Body.String())
 		}
 	}
 }
