@@ -180,6 +180,18 @@ func TestProbeHTTPRedirectRebindingClosed(t *testing.T) {
 	}()
 
 	oldResolver := net.DefaultResolver
+	// Bound the seam dialer: the hop dials 203.0.113.1 (blackholed), and
+	// Go 1.26's getConn DETACHES the dial ctx from the request ctx ("the
+	// dial should proceed even if the request is canceled"), so the
+	// un-timeouted probeDialer would keep the transport's dialConn dialing
+	// ~2min past the 5s probe timeout — past this test's deferred
+	// restores and later tests' probeDialer/resolver writes (the -race
+	// hit of 2026-11-11). A short Timeout lands the dial failure inside
+	// the pending-request window, so the result delivery synchronizes the
+	// dialConn with this test goroutine (happens-before) before any
+	// global is restored.
+	oldProbeDialer := probeDialer
+	probeDialer = &net.Dialer{Timeout: 2 * time.Second}
 	net.DefaultResolver = &net.Resolver{
 		PreferGo: true,
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -198,6 +210,7 @@ func TestProbeHTTPRedirectRebindingClosed(t *testing.T) {
 		httpClient.Transport.(uaRoundTripper).base.(*http.Transport).CloseIdleConnections()
 		time.Sleep(50 * time.Millisecond) // let any in-flight dialer goroutine finish
 		net.DefaultResolver = oldResolver
+		probeDialer = oldProbeDialer
 	}()
 
 	// Source server 302s to the rebinding hostname on the stand-in's port.

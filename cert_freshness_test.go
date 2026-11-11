@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 	"time"
 )
@@ -162,5 +163,63 @@ func TestCertReadKeyIsOriginalTarget(t *testing.T) {
 	}
 	if finalOK {
 		t.Errorf("certReadTimes keyed under the final hop (pre-fix behavior)")
+	}
+}
+
+// TestStaleCertProbeForcesFreshDial proves the stale-cert refresh lands in
+// the SAME probe, not one probe late: probe 1 (no cert entry) dials and
+// closes, probe 2 (fresh cert) keep-alives into the pool, the entry is then
+// backdated past certFreshness, and probe 3 (req.Close set) must open a
+// THIRD connection — a fresh handshake whose cert is the one reported. On
+// the pooled transport req.Close rides probe 2's idle conn (getConn serves
+// it regardless of the flag; verified on Go 1.26), so the "fresh handshake"
+// the flag claimed to force was a lie until the flagged-request routing
+// (probeFreshTransport) made it real.
+func TestStaleCertProbeForcesFreshDial(t *testing.T) {
+	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
+	var mu sync.Mutex
+	seen := map[string]bool{}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen[r.RemoteAddr] = true
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	defer srv.Close()
+	t.Cleanup(func() {
+		httpClient.Transport.(uaRoundTripper).base.(*http.Transport).CloseIdleConnections()
+	})
+
+	hostKey := "https://" + srv.Listener.Addr().String()
+	certReadMu.Lock()
+	oldMap := certReadTimes
+	certReadTimes = make(map[string]time.Time)
+	certReadMu.Unlock()
+	t.Cleanup(func() {
+		certReadMu.Lock()
+		certReadTimes = oldMap
+		certReadMu.Unlock()
+	})
+
+	ctx := context.Background()
+	for i := 1; i <= 2; i++ {
+		if res := probeHTTP(ctx, srv.URL, 5*time.Second); res.Lost {
+			t.Fatalf("probe %d lost: %+v", i, res)
+		}
+	}
+	certReadMu.Lock()
+	certReadTimes[hostKey] = time.Now().Add(-certFreshness - time.Second)
+	certReadMu.Unlock()
+	if res := probeHTTP(ctx, srv.URL, 5*time.Second); res.Lost {
+		t.Fatalf("stale-cert probe lost: %+v", res)
+	}
+	mu.Lock()
+	n := len(seen)
+	mu.Unlock()
+	if n != 3 {
+		t.Fatalf("server saw %d distinct connections over 3 probes, want 3 — the stale-cert probe rode the pooled conn (cert re-read lags one probe)", n)
 	}
 }

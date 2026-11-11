@@ -330,14 +330,58 @@ var probeUserAgent = "pulsemon/" + Version
 // redirect hops — the client calls RoundTrip for each one). It only sets the
 // header when the caller hasn't already, so a test that pins its own UA is
 // respected.
-type uaRoundTripper struct{ base http.RoundTripper }
+//
+// Invariant: a request flagged req.Close is routed to the no-reuse transport.
+// req.Close is the probe's "must dial" signal (stale-cert probes, flagged
+// redirect hops), and the POOLED transport cannot serve it: Transport.getConn
+// takes an idle conn regardless of Request.Close — the flag only keeps that
+// conn out of the pool afterwards (verified empirically on Go 1.26). A
+// pinned redirect hop riding an idle conn would dial WITHOUT the checked
+// pin, bypassing the DNS-rebinding protection, and a stale-cert probe would
+// re-report the pooled conn's original-handshake cert one probe late
+// (TestReqCloseRoutesFlaggedRequests, TestPinnedRedirectHopDialsFreshConn).
+type uaRoundTripper struct{ base, fresh http.RoundTripper }
 
 func (u uaRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Header.Get("User-Agent") == "" {
 		req.Header.Set("User-Agent", probeUserAgent)
 	}
+	if req.Close {
+		return u.fresh.RoundTrip(req)
+	}
 	return u.base.RoundTrip(req)
 }
+
+// probeTransport is the probe client's pooled (keep-alive) transport: N HTTP
+// sensors hitting one host pay one TCP handshake.
+var probeTransport = &http.Transport{
+	MaxIdleConns:          100,
+	MaxIdleConnsPerHost:   32,
+	IdleConnTimeout:       10 * time.Minute,
+	ExpectContinueTimeout: 1 * time.Second,
+	// TLS is owned by probeDialTLS (dial + handshake + verify
+	// before any request bytes): TLSClientConfig is deliberately
+	// nil — the transport's own TLS path, and its InsecureSkipVerify,
+	// are not used. TLSHandshakeTimeout is likewise moot (it only
+	// governs the transport's addTLS); probeDialTLS caps the
+	// handshake itself. DialContext (probeDial) serves the plain-HTTP
+	// path with the same pin lookup; HTTPS uses DialTLSContext, so the
+	// two never interfere.
+	DialContext:    probeDial,
+	DialTLSContext: probeDialTLS,
+}
+
+// probeFreshTransport serves every req.Close-flagged request.
+// DisableKeepAlives makes the pool empty by construction (putIdleConn
+// closes, so getConn can never hand out an idle conn): every flagged
+// request DIALS, and the dial hooks consult the per-probe pin map — the
+// only way "force a fresh connection" is real. Redirect conns land here
+// and die after their response; nothing is pooled.
+var probeFreshTransport = func() *http.Transport {
+	t := probeTransport.Clone()
+	t.DisableKeepAlives = true
+	return t
+}()
 
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
@@ -374,7 +418,10 @@ var httpClient = &http.Client{
 				p.mu.Unlock()
 			}
 		}
-		// Force a fresh connection on EVERY pinned or HTTPS redirect hop:
+		// Force a fresh connection on EVERY pinned or HTTPS redirect hop
+		// (req.Close routes the hop to probeFreshTransport — on the POOLED
+		// transport the flag alone does NOT force a dial, see the
+		// uaRoundTripper invariant):
 		//   - Pinned hops (cross-host, any scheme) MUST get a fresh conn:
 		//     the pin is honored only at dial time, and a pooled conn was
 		//     dialed WITHOUT this pin (or with a different one), so reusing
@@ -397,22 +444,7 @@ var httpClient = &http.Client{
 		}
 		return nil
 	},
-	Transport: uaRoundTripper{base: &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       10 * time.Minute,
-		ExpectContinueTimeout: 1 * time.Second,
-		// TLS is owned by probeDialTLS (dial + handshake + verify
-		// before any request bytes): TLSClientConfig is deliberately
-		// nil — the transport's own TLS path, and its InsecureSkipVerify,
-		// are not used. TLSHandshakeTimeout is likewise moot (it only
-		// governs the transport's addTLS); probeDialTLS caps the
-		// handshake itself. DialContext (probeDial) serves the plain-HTTP
-		// path with the same pin lookup; HTTPS uses DialTLSContext, so the
-		// two never interfere.
-		DialContext:    probeDial,
-		DialTLSContext: probeDialTLS,
-	}},
+	Transport: uaRoundTripper{base: probeTransport, fresh: probeFreshTransport},
 }
 
 // certFreshness is the maximum age of a cached cert reading before
