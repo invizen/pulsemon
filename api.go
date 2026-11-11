@@ -1059,16 +1059,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				DownAfter: feffDownAfter,
 			}
 			if err := crossField.validateCrossField(); err != nil {
-				if strings.Contains(err.Error(), "URL") {
-					return errPatchTargetNotURL
-				}
-				if strings.Contains(err.Error(), "timeout") {
-					return errPatchTimeoutExceedsInterval
-				}
-				if strings.Contains(err.Error(), "down_after") {
-					return errPatchDownAfterExceedsRetention
-				}
-				return errPatchTargetInvalid
+				// The rule's sentinel travels inside the error
+				// (crossFieldError.Unwrap); the outer errors.Is switch
+				// maps it. No message-substring re-derivation
+				// (review 2026-11-11).
+				return err
 			}
 
 			if len(sets) > 0 {

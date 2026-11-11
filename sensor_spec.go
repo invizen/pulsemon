@@ -93,24 +93,43 @@ func (s *sensorSpec) validate() error {
 	return nil
 }
 
+// crossFieldError ties a client-facing validation message to the PATCH
+// sentinel that stands for the same rule (review 2026-11-11). The PATCH
+// path maps validateCrossField failures onto the errPatch* sentinels for
+// its outer errors.Is switch; it used to re-derive that mapping from
+// substrings of the message ("URL" / "timeout" / "down_after"), so a
+// wording tweak — or a target validation message that happens to contain
+// one of those words — silently mis-routed the 400. The rule's code now
+// travels INSIDE the error; every caller matches it with errors.Is, and
+// Error() keeps the exact detailed text POST /api/sensors renders.
+type crossFieldError struct {
+	msg  string
+	code error
+}
+
+func (e *crossFieldError) Error() string { return e.msg }
+func (e *crossFieldError) Unwrap() error { return e.code }
+
 // validateCrossField checks the cross-field rules: target format for the
 // probe type, and timeout vs interval. Called by validate() and by the
 // PATCH in-tx path (which overlays request fields on current DB values
-// before calling it).
+// before calling it). Every rejection carries its sentinel (crossFieldError).
 func (s *sensorSpec) validateCrossField() error {
 	if s.Type == "http" {
 		if !validURL(s.Target) {
-			return errors.New("target must be an http:// or https:// URL (e.g. https://example.com/health)")
+			return &crossFieldError{"target must be an http:// or https:// URL (e.g. https://example.com/health)", errPatchTargetNotURL}
 		}
 	} else if s.Type == "tcp" {
 		if !validTCPTarget(s.Target) {
-			return errors.New("target must be host:port with an explicit port 1-65535 (e.g. 10.0.0.5:5432)")
+			// TCP and ICMP target failures share the TargetInvalid sentinel
+			// — same fall-through the old mapping's default branch produced.
+			return &crossFieldError{"target must be host:port with an explicit port 1-65535 (e.g. 10.0.0.5:5432)", errPatchTargetInvalid}
 		}
 	} else if !validTarget(s.Target) {
-		return errors.New("target must be an IPv4 address or hostname")
+		return &crossFieldError{"target must be an IPv4 address or hostname", errPatchTargetInvalid}
 	}
 	if s.TimeoutMS > s.IntervalS*1000 {
-		return errors.New("timeout_ms must not exceed interval_s*1000")
+		return &crossFieldError{"timeout_ms must not exceed interval_s*1000", errPatchTimeoutExceedsInterval}
 	}
 	// down_after × interval_s beyond the 24h probe-retention window can never
 	// accumulate down_after consecutive losses (purgeOld keeps only 24h of
@@ -118,7 +137,7 @@ func (s *sensorSpec) validateCrossField() error {
 	// would then sit in warning forever and never reach error — and warnings
 	// are never alerted. Reject the combination at write time.
 	if int64(s.DownAfter)*int64(s.IntervalS) > retentionSeconds {
-		return errors.New("down_after × interval_s must not exceed 24h (probe retention)")
+		return &crossFieldError{"down_after × interval_s must not exceed 24h (probe retention)", errPatchDownAfterExceedsRetention}
 	}
 	return nil
 }

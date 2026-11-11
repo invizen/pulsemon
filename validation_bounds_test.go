@@ -174,3 +174,49 @@ func TestFix_M10b_TimeoutVsInterval(t *testing.T) {
 		t.Fatalf("PATCH timeout_ms=10000 body = %v, want updated", out)
 	}
 }
+
+// TestPatchCrossFieldSentinelsNotSubstrings (review 2026-11-11 #7) pins
+// that PATCH routes every validateCrossField rejection onto its sentinel
+// through the error VALUE (crossFieldError.Unwrap → errors.Is), not
+// through substrings of the message ("URL" / "timeout" / "down_after").
+// Pre-refactor the closure re-derived the mapping from err.Error() text,
+// so any wording tweak in sensor_spec.go silently mis-routed the 400 —
+// and with the refactor's plain-returns as the sabotage (sentinel codes
+// stripped from the returned errors), every case here lands on the
+// closure's outer default (respondInternal) and answers 500.
+// All field values stay inside sensorBounds so each request reaches the
+// cross-field gate, not the per-field bound check.
+func TestPatchCrossFieldSentinelsNotSubstrings(t *testing.T) {
+	_, do := newM10bServer(t)
+	code, out := do("POST", "/api/sensors", `{"name":"cf-1","target":"10.0.0.1","type":"icmp","interval_s":60,"timeout_ms":1000,"loss_warn":25,"down_after":2,"spike_mult":3}`)
+	if code != http.StatusCreated {
+		t.Fatalf("seed sensor: %d %v", code, out)
+	}
+	id, _ := out["id"].(string)
+	cases := []struct{ label, body, want string }{
+		{"http target not a URL", `{"type":"http","target":"notaurl"}`, "target must be an http://"},
+		{"tcp target without port", `{"type":"tcp","target":"noport"}`, "target must be an IPv4 address or hostname"},
+		{"icmp target invalid", `{"target":"!!!"}`, "target must be an IPv4 address or hostname"},
+		{"timeout over interval", `{"interval_s":5,"timeout_ms":30000}`, "timeout_ms must not exceed interval_s*1000"},
+		{"down_after over retention", `{"interval_s":3600,"down_after":100}`, "down_after × interval_s must not exceed 24h"},
+	}
+	for _, c := range cases {
+		code, out = do("PATCH", "/api/sensors/"+id, c.body)
+		msg, _ := out["error"].(string)
+		if code != http.StatusBadRequest {
+			t.Errorf("%s: PATCH got %d %v, want 400 routed to its sentinel (500 = sentinel lost, fell through to respondInternal)", c.label, code, out)
+			continue
+		}
+		if !strings.Contains(msg, c.want) {
+			t.Errorf("%s: 400 body %q, want it to carry %q (silent cross-field misroute)", c.label, msg, c.want)
+		}
+	}
+
+	// The detailed POST text is the SAME Error() string: validate() must
+	// keep rendering the full example message (client-visible contract).
+	code, out = do("POST", "/api/sensors", `{"name":"cf-2","target":"notaurl","type":"http"}`)
+	msg, _ := out["error"].(string)
+	if code != http.StatusBadRequest || !strings.Contains(msg, "target must be an http:// or https:// URL (e.g. https://example.com/health)") {
+		t.Errorf("POST http invalid target: %d %v, want 400 with the detailed example text", code, out)
+	}
+}
