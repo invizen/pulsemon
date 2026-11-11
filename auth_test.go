@@ -2833,3 +2833,91 @@ func TestLoginThrottleKnownGoodHardCapWipe(t *testing.T) {
 		t.Fatal("ip2 missing from the per-IP map after the wipe")
 	}
 }
+
+// TestLoginOversizedCredentialsRejectedPreDB (review 2026-11-11 #6):
+// /api/auth/login is unauthenticated and authGate's body cap is 1 MiB
+// (sized for TLS cert uploads), so the login handler used to accept
+// 1 MiB usernames/passwords and pay for them: strings.ToLower, the
+// checkUserLock map hash, the userExists SQL bind — and a throttle
+// charge, since the path ends in the dummy-KDF 401. AddUserMode enforces
+// ≤32-byte usernames and ≤72-byte passwords at creation, so an overlong
+// pair can never match any account: the guard rejects them in the
+// empty-credential category (400, uncharged, before ANY DB work).
+//
+// Pins:
+//  1. 1 MiB username / 1 MiB password → 400 validation (not 401).
+//  2. Uncharged: loginFailMax+2 oversized attempts never 429.
+//  3. Boundaries stay credential attempts: 32-byte name + 72-byte pw
+//     reach the KDF path (401, charged).
+//  4. No DB touch on the oversized path: with the users table DROPPED,
+//     oversized → 400 (guard runs before the store) while a normal login
+//     → 401 (proves the normal path reaches the store; the asymmetry is
+//     the pin — pre-fix the oversized request hits the same missing
+//     table and answers the 401).
+func TestLoginOversizedCredentialsRejectedPreDB(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+
+	big := strings.Repeat("x", 900<<10) // 900 KiB: huge vs the 32/72 bounds, under authGate's 1 MiB envelope
+	post := func(body, ip string) *http.Response {
+		return loginPost(t, httpSrv.URL, body, ip)
+	}
+
+	resp := post(`{"username":"`+big+`","password":"pw"}`, "203.0.113.50")
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "username exceeds") {
+		t.Fatalf("1 MiB username: %d %s, want 400 username-exceeds (rejected before DB/KDF)", resp.StatusCode, body)
+	}
+	resp = post(`{"username":"admin","password":"`+big+`"}`, "203.0.113.50")
+	body, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "password exceeds 72 bytes") {
+		t.Fatalf("1 MiB password: %d %s, want 400 password-exceeds", resp.StatusCode, body)
+	}
+
+	// Uncharged: more oversized attempts than the whole IP budget must
+	// never tip into 429 — they are validation, not credential attempts.
+	for i := 0; i < loginFailMax+2; i++ {
+		resp = post(`{"username":"`+big+`","password":"pw"}`, "203.0.113.50")
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("oversized attempt %d: %d, want 400 (oversized rejects must not charge the throttle)", i, resp.StatusCode)
+		}
+	}
+
+	// Boundaries: exactly-max sizes are real credential attempts.
+	resp = post(`{"username":"`+strings.Repeat("u", 32)+`","password":"pw"}`, "203.0.113.51")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("32-byte username: %d, want 401 (boundary is a credential attempt)", resp.StatusCode)
+	}
+	resp = post(`{"username":"admin","password":"`+strings.Repeat("p", 72)+`"}`, "203.0.113.51")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("72-byte password: %d, want 401 (boundary is a credential attempt)", resp.StatusCode)
+	}
+
+	// No DB touch: drop the users table; oversized stays 400 (guard runs
+	// before the store), the normal path answers 401 via the store-failure
+	// swallow — pre-fix the oversized request hit the same table and also
+	// answered 401, failing this pin.
+	if _, err := db.Exec(`DROP TABLE users`); err != nil {
+		t.Fatal(err)
+	}
+	resp = post(`{"username":"`+big+`","password":"pw"}`, "203.0.113.52")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("oversized login with users table dropped: %d, want 400 (the guard must run before ANY DB work)", resp.StatusCode)
+	}
+	resp = post(`{"username":"admin","password":"secretpw"}`, "203.0.113.52")
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("normal login with users table dropped: %d, want 401 (sanity: the normal path reaches the store)", resp.StatusCode)
+	}
+}

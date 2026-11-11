@@ -1592,6 +1592,23 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest, "username and password required")
 		return
 	}
+	if len(req.Username) > maxUsernameLen || len(req.Password) > 72 {
+		// Structurally unmatchable (2026-11-11 review): AddUserMode enforces
+		// both bounds at creation, so no account can carry a longer name,
+		// and bcrypt rejects inputs over 72 bytes — a longer password can
+		// never verify. Reject in the SAME category as empty credentials:
+		// no KDF will run, so it is not a credential attempt — 400,
+		// uncharged, and critically BEFORE the ToLower, the checkUserLock
+		// map hash, and the userExists SQL binding that an unauthenticated
+		// attacker used to pay 1 MiB per request (the setup route already
+		// rejects these pre-KDF via the AddUserMode sentinels).
+		if len(req.Username) > maxUsernameLen {
+			respondWithError(w, http.StatusBadRequest, fmt.Sprintf("username exceeds %d characters", maxUsernameLen))
+		} else {
+			respondWithError(w, http.StatusBadRequest, "password exceeds 72 bytes")
+		}
+		return
+	}
 
 	// Per-IP failure throttle: reject a locked-out client FAST, before any
 	// bcrypt work (the KDF is the expensive part, and a locked-out attacker
