@@ -16,32 +16,12 @@ import (
 // postCard) — one code path for state-transition alerts. This file holds the
 // shared outbound client and destination validation (SSRF hardening).
 
-// webhookClient is the ONLY client used for alert delivery. Three deliberate
-// hardening choices:
-//
-//  1. No redirects. The default http.Client follows 302s, which is an SSRF
-//     pivot: the save-time check requires https://, but a public URL that
-//     redirects to http://169.254.169.254/ (cloud metadata) or an internal
-//     admin console would get pulsemon's egress for free. Real webhook
-//     endpoints (Google Chat, ntfy, …) don't redirect — a redirect is
-//     reported to the caller instead of followed.
-//  2. 10s timeout. The default client has none; a hung endpoint would
-//     block the alert path indefinitely.
-//  3. Dial-time IP check (DNS-rebinding defense). validateWebhookURL runs
-//     at save time; the default transport resolves the host AGAIN at dial
-//     time. A rebinding domain — allowed IP at save time, 127.0.0.1 /
-//     169.254.169.254 a second later — would slip past the save-time
-//     blocklist. webhookTransport enforces the blocklist at dial time AND
-//     connects to the very IP it checked (dialChecked), so the connection
-//     cannot land on an address the check never saw — not even one that
-//     flips between two lookups microseconds apart.
-//
-// webhookDialer is the dialer seam (tcpDialer — see http.go) used by both
-// checked dial paths. Production value is the default dialer; tests inject a
-// fake to exercise the cleartext SUCCESS path, which a real dial can never
-// reach through the SSRF guard (loopback is refused, TEST-NET never
-// connects) — that blind spot is exactly how the cancelled-context dial
-// (review 2026-11-10 C1) stayed green.
+// webhookDialer is the TCP dialer seam (tcpDialer — see http.go) used by
+// both checked dial paths below. Production value is the default dialer;
+// tests inject a fake to exercise the cleartext SUCCESS path, which a real
+// dial can never reach through the SSRF guard (loopback is refused,
+// TEST-NET never connects) — that blind spot is exactly how the
+// cancelled-context dial (review 2026-11-10 C1) stayed green.
 var webhookDialer tcpDialer = &net.Dialer{KeepAlive: 30 * time.Second}
 
 // dialChecked resolves host (or parses a literal IP), enforces the webhook
@@ -154,6 +134,25 @@ var webhookTransport = &http.Transport{
 	DialContext: dialChecked,
 }
 
+// webhookClient is the ONLY client used for alert delivery. Three deliberate
+// hardening choices:
+//
+//  1. No redirects. The default http.Client follows 302s, which is an SSRF
+//     pivot: the save-time check requires https://, but a public URL that
+//     redirects to http://169.254.169.254/ (cloud metadata) or an internal
+//     admin console would get pulsemon's egress for free. Real webhook
+//     endpoints (Google Chat, ntfy, …) don't redirect — a redirect is
+//     reported to the caller instead of followed.
+//  2. 10s timeout. The default client has none; a hung endpoint would
+//     block the alert path indefinitely.
+//  3. Dial-time IP check (DNS-rebinding defense). validateWebhookURL runs
+//     at save time; the default transport resolves the host AGAIN at dial
+//     time. A rebinding domain — allowed IP at save time, 127.0.0.1 /
+//     169.254.169.254 a second later — would slip past the save-time
+//     blocklist. webhookTransport enforces the blocklist at dial time AND
+//     connects to the very IP it checked (dialChecked), so the connection
+//     cannot land on an address the check never saw — not even one that
+//     flips between two lookups microseconds apart.
 var webhookClient = &http.Client{
 	Timeout:   10 * time.Second,
 	Transport: webhookTransport,

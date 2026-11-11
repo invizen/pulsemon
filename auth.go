@@ -153,6 +153,13 @@ var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
 // It MUST stay tied to bcryptCost (never hardcode a fixed cost): raising the
 // cost and leaving the dummy behind would make the unknown-user path run a
 // weaker KDF than real hashes — a timing oracle.
+//
+// The embedded hash body is the canonical public bcrypt test vector — the
+// cost-10 hash of the literal string "password" — and that is intentional:
+// nothing authenticates against it, only its SHAPE (well-formed bcrypt
+// syntax, 22-char salt, 31-char checksum) and its COST matter. Never
+// "fix" it by pasting a real account's hash here: the equalizer would stop
+// being public, and a leaked repo leaks the dummy's plaintext with it.
 var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost))
 
 // bcryptSem bounds the number of CONCURRENT bcrypt KDFs. The
