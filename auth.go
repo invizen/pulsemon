@@ -197,6 +197,17 @@ func acquireBcryptSem(ctx context.Context) bool {
 
 func releaseBcryptSem() { <-bcryptSem }
 
+// kdfCostFloor separates a ZERO-KDF-COST return from the bcrypt queue
+// (acquireBcryptSem's ctx.Done select fires in microseconds) from a return
+// that PAID the KDF (bcrypt at bcryptCost=DefaultCost runs ≥50ms on any
+// supported hardware and cannot be interrupted by ctx — see the
+// api_context_test.go empirical pin) when the login and change-password
+// disconnect arms decide whether to refund the per-IP throttle admission.
+// The refund contract ("throttling is for KDF cost", refundAttempt) refunds
+// only the unpaid case; the margin is ≥2x under the paid side and ≥4
+// orders of magnitude over the unpaid side, so the split is deterministic.
+const kdfCostFloor = 25 * time.Millisecond
+
 type authSession struct {
 	user   string
 	expiry time.Time
@@ -1680,6 +1691,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	t0 := time.Now()
 	tok, ok := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
 		// Client already gone (disconnected while queued on bcryptSem): a
@@ -1689,6 +1701,21 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		// Live clients take the full path below, so the timing equalizer
 		// is untouched.
 		if r.Context().Err() != nil {
+			// Refund the per-IP admission beginAttempt appended — but
+			// ONLY when the KDF never ran (review 2026-11-13): a queued-
+			// then-canceled call returns in microseconds (the ctx.Done
+			// select), a canceled call that still paid the KDF (disconnect
+			// DURING bcrypt, which is ctx-ignoring) took bcrypt time.
+			// kdfCostFloor separates the two. Refunding the paid case
+			// would hand a scripted attacker an unbounded per-IP guessing
+			// channel (abort mid-KDF → budget refunded → re-spray, capped
+			// only by the global semaphore) — the refund contract is
+			// "throttling is for KDF cost", the exact split the setup-mode
+			// path draws ("the in-tx bootstrap race loss DID pay the
+			// KDF — it is deliberately not refunded").
+			if time.Since(t0) < kdfCostFloor {
+				s.auth.refundAttempt(key)
+			}
 			return
 		}
 		// Count the failure against the account (across all IPs) — the
@@ -1980,11 +2007,19 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	t0 := time.Now()
 	if _, ok := s.auth.VerifyUser(r.Context(), user, req.Current); !ok {
 		// Client gone while queued on bcryptSem:
 		// a disconnect is not a failed current_password attempt — skip
-		// the failure budget and the rejection delay.
+		// the failure budget and the rejection delay. Refund the per-IP
+		// admission ONLY for the zero-KDF-cost case (queued-then-canceled
+		// returns in microseconds; a disconnect DURING the ctx-ignoring
+		// KDF paid it and stays counted) — same split as the login path
+		// (review 2026-11-13).
 		if r.Context().Err() != nil {
+			if time.Since(t0) < kdfCostFloor {
+				s.auth.refundAttempt(key)
+			}
 			return
 		}
 		// Count the failure against the account (across all IPs) — the

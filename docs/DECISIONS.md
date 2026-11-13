@@ -1026,3 +1026,36 @@ reverting the three bodies to `tx.QueryRow`/`tx.Exec` (signatures kept) makes th
 canceled-ctx guard answer with the sentinel instead of the ctx error, and
 `SetSettingInTx`/`applyProviderUpdateInTx` return nil with the rows WRITTEN — the
 canceled-ctx assertions fail.
+
+## disconnect-refund-kdf-split (auth.go handleAuthLogin / handleAuthUserPassword, auth_refund_test.go, 2026-11-13)
+**Decision:** the login and change-password disconnect arms (CreateSession/VerifyUser
+returned false with `r.Context().Err() != nil`) now refund the per-IP throttle
+admission beginAttempt appended — but ONLY for the zero-KDF-cost case: the refund
+fires when the callee returned in under `kdfCostFloor` (25ms), the new const that
+separates a queued-then-canceled acquireBcryptSem return (µs) from one that paid
+the bcrypt KDF (≥50ms at bcryptCost=DefaultCost, and bcrypt is ctx-ignoring).
+**Why:** the arms returned without refunding, so client disconnects while queued
+on bcryptSem (NumCPU slots saturated — an attacker flood, browser double-submits,
+operator timeouts) accumulated toward the 7-failures/60s per-IP lockout at zero
+cost: the operator gets locked out by requests that never ran a KDF. The review's
+suggested fix (refund on ctx.Err() unconditionally, mirroring handleAuthUsers)
+was NOT adopted as written: the login arm mixes two cases the setup path keeps
+apart — queued-canceled (KDF never ran) and canceled-DURING-KDF (KDF paid) —
+and refunding the paid case hands a scripted attacker an unbounded per-IP
+guessing channel (abort mid-KDF → budget refunded → re-spray; recordUserFail and
+loginSlowDown are both skipped on that arm, so the account budget and the delay
+offer no cap; the global semaphore becomes the only limiter). The setup path
+already draws exactly this line ("the in-tx bootstrap race loss DID pay the KDF
+— it is deliberately not refunded"); the time-floor is the login-path
+equivalent, with ≥2x margin under the paid side (bcrypt cost-10 ≥50ms on any
+supported hardware) and ≥4 orders of magnitude over the unpaid side.
+refundAttempt's n6 arm covers the edge where the zero-cost appends already
+tripped the lockout: the refunds drop the count back under loginFailMax and
+clear it.
+**Pinned by:** TestFix_QueuedCancelRefundsPerIPAttempt (sem saturated,
+2×loginFailMax canceled-ctx requests across both handlers → bucket 0 and the
+follow-up live login 200) and TestFix_PaidKDFDisconnectNotRefunded (cancel 20ms
+into a real bcrypt → exactly 1 counted admission; passes on both pre- and
+post-fix — it is the guard-pin against the over-refund regression).
+Sabotage-verified: reverting the two arms to a bare `return` leaves 14 counted
+attempts and flips the live login to 429.
