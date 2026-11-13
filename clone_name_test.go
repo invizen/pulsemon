@@ -237,3 +237,50 @@ func TestCloneClampsLegacyParams(t *testing.T) {
 			got.IntervalS, got.TimeoutMS, got.LossWarn, got.DownAfter, got.SpikeMult)
 	}
 }
+
+// TestFix_CloneGlobEscapeSurvivesDeepClones pins the 2026-11-13 review:
+// a base name containing GLOB metacharacters must find the first free
+// suffix in one in-memory scan at any clone depth, like a plain base.
+// Unescaped, "a[b" produced the pattern "a[b-copy*" — an unterminated
+// '[' never matches, so the taken set came back empty and EVERY existing
+// clone burned one of the cloneMaxAttempts (5) INSERT retries: clones 1-5
+// still succeeded (the UNIQUE index absorbed the misses, see
+// TestFix_CloneNamePickedInOneQuery), the 6th clone permanently died
+// with 409 "too many clones with this name" while -copy6..-copy100 sat
+// free. The '*'/'?' bases are pinned alongside: their unescaped patterns
+// only ever OVER-matched (harmless), so the escape must not change their
+// observable behavior either.
+func TestFix_CloneGlobEscapeSurvivesDeepClones(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+	mk := func(name string) string {
+		id := store.NewID()
+		if _, err := db.Exec(`INSERT INTO sensors (id,name,target,type,interval_s,timeout_ms,loss_warn,down_after,spike_mult,state,status,created_at) VALUES (?, ?,'10.0.0.1','icmp',60,1000,25,2,5,'paused','up',?)`, id, name, store.Now()); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	clone := func(srcID string) (int, string) {
+		req := httptest.NewRequest("POST", "/api/sensors/"+srcID+"/clone", nil)
+		req.SetPathValue("id", srcID)
+		rr := httptest.NewRecorder()
+		srv.handleSensorClone(rr, req)
+		if rr.Code != http.StatusCreated {
+			return rr.Code, rr.Body.String()
+		}
+		var body Sensor
+		if err := json.NewDecoder(rr.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		return rr.Code, body.Name
+	}
+	for _, base := range []string{"a[b", "nas[01]", "q*z?x"} {
+		id := mk(base)
+		mk(base + "-copy")
+		for i := 2; i <= 6; i++ { // 6 clones: 5 saturate the retry budget
+			mk(fmt.Sprintf("%s-copy%d", base, i))
+		}
+		if code, name := clone(id); code != http.StatusCreated || name != base+"-copy7" {
+			t.Errorf("deep clone of %q: %d %q, want 201 %s-copy7", base, code, name, base)
+		}
+	}
+}

@@ -1478,6 +1478,12 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 // the same name.
 const cloneMaxAttempts = 5
 
+// globEscaper quotes the GLOB wildcards so a base name is matched
+// literally. validSensorName is a blacklist, so [ * ? are legal name
+// characters; an unescaped pattern distorts the taken-name set ("[b]"
+// becomes a character class, an unterminated '[' never matches).
+var globEscaper = strings.NewReplacer("[", "[[]", "*", "[*]", "?", "[?]")
+
 // Sentinel errors from the PATCH sensor write transaction: the re-validation runs inside the BEGIN IMMEDIATE tx, so its
 // failures are returned as sentinels and mapped to HTTP codes by the
 // handler (the response can't be written from inside the closure without
@@ -1561,12 +1567,17 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// GLOB, not LIKE: the UNIQUE index is case-sensitive (BINARY
 	// collation) and GLOB matches case-sensitively, while LIKE folds ASCII
 	// case — a LIKE match set would drift from the uniqueness semantics.
-	// GLOB metacharacters in the base name (* ? [ are legal —
-	// validSensorName is a blacklist) can only distort the match set,
-	// never the outcome: an over-match skips free names (we pick a higher
-	// suffix), an under-match (a "[" class) lets a taken name through to
-	// the INSERT, where the UNIQUE index rejects it and the retry below
-	// moves on — the same contract the old exact-match loop had.
+	// The base name is GLOB-escaped (globEscaper) so it matches
+	// literally. The old exact-match loop probed each candidate
+	// individually, so metacharacters there were harmless; under the
+	// one-query design an unescaped under-match (an unterminated '['
+	// never matches, "[b]" becomes a class) empties the taken set, every
+	// existing clone then burns one of the cloneMaxAttempts INSERT
+	// retries, and the 6th clone of a base like "nas[01]" died with 409
+	// "too many clones" while -copy6..-copy100 sat free (2026-11-13
+	// review). Over-matching was benign, so this closed the only half
+	// that distorted the outcome; the UNIQUE index stays the arbiter for
+	// the concurrent-race retries.
 	cloneID := store.NewID()
 	now := store.Now()
 	created := false
@@ -1583,7 +1594,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if r := []rune(cloneBase); len(r) > 60-cloneSuffixCeil {
 		cloneBase = string(r[:60-cloneSuffixCeil])
 	}
-	rows, err := s.db.QueryContext(r.Context(), "SELECT name FROM sensors WHERE name GLOB ?", cloneBase+"-copy*")
+	rows, err := s.db.QueryContext(r.Context(), "SELECT name FROM sensors WHERE name GLOB ?", globEscaper.Replace(cloneBase)+"-copy*")
 	if err != nil {
 		respondInternal(w, "clone sensor "+id, err)
 		return

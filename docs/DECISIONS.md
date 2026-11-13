@@ -1059,3 +1059,39 @@ into a real bcrypt → exactly 1 counted admission; passes on both pre- and
 post-fix — it is the guard-pin against the over-refund regression).
 Sabotage-verified: reverting the two arms to a bare `return` leaves 14 counted
 attempts and flips the live login to 429.
+
+## clone-glob-escape (api.go handleSensorClone, clone_name_test.go, 2026-11-13)
+
+**Verdict:** valid — fix adopted (review finding #3 of the 2026-11-13 batch).
+
+**The bug:** `handleSensorClone` enumerates existing clone names with
+`SELECT name FROM sensors WHERE name GLOB cloneBase||'-copy*'`.
+`validSensorName` is a blacklist, so `[ * ?` are legal name characters.
+An unescaped `[` in the base distorts SQLite GLOB: `[b]` becomes a
+character class and an unterminated `[` never matches at all — the
+taken-name set comes back EMPTY. Every existing clone then collides at
+INSERT and burns one of the `cloneMaxAttempts` (5) retries, so the 6th
+clone of a base like `nas[01]` permanently died with 409 "too many
+clones with this name" while `-copy6`..`-copy100` sat free.
+
+**Why the old comment was wrong:** it claimed metacharacters "can only
+distort the match set, never the outcome ... the same contract the old
+exact-match loop had." The old loop probed each candidate with an exact
+`name = ?` match (metacharacters inert); the 2026-10-22 one-query
+rewrite moved the enumeration into a pattern match WITHOUT translating
+that guarantee. Over-matching (`*`/`?`) stayed benign; under-matching
+(`[`) shifted the failure from "retry advances" (bounded by how many
+names a race can take, ~1-2) to "budget exhaustion at clone depth 5".
+The pinned 1-clone metacharacter test never straddled the budget, so the
+regression stayed invisible.
+
+**The fix:** `globEscaper = NewReplacer("[", "[[]", "*", "[*]", "?",
+"[?]")` quotes the base before appending the intentional `-copy*`
+suffix. UNIQUE index remains the arbiter for genuine concurrent races.
+`]` needs no escape: outside a class it is a literal in SQLite GLOB.
+
+**Proven:** `TestFix_CloneGlobEscapeSurvivesDeepClones` seeds 6 clones
+for `a[b`, `nas[01]`, `q*z?x` and demands 201 `-copy7`; reverts to 409
+on the sabotage tree for the `[` bases (the `*`/`?` bases pass both
+sides, pinning escape-nondisturbance). All existing clone tests pass
+unchanged.
