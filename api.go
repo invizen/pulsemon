@@ -1998,11 +1998,19 @@ func (s *Server) settingsPayload() (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read allow_unauth_update: %w", err)
 	}
+	// The providers array is built fail-loud too (2026-11-13 review): it
+	// embeds every provider's enabled/has_url/url/extra reads, and a
+	// swallowed DB error there answered 200 with silent "false" provider
+	// states inside an otherwise fail-loud payload.
+	providers, err := s.probeWorker.providerStatuses()
+	if err != nil {
+		return nil, fmt.Errorf("read provider statuses: %w", err)
+	}
 	return map[string]any{
 		"webhook_url":         webhookMasked(chatURL),
 		"webhook_configured":  chatURL != "",
 		"source":              chatSource,
-		"providers":           s.probeWorker.providerStatuses(),
+		"providers":           providers,
 		"alert_scope":         scope,
 		"alert_filter":        filter,
 		"realert_min":         realert,

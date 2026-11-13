@@ -939,6 +939,32 @@ func (db *Store) GetSettingErr(key string) (string, error) {
 	return v, nil
 }
 
+// GetAllSettings loads the whole settings table in ONE read. Snapshot
+// loaders use this instead of N point reads: the settings PUT commits all
+// of its keys in a single transaction, so N separate GetSetting reads can
+// straddle that commit and install a HALF-APPLIED snapshot, while one
+// SELECT observes a single consistent commit point. Errors propagate:
+// a caller must abort, never fall back to per-key "" defaults.
+func (db *Store) GetAllSettings() (map[string]string, error) {
+	rows, err := db.Query("SELECT setting_key, value FROM settings")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string, 24)
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TSLayout is the single writer-side timestamp format: UTC, ALWAYS 9
 // fractional digits. Fixed width is what makes string order equal
 // chronological order (time.RFC3339Nano trims trailing zeros, so "…25.13Z"

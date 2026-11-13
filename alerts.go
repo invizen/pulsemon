@@ -183,22 +183,42 @@ func defaultAlertSettings() *alertSettings {
 }
 
 // resolveDestinationsFromDB resolves the active, URL-configured providers
-// (with the Telegram chat_id) from the DB. It is the single place that turns
-// raw provider settings into delivery destinations, run at snapshot-load
-// time so the hot path reads the result lock-free. It uses the error-aware
-// getSettingErr for the URL/chat_id reads: a real read failure aborts the
-// load (the caller keeps the previous snapshot) rather than posting an empty
-// chat_id.
+// (with the Telegram chat_id) from the DB. It is the single place that
+// turns raw provider settings into delivery destinations, run at
+// snapshot-load time so the hot path reads the result lock-free. Every key
+// — Enabled, HasURL, URL, chat_id — is evaluated fail-loud from ONE bulk
+// settings read (getAllSettings): a real read failure aborts the load (the
+// caller keeps the previous snapshot), for EVERY key, rather than only the
+// URL/chat_id reads. Swallowing Enabled/HasURL (GetSetting) let a transient
+// lock silently DROP a provider from an installed snapshot — alerts for it
+// stopped until the next settings save, the exact half-read state the
+// snapshot design forbids (2026-11-13 review).
 func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
+	m, err := getAllSettings(db)
+	if err != nil {
+		return nil, err
+	}
+	return resolveDestsGet(func(k string) (string, error) { return m[k], nil })
+}
+
+func resolveDestsGet(get settingGet) ([]dest, error) {
 	var dests []dest
 	for _, p := range providerList {
-		if !p.Enabled(db) || !p.HasURL(db) {
+		en, err := p.enabledGet(get)
+		if err != nil {
+			return nil, err
+		}
+		hu, err := p.hasURLGet(get)
+		if err != nil {
+			return nil, err
+		}
+		if !en || !hu {
 			continue
 		}
 		// p.URLField, NOT p.Kind + "_url": SMTP's value lives in
 		// "smtp_host", and a "smtp_url" lookup returns "" for every real
 		// SMTP config — silently skipping email (see resolveDestinations).
-		url, err := getSettingErr(db, p.URLField)
+		url, err := get(p.URLField)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +233,7 @@ func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
 			// Resolved up front, error-aware: a transient DB lock must
 			// fail the load (and keep the previous snapshot), never post
 			// an empty chat_id (Telegram 400).
-			chatID, err = getSettingErr(db, "telegram_chat_id")
+			chatID, err = get("telegram_chat_id")
 			if err != nil || chatID == "" {
 				return nil, err
 			}
@@ -224,31 +244,31 @@ func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
 }
 
 // loadAlertSettings reads the alert-relevant settings from the DB into a
-// fresh snapshot. A MISSING key falls back to the same default the old
-// per-read code used (scope "all", realert 30, no filter). A read ERROR on
-// any core field (not a missing key) aborts the load with an error, so the
-// caller keeps the previous snapshot instead of installing a half-read one.
+// fresh snapshot. Every key (core fields AND providers) comes from ONE
+// bulk settings read (getAllSettings): a read ERROR aborts the load with
+// an error, so the caller keeps the previous snapshot instead of
+// installing a half-read one, and the whole snapshot observes a single
+// consistent commit of the settings table (the settings PUT commits all
+// its keys in one tx; N point reads could straddle it). A MISSING key
+// falls back to the same default the old per-read code used (scope
+// "all", realert 30, no filter).
 func loadAlertSettings(db *store.Store) (*alertSettings, error) {
+	m, err := getAllSettings(db)
+	if err != nil {
+		return nil, err
+	}
+	get := func(k string) (string, error) { return m[k], nil }
 	s := defaultAlertSettings()
 
-	maint, err := db.GetSettingErr("maintenance_mode")
-	if err != nil {
-		return nil, err
-	}
-	s.maintenance = maint == "1"
+	s.maintenance = m["maintenance_mode"] == "1"
 
-	scope, err := db.GetSettingErr("alert_scope")
-	if err != nil {
-		return nil, err
-	}
+	scope := m["alert_scope"]
 	if scope == "" {
 		scope = "all"
 	}
 	s.scope = scope
 
-	if f, err := db.GetSettingErr("alert_filter"); err != nil {
-		return nil, err
-	} else if f != "" {
+	if f := m["alert_filter"]; f != "" {
 		var items []string
 		if err := json.Unmarshal([]byte(f), &items); err != nil {
 			// A corrupt filter is treated as "no filter": the old
@@ -262,15 +282,13 @@ func loadAlertSettings(db *store.Store) (*alertSettings, error) {
 		}
 	}
 
-	if v, err := db.GetSettingErr("realert_min"); err != nil {
-		return nil, err
-	} else if v != "" {
+	if v := m["realert_min"]; v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 1440 {
 			s.realertMin = n
 		}
 	}
 
-	dests, err := resolveDestinationsFromDB(db)
+	dests, err := resolveDestsGet(get)
 	if err != nil {
 		return nil, err
 	}
@@ -545,38 +563,56 @@ type providerMeta struct {
 	URLField    string // JSON field the settings payload uses
 	Placeholder string // input placeholder
 	EnvFallback string // env var that supplies a URL when the dashboard one is empty ("") = none
-	Enabled     func(db *store.Store) bool
-	HasURL      func(db *store.Store) bool
+	// The canonical predicates take a settingGet so each provider's
+	// enabled/has-URL logic lives in EXACTLY ONE place and can be
+	// evaluated fail-loud against any read source: the bulk-map adapter
+	// (snapshot load + settings GET) or db.GetSettingErr (TestWebhook).
+	// The old bool, GetSetting-swallowing predicates survive only as free
+	// functions for the test suite; production reads all go through these.
+	enabledGet func(get settingGet) (bool, error)
+	hasURLGet  func(get settingGet) (bool, error)
 }
+
+// settingGet reads one settings key. Contract: absent key is ("", nil);
+// a read FAILURE is ("", err) and must abort the caller's evaluation —
+// "unset" and "read failed" must never look the same on the alert paths
+// (the class the 2026-10-30 chat_id fix and the 2026-11-11 settings-GET
+// fail-loud refactor established).
+type settingGet = func(key string) (string, error)
+
+// getAllSettings is the bulk-load seam (test seam, mirroring
+// getSettingErr): the snapshot load and the settings GET payload evaluate
+// every provider key from ONE consistent settings-table read.
+var getAllSettings = func(db *store.Store) (map[string]string, error) { return db.GetAllSettings() }
 
 var providerList = []providerMeta{
 	{
 		Kind: "google_chat", Label: "Google Chat", URLField: "google_chat_url",
 		Placeholder: "https://chat.googleapis.com/v1/spaces/…/messages?key=…",
 		EnvFallback: "GOOGLE_CHAT_WEBHOOK_URL",
-		Enabled:     chatEnabled,
-		HasURL:      chatHasURL,
+		enabledGet:  chatEnabledGet,
+		hasURLGet:   chatHasURLGet,
 	},
 	{
 		Kind: "discord", Label: "Discord", URLField: "discord_url",
 		Placeholder: "https://discord.com/api/webhooks/…/…",
 		EnvFallback: "",
-		Enabled:     flagEnabled("discord"),
-		HasURL:      flagHasURL("discord"),
+		enabledGet:  flagEnabledGet("discord"),
+		hasURLGet:   flagHasURLGet("discord"),
 	},
 	{
 		Kind: "telegram", Label: "Telegram", URLField: "telegram_url",
 		Placeholder: "https://api.telegram.org/bot<TOKEN>/sendMessage",
 		EnvFallback: "",
-		Enabled:     flagEnabled("telegram"),
-		HasURL:      telegramHasURL,
+		enabledGet:  flagEnabledGet("telegram"),
+		hasURLGet:   telegramHasURLGet,
 	},
 	{
 		Kind: "smtp", Label: "Email (SMTP)", URLField: "smtp_host",
 		Placeholder: "smtp.example.com",
 		EnvFallback: "",
-		Enabled:     smtpEnabled,
-		HasURL:      smtpHasURL,
+		enabledGet:  smtpEnabledGet,
+		hasURLGet:   smtpHasURLGet,
 	},
 }
 
@@ -589,45 +625,93 @@ func providerByKey(kind string) (providerMeta, bool) {
 	return providerMeta{}, false
 }
 
-// chatEnabled: google_chat's legacy default. Explicitly enabled ("1") wins;
-// explicitly disabled ("0") wins; with no flag, a present URL (dashboard or
-// env) keeps it active so an upgrade changes nothing. Fresh install: no URL,
-// no flag → off.
-func chatEnabled(db *store.Store) bool {
-	switch db.GetSetting("google_chat_enabled") {
+// chatEnabledGet: google_chat's legacy default. Explicitly enabled ("1")
+// wins; explicitly disabled ("0") wins; with no flag, a present URL
+// (dashboard or env) keeps it active so an upgrade changes nothing. Fresh
+// install: no URL, no flag → off. (The bool chatEnabled/chatHasURL/
+// flagEnabled/flagHasURL/telegramHasURL wrappers below keep the
+// swallow-to-"" GetSetting contract for the test suite only — every
+// production read uses these *Get predicates so a settings read failure
+// aborts the caller instead of reading as "provider unset"; 2026-11-13
+// review, closing the Enabled/HasURL half of the class the 2026-10-30
+// chat_id fix opened.)
+func chatEnabledGet(get settingGet) (bool, error) {
+	v, err := get("google_chat_enabled")
+	if err != nil {
+		return false, err
+	}
+	switch v {
 	case "1":
-		return true
+		return true, nil
 	case "0":
-		return false
+		return false, nil
 	}
-	return chatHasURL(db)
+	return chatHasURLGet(get)
 }
 
-// chatHasURL: the dashboard URL, falling back to the GOOGLE_CHAT_WEBHOOK_URL
-// env (the pre-multi-provider mechanism, kept working).
-func chatHasURL(db *store.Store) bool {
-	if db.GetSetting("google_chat_url") != "" {
-		return true
+// chatHasURLGet: the dashboard URL, falling back to the
+// GOOGLE_CHAT_WEBHOOK_URL env (the pre-multi-provider mechanism, kept
+// working).
+func chatHasURLGet(get settingGet) (bool, error) {
+	v, err := get("google_chat_url")
+	if err != nil {
+		return false, err
 	}
-	return os.Getenv("GOOGLE_CHAT_WEBHOOK_URL") != ""
+	if v != "" {
+		return true, nil
+	}
+	return os.Getenv("GOOGLE_CHAT_WEBHOOK_URL") != "", nil
 }
 
-// flagEnabled / flagHasURL: a generic provider — explicit "1" flag and a
-// non-empty URL. No env fallback, no legacy default. Built as closures over
-// the provider kind so each entry is self-contained.
+// flagEnabledGet / flagHasURLGet: a generic provider — explicit "1" flag
+// and a non-empty URL. No env fallback, no legacy default. Built as
+// closures over the provider kind so each entry is self-contained.
+func flagEnabledGet(kind string) func(settingGet) (bool, error) {
+	return func(get settingGet) (bool, error) {
+		v, err := get(kind + "_enabled")
+		return v == "1", err
+	}
+}
+
+func flagHasURLGet(kind string) func(settingGet) (bool, error) {
+	return func(get settingGet) (bool, error) {
+		v, err := get(kind + "_url")
+		return v != "", err
+	}
+}
+
+// telegramHasURLGet: Telegram needs BOTH the bot endpoint and a chat_id
+// to deliver; a URL alone can't reach anyone.
+func telegramHasURLGet(get settingGet) (bool, error) {
+	u, err := get("telegram_url")
+	if err != nil {
+		return false, err
+	}
+	c, err := get("telegram_chat_id")
+	if err != nil {
+		return false, err
+	}
+	return u != "" && c != "", nil
+}
+
+// Swallow-bool legacy-contract wrappers (the GetSetting contract: a read
+// failure is indistinguishable from "unset"). Test-suite surface only —
+// production paths evaluate the *Get predicates above.
+func chatEnabled(db *store.Store) bool { b, _ := chatEnabledGet(db.GetSettingErr); return b }
+
+func chatHasURL(db *store.Store) bool { b, _ := chatHasURLGet(db.GetSettingErr); return b }
+
 func flagEnabled(kind string) func(db *store.Store) bool {
-	return func(db *store.Store) bool { return db.GetSetting(kind+"_enabled") == "1" }
+	g := flagEnabledGet(kind)
+	return func(db *store.Store) bool { b, _ := g(db.GetSettingErr); return b }
 }
 
 func flagHasURL(kind string) func(db *store.Store) bool {
-	return func(db *store.Store) bool { return db.GetSetting(kind+"_url") != "" }
+	g := flagHasURLGet(kind)
+	return func(db *store.Store) bool { b, _ := g(db.GetSettingErr); return b }
 }
 
-// telegramHasURL: Telegram needs BOTH the bot endpoint and a chat_id to
-// deliver; a URL alone can't reach anyone.
-func telegramHasURL(db *store.Store) bool {
-	return db.GetSetting("telegram_url") != "" && db.GetSetting("telegram_chat_id") != ""
-}
+func telegramHasURL(db *store.Store) bool { b, _ := telegramHasURLGet(db.GetSettingErr); return b }
 
 // providerStatus is the per-provider read the settings API returns to the
 // dashboard.
@@ -640,54 +724,69 @@ type providerStatus struct {
 	Extra   map[string]string `json:"extra,omitempty"` // non-secret fields (e.g. telegram chat_id)
 }
 
-// providerExtra returns a provider's non-secret, non-URL fields for the
+// providerExtraGet returns a provider's non-secret, non-URL fields for the
 // dashboard to pre-fill. chat_id is not a credential — the token lives in
-// the masked URL — so it is returned in the clear.
-func providerExtra(p providerMeta, db *store.Store) map[string]string {
+// the masked URL — so it is returned in the clear. Reads go through the
+// settingGet contract (see providerMeta): every read is fail-loud, and
+// the fixed slice order keeps the read order deterministic.
+func providerExtraGet(p providerMeta, get settingGet) (map[string]string, error) {
 	if p.Kind == "telegram" {
-		if cid := db.GetSetting("telegram_chat_id"); cid != "" {
-			return map[string]string{"chat_id": cid}
+		cid, err := get("telegram_chat_id")
+		if err != nil {
+			return nil, err
+		}
+		if cid != "" {
+			return map[string]string{"chat_id": cid}, nil
 		}
 	}
 	if p.Kind == "smtp" {
 		extra := map[string]string{}
-		if v := db.GetSetting("smtp_port"); v != "" {
-			extra["port"] = v
-		}
-		if v := db.GetSetting("smtp_from"); v != "" {
-			extra["from"] = v
-		}
-		if v := db.GetSetting("smtp_to"); v != "" {
-			extra["to"] = v
-		}
-		if v := db.GetSetting("smtp_username"); v != "" {
-			extra["username"] = v
-		}
-		if v := db.GetSetting("smtp_tls_mode"); v != "" {
-			extra["tls_mode"] = v
+		for _, kf := range [][2]string{
+			{"smtp_port", "port"}, {"smtp_from", "from"}, {"smtp_to", "to"},
+			{"smtp_username", "username"}, {"smtp_tls_mode", "tls_mode"},
+		} {
+			v, err := get(kf[0])
+			if err != nil {
+				return nil, err
+			}
+			if v != "" {
+				extra[kf[1]] = v
+			}
 		}
 		// The password is never returned in the clear. A stored password is
 		// surfaced as a fixed mask ("••••••••") so the UI knows the field is
 		// filled; the save path treats the mask as "unchanged" and omits it.
-		if db.GetSetting("smtp_password") != "" {
+		pw, err := get("smtp_password")
+		if err != nil {
+			return nil, err
+		}
+		if pw != "" {
 			extra["password"] = "••••••••"
 		}
 		if len(extra) > 0 {
-			return extra
+			return extra, nil
 		}
 	}
-	return nil
+	return nil, nil
 }
 
-func (pw *ProbeWorker) providerStatuses() []providerStatus {
+// providerStatuses builds the per-provider view for the settings API.
+// Every key comes from ONE bulk settings read and every read is fail-loud
+// (2026-11-13 review): settingsPayload() aborts on a transient DB failure
+// for its own fields via GetSettingErr — a swallowed provider read here
+// used to answer 200 with providers claiming enabled:false/has_url:false,
+// a payload the settings PUT can echo back and write.
+func (pw *ProbeWorker) providerStatuses() ([]providerStatus, error) {
+	m, err := getAllSettings(pw.db)
+	if err != nil {
+		return nil, err
+	}
+	get := func(k string) (string, error) { return m[k], nil }
 	out := []providerStatus{}
 	for _, p := range providerList {
-		url := pw.db.GetSetting(p.Kind + "_url")
-		if p.Kind == "smtp" {
-			// SMTP stores the mail server under smtp_host (not smtp_url);
-			// surface it as the display URL so the UI shows the host.
-			url = pw.db.GetSetting("smtp_host")
-		}
+		// p.URLField is the canonical read (SMTP's display "URL" is
+		// smtp_host, which the providerList literal already declares).
+		url := m[p.URLField]
 		source := "none"
 		if url != "" {
 			source = "dashboard"
@@ -695,16 +794,28 @@ func (pw *ProbeWorker) providerStatuses() []providerStatus {
 			url = os.Getenv(p.EnvFallback)
 			source = "env"
 		}
+		en, err := p.enabledGet(get)
+		if err != nil {
+			return nil, err
+		}
+		hu, err := p.hasURLGet(get)
+		if err != nil {
+			return nil, err
+		}
+		extra, err := providerExtraGet(p, get)
+		if err != nil {
+			return nil, err
+		}
 		out = append(out, providerStatus{
 			Kind:    p.Kind,
-			Enabled: p.Enabled(pw.db),
-			HasURL:  p.HasURL(pw.db),
+			Enabled: en,
+			HasURL:  hu,
 			URL:     webhookMasked(url),
 			Source:  source,
-			Extra:   providerExtra(p, pw.db),
+			Extra:   extra,
 		})
 	}
-	return out
+	return out, nil
 }
 
 // sendWebhook delivers one alert to every active provider and reports
@@ -1179,8 +1290,16 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		url = os.Getenv(p.EnvFallback)
 	}
 	if p.Kind == "smtp" {
-		// SMTP has no URL field; the host+recipient gate is smtpHasURL.
-		if !smtpHasURL(pw.db) {
+		// SMTP has no URL field; the host+recipient gate is smtpHasURL —
+		// evaluated fail-loud through the same seam (2026-11-13 review):
+		// a transient DB lock at test time must surface as a database
+		// error, not masquerade as "no SMTP host and recipient
+		// configured" — the same fix the URL/chat_id reads above got.
+		gate, err := p.hasURLGet(func(k string) (string, error) { return getSettingErr(pw.db, k) })
+		if err != nil {
+			return false, "database error reading provider settings"
+		}
+		if !gate {
 			return false, "no SMTP host and recipient configured"
 		}
 	} else if url == "" {

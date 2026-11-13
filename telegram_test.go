@@ -171,17 +171,17 @@ func TestTelegramDeliveryFailsClosedOnChatIDReadError(t *testing.T) {
 		t.Fatalf("initial snapshot did not resolve the telegram chat_id (dests=%v)", dests)
 	}
 
-	// Now a transient DB lock on the chat_id read: the reload must KEEP the
-	// last good snapshot (with the valid chat_id), never install a half-read
-	// state with an empty chat_id.
-	orig := getSettingErr
-	getSettingErr = func(db *store.Store, key string) (string, error) {
-		if key == "telegram_chat_id" {
-			return "", errors.New("simulated transient DB lock")
-		}
-		return orig(db, key)
+	// Now a transient DB lock on the settings reload: the reload must KEEP
+	// the last good snapshot (with the valid chat_id), never install a
+	// half-read state with an empty chat_id. Injected on the bulk seam
+	// (getAllSettings) — since the 2026-11-13 review every snapshot key
+	// (Enabled/HasURL included, not just URL/chat_id) is evaluated from
+	// that ONE read, so a failure anywhere in the load aborts it.
+	orig := getAllSettings
+	getAllSettings = func(db *store.Store) (map[string]string, error) {
+		return nil, errors.New("simulated transient DB lock")
 	}
-	defer func() { getSettingErr = orig }()
+	defer func() { getAllSettings = orig }()
 	pw.reloadAlertSettings()
 
 	// The snapshot kept the last good state: the telegram dest is still

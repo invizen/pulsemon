@@ -361,15 +361,36 @@ func smtpBodyRe(state, name, target string, rttMs float64) string {
 	return body
 }
 
-// smtpEnabled: explicit "1" flag. No legacy default (fresh install = off).
-func smtpEnabled(db *store.Store) bool { return db.GetSetting("smtp_enabled") == "1" }
+// smtpEnabledGet: explicit "1" flag. No legacy default (fresh install = off).
+func smtpEnabledGet(get settingGet) (bool, error) {
+	v, err := get("smtp_enabled")
+	return v == "1", err
+}
 
-// smtpHasURL: SMTP is "configured" when it has a host, a SENDER, and a
+// smtpHasURLGet: SMTP is "configured" when it has a host, a SENDER, and a
 // recipient — the mail-server equivalent of Telegram needing a URL and a
 // chat_id. A host alone can't deliver (no one to send to), a recipient
 // alone has nowhere to go, and a missing sender produces MAIL FROM:<>
 // (a null reverse path that submission servers reject with 501) — so all
 // three are required for the provider to count as ready.
-func smtpHasURL(db *store.Store) bool {
-	return db.GetSetting("smtp_host") != "" && db.GetSetting("smtp_from") != "" && db.GetSetting("smtp_to") != ""
+func smtpHasURLGet(get settingGet) (bool, error) {
+	host, err := get("smtp_host")
+	if err != nil {
+		return false, err
+	}
+	from, err := get("smtp_from")
+	if err != nil {
+		return false, err
+	}
+	to, err := get("smtp_to")
+	if err != nil {
+		return false, err
+	}
+	return host != "" && from != "" && to != "", nil
 }
+
+// Swallow-bool legacy-contract wrappers (the GetSetting contract; test-
+// suite surface only — see the note on the *Get predicates in alerts.go).
+func smtpEnabled(db *store.Store) bool { b, _ := smtpEnabledGet(db.GetSettingErr); return b }
+
+func smtpHasURL(db *store.Store) bool { b, _ := smtpHasURLGet(db.GetSettingErr); return b }

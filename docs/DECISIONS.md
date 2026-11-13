@@ -1124,3 +1124,44 @@ with a wrong current_password leave the per-IP and per-username budgets
 untouched — pre-fix each ran the KDF, charged both, and the
 legitimate change after the loop 429'd; (3) exactly-72-byte current AND
 new passwords stay the real path (200, KDF, password actually changed).
+
+## provider-reads-bulk-fail-loud (alerts.go, smtp.go, internal/store/store.go, provider_bulk_reads_test.go, 2026-11-13)
+
+Finding #6: resolveDestinationsFromDB read URLField/telegram_chat_id
+fail-loud via getSettingErr but Enabled/HasURL two lines earlier via the
+error-swallowing GetSetting; providerStatuses (embedded in the
+otherwise-fail-loud settingsPayload) read every provider key through
+GetSetting. A transient SQLite failure therefore read as "provider
+disabled/unset": the snapshot load SUCCEEDED with a half-read snapshot
+(provider silently dropped until the next settings save — there is no
+periodic reload), and GET/PUT /api/settings could answer 200 with
+enabled:false/has_url:false rows the PUT echoes back.
+
+Fix adopted, upgraded from the suggestion's "use GetSettingErr at those
+call sites": every provider key (enabled flags, URLs, chat_id, SMTP
+extras) is now evaluated through the settingGet seam on ONE bulk
+settings-table read (store.GetAllSettings — single SELECT, errors
+propagate). resolveDestinationsFromDB/loadAlertSettings/providerStatuses
+all abort on read error (snapshot reload keeps the last-good snapshot;
+settingsPayload answers 500), and TestWebhook's SMTP gate + chat_id read
+route through the seam fail-loud.
+
+Why bulk over per-key GetSettingErr: (1) atomicity — the settings PUT
+commits all its keys in one tx, so one SELECT observes one consistent
+commit; 15+ point reads could straddle a concurrent PUT and install a
+snapshot mixing pre-/post-PUT keys; (2) one query replaces the point-
+query storm on every snapshot reload and every settings GET.
+
+Predicates moved to enabledGet/hasURLGet funcs; the legacy bool
+Enabled/HasURL(db) wrappers are kept ONLY for tests (documented as the
+swallowing shape, prod callers zero) so ~40 test call sites keep the
+compact form. providerExtra became providerExtraGet with a fixed read
+order (deterministic failure: a map iteration order must not decide
+which key's error surfaces).
+
+Sabotage (behavior-level, compiles): bulk reads' error handling reverted
+to swallow-to-empty-map in loadAlertSettings + providerStatuses → all
+three pins fail (new snapshot test, new statuses test, and the existing
+TestTelegramDeliveryFailsClosedOnChatIDReadError, whose seam-swap moved
+from getSettingErr to the bulk seam since snapshot keys are no longer
+point-read).
