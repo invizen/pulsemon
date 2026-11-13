@@ -1165,3 +1165,40 @@ three pins fail (new snapshot test, new statuses test, and the existing
 TestTelegramDeliveryFailsClosedOnChatIDReadError, whose seam-swap moved
 from getSettingErr to the bulk seam since snapshot keys are no longer
 point-read).
+
+## settings-put-pretx-bulk-fail-loud (api.go handleSettingsPut / storedProviderExtra, settings_pretx_test.go, 2026-11-13)
+
+Finding #7: the settings PUT's pre-tx validation reads used the
+error-swallowing GetSetting: effScope (dead-filter guard), the stored
+alert_filter fallback, the per-provider storedProviderExtra snapshot, and
+maintAlreadyOn (maintenance re-enable pre-check). A transient SQLite
+failure silently MISCOMPUTED the guard inputs, and two miscomputations
+are destructive in ways the in-tx guards do NOT cover:
+
+- stored alert_scope read as "" → effScope defaulted to "all" → the
+  empty-filter guard skipped → PUT persists scope=tags + filter=[] — the
+  dead-alert state (all alerting silently off) the guard exists to
+  refuse, and it persists in the store after the 200. Sabotage run
+  reproduced it verbatim: stored alert_filter = "[]" after a failed
+  pre-flight read.
+- stored maintenance_mode read as "off" on a re-enable → handler took the
+  off→on branch → enterMaintenance took a FRESH snapshot replacing the
+  entry-time restore set → sensors paused at maintenance entry lose their
+  restore entry and are left paused forever at resume (the documented
+  re-snapshot hazard, triggered by a swallowed read).
+- storedProviderExtra degraded to {} on read failure: pre-flight
+  credentials evaluation weakens; the in-tx SMTP guard remains the
+  backstop (sabotage: 400 from in-tx guard where the fix answers 500 at
+  pre-flight — store intact either way, hence the status-code pin).
+
+Fix (suggestion's bulk option): ONE fail-loud bulk pre-flight read
+(getAllSettings seam) feeds every pre-check — a read failure answers 500
+before any write, and all pre-checks observe a single commit of the
+settings table (point reads across a concurrent PUT's commit boundary
+could mix pre-/post-PUT keys into the guard inputs). storedProviderExtra
+(standalone twin) moves to the same seam fail-loud, aborting its own tx
+before any write.
+
+Note: the pre-flight map reads replace point reads that each had their
+own failure direction (guard-skip vs spurious 400); with the bulk read
+the whole phase has ONE failure direction: 500, store untouched.

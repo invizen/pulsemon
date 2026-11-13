@@ -2129,6 +2129,22 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		req.AlertFilter = &cleaned
 	}
+	// One pre-flight snapshot of the settings table for EVERY pre-tx read
+	// in this handler (dead-filter guard, provider stored-state,
+	// maintenance pre-check), fail-loud (2026-11-13 review): these reads
+	// used the error-swallowing GetSetting, so a transient SQLite failure
+	// silently MISCOMPUTED the guard inputs — stored scope read as ""
+	// let the guard wave a scope=tags + filter=[] save through (silent
+	// stop of ALL alerting, the exact state the guard exists to refuse),
+	// and a maintenance re-enable whose stored mode read as "off" took a
+	// FRESH snapshot, replacing the entry-time restore set. The bulk read
+	// also keeps every pre-check on a single commit of the settings
+	// table (same reason as the snapshot/statuses reads in alerts.go).
+	pre, err := getAllSettings(s.db)
+	if err != nil {
+		respondInternal(w, "read current settings", err)
+		return
+	}
 	// Reject the dead-alert state on save: with scope=tags/sensors and an
 	// EMPTY effective filter, shouldAlert matches no sensor — the monitor
 	// silently stops alerting for everything, the worst failure mode for
@@ -2136,7 +2152,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// tag selected stores alert_filter=[]), so the server refuses the
 	// state. Effective = incoming value if sent, else stored — the same
 	// read-then-400 posture as the rest of this handler, before any write.
-	effScope := s.db.GetSetting("alert_scope")
+	effScope := pre["alert_scope"]
 	if req.AlertScope != nil {
 		effScope = *req.AlertScope
 	}
@@ -2147,7 +2163,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		effFilter := []string{}
 		if req.AlertFilter != nil {
 			effFilter = *req.AlertFilter
-		} else if f := s.db.GetSetting("alert_filter"); f != "" {
+		} else if f := pre["alert_filter"]; f != "" {
 			_ = json.Unmarshal([]byte(f), &effFilter)
 		}
 		if len(effFilter) == 0 {
@@ -2155,14 +2171,16 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	// One stored-state snapshot per provider, taken BEFORE the tx and
-	// reused by the apply pass below, so validation and apply evaluate the
-	// same effective state and the two paths can't drift. (A concurrent
-	// settings PUT can interleave between the snapshot and the tx — the
-	// same read-then-write window the rest of this handler has.)
+	// One stored-state snapshot per provider, taken from the pre-flight
+	// bulk read above (BEFORE the tx) and reused by the apply pass below,
+	// so validation and apply evaluate the same effective state and the
+	// two paths can't drift. (A concurrent settings PUT can interleave
+	// between the snapshot and the tx — the same read-then-write window
+	// the rest of this handler has; the in-tx SMTP guard is the backstop
+	// for the one rule where stored state is security-relevant.)
 	storedExtras := make([]map[string]string, len(req.Providers))
 	for i, prov := range req.Providers {
-		storedExtras[i] = s.storedProviderExtra(prov.Kind)
+		storedExtras[i] = providerExtrasFrom(pre, prov.Kind)
 		if err := validateProviderUpdate(prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
@@ -2187,7 +2205,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// sensor the operator resumed during maintenance — and those sensors
 	// would be left paused forever, because resume restores only the
 	// snapshot.
-	maintAlreadyOn := s.db.GetSetting("maintenance_mode") == "1"
+	maintAlreadyOn := pre["maintenance_mode"] == "1"
 	var maintIDs []string
 	if req.MaintMode != nil && *req.MaintMode && !maintAlreadyOn {
 		ids, err := s.db.ActiveSensorIDs(r.Context())
@@ -2535,17 +2553,31 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 
 // storedProviderExtra returns the provider's currently-stored extra values
 // (only keys in extraFields[kind]), so validation can evaluate the
-// effective state of partial updates. Unknown kinds return nil.
-func (s *Server) storedProviderExtra(kind string) map[string]string {
+// effective state of partial updates. Unknown kinds return nil. The read
+// is fail-loud (2026-11-13 review): this snapshot feeds the effective-
+// state validation, so a swallowed DB failure must not degrade it to
+// "nothing stored". The settings-PUT path shares its one bulk pre-flight
+// read via providerExtrasFrom; this is the standalone twin.
+func (s *Server) storedProviderExtra(kind string) (map[string]string, error) {
+	m, err := getAllSettings(s.db)
+	if err != nil {
+		return nil, err
+	}
+	return providerExtrasFrom(m, kind), nil
+}
+
+// providerExtrasFrom filters a settings snapshot down to a provider's
+// extra keys (the pure half of storedProviderExtra).
+func providerExtrasFrom(m map[string]string, kind string) map[string]string {
 	keys, ok := extraFields[kind]
 	if !ok {
 		return nil
 	}
-	m := make(map[string]string, len(keys))
+	out := make(map[string]string, len(keys))
 	for k := range keys {
-		m[k] = s.db.GetSetting(kind + "_" + k)
+		out[k] = m[kind+"_"+k]
 	}
-	return m
+	return out
 }
 
 // errSMTPNoneWithCreds: the tls_mode=none-with-credentials rejection. A
@@ -2647,8 +2679,12 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 	}
 	defer tx.Rollback()
 	// Standalone entry point: read the stored snapshot fresh (there is no
-	// pre-tx validation pass to share one with).
-	if err := applyProviderUpdateInTx(context.Background(), tx, kind, url, enabled, extra, s.storedProviderExtra(kind)); err != nil {
+	// pre-tx validation pass to share one with), fail-loud.
+	stored, err := s.storedProviderExtra(kind)
+	if err != nil {
+		return fmt.Errorf("read stored provider state: %w", err)
+	}
+	if err := applyProviderUpdateInTx(context.Background(), tx, kind, url, enabled, extra, stored); err != nil {
 		return err
 	}
 	return tx.Commit()
