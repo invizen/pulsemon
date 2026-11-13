@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // authedStatus fetches /api/auth/status with the given client and returns
@@ -352,5 +353,97 @@ func TestChangePasswordLockout429RefundsFreshIP(t *testing.T) {
 	srv.auth.clearUserFail("admin")
 	if code := pw("10.2.2.40", "secretpw", "newpass99"); code != http.StatusOK {
 		t.Fatalf("valid change from fresh IP after lockout lifted = %d, want 200: 429-only requests burned the IP's budget", code)
+	}
+}
+
+// TestFix_ChangePasswordOversizedRejectedPreKDF (review 2026-11-13,
+// parity with TestLoginOversizedCredentialsRejectedPreDB): the change-
+// password route used to validate the NEW password only inside
+// SetUserPassword — AFTER VerifyUser had already paid a full bcrypt KDF
+// on req.Current — and a >72-byte req.Current (bcrypt can never verify
+// it: inputs over 72 bytes are rejected, so it is structurally
+// unmatchable) ran the KDF and answered 401 CHARGED. Such requests can
+// never succeed; they belong in the empty-credential category: 400,
+// uncharged, before beginAttempt and before ANY KDF.
+//
+// Pins:
+//  1. Pre-KDF: with bcryptSem FULL, every structurally-doomed shape
+//     answers 400 immediately — any request that reaches VerifyUser
+//     parks on the full semaphore for its whole life (live ctx), so a
+//     pre-fix shape hangs here (the 3s deadline is the assertion).
+//  2. Uncharged: loginFailMax+2 structural rejects with a WRONG
+//     current_password must not tip the IP into 429 — pre-fix each ran
+//     the KDF, charged the per-IP bucket and the per-username budget
+//     (recordUserFail), and the legitimate change after the loop died
+//     429.
+//  3. Boundaries stay the real path: exactly 72 bytes for both fields
+//     reaches the KDF and succeeds.
+func TestFix_ChangePasswordOversizedRejectedPreKDF(t *testing.T) {
+	_, httpSrv := adminFlagServer(t)
+	ojar, _ := cookiejar.New(nil)
+	admin := &http.Client{Jar: ojar}
+	bootstrapAdmin(t, admin, httpSrv.URL)
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login: %d", code)
+	}
+	const pwPath = "/api/auth/users/admin/password"
+	big := strings.Repeat("x", 900<<10) // under authGate's 1 MiB cap, far over 72
+
+	postBody := func(client *http.Client, body string) (int, string) {
+		resp, err := client.Post(httpSrv.URL+pwPath, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	release := fillBcryptSem()
+	// No defer: released exactly once below, before the live-KDF arms.
+	for _, arm := range []struct{ body, want string }{
+		{`{"current_password":"secretpw","password":"` + big + `"}`, "exceeds 72 bytes"},
+		{`{"current_password":"` + big + `","password":"newpass99"}`, "exceeds 72 bytes"},
+		{`{"current_password":"secretpw","password":"short"}`, "at least 8 characters"},
+	} {
+		done := make(chan string, 1)
+		go func(body string) {
+			code, msg := postBody(admin, body)
+			done <- fmt.Sprintf("%d %s", code, msg)
+		}(arm.body)
+		select {
+		case got := <-done:
+			if !strings.HasPrefix(got, "400 ") || !strings.Contains(got, arm.want) {
+				t.Fatalf("structural arm: %s, want 400 %q", got, arm.want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("structural arm did not answer with bcryptSem full: the KDF ran (no pre-KDF gate)")
+		}
+	}
+	release()
+
+	// Uncharged: structural rejects with a wrong current_password must not
+	// consume the per-IP budget NOR the shared per-username budget.
+	for i := 0; i < loginFailMax+2; i++ {
+		code, _ := postBody(admin, `{"current_password":"wrongpw","password":"`+strings.Repeat("y", 73)+`"}`)
+		if code != http.StatusBadRequest {
+			t.Fatalf("structural reject %d: %d, want 400", i, code)
+		}
+	}
+	if code, msg := postBody(admin, `{"current_password":"secretpw","password":"changed1"}`); code != http.StatusOK {
+		t.Fatalf("legitimate change after %d structural rejects: %d %s, want 200 (structural rejects must not charge the throttle)", loginFailMax+2, code, msg)
+	}
+
+	// Boundary: exactly-72-byte current AND new passwords reach the KDF
+	// and succeed.
+	p72 := strings.Repeat("p", 72)
+	if code, msg := postBody(admin, `{"current_password":"changed1","password":"`+p72+`"}`); code != http.StatusOK {
+		t.Fatalf("72-byte new password: %d %s, want 200 (boundary is the real path)", code, msg)
+	}
+	bare := &http.Client{}
+	if code := postJSONStatus(t, bare, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"`+p72+`"}`); code != http.StatusOK {
+		t.Fatalf("login with the 72-byte password: %d, want 200", code)
 	}
 }

@@ -1967,6 +1967,24 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusBadRequest, "current password and new password required")
 		return
 	}
+	if len(req.Password) < minPasswordLen {
+		// Structurally doomed (2026-11-13 review, parity with the login
+		// gate of 2026-11-11 #6): SetUserPassword enforces the same floor,
+		// so this request can never succeed — reject in the
+		// empty-credential category (400, uncharged) BEFORE beginAttempt
+		// and before the KDF on req.Current that the old order paid first.
+		// Same sentinel text as the SetUserPassword 400 it replaces.
+		respondWithError(w, http.StatusBadRequest, errPasswordWeak.Error())
+		return
+	}
+	if len(req.Password) > 72 || len(req.Current) > 72 {
+		// bcrypt rejects inputs over 72 bytes: a longer new password can
+		// never be stored, and a longer current password can never verify
+		// (the old order ran the KDF and answered 401 CHARGED for it).
+		// Same category, same text as the login gate.
+		respondWithError(w, http.StatusBadRequest, errPasswordTooLong.Error())
+		return
+	}
 
 	// Per-IP failure throttle, identical bucketing to login: this endpoint
 	// verifies a real password, so it must carry the same 7-failures/60s →

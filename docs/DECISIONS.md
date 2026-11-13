@@ -1095,3 +1095,32 @@ for `a[b`, `nas[01]`, `q*z?x` and demands 201 `-copy7`; reverts to 409
 on the sabotage tree for the `[` bases (the `*`/`?` bases pass both
 sides, pinning escape-nondisturbance). All existing clone tests pass
 unchanged.
+
+## change-password-prekdf-gate (auth.go handleAuthUserPassword, password_change_test.go, 2026-11-13)
+
+**Verdict:** valid — fix adopted as suggested (review finding #5 of the
+2026-11-13 batch).
+
+**The gap:** login gained the 2026-11-11 pre-KDF structural gate
+(oversized credentials → 400, uncharged, before any KDF/DB work), but
+the change-password mirror of the same KDF surface never did:
+`req.Password` was validated only INSIDE `SetUserPassword` — after
+`VerifyUser` had already paid a full bcrypt KDF on `req.Current` — and a
+>72-byte `req.Current` (bcrypt can never verify inputs over 72 bytes, so
+it is structurally unmatchable) ran the KDF and answered 401 CHARGED.
+
+**The fix:** the empty-credential block in `handleAuthUserPassword`
+gains the two structural arms — `len(req.Password) < minPasswordLen` →
+400 `errPasswordWeak`, `len(req.Password) > 72 || len(req.Current) > 72`
+→ 400 `errPasswordTooLong` — before `beginAttempt`, same category and
+same sentinel text as the paths they replace (the SetUserPassword 400
+and the login gate).
+
+**Proven:** `TestFix_ChangePasswordOversizedRejectedPreKDF` pins (1)
+all three structural arms answer 400 immediately with `bcryptSem` FULL
+— pre-fix they park on the full semaphore for their whole life (the 3s
+deadline IS the pre-KDF proof); (2) `loginFailMax+2` structural rejects
+with a wrong current_password leave the per-IP and per-username budgets
+untouched — pre-fix each ran the KDF, charged both, and the
+legitimate change after the loop 429'd; (3) exactly-72-byte current AND
+new passwords stay the real path (200, KDF, password actually changed).
