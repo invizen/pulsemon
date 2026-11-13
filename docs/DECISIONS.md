@@ -996,3 +996,33 @@ go1.27 (application built with go1.26)`. CI is immune (setup-go installs 1.27.4 
 `go install govulncheck@latest`), but on the gate box it must be rebuilt:
 `GOTOOLCHAIN=go1.27.4 go install golang.org/x/vuln/cmd/govulncheck@latest`. Same drift
 class as the family pin — the SCANNER has a Go version too, not just the build.
+
+## settings-apply-path-ctx (api.go, internal/store/store.go, api_context_test.go, 2026-11-13)
+**Decision:** `guardSMTPNoCredsOverTLSInTx` and `applyProviderUpdateInTx` take a
+`context.Context` as first parameter and `store.SetSettingInTx(ctx, tx, key, value)`
+runs `tx.ExecContext`; `handleSettingsPut` threads `r.Context()` through the whole
+apply phase (provider applies, routing-field writes). The standalone
+`applyProviderUpdate` entry point passes `context.Background()` (no request ctx
+exists; its `Begin()` stays). The guard's `stored()` reads are no longer
+error-swallowed (`_ =`): `sql.ErrNoRows` keeps meaning "key absent -> empty",
+every other read error is RETURNED, so the guard fails CLOSED (500, store
+untouched) on a canceled ctx or a transient read failure — previously any read
+failure was indistinguishable from "no stored credentials" and the guard passed.
+**Why:** the settings PUT apply phase bound ctx at its first two calls
+(`BeginTx(r.Context())` + the txlock-pin `ExecContext`) and abandoned it for every
+statement after — the exact class the 2026-10-30 review #5 closed at four other
+request-path sites (api_context_test.go contract: "a dead ctx means the statement
+never runs"). Store integrity was never at risk on a mid-handler disconnect: a tx
+from `BeginTx(ctx)` is ctx-bound for its whole lifetime (database/sql cancellation
+watcher rolls back, every later op answers ErrTxDone, Commit fails) — the residual
+gap was that an unbound call issued between ctx cancel and the watcher goroutine
+being SCHEDULED executed its statement (the done-channel check is a race, not a
+gate). Bounding every call makes fail-fast deterministic at each call site. The
+driver cannot interrupt an in-flight statement (modernc.org/sqlite v1.29.1 ignores
+ctx during the busy_timeout wait — empirically pinned in api_context_test.go), so
+call-site bounding is the whole available guarantee.
+**Pinned by:** `TestFix_SettingsApplyPathHonorsRequestContext`. Sabotage-verified:
+reverting the three bodies to `tx.QueryRow`/`tx.Exec` (signatures kept) makes the
+canceled-ctx guard answer with the sentinel instead of the ctx error, and
+`SetSettingInTx`/`applyProviderUpdateInTx` return nil with the rows WRITTEN — the
+canceled-ctx assertions fail.

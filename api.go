@@ -2211,7 +2211,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for i, prov := range req.Providers {
-		if err := applyProviderUpdateInTx(tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
+		if err := applyProviderUpdateInTx(r.Context(), tx, prov.Kind, prov.URL, prov.Enabled, prov.Extra, storedExtras[i]); err != nil {
 			if errors.Is(err, errSMTPNoneWithCreds) {
 				// Reachable now (in-tx re-check): a concurrent admin PUT
 				// committed between this request's pre-flight validation
@@ -2228,26 +2228,26 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.WebhookURL != nil {
-		if err := applyProviderUpdateInTx(tx, "google_chat", req.WebhookURL, nil, nil, nil); err != nil {
+		if err := applyProviderUpdateInTx(r.Context(), tx, "google_chat", req.WebhookURL, nil, nil, nil); err != nil {
 			respondInternal(w, "apply provider google_chat", err)
 			return
 		}
 	}
 	if req.RealertMin != nil {
-		if err := store.SetSettingInTx(tx, "realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
+		if err := store.SetSettingInTx(r.Context(), tx, "realert_min", strconv.Itoa(*req.RealertMin)); err != nil {
 			respondInternal(w, "save setting realert_min", err)
 			return
 		}
 	}
 	if req.AlertScope != nil {
-		if err := store.SetSettingInTx(tx, "alert_scope", *req.AlertScope); err != nil {
+		if err := store.SetSettingInTx(r.Context(), tx, "alert_scope", *req.AlertScope); err != nil {
 			respondInternal(w, "save setting alert_scope", err)
 			return
 		}
 	}
 	if req.AlertFilter != nil {
 		filterJSON, _ := json.Marshal(*req.AlertFilter)
-		if err := store.SetSettingInTx(tx, "alert_filter", string(filterJSON)); err != nil {
+		if err := store.SetSettingInTx(r.Context(), tx, "alert_filter", string(filterJSON)); err != nil {
 			respondInternal(w, "save setting alert_filter", err)
 			return
 		}
@@ -2257,7 +2257,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		if *req.AllowUnauth {
 			val = "1"
 		}
-		if err := store.SetSettingInTx(tx, "allow_unauth_update", val); err != nil {
+		if err := store.SetSettingInTx(r.Context(), tx, "allow_unauth_update", val); err != nil {
 			respondInternal(w, "save setting allow_unauth_update", err)
 			return
 		}
@@ -2546,29 +2546,64 @@ var errSMTPNoneWithCreds = errors.New("smtp tls_mode=none cannot use credentials
 // in-tx read sees the earlier write and takes the 400 with the store
 // untouched. Mask semantics mirror the write path below: a masked
 // incoming password means "keep stored", i.e. credential PRESENT.
-func guardSMTPNoCredsOverTLSInTx(tx *sql.Tx, incoming map[string]string) error {
-	stored := func(k string) string {
+//
+// ctx bounds every in-tx read (same request-context contract as the writes).
+// Read failures FAIL CLOSED: sql.ErrNoRows means "key absent → empty value"
+// (normal on a fresh DB), any other scan error is returned, so the guard
+// can never answer "no stored credentials" off a read that never ran (a
+// canceled ctx, disk I/O) and wave tls_mode=none through over real ones.
+func guardSMTPNoCredsOverTLSInTx(ctx context.Context, tx *sql.Tx, incoming map[string]string) error {
+	stored := func(k string) (string, error) {
 		var v string
-		_ = tx.QueryRow("SELECT value FROM settings WHERE setting_key = ?", "smtp_"+k).Scan(&v)
-		return v
+		err := tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE setting_key = ?", "smtp_"+k).Scan(&v)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", nil
+		}
+		if err != nil {
+			return "", err
+		}
+		return v, nil
 	}
 	effTLS := strings.TrimSpace(incoming["tls_mode"])
 	if _, ok := incoming["tls_mode"]; !ok {
-		effTLS = strings.TrimSpace(stored("tls_mode"))
+		v, err := stored("tls_mode")
+		if err != nil {
+			return err
+		}
+		effTLS = strings.TrimSpace(v)
 	}
 	if effTLS != "none" {
 		return nil
 	}
-	credPresent := func(k string) bool {
+	credPresent := func(k string) (bool, error) {
 		if v, ok := incoming[k]; ok {
 			if k == "password" && v == "••••••••" { // mask = keep stored
-				return stored("password") != ""
+				p, err := stored("password")
+				if err != nil {
+					return false, err
+				}
+				return p != "", nil
 			}
-			return v != ""
+			return v != "", nil
 		}
-		return stored(k) != ""
+		v, err := stored(k)
+		if err != nil {
+			return false, err
+		}
+		return v != "", nil
 	}
-	if credPresent("username") || credPresent("password") {
+	userHas, err := credPresent("username")
+	if err != nil {
+		return err
+	}
+	if userHas {
+		return errSMTPNoneWithCreds
+	}
+	passHas, err := credPresent("password")
+	if err != nil {
+		return err
+	}
+	if passHas {
 		return errSMTPNoneWithCreds
 	}
 	return nil
@@ -2585,8 +2620,8 @@ func guardSMTPNoCredsOverTLSInTx(tx *sql.Tx, incoming map[string]string) error {
 // many providers exist.
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
 	// Standalone (non-HTTP) entry point — no request context to thread, so
-	// the plain Begin() stays (the HTTP save path uses BeginTx in
-	// handleSettingsPut).
+	// the plain Begin() stays and statements run under context.Background()
+	// (the HTTP save path uses BeginTx in handleSettingsPut).
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -2594,7 +2629,7 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 	defer tx.Rollback()
 	// Standalone entry point: read the stored snapshot fresh (there is no
 	// pre-tx validation pass to share one with).
-	if err := applyProviderUpdateInTx(tx, kind, url, enabled, extra, s.storedProviderExtra(kind)); err != nil {
+	if err := applyProviderUpdateInTx(context.Background(), tx, kind, url, enabled, extra, s.storedProviderExtra(kind)); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -2603,7 +2638,7 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
 // caller's transaction so handleSettingsPut can apply every provider and
 // routing field atomically (mirrors db.SetSensorTags).
-func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
+func applyProviderUpdateInTx(ctx context.Context, tx *sql.Tx, kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	// Format-only validation: the DNS reachability
 	// check runs in the PRE-transaction pass (handleSettingsPut →
 	// validateProviderUpdate with DNS), never under the write lock.
@@ -2615,7 +2650,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		// handler's guard ran on a pre-BeginTx snapshot; this one sees the
 		// serialized write state, so two racing admin PUTs can no longer
 		// jointly commit tls_mode=none over credentials.
-		if err := guardSMTPNoCredsOverTLSInTx(tx, extra); err != nil {
+		if err := guardSMTPNoCredsOverTLSInTx(ctx, tx, extra); err != nil {
 			return err
 		}
 	}
@@ -2624,11 +2659,11 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		if kind == "smtp" {
 			// Persist the host under smtp_host (not smtp_url) so the SMTP
 			// transport reads it from the right key.
-			if err := store.SetSettingInTx(tx, "smtp_host", u); err != nil {
+			if err := store.SetSettingInTx(ctx, tx, "smtp_host", u); err != nil {
 				return fmt.Errorf("failed to save smtp host: %s", err.Error())
 			}
 		} else {
-			if err := store.SetSettingInTx(tx, kind+"_url", u); err != nil {
+			if err := store.SetSettingInTx(ctx, tx, kind+"_url", u); err != nil {
 				return fmt.Errorf("failed to save %s url: %s", kind, err.Error())
 			}
 		}
@@ -2638,7 +2673,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 		if *enabled {
 			val = "1"
 		}
-		if err := store.SetSettingInTx(tx, kind+"_enabled", val); err != nil {
+		if err := store.SetSettingInTx(ctx, tx, kind+"_enabled", val); err != nil {
 			return fmt.Errorf("failed to save %s enable flag: %s", kind, err.Error())
 		}
 	}
@@ -2669,7 +2704,7 @@ func applyProviderUpdateInTx(tx *sql.Tx, kind string, url *string, enabled *bool
 				vv = addr
 			}
 		}
-		if err := store.SetSettingInTx(tx, kind+"_"+k, vv); err != nil {
+		if err := store.SetSettingInTx(ctx, tx, kind+"_"+k, vv); err != nil {
 			return fmt.Errorf("failed to save %s %s: %s", kind, k, err.Error())
 		}
 	}

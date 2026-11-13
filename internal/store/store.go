@@ -961,8 +961,13 @@ func (db *Store) SetSetting(key, value string) error {
 }
 
 // SetSettingInTx is SetSetting through a caller's transaction (lets handleSettingsPut apply a multi-key save atomically).
-func SetSettingInTx(tx *sql.Tx, key, value string) error {
-	_, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+// ctx is the caller's request context: every statement on the settings PUT
+// apply phase runs bounded, so a client disconnect mid-handler fails fast at
+// the call site instead of racing the transaction's cancellation watcher
+// (api_context_test.go contract; the apply phase's BeginTx/txlock calls were
+// already ctx-bound — the writes and the guard read below were not).
+func SetSettingInTx(ctx context.Context, tx *sql.Tx, key, value string) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		key, value, Now())
 	return err

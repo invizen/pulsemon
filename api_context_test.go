@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -356,5 +357,117 @@ func TestFix_SettingsAndTagsReadsFailLoudly(t *testing.T) {
 	srv.Mux().ServeHTTP(rr, req)
 	if rr.Code != http.StatusInternalServerError {
 		t.Errorf("settings GET with a failing settings read: %d, want 500 (a read failure must not render as 200 of defaults: body=%s)", rr.Code, rr.Body.String())
+	}
+}
+
+// TestFix_SettingsApplyPathHonorsRequestContext pins the settings PUT apply
+// phase (external review 2026-11-13): applyProviderUpdateInTx / guardSMTP-
+// NoCredsOverTLSInTx ran an unbound tx.QueryRow, and store.SetSettingInTx
+// an unbound tx.Exec. handleSettingsPut binds r.Context() at BeginTx and at
+// the txlock pin, so the tx itself IS context-bound (the database/sql
+// cancellation watcher rolls back on cancel and every later op on the tx
+// answers ErrTxDone) — a mid-handler disconnect never risks a partial
+// settings save. What the unbound calls DID break is the guarantee
+// api_context_test.go pins everywhere else: the ctx observed at the CALL
+// SITE. An unbound statement issued in the window between ctx cancellation
+// and the watcher goroutine closing tx.done EXECUTES; the ctx-aware forms
+// check ctx.Err() synchronously and never run the statement. This test
+// reproduces exactly that window (tx begun on a live ctx, statement ctx
+// canceled at the call site) and pins the three sites: the guard read,
+// applyProviderUpdateInTx, and SetSettingInTx all must fail fast with the
+// store intact.
+func TestFix_SettingsApplyPathHonorsRequestContext(t *testing.T) {
+	db := newTestDB(t)
+
+	// Seed a stored SMTP credential so the in-tx guard read has something
+	// to find: with the unbound QueryRow the read SUCCEEDS after the ctx is
+	// canceled (the ctx is never observed), so the guard answers the
+	// sentinel; with QueryRowContext the read fails fast and the guard
+	// fails closed with the ctx error — a distinct, checkable signature.
+	if _, err := db.Exec(`INSERT INTO settings (setting_key, value, updated_at)
+		VALUES ('smtp_username', 'realuser', ?)`, store.Now()); err != nil {
+		t.Fatal(err)
+	}
+
+	txLive, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txLive.Rollback() }()
+	if _, err := txLive.ExecContext(context.Background(), "UPDATE settings SET value = value WHERE setting_key = ?", "\x00pulsemon-txlock"); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // "mid-handler": the request ctx died after BeginTx succeeded
+
+	// 1. guardSMTPNoCredsOverTLSInTx: post-fix the in-tx read fails fast
+	// (ctx.Err() at the call site) and the guard fails CLOSED with that
+	// error. Pre-fix the read ignores the ctx, succeeds, and the guard
+	// returns the sentinel — the assertion distinguishes the two.
+	err = guardSMTPNoCredsOverTLSInTx(ctx, txLive, map[string]string{"tls_mode": "none"})
+	if err == nil {
+		t.Error("guard with canceled ctx: nil, want a fail-closed error")
+	} else if errors.Is(err, errSMTPNoneWithCreds) {
+		t.Error("guard with canceled ctx returned the sentinel — the in-tx read ran with the ctx ignored (pre-fix behavior)")
+	} else if !errors.Is(err, context.Canceled) {
+		t.Errorf("guard with canceled ctx: %v, want the ctx error", err)
+	}
+
+	// 2. applyProviderUpdateInTx: every write is ctx-bound, so a canceled
+	// ctx fails fast (nothing persisted). Pre-fix the writes ran.
+	if err := applyProviderUpdateInTx(ctx, txLive, "telegram", strPtr("https://api.telegram.org/botT/sendMessage"), boolPtr(true), nil, nil); err == nil {
+		t.Error("applyProviderUpdateInTx with canceled ctx: nil, want an error (writes must not run)")
+	}
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM settings WHERE setting_key = 'telegram_url'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("applyProviderUpdateInTx with a canceled ctx persisted telegram_url — the ctx was ignored")
+	}
+
+	// 3. store.SetSettingInTx: same, called directly (the routing-field
+	// writes in handleSettingsPut).
+	if err := store.SetSettingInTx(ctx, txLive, "realert_min", "9"); err == nil {
+		t.Error("SetSettingInTx with canceled ctx: nil, want an error")
+	}
+	if err := db.QueryRow("SELECT COUNT(*) FROM settings WHERE setting_key = 'realert_min'").Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Error("SetSettingInTx with a canceled ctx wrote realert_min — the ctx was ignored")
+	}
+	// Release the first tx BEFORE the sanity block: a second open write
+	// tx is the deferred-upgrade BUSY_SNAPSHOT hazard itself (see the
+	// handleSettingsPut txlock pin), not what sanity is here to prove.
+	if err := txLive.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity (live ctx, fresh tx): the ctx threading must not have broken
+	// the happy path — guard reads succeed and the writes apply. The tx
+	// pins the write lock first (the production apply-phase order), so the
+	// guard read is a committed-state read and the write is not a
+	// deferred upgrade.
+	txOK, err := db.BeginTx(context.Background(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txOK.Rollback() }()
+	if _, err := txOK.ExecContext(context.Background(), "UPDATE settings SET value = value WHERE setting_key = ?", "\x00pulsemon-txlock"); err != nil {
+		t.Fatal(err)
+	}
+	if err := guardSMTPNoCredsOverTLSInTx(context.Background(), txOK, map[string]string{"tls_mode": "none"}); !errors.Is(err, errSMTPNoneWithCreds) {
+		t.Errorf("guard with live ctx over stored creds: %v, want the sentinel", err)
+	}
+	if err := store.SetSettingInTx(context.Background(), txOK, "realert_min", "9"); err != nil {
+		t.Errorf("SetSettingInTx with live ctx: %v", err)
+	}
+	if err := txOK.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.GetSetting("realert_min"); got != "9" {
+		t.Errorf("SetSettingInTx with live ctx: realert_min=%q, want 9", got)
 	}
 }
