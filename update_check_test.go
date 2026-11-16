@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -158,6 +160,123 @@ func TestUpdateCheckRefreshThrottled(t *testing.T) {
 	if hits != 2 {
 		t.Fatalf("post-interval refresh hit upstream %d times, want 2", hits)
 	}
+}
+
+// TestUpdateCheckConcurrentPollsCoalesce pins the single-flight fetch: N
+// concurrent pollers on a cold/expired cache must produce exactly ONE
+// upstream fetch (pre-fix the mutex serialized them into N sequential
+// fetches and the throttle read of updateCheckAttemptAt raced its write).
+// The stale-serve path must also answer concurrently under -race.
+func TestUpdateCheckConcurrentPollsCoalesce(t *testing.T) {
+	var hits int32
+	release := make(chan struct{})
+	gh := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		<-release // hold the flight open so joiners pile onto it
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"tag_name":"v9.9.9","html_url":"https://github.com/invizen/pulsemon/releases/tag/v9.9.9"}`))
+	}))
+	defer gh.Close()
+
+	oldBase := releaseBase
+	releaseBase = gh.URL + "/releases"
+	t.Cleanup(func() { releaseBase = oldBase })
+
+	oldCache, oldAt, oldAttempt, oldFailed := updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed
+	oldTTL, oldFailTTL, oldMinRefresh := updateCheckTTL, updateCheckFailTTL, updateCheckRefreshMinInterval
+	t.Cleanup(func() {
+		updateCheckCached, updateCheckAt, updateCheckAttemptAt, updateCheckFailed = oldCache, oldAt, oldAttempt, oldFailed
+		updateCheckTTL, updateCheckFailTTL, updateCheckRefreshMinInterval = oldTTL, oldFailTTL, oldMinRefresh
+	})
+	updateCheckCached, updateCheckFailed = nil, false
+	updateCheckAt, updateCheckAttemptAt = time.Time{}, time.Time{}
+	updateCheckTTL, updateCheckFailTTL = time.Millisecond, time.Millisecond
+
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+
+	const n = 8
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			u := "/api/update-check"
+			if i%2 == 1 {
+				// refresh pollers exercise the throttle read concurrent
+				// with the fetch leader's write of the attempt timestamp.
+				u += "?refresh=1"
+			}
+			req := httptest.NewRequest("GET", u, nil)
+			rec := httptest.NewRecorder()
+			srv.handleUpdateCheck(rec, req)
+			codes[i] = rec.Code
+		}(i)
+	}
+	time.Sleep(100 * time.Millisecond) // all pollers are inside the flight now
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&hits); got != 1 {
+		t.Fatalf("%d concurrent pollers fired %d upstream fetches, want 1 (single-flight)", n, got)
+	}
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Fatalf("poller %d got %d, want 200", i, c)
+		}
+	}
+
+	// Stale path concurrently: expire the fresh entry, upstream now fails;
+	// a second concurrent wave must all be served 200 (one fetch + shared
+	// stale outcome for the joiners).
+	gh.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(http.StatusInternalServerError)
+	})
+	var wg2 sync.WaitGroup
+	codes2 := make([]int, n)
+	for i := 0; i < n; i++ {
+		wg2.Add(1)
+		go func(i int) {
+			defer wg2.Done()
+			req := httptest.NewRequest("GET", "/api/update-check", nil)
+			rec := httptest.NewRecorder()
+			srv.handleUpdateCheck(rec, req)
+			codes2[i] = rec.Code
+		}(i)
+	}
+	wg2.Wait()
+	for i, c := range codes2 {
+		if c != http.StatusOK {
+			t.Fatalf("stale-path poller %d got %d, want 200 (stale cached result)", i, c)
+		}
+	}
+
+	// A slow fetch in flight (forced by refresh) must not stall a normal
+	// poll that the fresh cache can serve: pre-fix the mutex was held
+	// across the network call, so the poll blocked for the whole fetch.
+	updateCheckMu.Lock()
+	updateCheckFailed = false
+	updateCheckCached = &updateCheckResult{Latest: "v9.9.9"}
+	updateCheckAt = time.Now()
+	updateCheckMu.Unlock()
+	updateCheckTTL = time.Hour // cache is fresh for this wave
+	updateCheckRefreshMinInterval = 0
+	slow := make(chan struct{})
+	go func() {
+		w := httptest.NewRecorder()
+		srv.handleUpdateCheck(w, httptest.NewRequest("GET", "/api/update-check?refresh=1", nil))
+		close(slow)
+	}()
+	time.Sleep(50 * time.Millisecond) // the refresh is mid-fetch now
+	start := time.Now()
+	rec := httptest.NewRecorder()
+	srv.handleUpdateCheck(rec, httptest.NewRequest("GET", "/api/update-check", nil))
+	if el := time.Since(start); el > 150*time.Millisecond {
+		t.Fatalf("normal poll blocked %v behind an in-flight fetch; cache must be served outside the fetch lock", el)
+	}
+	<-slow
 }
 
 // TestCertFreshnessReusesConn verifies the cert-freshness optimization:

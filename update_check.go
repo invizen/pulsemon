@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 // updateCheckResult is the cached outcome of a GitHub releases lookup.
@@ -24,6 +26,12 @@ type updateCheckResult struct {
 }
 
 var (
+	// updateCheckMu guards the four state vars below ONLY — it is never
+	// held across the network fetch. The fetch itself is single-flighted
+	// by updateCheckFlight: concurrent cache misses coalesce into ONE
+	// upstream call (the old mutex-across-fetch serialized every poll
+	// behind one 10s miss AND raced updateCheckAttemptAt, whose throttle
+	// read happened before the lock).
 	updateCheckMu     sync.Mutex
 	updateCheckCached *updateCheckResult
 	updateCheckAt     time.Time
@@ -36,19 +44,20 @@ var (
 	updateCheckTTL       = 30 * time.Minute
 	// updateCheckRefreshMinInterval is the minimum time between two GitHub
 	// fetches forced by ?refresh=1. Without it, an authenticated user (or
-	// anyone on the LAN when auth is off) can spam the check: every ?refresh=1
-	// bypasses the 30-min cache and forces fetchRelease while updateCheckMu is
-	// held (blocking every other caller up to the 10s client timeout), and
-	// rapid refreshes walk straight into GitHub's 60 req/hour unauthenticated
-	// limit. A refresh younger than this is ignored and served from the cache
-	// like a normal poll. 60s keeps an explicit "check now" useful while
-	// bounding forced calls to one per minute.
+	// anyone on the LAN when auth is off) can spam the check: every
+	// ?refresh=1 bypasses the 30-min cache and forces a fetch, walking
+	// straight into GitHub's 60 req/hour unauthenticated limit. A refresh
+	// younger than this is ignored and served from the cache like a normal
+	// poll. 60s keeps an explicit "check now" useful while bounding forced
+	// calls to one per minute.
 	updateCheckRefreshMinInterval = 60 * time.Second
 	// How long a failed check suppresses new GitHub calls. Without this,
 	// every 5s dashboard poll during an outage re-hits the API and walks
 	// into a secondary rate limit, making the failure sticky.
-	updateCheckFailTTL = 1 * time.Minute
 	updateCheckFailed  bool
+	updateCheckFailTTL = 1 * time.Minute
+
+	updateCheckFlight singleflight.Group
 )
 
 // handleUpdateCheck reports whether a newer release is available on
@@ -62,78 +71,84 @@ var (
 // result at all, a failure is a 503. Only a fresh success overwrites the
 // cached result (the stale response carries cached:true).
 //
-// ?refresh=1 forces a fresh lookup, but only when the last fetch attempt was
-// at least updateCheckRefreshMinInterval ago; a fresher refresh is ignored
-// and served from the cache like a normal poll, so the endpoint cannot be
-// used to hammer the GitHub API (and block every other caller on the
-// single-flight lock) by repeated refreshes.
+// ?refresh=1 forces a fresh lookup, but only when the last fetch attempt
+// was at least updateCheckRefreshMinInterval ago; a fresher refresh is
+// ignored and served from the cache like a normal poll, so the endpoint
+// cannot be used to hammer the GitHub API.
+//
+// Locking: updateCheckMu guards state only (microseconds); responses are
+// written outside it, and concurrent misses coalesce on the singleflight
+// fetch, so a slow upstream blocks at most one goroutine per flight —
+// cached-hit polls sail past untouched.
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	refresh := r.URL.Query().Get("refresh") == "1"
-	// A ?refresh=1 younger than updateCheckRefreshMinInterval since the last
-	// fetch attempt is ignored and served from the cache like a normal poll:
-	// honored, it would force a fetchRelease on every click — while
-	// updateCheckMu is held (blocking every other caller up to the 10s client
-	// timeout) and straight into GitHub's 60 req/hour unauthenticated limit.
-	// The throttle keys on the last ATTEMPT (not the last success), so a
-	// failed attempt also counts and an outage can't be used to keep forcing
-	// calls.
+
+	updateCheckMu.Lock()
 	if refresh && time.Since(updateCheckAttemptAt) < updateCheckRefreshMinInterval {
 		refresh = false
 	}
-
-	// mu held across the whole check: that is the single-flight —
-	// concurrent cache-miss requests queue here, and the first fetch
-	// populates the cache before the next one proceeds.
-	updateCheckMu.Lock()
-	defer updateCheckMu.Unlock()
-
+	var res updateCheckResult
 	if updateCheckCached != nil {
+		res = *updateCheckCached
 		age := time.Since(updateCheckAt)
 		switch {
 		case !refresh && !updateCheckFailed && age < updateCheckTTL:
-			respondWithJSON(w, http.StatusOK, updateCheckCached)
+			updateCheckMu.Unlock()
+			respondWithJSON(w, http.StatusOK, res)
 			return
 		case !refresh && updateCheckFailed && age < updateCheckFailTTL:
-			res := *updateCheckCached
 			res.Cached = true
+			updateCheckMu.Unlock()
 			respondWithJSON(w, http.StatusOK, res)
 			return
 		}
 	}
+	updateCheckMu.Unlock()
 
-	updateCheckAttemptAt = time.Now()
-	client := &http.Client{Timeout: 10 * time.Second}
-	rel, err := fetchRelease(client, "latest")
-	if err != nil {
-		if updateCheckCached != nil {
-			updateCheckFailed = true // updateCheckAt unchanged: it ages the stale entry
-			res := *updateCheckCached
-			res.Cached = true
-			respondWithJSON(w, http.StatusOK, res)
-			return
+	// Miss (or an honored refresh): coalesce on ONE upstream fetch. The
+	// flight updates state under the lock at attempt and completion; the
+	// returned outcome is what every joining caller serves.
+	v, _, _ := updateCheckFlight.Do("latest", func() (any, error) {
+		updateCheckMu.Lock()
+		updateCheckAttemptAt = time.Now()
+		updateCheckMu.Unlock()
+
+		client := &http.Client{Timeout: 10 * time.Second}
+		rel, err := fetchRelease(client, "latest")
+
+		updateCheckMu.Lock()
+		defer updateCheckMu.Unlock()
+		if err != nil {
+			// The raw error can name upstream URLs, the resolver, or proxy
+			// config — details belong in the log, not the response body
+			// (same contract as respondInternal).
+			log.Printf("update check: %v", err)
+			if updateCheckCached != nil {
+				updateCheckFailed = true // updateCheckAt unchanged: it ages the stale entry
+				out := *updateCheckCached
+				out.Cached = true
+				return out, nil
+			}
+			return nil, nil // no cache to fall back on: caller answers 503
 		}
-		// The raw error can name upstream URLs, the resolver, or proxy
-		// config — details belong in the log, not the response body
-		// (same contract as respondInternal).
-		log.Printf("update check: %v", err)
+		latest := rel.TagName
+		out := updateCheckResult{
+			Running:   Version,
+			Latest:    latest,
+			Available: newerRelease(latest, Version),
+			URL:       "https://github.com/invizen/pulsemon/releases/tag/" + url.PathEscape(latest),
+			CheckedAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		updated := out
+		updateCheckCached = &updated
+		updateCheckAt = time.Now()
+		updateCheckFailed = false
+		return out, nil
+	})
+
+	if v == nil {
 		respondWithError(w, http.StatusServiceUnavailable, "update check failed (upstream unreachable); try again later")
 		return
 	}
-
-	latest := rel.TagName
-	avail := newerRelease(latest, Version)
-	tagURL := "https://github.com/invizen/pulsemon/releases/tag/" + url.PathEscape(latest)
-
-	res := &updateCheckResult{
-		Running:   Version,
-		Latest:    latest,
-		Available: avail,
-		URL:       tagURL,
-		CheckedAt: time.Now().UTC().Format(time.RFC3339),
-	}
-
-	updateCheckCached = res
-	updateCheckAt = time.Now()
-	updateCheckFailed = false
-	respondWithJSON(w, http.StatusOK, res)
+	respondWithJSON(w, http.StatusOK, v.(updateCheckResult))
 }

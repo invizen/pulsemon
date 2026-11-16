@@ -620,6 +620,17 @@ revisit the split as a fresh decision. The pilot means it would then be
 a known process (leaf-first, one green-gated package at a time,
 constructor injection), not an experiment.
 
+**Re-adjudicated 2026-11-16 (external review re-flag M3): stays CLOSED.**
+All three clauses re-measured on the live tree: full -race suite 336.7s
+(~5.6 min, below the ~8-min clause, though the +40%-in-2.5-weeks growth
+from the 241.6s pilot baseline says the clause is trending toward
+firing — re-measure each release cut); no globals-related -race hit has
+recurred since the capture rule; solo developer. The seam inventory in
+the re-flag is already stale (setMaintenanceMode was removed by the
+maintenance-leave rework). If a clause fires, the documented process
+applies (leaf-first, one green-gated package at a time, constructor
+injection), not a big-bang move.
+
 ## admin-gate double session check (auth.go `requireAdmin`/`sessionFrom`) — REJECTED, decision 2026-10-30
 
 **Finding (external review 2026-10-30 #4, second half):** `requireAdmin`
@@ -1264,3 +1275,25 @@ brings the code in line with it.
 **Pinned by:** comment-stripped token equality (a comment-only sweep must
 produce byte-identical code token streams); any future grep for
 `(2026-` review citations in non-test .go must find nothing.
+
+## update-check single-flight (update_check.go, update_check_test.go, 2026-11-16)
+**Decision:** `handleUpdateCheck` no longer holds `updateCheckMu` across the
+10s GitHub fetch. `updateCheckMu` guards state only; cache hits and the
+stale-serve path are answered from a snapshot copied out under the short
+lock, and concurrent misses coalesce on a `singleflight.Group`
+(`golang.org/x/sync/singleflight`, already used by the DNS cache) that
+performs the one fetch and updates state at attempt and completion.
+**Why:** the old shape had two defects. (1) A real data race: the
+?refresh=1 throttle read `updateCheckAttemptAt` before the lock while the
+fetching goroutine wrote it under the lock — latent (short-circuit hid it
+from serial tests) but detector-confirmed under the new concurrent test.
+(2) Head-of-line blocking: one cache-miss fetch serialized EVERY poll
+behind up to 10s of network. Single-flight keeps the coalescing property
+(N misses = 1 upstream call, the GitHub rate-limit shield) without the
+serialization: a slow upstream now blocks at most one goroutine per
+flight, and fresh-cache polls sail past untouched.
+**Pinned by:** `TestUpdateCheckConcurrentPollsCoalesce` — mixed
+normal+refresh concurrent wave (old code = DATA RACE + FAIL, verified
+by sabotage), hit-count pin (8 pollers → 1 upstream fetch), and a
+latency pin (normal poll during an in-flight slow refresh must return
+<150ms).
