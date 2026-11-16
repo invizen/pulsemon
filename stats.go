@@ -453,6 +453,11 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 
 	// 60-probe window: the last 60 probes (oldest-first slice), then scanned
 	// newest-first to match the original ROW_NUMBER() ordering.
+	// The inspector's 60-probe window INCLUDES manual (Pulse Now) rows on
+	// purpose: the inspector panel displays the raw history — manual pulses
+	// included — and its loss%/lost_count must describe exactly the bars on
+	// screen. Every decisioning figure excludes manual rows: the hour tier
+	// and the status window below, deriveStatus, and the 24h aggregates.
 	window := entries
 	if len(window) > 60 {
 		window = window[len(window)-60:]

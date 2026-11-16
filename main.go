@@ -704,6 +704,12 @@ func runServer(stop <-chan struct{}) {
 		log.Printf("Warning: failed to seed sensors: %v", err)
 	}
 
+	// Probe trust bundle (PULSEMON_CA_FILE) must be in place before the
+	// first probe runs (see initProbeCA).
+	if err := initProbeCA(); err != nil {
+		log.Fatalf("FATAL: %v", err)
+	}
+
 	pw := NewProbeWorker(db)
 	ctx, cancel := context.WithCancel(context.Background())
 	// Track the worker so shutdown can wait for it: Run returns only after

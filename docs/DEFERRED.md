@@ -139,3 +139,47 @@ alert_state outside the worker (sensor delete, per-sensor and
 all-history clear — `Remove` / `ResetStatsFor` / `ResetStatsAll`), and
 a miss re-reads the row, so a restart converges. No write-back is ever
 done from the cache.
+
+### Private CA for HTTPS sensors: PULSEMON_CA_FILE, not SSL_CERT_FILE (2026-11-16)
+The stdlib honors `SSL_CERT_FILE`/`SSL_CERT_DIR`, and it does work in a
+deployed pulsemon process (env set at launch; even in the FROM scratch
+image). Deliberate product choice: the supported knob is
+`PULSEMON_CA_FILE` (initProbeCA, http.go) because Go caches the system
+pool at the FIRST TLS verification for the process lifetime — the stdlib
+env is un-settable after boot, untestable in-process, and invisible from
+pulsemon's docs surface — and a fail-loud startup check on the bundle
+(unreadable / zero certificates = refuse to start) is only possible with
+a knob we read ourselves.
+
+### IPv6: HTTP accepts v6 literals; ICMP/TCP refuse them (2026-11-16)
+`validURL` accepts bracketed IPv6 hosts (`[::1]`) while `validTarget`
+(ICMP/TCP) is IPv4-only. **Why accepted (deliberate asymmetry, no IPv6
+ICMP roadmap item):** HTTP probes dial through net/http, which speaks
+IPv6 end-to-end for free; refusing v6 there would cut a probe path that
+works. The ICMP engine is IPv4-shaped by design (raw/datagram sockets,
+4-byte-normalized demux keys) and the TCP probe reuses that resolution
+path; v6 ICMP/TCP is a feature, not an oversight.
+Comment at `validURL` (http.go) pins the reasoning.
+
+### Masked sensor targets: declined (2026-11-16)
+Proposed: mask `target` in list responses, raw only on
+`GET /api/sensors/{id}` (the edit modal). **Declined:** the edit modal
+populates from the LIST payload (no detail fetch — see web/app.js), so a
+masked list target would round-trip into PATCH/PUT and persist the mask.
+A safe split needs the modal refactored to fetch detail first, and on
+auth-off installs the detail endpoint is equally open, so the split buys
+little against the accepted mitigation (don't store credentials in
+targets; keep auth on).
+
+### Windows: core runtime is QA-box-tested; the reasoned-not-executed
+note is scoped to the CLI self-update/rollback rename (2026-11-16)
+`windows-release.yml` runs on a Windows CI runner (exe + installer +
+signing per tag), and the service runtime (install, ICMP/HTTP/TCP probes,
+dashboard, alerting) was QA-tested on a real Windows host. The
+"reasoned, not executed" note (update.go, rollbackBinary) covers ONLY
+the Win32 image-rename semantics of the CLI update/rollback path:
+manual `pulsemon update rollback` while the service runs fails safe
+(sharing violation, running binary untouched) — stop the service first.
+No README best-effort banner: the runtime is tested; the one caveat is
+documented where it bites (update.go) and in the installer flow, which
+restarts the service on upgrade.

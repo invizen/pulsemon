@@ -13,6 +13,7 @@ import (
 	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -451,6 +452,40 @@ func (e *certVerifyError) Error() string { return "pulsemon: " + e.err.Error() }
 
 func (e *certVerifyError) Unwrap() error { return e.err }
 
+// probeCAPool is the HTTPS-sensor probe trust store loaded from
+// PULSEMON_CA_FILE (a PEM bundle of CA certificates — private roots such
+// as a step-ca/Smallstep CA), nil when unset (verify against the
+// platform store). Loaded once at startup (initProbeCA), before probes
+// start. Chosen over the stdlib SSL_CERT_FILE env: that works in a
+// deployed process too, but Go caches the system pool at the FIRST TLS
+// verification for the whole process lifetime (so it is un-settable
+// after boot, untestable in-process, and undiscoverable from pulsemon's
+// own surface) — and an explicit knob is documented product behavior.
+// When set, the bundle REPLACES the system trust paths for probes: it
+// must contain every CA you monitor.
+var probeCAPool *x509.CertPool
+
+// initProbeCA loads PULSEMON_CA_FILE into probeCAPool. Fails loud: a
+// configured trust bundle that is unreadable or contains no parseable
+// certificate must stop startup, not degrade silently to a trust store
+// the operator did not ask for.
+func initProbeCA() error {
+	f := os.Getenv("PULSEMON_CA_FILE")
+	if f == "" {
+		return nil
+	}
+	data, err := os.ReadFile(f)
+	if err != nil {
+		return fmt.Errorf("PULSEMON_CA_FILE: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return fmt.Errorf("PULSEMON_CA_FILE: no certificates parsed from %s", f)
+	}
+	probeCAPool = pool
+	return nil
+}
+
 // verifyHTTPCert validates the certificate(s) the server presented during
 // a skip-verify handshake (probeDialTLS runs it before the connection is
 // handed to the transport, so a rejection writes zero request bytes). It
@@ -502,11 +537,13 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 		inter.AddCert(c)
 	}
 
-	// (a) Trusted by the system roots, with the presented intermediates —
-	// accept. Roots nil → the platform/system trust store. EXACT hostname
-	// match (optsA.DNSName = host): no www/bare variant fallback, so the
+	// (a) Trusted by the probe trust store, with the presented
+	// intermediates — accept. Roots nil (no PULSEMON_CA_FILE) → the
+	// platform/system trust store; set, the operator's PEM bundle
+	// REPLACES it for probes (see initProbeCA). EXACT hostname match
+	// (optsA.DNSName = host): no www/bare variant fallback, so the
 	// probe's cert judgment matches what a browser does.
-	optsA := x509.VerifyOptions{Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	optsA := x509.VerifyOptions{Roots: probeCAPool, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
 	optsA.DNSName = host
 	if _, err := leaf.Verify(optsA); err == nil {
 		return nil
@@ -826,7 +863,11 @@ func validURL(t string) bool {
 		return false
 	}
 	// A dotted host, a bracketed/IPv6 host, a host with an EXPLICIT port,
-	// or a bare single-label host (validSingleLabel) is accepted.
+	// or a bare single-label host (validSingleLabel) is accepted. IPv6 is
+	// accepted here ON PURPOSE, unlike validTarget (ICMP/TCP are IPv4-only
+	// engine decisions): HTTP targets dial through net/http, which speaks
+	// IPv6 end-to-end for free — refusing a bracketed host here would cut
+	// a working probe path for symmetry's sake (DEFERRED: ipv6).
 	if strings.Contains(host, ".") || strings.Contains(host, ":") || u.Port() != "" {
 		return true
 	}

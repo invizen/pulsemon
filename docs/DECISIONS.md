@@ -1479,3 +1479,23 @@ error ticks, exactly 1 after invalidation), TestHotReloadCertStatMemo
 TestUpdateCheckDisabledOptOut (disabled:true, 0 upstream hits) — all
 three sabotage-verified red; live zentest: /tailwind.config.js and
 /tailwind.input.css = 404 post-move, index + update-check unaffected.
+
+## private-ca-trust (http.go, main.go, README)
+**Decision:** HTTPS sensors behind a private CA are supported via
+`PULSEMON_CA_FILE`: a PEM bundle loaded once at startup (initProbeCA,
+before the probe worker starts) into the probe verification pool
+(verifyHTTPCert path (a) Roots). Unreadable file / zero parsed
+certificates = fatal startup error. The bundle REPLACES the system
+trust paths for probes. The dashboard listener's own TLS is unaffected.
+**Why:** verifyHTTPCert accepted only system roots or exact self-signed,
+so step-ca-style internal CAs read lost, and self-signed was the only
+operator-configurable trust. Go's SSL_CERT_FILE env technically works
+in a deployed process (even in FROM scratch: the file IS the store),
+but Go caches the system pool at the FIRST TLS verification for the
+process lifetime — un-settable after boot, untestable in-process, and
+invisible from pulsemon's own surface; an explicit knob is documented,
+testable, and fail-loud (see DEFERRED).
+**Pinned by:** TestProbeHTTPPrivateCAFile (same probe, both directions:
+CA-signed leaf reads lost with no bundle, UP with PULSEMON_CA_FILE set;
+zero-cert bundle must fail initProbeCA — sabotage-verified: pool ignored
+(Roots nil) turns the UP leg red).
