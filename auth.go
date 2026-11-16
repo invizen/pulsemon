@@ -1336,32 +1336,6 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 	}
 }
 
-// ValidSession validates a session token: a live hit slides its expiry
-// forward; an unknown, expired, OR past-max-age token is rejected AND
-// deleted — the returned value is the validity test, never just a map hit.
-// The absolute authSessionMaxAge cap (measured from login time, not
-// activity) is enforced here too, so a continuously-active session cannot
-// be slid indefinitely — see authSessionMaxAge. The owner's account is
-// re-checked against the users table (TTL-cached, see userOKTTL) so a user
-// deleted out-of-band (CLI `auth-user remove`) is rejected within the window
-// even though the in-memory map can't know about it.
-func (a *AuthState) ValidSession(tok string) bool {
-	if tok == "" {
-		return false
-	}
-	a.mu.Lock()
-	s, ok := a.sessions[tok]
-	if ok && time.Now().Before(s.expiry) && a.sessionWithinMaxAge(s) && a.userExistsCached(s.user) {
-		s.expiry = time.Now().Add(authSessionTTL)
-		a.sessions[tok] = s
-	} else {
-		ok = false
-		delete(a.sessions, tok)
-	}
-	a.mu.Unlock()
-	return ok
-}
-
 // sessionWithinMaxAge reports whether the session is still within the
 // absolute authSessionMaxAge cap from its login time (s.created). Unlike
 // s.expiry — which ValidSession and SessionUser slide forward on every live

@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
-	"pulsemon/internal/store"
 	"strconv"
 	"strings"
 	"time"
@@ -426,9 +425,3 @@ func smtpHasURLGet(get settingGet) (bool, error) {
 	}
 	return host != "" && from != "" && to != "", nil
 }
-
-// Swallow-bool legacy-contract wrappers (the GetSetting contract; test-
-// suite surface only — see the note on the *Get predicates in alerts.go).
-func smtpEnabled(db *store.Store) bool { b, _ := smtpEnabledGet(db.GetSettingErr); return b }
-
-func smtpHasURL(db *store.Store) bool { b, _ := smtpHasURLGet(db.GetSettingErr); return b }

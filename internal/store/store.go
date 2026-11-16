@@ -1181,38 +1181,6 @@ func (db *Store) SensorIDs() ([]string, error) {
 	return ids, rows.Err()
 }
 
-// SetSensorStates sets the state for a batch of sensor ids, running in
-// InQueryChunk-sized IN(...) batches so a large snapshot can't exceed the
-// SQLite host-parameter limit (same rule as SensorTagsFor). Returns the number
-// of rows changed. An empty id list is a no-op.
-func (db *Store) SetSensorStates(ids []string, state string) (int64, error) {
-	if len(ids) == 0 {
-		return 0, nil
-	}
-	var total int64
-	for start := 0; start < len(ids); start += InQueryChunk {
-		end := start + InQueryChunk
-		if end > len(ids) {
-			end = len(ids)
-		}
-		chunk := ids[start:end]
-		q := make([]string, len(chunk))
-		args := make([]any, 0, len(chunk)+1)
-		args = append(args, state)
-		for j, id := range chunk {
-			q[j] = "?"
-			args = append(args, id)
-		}
-		res, err := db.Exec("UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...)
-		if err != nil {
-			return total, err
-		}
-		n, _ := res.RowsAffected()
-		total += n
-	}
-	return total, nil
-}
-
 func (db *Store) SeedSensors() error {
 	var count int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&count); err != nil {

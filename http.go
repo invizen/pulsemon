@@ -832,12 +832,3 @@ func validURL(t string) bool {
 	}
 	return validSingleLabel(host)
 }
-
-// httpStatusText formats a status code for display ("503"), or "no response"
-// when no response arrived at all (timeout / connection failure).
-func httpStatusText(status *int) string {
-	if status == nil {
-		return "no response"
-	}
-	return fmt.Sprintf("%d", *status)
-}

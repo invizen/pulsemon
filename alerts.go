@@ -618,9 +618,8 @@ func providerByKey(kind string) (providerMeta, bool) {
 // chatEnabledGet: google_chat's legacy default. Explicitly enabled ("1")
 // wins; explicitly disabled ("0") wins; with no flag, a present URL
 // (dashboard or env) keeps it active so an upgrade changes nothing. Fresh
-// install: no URL, no flag → off. (The bool chatEnabled/chatHasURL/
-// flagEnabled/flagHasURL/telegramHasURL wrappers below keep the
-// swallow-to-"" GetSetting contract for the test suite only — every
+// install: no URL, no flag → off. (The swallow-to-"" twins the test suite
+// uses live in provider_predicates_test.go — every
 // production read uses these *Get predicates so a settings read failure
 // aborts the caller instead of reading as "provider unset"; 2026-11-13
 // review, closing the Enabled/HasURL half of the class the 2026-10-30
@@ -683,25 +682,6 @@ func telegramHasURLGet(get settingGet) (bool, error) {
 	}
 	return u != "" && c != "", nil
 }
-
-// Swallow-bool legacy-contract wrappers (the GetSetting contract: a read
-// failure is indistinguishable from "unset"). Test-suite surface only —
-// production paths evaluate the *Get predicates above.
-func chatEnabled(db *store.Store) bool { b, _ := chatEnabledGet(db.GetSettingErr); return b }
-
-func chatHasURL(db *store.Store) bool { b, _ := chatHasURLGet(db.GetSettingErr); return b }
-
-func flagEnabled(kind string) func(db *store.Store) bool {
-	g := flagEnabledGet(kind)
-	return func(db *store.Store) bool { b, _ := g(db.GetSettingErr); return b }
-}
-
-func flagHasURL(kind string) func(db *store.Store) bool {
-	g := flagHasURLGet(kind)
-	return func(db *store.Store) bool { b, _ := g(db.GetSettingErr); return b }
-}
-
-func telegramHasURL(db *store.Store) bool { b, _ := telegramHasURLGet(db.GetSettingErr); return b }
 
 // providerStatus is the per-provider read the settings API returns to the
 // dashboard.
@@ -1275,7 +1255,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	// configured" (the swallow-to-"" GetSetting maps a lock to an empty
 	// URL). p.URLField, not p.Kind+"_url": SMTP's value lives in
 	// smtp_host (url is unused for SMTP — the smtp branch below uses
-	// smtpHasURL + sendSMTP).
+	// p.hasURLGet gate + sendSMTP).
 	url, err := getSettingErr(pw.db, p.URLField)
 	if err != nil {
 		return false, "database error reading provider settings"

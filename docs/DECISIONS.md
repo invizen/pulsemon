@@ -1382,3 +1382,21 @@ accidental scripted pin, it does not gate trust.
 install path), alongside the existing un-pinned and CLI twins. Sabotage
 `allow=true` always → refusal test red; `allow=false` always → install
 test red.
+
+## dead-code-sweep (auth.go, smtp.go, alerts.go, http.go, internal/store/store.go, 2026-11-16)
+**Decision:** production files carry only live code. Moved to _test.go:
+`ValidSession` (the boolean twin of the production `SessionUser` validator)
+→ session_validsession_test.go, and the swallow-bool provider wrappers
+`smtpHasURL`/`chatEnabled`/`flagEnabled`/`flagHasURL`/`telegramHasURL`
+→ provider_predicates_test.go. Deleted (zero callers anywhere):
+`Store.SetSensorStates` (superseded by the maintenance-tx paths),
+`httpStatusText`, `chatHasURL` (bool wrapper; the *Get predicate stays).
+**Why:** "test-suite surface only" functions in production files inflate
+the reviewable surface, invite reimplementation drift (SetSensorStates
+sat next to the maintenance tx that reimplemented it), and keep the
+dead-code detector noisy. The twins in _test.go keep their full doc
+comments, so the semantics under test stay documented where they are
+exercised.
+**Pinned by:** gate convention — `go vet` + full suite; the sweep is
+behavior-free (moved functions byte-identical; deleted ones had zero
+references repo-wide, verified by grep before removal).
