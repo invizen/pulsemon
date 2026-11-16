@@ -149,8 +149,11 @@ func TestSettingsPutSwapsAlertSnapshot(t *testing.T) {
 // same PUT stayed stale in pw.alertCfg until the next successful PUT or a
 // restart. The reload is now deferred at commit, so every committed save
 // converges memory to the store. Both 500 paths are pinned: entering
-// maintenance (enterMaintenance seam) and leaving (setMaintenanceMode
-// seam).
+// maintenance (enterMaintenance seam) and leaving (leaveMaintenance
+// seam). The leave case additionally pins the 2026-11-16 review M1
+// contract: a failed leave must touch NOTHING maintenance-related — mode
+// stays ON (banner up, alerts gated) and the snapshot survives for the
+// retry.
 func TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails(t *testing.T) {
 	srv, db := fixServerWithDB(t)
 	pw := srv.probeWorker
@@ -194,16 +197,22 @@ func TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails(t *testing.T) {
 	})
 
 	t.Run("leave-maintenance-500", func(t *testing.T) {
-		// Seed: maintenance ON, so the leave path reaches SetMaintenanceMode.
+		// Seed: maintenance ON with a real snapshot, so the leave path
+		// reaches the leave tx — and so a silent wipe of the restore set
+		// would be visible.
 		if err := db.SetSetting("maintenance_mode", "1"); err != nil {
 			t.Fatal(err)
 		}
-		pw.reloadAlertSettings()
-		origSet := setMaintenanceMode
-		setMaintenanceMode = func(db *store.Store, ctx context.Context, on bool, ids []string, snap string) error {
-			return errors.New("simulated maintenance tx failure")
+		snapSeed := `["s1","s2"]`
+		if err := db.SetSetting("maintenance_active_ids", snapSeed); err != nil {
+			t.Fatal(err)
 		}
-		defer func() { setMaintenanceMode = origSet }()
+		pw.reloadAlertSettings()
+		origLeave := leaveMaintenance
+		leaveMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
+			return nil, errors.New("simulated maintenance tx failure")
+		}
+		defer func() { leaveMaintenance = origLeave }()
 
 		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{"realert_min": 20, "maintenance_mode": false}`))
 		rr := httptest.NewRecorder()
@@ -216,6 +225,15 @@ func TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails(t *testing.T) {
 		}
 		if got := pw.realertMin(); got != 20 {
 			t.Errorf("snapshot realertMin = %d after a 500 leave-maintenance PUT, want 20", got)
+		}
+		// M1: the failed leave must leave maintenance fully intact —
+		// mode ON and the snapshot byte-identical, so the operator
+		// retries against the real restore set instead of an empty one.
+		if got := db.GetSetting("maintenance_mode"); got != "1" {
+			t.Errorf("maintenance_mode = %q after the failed leave, want \"1\" (the leave must fail with the banner UP)", got)
+		}
+		if got := db.GetSetting("maintenance_active_ids"); got != snapSeed {
+			t.Errorf("snapshot = %q after the failed leave, want %q (the restore set must survive)", got, snapSeed)
 		}
 	})
 }

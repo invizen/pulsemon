@@ -645,29 +645,17 @@ func (db *Store) SetSensorTags(id string, tags []string) error {
 	return tx.Commit()
 }
 
-// SetMaintenanceMode atomically applies a maintenance mode transition in ONE
-// transaction: pauses/resumes the given sensors AND updates the
-// maintenance_mode + maintenance_active_ids settings, so a crash mid-write
-// can't leave sensors paused without the mode flag (or vice versa). Without
-// this, the three separate autocommit writes (SetSensorStates, snapshot,
-// mode) could tear: a crash after pausing but before setting mode=1 orphans
-// the sensors in paused state with no maintenance banner and no toggle to
-// trigger the resume path. Mirrors the SetSensorTags transaction idiom
-// above: a mid-write error (or crash) rolls back cleanly.
-//
-// on=true:  pause ids, save snapJSON as maintenance_active_ids, set mode=1.
-// on=false: resume ids, clear maintenance_active_ids, set mode=0.
-//
-// The chunked sensor-state UPDATE mirrors SetSensorStates so an unbounded
-// id list can't exceed SQLite's parameter limit.
-func (db *Store) SetMaintenanceMode(ctx context.Context, on bool, ids []string, snapJSON string) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
-	return applyMaintenanceTx(tx, on, ids, snapJSON)
-}
+// settingsTxLockKey: the sentinel key of the zero-row UPDATE that pins
+// SQLite's write lock at the start of a maintenance transaction (and the
+// settings PUT in api.go). A deferred tx whose first statement is a SELECT
+// takes a read snapshot; upgrading it to a write after a concurrent writer
+// committed fails fast with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout
+// does NOT retry. A zero-row UPDATE acquires the write lock immediately
+// (busy_timeout applies to the ACQUIRE), so colliding writers serialize
+// into wait-then-succeed instead of spurious 500s. The \x00 prefix makes
+// the key unmatchable by any real setting, so the UPDATE always touches
+// zero rows.
+const settingsTxLockKey = "\x00pulsemon-txlock"
 
 // EnterMaintenanceWithFreshSnapshot enters maintenance mode with the
 // active-sensor snapshot computed INSIDE the pause transaction itself.
@@ -685,6 +673,15 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+	// Pin the write lock BEFORE the snapshot read (see
+	// settingsTxLockKey on LeaveMaintenanceFromSnapshot): a deferred tx
+	// whose first statement is a SELECT becomes a READER, and upgrading
+	// that read snapshot to a write after a concurrent writer committed
+	// fails fast with SQLITE_BUSY_SNAPSHOT (517) — busy_timeout does not
+	// retry it, so a normal lock collision surfaced as a spurious 500.
+	if _, err := tx.ExecContext(ctx, "UPDATE settings SET value = value WHERE setting_key = ?", settingsTxLockKey); err != nil {
+		return nil, err
+	}
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
 	if err != nil {
 		return nil, err
@@ -708,6 +705,48 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 		return nil, err
 	}
 	if err := applyMaintenanceTx(tx, true, ids, string(snap)); err != nil {
+		return nil, err
+	}
+	return ids, nil
+}
+
+// LeaveMaintenanceFromSnapshot leaves maintenance mode with the restore-set
+// snapshot read INSIDE the resume transaction — the mirror of
+// EnterMaintenanceWithFreshSnapshot above, which exists for the same class
+// of reason. The handler used to read the snapshot with the swallow-to-""
+// GetSetting before the transaction: a transient read failure (or a value
+// that failed to decode) yielded an EMPTY id list, and the leave then
+// resumed nothing, wiped the snapshot and cleared the mode flag — the
+// maintenance banner vanished, every maintenance-paused sensor stayed
+// paused forever with alerts silent, and nothing recorded which sensors
+// were in the lost restore set (2026-11-16 review M1). One transaction
+// now: pin the write lock → SELECT snapshot → resume those ids → clear
+// snapshot + mode flag. Returns the ids actually resumed (the handler
+// feeds them to the SetPaused in-memory fast path). An undecodable
+// snapshot is a HARD error with the tx rolled back: mode stays ON and the
+// value stays on disk for an operator to inspect — the restore set must
+// never be silently guessed.
+func (db *Store) LeaveMaintenanceFromSnapshot(ctx context.Context) ([]string, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
+	if _, err := tx.ExecContext(ctx, "UPDATE settings SET value = value WHERE setting_key = ?", settingsTxLockKey); err != nil {
+		return nil, err
+	}
+	var snap string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE setting_key = 'maintenance_active_ids'").Scan(&snap)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	var ids []string
+	if snap != "" {
+		if err := json.Unmarshal([]byte(snap), &ids); err != nil {
+			return nil, fmt.Errorf("maintenance snapshot is not valid JSON (%q): %w", snap, err)
+		}
+	}
+	if err := applyMaintenanceTx(tx, false, ids, ""); err != nil {
 		return nil, err
 	}
 	return ids, nil

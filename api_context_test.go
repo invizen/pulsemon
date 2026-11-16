@@ -91,7 +91,7 @@ func TestFix_HandlerDBCallsHonorRequestContext(t *testing.T) {
 
 // TestFix_MaintenanceAndTagDeleteHonorRequestContext pins the 2026-10-30
 // review #5: the last four ctx-less DB calls on the request path —
-// ActiveSensorIDs, EnterMaintenanceWithFreshSnapshot, SetMaintenanceMode,
+// ActiveSensorIDs, EnterMaintenanceWithFreshSnapshot, LeaveMaintenanceFromSnapshot,
 // DeleteTag — now carry the request context. Same pool-level fast-fail
 // contract as TestFix_HandlerDBCallsHonorRequestContext: a dead ctx means
 // the statement never runs.
@@ -168,8 +168,8 @@ func TestFix_MaintenanceAndTagDeleteHonorRequestContext(t *testing.T) {
 	if n != 0 {
 		t.Error("EnterMaintenanceWithFreshSnapshot with a canceled ctx paused sensors")
 	}
-	if err := db.SetMaintenanceMode(ctx, false, []string{"ctx-m1"}, ""); err == nil {
-		t.Error("SetMaintenanceMode with a canceled ctx: want an error")
+	if _, err := db.LeaveMaintenanceFromSnapshot(ctx); err == nil {
+		t.Error("LeaveMaintenanceFromSnapshot with a canceled ctx: want an error (tx never ran)")
 	}
 
 	// Sanity: live ctx, the same operations work end-to-end — the ctx
@@ -183,11 +183,11 @@ func TestFix_MaintenanceAndTagDeleteHonorRequestContext(t *testing.T) {
 	if got := db.GetSetting("maintenance_mode"); got != "1" {
 		t.Error("maintenance enable with live ctx did not set the mode flag")
 	}
-	if err := db.SetMaintenanceMode(context.Background(), false, []string{"ctx-m1"}, ""); err != nil {
-		t.Errorf("SetMaintenanceMode with live ctx: %v", err)
+	if _, err := db.LeaveMaintenanceFromSnapshot(context.Background()); err != nil {
+		t.Errorf("LeaveMaintenanceFromSnapshot with live ctx: %v", err)
 	}
 	if got := db.GetSetting("maintenance_mode"); got == "1" {
-		t.Error("SetMaintenanceMode with live ctx did not clear the mode flag")
+		t.Error("LeaveMaintenanceFromSnapshot with live ctx did not clear the mode flag")
 	}
 	if _, err := db.DeleteTag(context.Background(), "ctxtag"); err != nil {
 		t.Errorf("DeleteTag with live ctx: %v", err)

@@ -2033,16 +2033,16 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 	respondWithJSON(w, http.StatusOK, payload)
 }
 
-// enterMaintenance / setMaintenanceMode: the two maintenance-mode store
-// calls as vars so a test can force the post-commit failure path (review
+// enterMaintenance / leaveMaintenance: the two maintenance-mode store calls
+// as vars so a test can force the post-commit failure path (review
 // 2026-11-10 #6) — settings tx committed, maintenance tx failed → the
 // alert snapshot must still reload. Production is a plain method call
 // (same seam pattern as deliverDestinations in alerts.go).
 var enterMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
 	return db.EnterMaintenanceWithFreshSnapshot(ctx)
 }
-var setMaintenanceMode = func(db *store.Store, ctx context.Context, on bool, ids []string, snap string) error {
-	return db.SetMaintenanceMode(ctx, on, ids, snap)
+var leaveMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
+	return db.LeaveMaintenanceFromSnapshot(ctx)
 }
 
 func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
@@ -2225,8 +2225,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// sent — nil means keep, so a partial save no longer resets routing.
 	// The whole apply phase is ONE transaction: validation can't rule out a
 	// mid-sequence write failure (disk full, SQLITE_BUSY), and the old
-	// autocommit writes left a partial save behind a 500. Maintenance mode below stays outside — it has its own atomic
-	// snapshot transaction (SetMaintenanceMode).
+	// autocommit writes left a partial save behind a 500. Maintenance mode below stays outside — each transition has its own atomic
+	// snapshot transaction (EnterMaintenanceWithFreshSnapshot /
+	// LeaveMaintenanceFromSnapshot).
 	tx, err := s.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		respondInternal(w, "begin settings update", err)
@@ -2370,19 +2371,18 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			// BEFORE maintenance (not in the snapshot), or added during
 			// maintenance, stay paused. A snapshot sensor the user paused
 			// DURING maintenance is resumed with the rest — the snapshot is
-			// the restore set, and SetMaintenanceMode resumes it wholesale.
-			// Then clear the snapshot and reset alert timers so a still-bad
-			// sensor doesn't instantly re-alert on the next tick.
-			snap := s.db.GetSetting("maintenance_active_ids")
-			var ids []string
-			if snap != "" {
-				if err := json.Unmarshal([]byte(snap), &ids); err != nil {
-					ids = nil
-				}
-			}
-			// Atomic: resume + clear snapshot + mode flag in ONE transaction.
-			// See SetMaintenanceMode in db.go.
-			if err := setMaintenanceMode(s.db, r.Context(), false, ids, ""); err != nil {
+			// the restore set, applied wholesale. The snapshot is read
+			// INSIDE the resume transaction (the mirror of the enter path
+			// above): the pre-tx GetSetting read swallowed every failure
+			// into "", and a transient read error (or an undecodable value)
+			// then resumed NOTHING, wiped the snapshot and cleared the
+			// banner — stranding every maintenance-paused sensor in 'paused'
+			// with alerts silent and no record of the lost restore set
+			// (2026-11-16 review M1). A failed read/decode now 500s with
+			// mode still ON and the snapshot intact: the banner stays up,
+			// alerts stay gated, and the operator's retry can succeed.
+			ids, err := leaveMaintenance(s.db, r.Context())
+			if err != nil {
 				respondInternal(w, "leave maintenance mode", err)
 				return
 			}
@@ -2392,6 +2392,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			for _, id := range ids {
 				s.probeWorker.SetPaused(id, false)
 			}
+			// Snapshot cleared + alert timers reset, so a still-bad
+			// sensor doesn't instantly re-alert on the next tick.
 			s.probeWorker.ResetAlertStates()
 			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
 		}

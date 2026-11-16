@@ -1202,3 +1202,44 @@ before any write.
 Note: the pre-flight map reads replace point reads that each had their
 own failure direction (guard-skip vs spurious 400); with the bulk read
 the whole phase has ONE failure direction: 500, store untouched.
+
+## maintenance-leave-fails-loud (api.go, internal/store/store.go, maintenance_snapshot_test.go, settings_patch_test.go, api_context_test.go, 2026-11-16)
+**Decision:** Leaving maintenance mode now reads the restore-set snapshot INSIDE
+the resume transaction — new Store.LeaveMaintenanceFromSnapshot(ctx) mirrors
+EnterMaintenanceWithFreshSnapshot: pin the write lock (zero-row UPDATE on
+settingsTxLockKey) → SELECT maintenance_active_ids → resume those ids → clear
+snapshot + mode flag, all in ONE tx. handleSettingsPut's leave branch is one
+seam call (leaveMaintenance) that 500s on ANY failure without touching the
+mode flag, the snapshot, the sensor states, or the in-memory pause fast-path.
+The old Store.SetMaintenanceMode (caller supplies ids read outside the tx —
+the exact shape that made the bug possible) is removed; both transitions now
+compute their id set inside their own tx. The enter path gained the same
+write-lock pin its SELECT-first tx was missing.
+**Why:** the leave path read the snapshot with the swallow-to-"" GetSetting
+BEFORE the tx: a transient read failure — or a value that failed to decode
+(ids = nil) — yielded an EMPTY restore set, and the leave then resumed
+NOTHING, wiped the snapshot, and set maintenance_mode=0. The maintenance
+banner vanished, every maintenance-paused sensor stayed paused forever with
+alerts silent, and nothing recorded which sensors were in the lost set: the
+worst outcome for a monitor, and the same fail-loud class the enter path was
+already converted for (EnterMaintenanceWithFreshSnapshot exists for this
+reason). An undecodable snapshot is now a hard error with the tx rolled back:
+mode stays ON (banner up, alerts gated), the value stays on disk for
+inspection, and the retry can succeed. A MISSING snapshot row (pre-rework DB)
+stays a clean success — there is no restore set to lose; only a
+present-but-undecodable value is fatal. The write-lock pin goes in BEFORE the
+in-tx SELECT because a deferred tx that starts as a reader and upgrades after
+a concurrent commit fails fast with SQLITE_BUSY_SNAPSHOT (517), which
+busy_timeout does not retry — the established pin pattern from this handler's
+settings tx.
+**Pinned by:** TestLeaveMaintenanceFromSnapshot (enter→leave resumes exactly
+the snapshot; p1 user-paused untouched; snapshot cleared),
+TestLeaveMaintenanceUndecodableSnapshotFailsLoud,
+TestLeaveMaintenanceMissingSnapshotIsNotAnError,
+TestSettingsPutReloadsSnapshotWhenMaintenanceTxFails/leave-maintenance-500
+(500 + mode stays "1" + snapshot byte-identical),
+TestMaintenancePauseResume,
+TestFix_MaintenanceAndTagDeleteHonorRequestContext (leave is ctx-bound).
+Sabotage-verified: restoring the old read (decode error → ids = nil, no
+in-tx read) makes TestLeaveMaintenanceUndecodableSnapshotFailsLoud fail with
+"want an error, got nil" and mode/sensor-state assertions expose the wipe.
