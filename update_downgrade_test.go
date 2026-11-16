@@ -234,11 +234,12 @@ func servePinnedReleaseVerified(t *testing.T, tag string) string {
 	return srv.URL + "/releases"
 }
 
-// TestUpdateExplicitPinBypassesDowngradeGuard: an EXPLICIT version pin in
-// the request body is the API's opt-out (the dashboard's --allow-downgrade)
-// — pinning a below-floor tag is a deliberate operator choice, so the full
-// install path runs and the binary is swapped.
-func TestUpdateExplicitPinBypassesDowngradeGuard(t *testing.T) {
+// TestUpdateExplicitPinRefusedWithoutOptOut: a version pin is NOT the
+// downgrade opt-out (pre-fix it implicitly was: version != "latest" fed the
+// guard's allow). Post-rollback (running v0.4.4, floor v0.4.6), a pinned
+// v0.4.5 is newer than running — the ordering rule passes it — but below
+// the floor, so the API must 409 and point at "allow_downgrade".
+func TestUpdateExplicitPinRefusedWithoutOptOut(t *testing.T) {
 	db := newTestDB(t)
 	if err := db.SetSetting(maxVersionSeenSetting, "v0.4.6"); err != nil {
 		t.Fatal(err)
@@ -254,6 +255,35 @@ func TestUpdateExplicitPinBypassesDowngradeGuard(t *testing.T) {
 	t.Cleanup(func() { releaseBase, Version = oldBase, oldVer })
 
 	rec := postUpdate(t, srv, `{"version":"v0.4.5"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("code = %d, want 409 (a pin alone must not lift the floor): %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "allow_downgrade") {
+		t.Fatalf("409 must name the explicit opt-out field: %s", rec.Body.String())
+	}
+	if got, _ := os.ReadFile(h.exePath); string(got) != "old binary" {
+		t.Fatalf("binary was swapped on a downgrade-guard refusal: %q", got)
+	}
+}
+
+// TestUpdateExplicitPinWithAllowDowngradeInstalls: the explicit twin of the
+// CLI's --allow-downgrade lifts the floor and runs the full install path.
+func TestUpdateExplicitPinWithAllowDowngradeInstalls(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.SetSetting(maxVersionSeenSetting, "v0.4.6"); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(db, NewProbeWorker(db))
+	if err := srv.auth.AddUser(context.Background(), "admin", "update-test-password-1"); err != nil {
+		t.Fatal(err)
+	}
+	h := setupUpdateHarness(t, false)
+	base := servePinnedReleaseVerified(t, "v0.4.5")
+	oldBase, oldVer := releaseBase, Version
+	releaseBase, Version = base, "v0.4.4"
+	t.Cleanup(func() { releaseBase, Version = oldBase, oldVer })
+
+	rec := postUpdate(t, srv, `{"version":"v0.4.5","allow_downgrade":true}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200 (installed): %s", rec.Code, rec.Body.String())
 	}
@@ -261,6 +291,6 @@ func TestUpdateExplicitPinBypassesDowngradeGuard(t *testing.T) {
 		t.Fatalf("res = %+v, want installed", res)
 	}
 	if got, _ := os.ReadFile(h.exePath); !strings.Contains(string(got), "fake pulsemon binary payload") {
-		t.Fatalf("binary not swapped on an explicit pin: %q", got)
+		t.Fatalf("binary not swapped on an explicit allow_downgrade install: %q", got)
 	}
 }

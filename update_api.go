@@ -150,10 +150,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	defer lockFile.Close()
 
 	version := "latest"
+	var body struct {
+		Version        string `json:"version"`
+		AllowDowngrade bool   `json:"allow_downgrade"`
+	}
 	if r.ContentLength > 0 {
-		var body struct {
-			Version string `json:"version"`
-		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Version != "" {
 			version = body.Version
 		}
@@ -190,15 +191,18 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Anti-downgrade floor: same rule as the CLI — a release
-	// tag below the highest version this install has ever run is refused
-	// (409). An EXPLICIT version pin in the request body is the API's
-	// opt-out, the dashboard's analog of the CLI's --allow-downgrade:
-	// pinning an old tag is a deliberate operator choice; an un-pinned
-	// "latest" request gets the full guard.
-	if err := downgradeGuard(s.db, rel.TagName, version != "latest"); err != nil {
+	// Anti-downgrade floor, symmetric with the CLI: a release tag below
+	// the highest version this install has ever run is refused (409)
+	// UNLESS the request carries an explicit "allow_downgrade": true —
+	// the API's twin of the CLI's --allow-downgrade flag. A version pin
+	// alone is NOT the opt-out: the dashboard never pins (it posts {}
+	// against the latest tag), so the pin was an implicit downgrade
+	// opt-out only raw API clients could reach, invisible to any
+	// operator reading the CLI as the reference contract.
+	if err := downgradeGuard(s.db, rel.TagName, body.AllowDowngrade); err != nil {
 		log.Printf("update: downgrade guard: %v", err)
-		respondWithError(w, http.StatusConflict, err.Error())
+		respondWithError(w, http.StatusConflict,
+			"refusing to install "+rel.TagName+": it is below the highest version this install has ever run; send \"allow_downgrade\": true to override")
 		return
 	}
 

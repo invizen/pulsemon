@@ -1361,3 +1361,24 @@ verbatim from install.sh and runs it over fixture releases: valid
 signature accepted; tampered binary, tag replay (sig made for an older
 tag), missing sig, unknown key, truncated sig, unreachable pubkeys, and
 comment-only keyset all refused. 8/8 on zentest.
+
+## api-downgrade-opt-out-explicit (update_api.go, update_downgrade_test.go, 2026-11-16)
+**Decision:** `POST /api/update` lifts the anti-downgrade floor ONLY on an
+explicit `"allow_downgrade": true` body field — the API twin of the CLI's
+`--allow-downgrade`. A version pin alone no longer bypasses the guard
+(pre-fix the opt-out was `version != "latest"`).
+**Why:** the floor exists precisely for the post-rollback window (running
+< tag < max_version_seen), and pinning is the natural way to walk INTO
+that window; the dashboard never pins (it posts `{}` against the latest
+tag), so the implicit rule was a downgrade opt-out that only raw API
+clients could reach, invisible to anyone reading the CLI as the reference
+contract. Symmetry is the point: a deliberate downgrade now looks the
+same from both entry points — an explicit, separately-stated opt-out.
+Admin-only route either way; this narrows the blast radius of an
+accidental scripted pin, it does not gate trust.
+**Pinned by:** `TestUpdateExplicitPinRefusedWithoutOptOut` (pin alone →
+409, message names the field, binary untouched),
+`TestUpdateExplicitPinWithAllowDowngradeInstalls` (explicit opt-out → full
+install path), alongside the existing un-pinned and CLI twins. Sabotage
+`allow=true` always → refusal test red; `allow=false` always → install
+test red.
