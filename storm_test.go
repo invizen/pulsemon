@@ -498,6 +498,8 @@ func TestHotReloadCert(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeTestCertPEM(t, certPath, keyPath)
 
+	certStatMemo = 0 // test: see every file change immediately
+	t.Cleanup(func() { certStatMemo = time.Second })
 	get := hotReloadCert(certPath, keyPath)
 	c1, err := get(nil)
 	if err != nil {
@@ -586,6 +588,8 @@ func TestHotReloadCertNoRespinWhileBroken(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeTestCertPEM(t, certPath, keyPath)
 
+	certStatMemo = 0 // test: see every file change immediately
+	t.Cleanup(func() { certStatMemo = time.Second })
 	get := hotReloadCert(certPath, keyPath)
 	if _, err := get(nil); err != nil {
 		t.Fatalf("initial load: %v", err)

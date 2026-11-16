@@ -11,10 +11,12 @@ TAILWIND := npx -y tailwindcss@3.4.17
 
 .PHONY: css build
 
-# Regenerate web/vendor/tailwind.css from web/tailwind.input.css, scanning
+# Regenerate web/vendor/tailwind.css from frontend/tailwind.input.css, scanning
 # web/index.html + web/app.js for class names. Run after editing classes.
+# The build INPUTS live in frontend/ (NOT web/) so the go:embed web/* asset
+# bundle ships served assets only — handleStatic must never serve build inputs.
 css:
-	$(TAILWIND) -i web/tailwind.input.css -o web/vendor/tailwind.css --config web/tailwind.config.js --minify
+	$(TAILWIND) -i frontend/tailwind.input.css -o web/vendor/tailwind.css --config frontend/tailwind.config.js --minify
 
 # Build the binary (embeds web/* via go:embed).
 build:

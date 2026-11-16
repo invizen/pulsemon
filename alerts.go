@@ -392,15 +392,41 @@ func (pw *ProbeWorker) shouldAlert(id string, tags []string) bool {
 	return false
 }
 
+// alertMemEntry is the in-memory copy of one alert_state row (see the
+// ProbeWorker.alertMem field comment).
+type alertMemEntry struct {
+	status string
+	ts     time.Time
+}
+
+// alertStateSelect reads a sensor's durable alert_state row. Seam: tests
+// count lookups to pin the in-memory cache in front of it.
+var alertStateSelect = func(db *store.Store, id string) (string, string, error) {
+	var status, ts string
+	err := db.QueryRow("SELECT status, last_ts FROM alert_state WHERE sensor_id = ?", id).Scan(&status, &ts)
+	return status, ts, err
+}
+
 // maybeRealert re-notifies while a sensor stays in the same non-up state,
-// at most once per re-alert interval (default 30 min).
+// at most once per re-alert interval (default 30 min). The state read goes
+// through the in-memory alert-state copy first: a steady non-up sensor hits
+// no SELECT at all, and the DB row remains the durable copy (re-read on
+// miss: fresh process, deleted/evicted id).
 func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64) {
 	now := time.Now().UTC()
 	var lastStatus, lastTs string
-	err := pw.db.QueryRow("SELECT status, last_ts FROM alert_state WHERE sensor_id = ?", c.id).Scan(&lastStatus, &lastTs)
-	if err != nil {
-		pw.setAlertState(c.id, status, now)
-		return
+	pw.alertMemMu.Lock()
+	mem, inMem := pw.alertMem[c.id]
+	pw.alertMemMu.Unlock()
+	if inMem {
+		lastStatus, lastTs = mem.status, store.FormatTS(mem.ts)
+	} else {
+		ls, lt, err := alertStateSelect(pw.db, c.id)
+		if err != nil {
+			pw.setAlertState(c.id, status, now)
+			return
+		}
+		lastStatus, lastTs = ls, lt
 	}
 	if lastStatus != status {
 		pw.setAlertState(c.id, status, now)
@@ -450,6 +476,14 @@ func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
 		SELECT id, ?, ? FROM sensors WHERE id = ?
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
 		status, store.FormatTS(ts), id)
+	// Write-through so the in-memory copy mirrors the durable row (it is
+	// seeded from writes, re-read from the DB only on miss).
+	pw.alertMemMu.Lock()
+	if pw.alertMem == nil {
+		pw.alertMem = make(map[string]alertMemEntry)
+	}
+	pw.alertMem[id] = alertMemEntry{status: status, ts: ts}
+	pw.alertMemMu.Unlock()
 }
 
 // alertRetryAfter is how soon a re-alert is retried after every provider

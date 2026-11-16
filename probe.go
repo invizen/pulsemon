@@ -457,6 +457,14 @@ type ProbeWorker struct {
 	alertMu         sync.Mutex
 	alertOrderGates map[string]chan func()
 
+	// alertMem is the in-memory copy of the alert_state rows the re-alert
+	// hot path reads (maybeRealert): setAlertState writes through, and
+	// Remove / ResetStatsFor / ResetStatsAll invalidate — the DB row stays
+	// the durable copy, re-read on any miss (fresh process, evicted id).
+	// Its own mutex: never nested with the others.
+	alertMemMu sync.Mutex
+	alertMem   map[string]alertMemEntry
+
 	// alertCfg is the typed settings snapshot the alert hot path reads
 	// lock-free (see alertSettings in alerts.go): the gate (maintenance,
 	// routing, re-alert interval) and the resolved delivery destinations.
@@ -504,6 +512,7 @@ func NewProbeWorker(db *store.Store) *ProbeWorker {
 		statsCache:      make(map[string]*probeSeries),
 		lastPulse:       make(map[string]time.Time),
 		alertOrderGates: make(map[string]chan func()),
+		alertMem:        make(map[string]alertMemEntry),
 		stopCtx:         ctx,
 		stopCancel:      cancel,
 	}
@@ -837,6 +846,9 @@ func (pw *ProbeWorker) Remove(id string) {
 	pw.alertMu.Lock()
 	delete(pw.alertOrderGates, id)
 	pw.alertMu.Unlock()
+	pw.alertMemMu.Lock()
+	delete(pw.alertMem, id)
+	pw.alertMemMu.Unlock()
 }
 
 // ActiveCount is the number of sensor loops currently tracked (healthz).

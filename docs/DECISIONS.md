@@ -1449,3 +1449,33 @@ a harmless ErrClosed, so success paths are unchanged.
 out read-only temps so the first write fails with EBADF, and the test
 diffs /proc/self/fd around the PUT: +2 fds on the pre-fix shape
 (sabotage-verified), 0 on the fix.
+
+## nit-round-2026-11-16 (tcp.go, probe.go, alerts.go, stats.go, main.go, web/->frontend/, update_check.go)
+**Decision:** six review nits landed at once. (1) tcpProbeResult.Elapsed
+doc corrected: the stamp lands AFTER resolveICMPTarget, so Elapsed is the
+TCP handshake only — connect-only is the intended measurement (the HTTP
+probe keeps the TTFB stance that includes DNS). (2) seriesTailProbes
+carries a new comment pinning why slow sensors (status window > 60)
+legitimately fall through recentFromCache to SQLite every tick — do not
+"optimize". (3) The re-alert hot path reads an in-memory copy of
+alert_state (alertMem, write-through from setAlertState, invalidated by
+Remove/ResetStatsFor/ResetStatsAll); the DB row stays the durable copy,
+re-read on miss. (4) hotReloadCert memoizes the cert/key (mtime,size)
+fingerprint for certStatMemo (1s) under its own mutex — two stats per
+handshake becomes one stat pair per second of handshake burst; a
+replaced pair lands at most 1s late. (5) Tailwind build INPUTS moved
+web/ -> frontend/ (Makefile css target updated): go:embed web/* ships
+served assets only, so handleStatic can no longer serve tailwind.config.js
+/ tailwind.input.css. (6) PULSEMON_DISABLE_UPDATE_CHECK=1 answers
+/api/update-check with a canned no-update (zero network); CLI update
+paths unaffected.
+**Why:** each was a correctness-of-docs or steady-state-waste item:
+misleading RTT semantics, a predictable "optimization" trap, a SELECT per
+error tick per sensor, 2 syscalls in every TLS handshake, build inputs
+public over HTTP, and an unhonored call-home opt-out expectation.
+**Pinned by:** TestRealertUsesAlertMemCache (0 DB lookups on steady
+error ticks, exactly 1 after invalidation), TestHotReloadCertStatMemo
+(frozen memo window serves the cached pair, closed window reloads),
+TestUpdateCheckDisabledOptOut (disabled:true, 0 upstream hits) — all
+three sabotage-verified red; live zentest: /tailwind.config.js and
+/tailwind.input.css = 404 post-move, index + update-check unaffected.

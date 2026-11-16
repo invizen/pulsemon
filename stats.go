@@ -392,6 +392,9 @@ func (pw *ProbeWorker) ResetStatsFor(id string) {
 	pw.statsMu.Lock()
 	delete(pw.statsCache, id)
 	pw.statsMu.Unlock()
+	pw.alertMemMu.Lock()
+	delete(pw.alertMem, id) // alert_state rows were wiped with the history
+	pw.alertMemMu.Unlock()
 }
 
 // ResetStatsAll empties every sensor's cached series and ProbeState
@@ -408,6 +411,9 @@ func (pw *ProbeWorker) ResetStatsAll() {
 	pw.statsMu.Lock()
 	pw.statsCache = make(map[string]*probeSeries)
 	pw.statsMu.Unlock()
+	pw.alertMemMu.Lock()
+	pw.alertMem = make(map[string]alertMemEntry)
+	pw.alertMemMu.Unlock()
 }
 
 // computeSensorStats turns a sensor's probe history (oldest-first) into the

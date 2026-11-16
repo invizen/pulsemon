@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"sync"
 	"time"
 
@@ -19,6 +20,9 @@ type updateCheckResult struct {
 	Available bool   `json:"available"`
 	URL       string `json:"url"`
 	CheckedAt string `json:"checked_at"`
+	// Disabled is true when PULSEMON_DISABLE_UPDATE_CHECK=1 silenced the
+	// check: no upstream call was made and none will be.
+	Disabled bool `json:"disabled,omitempty"`
 	// Cached is true when the response was served from the last known
 	// result while the GitHub check was failing (stale-but-useful), as
 	// opposed to a fresh-lookup success.
@@ -81,6 +85,14 @@ var (
 // fetch, so a slow upstream blocks at most one goroutine per flight —
 // cached-hit polls sail past untouched.
 func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
+	// PULSEMON_DISABLE_UPDATE_CHECK=1 silences the only routine outbound
+	// call-home: the endpoint answers a canned no-update result (zero
+	// network) so the dashboard pill goes quiet. Operator-initiated paths
+	// (CLI `pulsemon update-check` / `update`) are unaffected.
+	if os.Getenv("PULSEMON_DISABLE_UPDATE_CHECK") == "1" {
+		respondWithJSON(w, http.StatusOK, updateCheckResult{Running: Version, Disabled: true})
+		return
+	}
 	refresh := r.URL.Query().Get("refresh") == "1"
 
 	updateCheckMu.Lock()

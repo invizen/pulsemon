@@ -20,6 +20,8 @@ func TestHotReloadCertSizeFingerprint(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeTestCertPEM(t, certPath, keyPath)
 
+	certStatMemo = 0 // test: see every file change immediately
+	t.Cleanup(func() { certStatMemo = time.Second })
 	get := hotReloadCert(certPath, keyPath)
 	c1, err := get(nil)
 	if err != nil {
@@ -73,6 +75,8 @@ func TestHotReloadCertBackoffRecoversSameTickSameSize(t *testing.T) {
 	keyPath := filepath.Join(dir, "key.pem")
 	writeTestCertPEM(t, certPath, keyPath)
 
+	certStatMemo = 0 // test: see every file change immediately
+	t.Cleanup(func() { certStatMemo = time.Second })
 	get := hotReloadCert(certPath, keyPath)
 	c1, err := get(nil)
 	if err != nil {

@@ -13,10 +13,11 @@ import (
 // normalized by probeTarget into probeOutcome so doProbe, PingNow, and
 // status derivation share one code path.
 type tcpProbeResult struct {
-	// Elapsed is the connect time (DNS + TCP three-way handshake);
-	// meaningful only when !Lost. Unlike ICMP's echo RTT, it includes
-	// name resolution for hostname targets — the same TTFB stance the
-	// HTTP probe takes (its RTT is DNS + TCP + TLS + response).
+	// Elapsed is the connect time — the TCP three-way handshake ONLY.
+	// The stamp lands after resolveICMPTarget, so name resolution is NOT
+	// counted (unlike the HTTP probe's TTFB stance, DNS + TCP + TLS +
+	// response); connect-only is the number that means "port RTT" here.
+	// Meaningful only when !Lost.
 	Elapsed time.Duration
 	Lost    bool
 	// IP is the address the connection was made to (diagnostic; empty

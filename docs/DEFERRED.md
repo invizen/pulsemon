@@ -101,3 +101,41 @@ CLI opt-out) refuses release tags below the highest version the install has
 ever run. Residual: a full pipeline compromise (key + tag) can still sign
 an old binary under a fake-newer tag; key custody/rotation is the
 mitigation.
+
+### No HSTS header when serving TLS (2026-11-16)
+`startListener` serves TLS without a `Strict-Transport-Security` header.
+**Why accepted (deliberate, not an oversight):** `DELETE /api/settings/tls`
+is a supported revert to plain HTTP; a long `max-age` would strand
+browsers on an https:// origin that no longer listens (and the
+in-app TLS install flow is LAN/self-signed, where HSTS pinning of a
+throwaway cert buys little). **If this is ever added:** keep `max-age`
+short (order of one hour) or make it operator opt-in, so the TLS→HTTP
+revert stays survivable.
+
+### GET /api/sensors carries the full sparkline payload every poll (2026-11-16)
+Each sensor ships 60 hour-tier + 30 recent-tier floats per poll
+(~0.5-1 MB per 5s tab at a few hundred sensors). Accepted for the
+stated homelab/1080p target: loopback/LAN bandwidth, and the payload is
+one indexed read amortized across the poll. **Scaling step if the fleet
+grows:** ETag/If-None-Match on the JSON (the static-asset machinery
+exists) or SSE deltas; not worth the cache-invalidation surface at
+homelab scale.
+
+### Slow sensors with status windows wider than the series tail read SQLite every tick (2026-11-16)
+`deriveStatus` asks for `max(statusWindow, down_after)` probes;
+`recentFromCache` can hold at most `seriesTailProbes` (60), so a sensor
+with e.g. down_after=96 falls through to `recentFromDB` every tick.
+**Why accepted:** the tail cap bounds resident memory; the cross-field
+rule (`down_after x interval <= 24h`) bounds the worst case at ~96 rows
+of an indexed `ORDER BY ts DESC LIMIT` per 15-minute tick. Comment at
+`seriesTailProbes` (probe.go) pins the reasoning against future
+"optimization".
+
+### Re-alert hot path keeps an in-memory copy of alert_state (2026-11-16)
+`maybeRealert` reads `ProbeWorker.alertMem` (write-through from
+`setAlertState`); the DB row stays the durable copy. Accepted
+simplification: the cache is invalidated on every path that writes
+alert_state outside the worker (sensor delete, per-sensor and
+all-history clear — `Remove` / `ResetStatsFor` / `ResetStatsAll`), and
+a miss re-reads the row, so a restart converges. No write-back is ever
+done from the cache.

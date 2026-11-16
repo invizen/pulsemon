@@ -372,6 +372,12 @@ type certFingerprint struct {
 // A var (not const) so tests can shorten it.
 var certReloadRetry = 10 * time.Second
 
+// certStatMemo is the (mtime, size) fingerprint memo window for the
+// GetCertificate hot-reload path: a burst of handshakes (short-lived
+// connections) costs one stat pair per window, not two syscalls per
+// handshake. A replaced pair lands at most one window late.
+var certStatMemo = 1 * time.Second
+
 // hotReloadCert returns a tls.Config.GetCertificate that serves the pair at
 // (certPath, keyPath), re-loading it whenever either file's (mtime, size)
 // fingerprint changes. A failed reload (half-written file, transient mismatch)
@@ -403,10 +409,18 @@ func hotReloadCert(certPath, keyPath string) func(*tls.ClientHelloInfo) (*tls.Ce
 		}
 		return fp
 	}
+	fpMemo, fpMemoAt := certFingerprint{}, time.Time{}
 	return func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-		fp := statFP()
 		mu.Lock()
 		defer mu.Unlock()
+		// Fingerprint memoized under the same mutex for certStatMemo: the
+		// hot path stops being two stats per handshake; a burst of
+		// handshakes costs one stat pair per window.
+		fp := fpMemo
+		if time.Since(fpMemoAt) >= certStatMemo {
+			fp = statFP()
+			fpMemo, fpMemoAt = fp, time.Now()
+		}
 		if cached != nil && fp == seen && (!due || time.Now().Before(retryAt)) {
 			return cached, nil
 		}
