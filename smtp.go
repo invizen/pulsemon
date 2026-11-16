@@ -28,8 +28,13 @@ import (
 // smtp_host); the UI's URL input is repurposed as the Host field. Delivery is
 // a plain-text email so it renders identically in every mail client.
 
-// smtpConfig is the persisted SMTP settings, read fresh on every send so an
-// operator editing the dashboard takes effect on the next alert.
+// smtpConfig is the persisted SMTP settings. It is resolved at snapshot
+// load (resolveDestsGet: the dest carries it, so delivery performs zero
+// per-alert settings reads) and, for the settings Test button, fresh from
+// ONE bulk settings read — never per-key swallow: a transient lock mapped
+// Host to "" and the send died as non-retryable "not configured".
+// Operator edits take effect on the next alert via the snapshot swap on
+// every PUT /api/settings commit.
 type smtpConfig struct {
 	Host string
 	Port int
@@ -40,17 +45,24 @@ type smtpConfig struct {
 	TLS  string // "auto" (default), "starttls", "tls", "none"
 }
 
-func (pw *ProbeWorker) smtpConfig() smtpConfig {
-	db := pw.db
-	cfg := smtpConfig{
-		Host: db.GetSetting("smtp_host"),
-		From: db.GetSetting("smtp_from"),
-		To:   db.GetSetting("smtp_to"),
-		User: db.GetSetting("smtp_username"),
-		Pass: db.GetSetting("smtp_password"),
-		TLS:  db.GetSetting("smtp_tls_mode"),
+// smtpConfigFromGet resolves the SMTP settings through an error-aware
+// getter (the snapshot's bulk map, or the getAllSettings seam).
+func smtpConfigFromGet(get settingGet) (smtpConfig, error) {
+	var cfg smtpConfig
+	var err error
+	keys := []*string{&cfg.Host, &cfg.From, &cfg.To, &cfg.User, &cfg.Pass, &cfg.TLS}
+	names := []string{"smtp_host", "smtp_from", "smtp_to", "smtp_username", "smtp_password", "smtp_tls_mode"}
+	for i, k := range names {
+		*keys[i], err = get(k)
+		if err != nil {
+			return smtpConfig{}, err
+		}
 	}
-	if p, err := strconv.Atoi(db.GetSetting("smtp_port")); err == nil && p > 0 {
+	port, err := get("smtp_port")
+	if err != nil {
+		return smtpConfig{}, err
+	}
+	if p, aerr := strconv.Atoi(port); aerr == nil && p > 0 {
 		cfg.Port = p
 	} else {
 		cfg.Port = 587 // conventional submission port
@@ -58,7 +70,18 @@ func (pw *ProbeWorker) smtpConfig() smtpConfig {
 	if cfg.TLS == "" {
 		cfg.TLS = "auto"
 	}
-	return cfg
+	return cfg, nil
+}
+
+// smtpConfig reads the SMTP settings live (settings Test button, tests)
+// via the same bulk seam the snapshot uses: a real read failure returns an
+// error instead of a half-configured zero value.
+func (pw *ProbeWorker) smtpConfig() (smtpConfig, error) {
+	m, err := getAllSettings(pw.db)
+	if err != nil {
+		return smtpConfig{}, err
+	}
+	return smtpConfigFromGet(func(k string) (string, error) { return m[k], nil })
 }
 
 // smtpPort validates a stored smtp_port value: a 1–65535 integer. Empty is
@@ -169,8 +192,23 @@ var errSMTPNotConfigured = errors.New("smtp: not configured")
 //   - "starttls" — require STARTTLS.
 //   - "tls"      — implicit TLS on any port (a relay on a non-465 port).
 //   - "none"     — plaintext, no TLS at all.
+//
+// The (subject, body) form reads the SMTP config live through the bulk
+// seam (settings Test button, tests); the alert delivery paths pass the
+// snapshot-resolved config via sendSMTPWith — see the dest comment.
 func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error {
-	cfg := pw.smtpConfig()
+	cfg, err := pw.smtpConfig()
+	if err != nil {
+		// A read failure is NOT errSMTPNotConfigured: a transient lock
+		// must be retryable, never classified as a permanent config gap.
+		return fmt.Errorf("smtp: reading settings: %w", err)
+	}
+	return pw.sendSMTPWith(ctx, cfg, subject, body)
+}
+
+// sendSMTPWith delivers with an already-resolved config (zero settings
+// reads on the delivery hot path).
+func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject, body string) error {
 	if cfg.Host == "" {
 		return fmt.Errorf("%w: no host", errSMTPNotConfigured)
 	}

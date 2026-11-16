@@ -1297,3 +1297,26 @@ normal+refresh concurrent wave (old code = DATA RACE + FAIL, verified
 by sabotage), hit-count pin (8 pollers → 1 upstream fetch), and a
 latency pin (normal poll during an in-flight slow refresh must return
 <150ms).
+
+## smtp-config-in-snapshot (smtp.go, alerts.go, smtp_snapshot_test.go, 2026-11-16)
+**Decision:** the SMTP mail config resolves at snapshot-load time into the
+delivery `dest` (like the Telegram chat_id), so the alert hot path performs
+ZERO settings reads for every provider. `resolveDestsGet` builds the full
+`smtpConfig` from the same bulk settings map (fail-loud: a read error
+aborts the load and keeps the previous snapshot); `sendSMTPWith` takes the
+resolved config. The live form `sendSMTP` (settings Test button, tests)
+reads ONE bulk `getAllSettings` and returns the error — never 7
+swallow-to-"" GetSetting calls.
+**Why:** the per-send live reads were the last violation of the snapshot
+design: a transient DB lock mid-send mapped Host to "" →
+`errSMTPNotConfigured`, which the retry loop classifies as permanent, so
+the in-band retries were skipped and recovery depended on the outer
+schedule. A read failure is now either invisible to the delivery (snapshot
+already loaded) or a retryable bulk-read error — never a fake
+configuration gap.
+**Pinned by:** `TestSMTPDestCarriesSnapshotConfig` (dest carries all seven
+keys, sabotage = resolver stops attaching → red),
+`TestSMTPDeliveryZeroSettingsReads` (delivery succeeds with the DB CLOSED
+— sabotage = restore a live read → red),
+`TestTestWebhookSMTPSurfacesDBError` (bulk-read failure → "database
+error", not "not configured").

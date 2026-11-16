@@ -147,7 +147,10 @@ func TestSmtpAddr(t *testing.T) {
 func TestSmtpConfigDefaults(t *testing.T) {
 	db := newTestDB(t)
 	pw := NewProbeWorker(db)
-	cfg := pw.smtpConfig()
+	cfg, err := pw.smtpConfig()
+	if err != nil {
+		t.Fatalf("smtpConfig: %v", err)
+	}
 	// No port set → default 587.
 	if cfg.Port != 587 {
 		t.Fatalf("default port = %d, want 587", cfg.Port)
@@ -162,7 +165,10 @@ func TestSmtpConfigDefaults(t *testing.T) {
 	db.SetSetting("smtp_tls_mode", "none")
 	db.SetSetting("smtp_from", "a@b.c")
 	db.SetSetting("smtp_to", "x@y.z")
-	cfg = pw.smtpConfig()
+	cfg, err = pw.smtpConfig()
+	if err != nil {
+		t.Fatalf("smtpConfig: %v", err)
+	}
 	if cfg.Host != "mail.local" || cfg.Port != 25 || cfg.TLS != "none" || cfg.From != "a@b.c" || cfg.To != "x@y.z" {
 		t.Fatalf("smtpConfig did not honor explicit values: %+v", cfg)
 	}

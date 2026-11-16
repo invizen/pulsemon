@@ -216,7 +216,20 @@ func resolveDestsGet(get settingGet) ([]dest, error) {
 				return nil, err
 			}
 		}
-		dests = append(dests, dest{p, url, chatID})
+		d := dest{p: p, url: url, chatID: chatID}
+		if p.Kind == "smtp" {
+			// The full mail config resolves here with the URL/chat_id
+			// (one bulk read, fail-loud): delivery then performs ZERO
+			// settings reads. The old live smtpConfig() did 7 swallow-to-""
+			// GetSetting calls per send — a transient lock degraded into
+			// "not configured", which the retry loop skips as permanent.
+			cfg, err := smtpConfigFromGet(get)
+			if err != nil {
+				return nil, err
+			}
+			d.smtp = &cfg
+		}
+		dests = append(dests, d)
 	}
 	return dests, nil
 }
@@ -1031,7 +1044,7 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 					"parse_mode": "HTML",
 				}) == nil
 			case "smtp":
-				ok = pw.sendSMTP(pw.stopCtx, subject, body) == nil
+				ok = d.smtp != nil && pw.sendSMTPWith(pw.stopCtx, *d.smtp, subject, body) == nil
 			}
 			if ok {
 				delivered.Store(true)
@@ -1109,7 +1122,8 @@ func stormSummaryPlain(entries []stormEntry) string {
 type dest struct {
 	p      providerMeta
 	url    string
-	chatID string // telegram only; "" for every other kind
+	chatID string      // telegram only; "" for every other kind
+	smtp   *smtpConfig // smtp kind only, resolved at snapshot load; nil elsewhere
 }
 
 // getSettingErr is the settings read resolveDestinations uses for the
@@ -1224,8 +1238,12 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 			subject = smtpSubject(state, state) + " (re-alert)"
 			body = smtpBodyRe(state, name, target, rttMs)
 		}
+		if d.smtp == nil {
+			log.Printf("smtp alert to %s: dest carries no resolved config", url)
+			return false
+		}
 		err := pw.retryAlert(func() (bool, time.Duration, error) {
-			err := pw.sendSMTP(pw.stopCtx, subject, body)
+			err := pw.sendSMTPWith(pw.stopCtx, *d.smtp, subject, body)
 			// A configuration gap (no host/sender/recipient) cannot succeed
 			// on retry. SMTP has no Retry-After: 0 keeps the fixed
 			// alertRetryDelays.
@@ -1265,18 +1283,30 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	if url == "" && p.EnvFallback != "" {
 		url = os.Getenv(p.EnvFallback)
 	}
+	var smtpCfg smtpConfig
 	if p.Kind == "smtp" {
-		// SMTP has no URL field; the host+recipient gate is smtpHasURL —
-		// evaluated fail-loud through the same seam
-		// a transient DB lock at test time must surface as a database
-		// error, not masquerade as "no SMTP host and recipient
-		// configured" — the same fix the URL/chat_id reads above got.
-		gate, err := p.hasURLGet(func(k string) (string, error) { return getSettingErr(pw.db, k) })
+		// SMTP has no URL field: ONE bulk read resolves the gate
+		// (smtpHasURL: host+sender+recipient) and the send config
+		// together, fail-loud through the getAllSettings seam — a
+		// transient lock must surface as a database error, never
+		// masquerade as "no SMTP host and recipient configured" (the
+		// swallow-to-"" contract) and never half-read across the gate
+		// and a second per-key read.
+		m, err := getAllSettings(pw.db)
+		if err != nil {
+			return false, "database error reading provider settings"
+		}
+		get := func(k string) (string, error) { return m[k], nil }
+		gate, err := p.hasURLGet(get)
 		if err != nil {
 			return false, "database error reading provider settings"
 		}
 		if !gate {
 			return false, "no SMTP host and recipient configured"
+		}
+		smtpCfg, err = smtpConfigFromGet(get)
+		if err != nil {
+			return false, "database error reading provider settings"
 		}
 	} else if url == "" {
 		return false, "no " + p.Label + " webhook URL configured"
@@ -1310,7 +1340,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		// protocol round-trip, not the shared http.Client path below.
 		subject := "✅ pulsemon: test alert"
 		bodyTxt := "✅ pulsemon: test alert\nSensor: settings\nTarget: webhook-verify\nState: test — your SMTP relay works."
-		if err := pw.sendSMTP(ctx, subject, bodyTxt); err != nil {
+		if err := pw.sendSMTPWith(ctx, smtpCfg, subject, bodyTxt); err != nil {
 			return false, err.Error()
 		}
 		return true, "test email sent via " + p.Label + " (SMTP 250 OK)"
