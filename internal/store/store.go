@@ -223,7 +223,7 @@ func (db *Store) InitSchema() error {
 	if err != nil {
 		return err
 	}
-	// Numbered, transactional schema migrations (external review #9):
+	// Numbered, transactional schema migrations:
 	// each step runs in its OWN transaction and advances PRAGMA
 	// user_version inside that same transaction, so a crash can never
 	// leave a half-applied step (the tag migration used to straddle
@@ -530,7 +530,7 @@ func (db *Store) migrateUserAdminColumn() error {
 }
 
 // SensorTags returns the sorted tag list for a sensor. ctx + error follow
-// the request-context contract (2026-11-11 review): the old swallow-to-
+// the request-context contract: the old swallow-to-
 // empty shape made a dead client ctx or a transient DB failure look like
 // "sensor has no tags" — for handleSensorByID / handleSensorClone that is a
 // lie rendered to the operator, so they surface the error (500) now.
@@ -572,7 +572,7 @@ const InQueryChunk = 500
 // not run a per-row SensorTags() inside a rows.Next() loop: the outer
 // iteration holds a pooled connection, and per-row queries starve the pool
 // under concurrent load. Empty ids → empty map; ids are internal UUIDs (no
-// user string injection). ctx + error (2026-11-11 review): the chunk-query
+// user string injection). ctx + error: the chunk-query
 // error is now RETURNED, not logged-and-skipped — a silently-skipped chunk
 // made the affected sensors route alerts as if they had NO tags. Each caller
 // owns the failure policy: request callers (fetchSensors) fail the request;
@@ -645,16 +645,14 @@ func (db *Store) SetSensorTags(id string, tags []string) error {
 	return tx.Commit()
 }
 
-// settingsTxLockKey: the sentinel key of the zero-row UPDATE that pins
-// SQLite's write lock at the start of a maintenance transaction (and the
-// settings PUT in api.go). A deferred tx whose first statement is a SELECT
-// takes a read snapshot; upgrading it to a write after a concurrent writer
-// committed fails fast with SQLITE_BUSY_SNAPSHOT (517), which busy_timeout
-// does NOT retry. A zero-row UPDATE acquires the write lock immediately
-// (busy_timeout applies to the ACQUIRE), so colliding writers serialize
-// into wait-then-succeed instead of spurious 500s. The \x00 prefix makes
-// the key unmatchable by any real setting, so the UPDATE always touches
-// zero rows.
+// settingsTxLockKey: sentinel key of the zero-row UPDATE that pins
+// SQLite's write lock at the start of every read-then-write deferred tx
+// (the maintenance transitions here, the settings PUT in api.go). A
+// deferred tx that starts as a READER and upgrades to a write after a
+// concurrent commit fails fast with SQLITE_BUSY_SNAPSHOT (517), which
+// busy_timeout does NOT retry; pinning the lock with a zero-row UPDATE
+// (the \x00 prefix matches no real setting) serializes colliding writers
+// into wait-then-succeed.
 const settingsTxLockKey = "\x00pulsemon-txlock"
 
 // EnterMaintenanceWithFreshSnapshot enters maintenance mode with the
@@ -673,12 +671,10 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }() // no-op after Commit succeeds
-	// Pin the write lock BEFORE the snapshot read (see
-	// settingsTxLockKey on LeaveMaintenanceFromSnapshot): a deferred tx
-	// whose first statement is a SELECT becomes a READER, and upgrading
-	// that read snapshot to a write after a concurrent writer committed
-	// fails fast with SQLITE_BUSY_SNAPSHOT (517) — busy_timeout does not
-	// retry it, so a normal lock collision surfaced as a spurious 500.
+	// Pin the write lock BEFORE the snapshot read: a deferred
+	// reader tx that upgrades after a concurrent commit fails fast with
+	// SQLITE_BUSY_SNAPSHOT, which busy_timeout does not retry. See
+	// settingsTxLockKey.
 	if _, err := tx.ExecContext(ctx, "UPDATE settings SET value = value WHERE setting_key = ?", settingsTxLockKey); err != nil {
 		return nil, err
 	}
@@ -710,22 +706,17 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 	return ids, nil
 }
 
-// LeaveMaintenanceFromSnapshot leaves maintenance mode with the restore-set
-// snapshot read INSIDE the resume transaction — the mirror of
-// EnterMaintenanceWithFreshSnapshot above, which exists for the same class
-// of reason. The handler used to read the snapshot with the swallow-to-""
-// GetSetting before the transaction: a transient read failure (or a value
-// that failed to decode) yielded an EMPTY id list, and the leave then
-// resumed nothing, wiped the snapshot and cleared the mode flag — the
-// maintenance banner vanished, every maintenance-paused sensor stayed
-// paused forever with alerts silent, and nothing recorded which sensors
-// were in the lost restore set (2026-11-16 review M1). One transaction
-// now: pin the write lock → SELECT snapshot → resume those ids → clear
-// snapshot + mode flag. Returns the ids actually resumed (the handler
-// feeds them to the SetPaused in-memory fast path). An undecodable
-// snapshot is a HARD error with the tx rolled back: mode stays ON and the
-// value stays on disk for an operator to inspect — the restore set must
-// never be silently guessed.
+// LeaveMaintenanceFromSnapshot leaves maintenance mode reading the
+// restore-set snapshot INSIDE the resume transaction — the mirror of
+// EnterMaintenanceWithFreshSnapshot. Contract: pin the write lock → SELECT
+// snapshot → resume those ids → clear snapshot + mode flag, one tx;
+// returns the ids actually resumed (the handler feeds them to the
+// SetPaused in-memory fast path). A snapshot that fails to decode is a
+// HARD error with the tx rolled back — mode stays ON and the value stays
+// on disk for inspection; the restore set must never be silently guessed
+// from a failed read. A MISSING snapshot row is not an error (a pre-rework
+// DB has no restore set to lose). History: docs/DECISIONS.md →
+// maintenance-leave-fails-loud.
 func (db *Store) LeaveMaintenanceFromSnapshot(ctx context.Context) ([]string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -803,7 +794,7 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 }
 
 // AllTags returns each distinct tag with the number of sensors using it.
-// ctx + error (2026-11-11 review): GET /api/tags renders this query's
+// ctx + error: GET /api/tags renders this query's
 // result as the whole payload, so a dead ctx or transient failure must
 // surface as a 500 — the old swallow-to-empty map rendered a failure as
 // "the fleet has no tags".

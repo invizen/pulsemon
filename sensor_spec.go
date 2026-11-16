@@ -94,7 +94,7 @@ func (s *sensorSpec) validate() error {
 }
 
 // crossFieldError ties a client-facing validation message to the PATCH
-// sentinel that stands for the same rule (review 2026-11-11). The PATCH
+// sentinel that stands for the same rule. The PATCH
 // path maps validateCrossField failures onto the errPatch* sentinels for
 // its outer errors.Is switch; it used to re-derive that mapping from
 // substrings of the message ("URL" / "timeout" / "down_after"), so a

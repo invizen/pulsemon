@@ -21,7 +21,7 @@ import (
 // tests inject a fake to exercise the cleartext SUCCESS path, which a real
 // dial can never reach through the SSRF guard (loopback is refused,
 // TEST-NET never connects) — that blind spot is exactly how the
-// cancelled-context dial (review 2026-11-10 C1) stayed green.
+// cancelled-context dial stayed green.
 var webhookDialer tcpDialer = &net.Dialer{KeepAlive: 30 * time.Second}
 
 // dialChecked resolves host (or parses a literal IP), enforces the webhook
@@ -59,7 +59,7 @@ func dialCheckedCleartext(ctx context.Context, network, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	// The 5s bound covers the LOOKUP only (review 2026-11-10 C1): the old
+	// The 5s bound covers the LOOKUP only: the old
 	// code shadowed ctx with this child, cancelled it, then handed the dead
 	// child to DialContext — DialContext checks ctx.Err() first, so every
 	// cleartext delivery failed with "context canceled" before a SYN left
@@ -310,46 +310,37 @@ func validateWebhookURL(raw string) error {
 // pass). validateWebhookURL now resolves once and judges the same answers;
 // the helper is gone.
 
-// blockedSubnets are address ranges a webhook must NEVER target. They are
-// not covered by net.IP.IsPrivate() (which is only RFC1918 + ULA), so they
-// need an explicit check:
+// blockedSubnets are address ranges a webhook must NEVER target. None are
+// covered by net.IP.IsPrivate() (RFC1918 + ULA only), so each needs an
+// explicit check:
 //
-//   - 0.0.0.0/8 — on Linux the whole block (not just 0.0.0.0) routes to the
-//     local table, so net.IP.IsUnspecified() alone leaves http://0.1.2.3
-//     reaching local services.
-//   - 198.18.0.0/15 (RFC 2544) — IETF-reserved-for-testing; never a valid
-//     destination.
-//   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. On a plain LAN this is
-//     the ISP's carrier range, NOT the user's LAN: a self-hosted relay
-//     reachable from the homelab sits in RFC1918 space (still allowed, see
-//     TestCheckWebhookIPDelta), so blocking CGNAT adds defense-in-depth.
-//     EXCEPTION: a Tailscale/Headscale
-//     tailnet assigns EVERY node an address in exactly this range, so on a
-//     tailnet the "NOT the user's LAN" comment is false — a webhook to a
-//     self-hosted ntfy/Gotify over the tailnet, and an HTTP sensor whose
-//     target redirects to a tailnet host, were both refused. The opt-out:
-//     PULSEMON_ALLOW_CGNAT=1 skips this entry only (allowCGNAT);
-//     169.254/16 (cloud metadata) and the rest of the blocklist stay hard.
+//   - 0.0.0.0/8 — on Linux the whole block routes to the local table, so
+//     net.IP.IsUnspecified() alone leaves http://0.1.2.3 reaching local
+//     services.
+//   - 198.18.0.0/15 (RFC 2544) — IETF test range; never a destination.
+//   - 100.64.0.0/10 (RFC 6598) — Carrier-Grade NAT. On a plain LAN this
+//     is the ISP's carrier range, not the user's LAN: a self-hosted relay
+//     reachable from the homelab sits in RFC1918 (still allowed), so
+//     blocking CGNAT is defense-in-depth. EXCEPTION: a Tailscale/
+//     Headscale tailnet assigns EVERY node an address in exactly this
+//     range, so PULSEMON_ALLOW_CGNAT=1 skips this entry only
+//     (allowCGNAT); 169.254/16 (cloud metadata) and the rest stay hard.
 //   - 64:ff9b::/96 (RFC 6052) — NAT64 well-known prefix: an IPv6 literal
-//     that TUNNELS an IPv4 destination (e.g. 64:ff9b::7f00:1 == 127.0.0.1).
-//     Without this, an attacker writes the loopback address in IPv6 dress.
+//     that TUNNELS an IPv4 destination (64:ff9b::7f00:1 == 127.0.0.1).
 //   - 2002::/16 (RFC 3056) — 6to4: an IPv4 destination embedded in bits
-//     16-47 (e.g. 2002:7f00:0001:: == 127.0.0.1).
+//     16-47 (2002:7f00:0001:: == 127.0.0.1).
 //   - 2001::/32 (RFC 4380) — Teredo: the same tunneling trick one level
-//     deeper. The server keeps the client's mapped IPv4 in the INVITED
+//     deeper — the server keeps the client's mapped IPv4 in the INVITED
 //     peer field, so a Teredo literal can relay toward an internal
-//     address; a public-internet-only sender must not reach it. (The
-//     pre-review list labeled 2002::/16 as Teredo and left Teredo itself
-//     unblocked — corrected with this review, 2026-10-24.)
+//     address.
 //   - 240.0.0.0/4 — Class E (reserved) through 255.255.255.255 (limited
-//     broadcast, which lands in this block). Never a valid destination.
+//     broadcast lands in this block). Never a valid destination.
 //
-// RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are deliberately
-// NOT here: the design allows them so a LAN relay works.
+// RFC1918 (10/8, 172.16/12, 192.168/16) and ULA (fc00::/7) are
+// deliberately NOT here: the design allows them so a LAN relay works.
 //
-// blockedRange is one entry of the list. cgnat marks 100.64.0.0/10, the one
-// entry an operator can opt out of (allowCGNAT / PULSEMON_ALLOW_CGNAT) —
-// see the CGNAT note above.
+// blockedRange is one entry of the list. cgnat marks 100.64.0.0/10, the
+// one entry an operator can opt out of (allowCGNAT / PULSEMON_ALLOW_CGNAT).
 type blockedRange struct {
 	cidr  *net.IPNet
 	cgnat bool
@@ -493,7 +484,7 @@ func validateSMTPHostNoDNS(host string) error {
 }
 
 func validateSMTPHost(host string) error {
-	// Trim ONCE up front (review 2026-11-10 m5): the NoDNS pass trimmed
+	// Trim ONCE up front: the NoDNS pass once trimmed
 	// its own copy, so a row stored as " mail.lan " passed the shape
 	// check and then died as cannot resolve smtp host " mail.lan " —
 	// the resolver must see the same name the shape check judged.

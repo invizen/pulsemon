@@ -436,7 +436,7 @@ func runUpdate(args []string) int {
 		return 2
 	}
 
-	// Anti-downgrade floor (2026-11-05): a release tag below the highest
+	// Anti-downgrade floor: a release tag below the highest
 	// version this install has ever run is refused — a replayed old build
 	// published under a newer-looking tag must not install over a box that
 	// has already run something newer. The DB is opened best-effort (the
@@ -590,7 +590,7 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 // watchdogTimeout is the health-poll budget for the restart watchdog,
 // overridable via PULSEMON_WATCHDOG_TIMEOUT (Go duration, clamped to
 // 5s..5m, invalid values warn and keep the 30s default). The hardcoded 30s
-// (review open question 2026-10-24) can roll back a WORKING update on an
+// can roll back a WORKING update on an
 // install whose startup work — InitSchema, warmStats — legitimately takes
 // longer on a very large DB; the operator can widen the window without a
 // code change.

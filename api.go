@@ -173,8 +173,8 @@ type Server struct {
 	// host or host:port entries). Empty = no Host check (LAN-trust default).
 	// Enforced only on the setup-mode bootstrap POST — see authGate.
 	allowedHosts []string
-	// tlsCert memoizes the parsed cert for tlsPayload (2026-10-24
-	// review n3); see tlsCertCached in tls_settings.go.
+	// tlsCert memoizes the parsed cert for tlsPayload;
+	// see tlsCertCached in tls_settings.go.
 	tlsCert tlsCertMemo
 	// sensorCountCache memoizes the healthz sensor count for a short window
 	// so frequent unauthenticated health checks don't do a DB COUNT per hit.
@@ -465,7 +465,7 @@ func (s *Server) authGate() http.Handler {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
-	// Authorization rule for the whole API surface (external review #8):
+	// Authorization rule for the whole API surface:
 	// EVERY /api/ route carries an explicit session wrapper — requireAuth
 	// for the authed-user surface, requireAdmin for the admin surface —
 	// except the four public endpoints (healthz, auth/status, auth/login,
@@ -664,7 +664,7 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 	if err != nil {
 		// Nil sentinel: the handler 500s. Returning the fleet with the
 		// tags silently missing would render partial data as complete
-		// (2026-11-11 review).
+		//
 		log.Printf("API: sensor tag batch query failed: %v", err)
 		return nil
 	}
@@ -885,7 +885,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		sn.Tags, err = s.db.SensorTags(r.Context(), id)
 		if err != nil {
 			// A failed tag read is not "sensor has no tags" — fail the
-			// request instead of rendering the swallow as truth (2026-11-11).
+			// request instead of rendering the swallow as truth
 			respondInternal(w, "get sensor tags "+id, err)
 			return
 		}
@@ -1075,8 +1075,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			if err := crossField.validateCrossField(); err != nil {
 				// The rule's sentinel travels inside the error
 				// (crossFieldError.Unwrap); the outer errors.Is switch
-				// maps it. No message-substring re-derivation
-				// (review 2026-11-11).
+				// maps it — no message-substring re-derivation
 				return err
 			}
 
@@ -1164,7 +1163,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 // inside a BEGIN IMMEDIATE ImmediateTxa *sql.Tx
 // from db.Begin can't join it because the transaction lives on the pinned
 // connection (db.SetSensorTags keeps its own transaction and can't join one
-// either, so the in-conn twin lives here rather than in db.go). The caller's
+// either, so the in-conn twin lives here rather than in the store
+// package). The caller's
 // ctx is threaded through: every statement on
 // this path honors request cancellation, matching the ImmediateTx boundary.
 func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
@@ -1510,7 +1510,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
 		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
 	if err != nil {
-		// Existence-check contract (2026-11-03, pinned by
+		// Existence-check contract (pinned by
 		// TestSensorExistenceCheckDistinguishesErrors): only sql.ErrNoRows
 		// means "sensor not found". A canceled ctx, SQLITE_BUSY, or I/O
 		// failure is a transient server error — it must not read as
@@ -1539,7 +1539,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// migrated (see minIntervalS — "a legacy 1s sensor keeps running until
 	// the operator edits it"). Copying verbatim let an operator multiply a
 	// legacy 1s sensor (or any out-of-range param) indefinitely via clone,
-	// bypassing the API floor (2026-10-28 review n5). Clamp each copied
+	// bypassing the API floor. Clamp each copied
 	// numeric into its valid range; the clone starts PAUSED, so the operator
 	// reviews the normalized values before resuming it.
 	spec := sensorSpec{
@@ -1574,8 +1574,8 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// never matches, "[b]" becomes a class) empties the taken set, every
 	// existing clone then burns one of the cloneMaxAttempts INSERT
 	// retries, and the 6th clone of a base like "nas[01]" died with 409
-	// "too many clones" while -copy6..-copy100 sat free (2026-11-13
-	// review). Over-matching was benign, so this closed the only half
+	// "too many clones" while -copy6..-copy100 sat free.
+	// Over-matching was benign, so this closed the only half
 	// that distorted the outcome; the UNIQUE index stays the arbiter for
 	// the concurrent-race retries.
 	cloneID := store.NewID()
@@ -1696,7 +1696,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		tags, err := s.db.AllTags(r.Context())
 		if err != nil {
 			// The query result IS the payload: a failure must surface as a
-			// 500, not render as an empty tag fleet (2026-11-11 review).
+			// 500, not render as an empty tag fleet
 			respondInternal(w, "list tags", err)
 			return
 		}
@@ -1865,8 +1865,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodDelete {
 		// Fleet-wide data wipe — admin-only, exactly like DELETE
 		// /api/history (requireAdmin). A regular (lower-trust) account
-		// must not be able to erase the audit/event log (review
-		// 2026-10-24). The GET branch below stays open to any session:
+		// must not be able to erase the audit/event log.
+		// The GET branch below stays open to any session:
 		// the event feed is dashboard data, not an admin surface.
 		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
 			respondWithError(w, http.StatusForbidden, "admin only")
@@ -1939,8 +1939,8 @@ func webhookMasked(raw string) string {
 }
 
 // settingsPayload assembles the GET /api/settings body (and the PUT
-// response echo). All settings reads go through GetSettingErr (2026-11-11
-// review): the swallow-to-"" shape made a transient DB failure render as
+// response echo). All settings reads go through GetSettingErr:
+// the swallow-to-"" shape made a transient DB failure render as
 // CONCRETE DEFAULTS (alert_scope "all", realert_min 30, maintenance off)
 // with a 200 — and the dashboard's alerts form seeds itself from this
 // payload and PUTs the fields back on save, so a swallowed read could be
@@ -1998,7 +1998,7 @@ func (s *Server) settingsPayload() (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("read allow_unauth_update: %w", err)
 	}
-	// The providers array is built fail-loud too (2026-11-13 review): it
+	// The providers array is built fail-loud too: it
 	// embeds every provider's enabled/has_url/url/extra reads, and a
 	// swallowed DB error there answered 200 with silent "false" provider
 	// states inside an otherwise fail-loud payload.
@@ -2034,8 +2034,8 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 }
 
 // enterMaintenance / leaveMaintenance: the two maintenance-mode store calls
-// as vars so a test can force the post-commit failure path (review
-// 2026-11-10 #6) — settings tx committed, maintenance tx failed → the
+// as vars so a test can force the post-commit failure path:
+// settings tx committed, maintenance tx failed → the
 // alert snapshot must still reload. Production is a plain method call
 // (same seam pattern as deliverDestinations in alerts.go).
 var enterMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
@@ -2131,7 +2131,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	// One pre-flight snapshot of the settings table for EVERY pre-tx read
 	// in this handler (dead-filter guard, provider stored-state,
-	// maintenance pre-check), fail-loud (2026-11-13 review): these reads
+	// maintenance pre-check), fail-loud: these reads
 	// used the error-swallowing GetSetting, so a transient SQLite failure
 	// silently MISCOMPUTED the guard inputs — stored scope read as ""
 	// let the guard wave a scope=tags + filter=[] save through (silent
@@ -2193,17 +2193,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Maintenance-mode entry validation runs BEFORE the settings tx opens
-	// "no active sensors to pause" is a derived
-	// check, and a 400 must leave the store exactly as it was — the old
-	// order committed the other settings first, then 400'd on the empty
-	// snapshot. The snapshot ids computed here are reused by the apply
-	// phase (nothing mutates the sensors table in between).
+	// Maintenance-mode entry validation runs BEFORE the settings tx
+	// opens: "no active sensors to pause" is a derived check, and a 400
+	// must leave the store exactly as it was — the old order committed
+	// the other settings first, then 400'd on the empty snapshot. The ids
+	// read here are the 400 pre-check only; the authoritative snapshot
+	// is taken inside the pause tx below.
 	//
-	// Re-enable (mode already ON) takes NO new snapshot: the snapshot belongs to the original off→on transition. A fresh
-	// snapshot would capture the currently-ACTIVE set, which excludes any
-	// sensor the operator resumed during maintenance — and those sensors
-	// would be left paused forever, because resume restores only the
+	// Re-enable (mode already ON) takes NO new snapshot: a fresh snapshot
+	// would capture the currently-ACTIVE set, which excludes any sensor
+	// the operator resumed during maintenance — those sensors would then
+	// be stranded paused forever, because resume restores only the
 	// snapshot.
 	maintAlreadyOn := pre["maintenance_mode"] == "1"
 	var maintIDs []string
@@ -2304,42 +2304,33 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "commit settings update", err)
 		return
 	}
-	// Swap the alert settings snapshot on EVERY path that got this far: the
-	// settings are committed, so the in-memory snapshot must follow —
-	// including the two maintenance-tx 500 paths below, which return before
-	// the explicit reload this handler used to end with. Without the defer,
-	// a PUT that committed provider/routing/
-	// realert_min changes but 500'd on the maintenance transaction left
-	// pw.alertCfg stale until the next successful PUT or a restart. A
-	// failed maintenance tx leaves the DB's maintenance flag as the
-	// settings tx committed it, so the reload converges memory to the
-	// store. The alert hot path (alertsEnabled, shouldAlert, realertMin,
-	// resolveDestinations) reads this snapshot lock-free, so a transient DB
-	// lock mid-probe can no longer read maintenance_mode as "0" and fire
-	// alerts during maintenance — the bug the per-call GetSetting reads had.
-	// reloadAlertSettings keeps the last good
-	// snapshot on a read error, so a hiccup here never installs a half-read
-	// state; it just leaves the previous (still-correct) snapshot in place
-	// until the next successful save.
+	// Swap the alert settings snapshot on EVERY path past the commit —
+	// including the two maintenance-tx 500 returns below, so a PUT that
+	// committed provider/routing/realert_min changes but failed on the
+	// maintenance tx never leaves pw.alertCfg stale until the next
+	// successful save. The alert hot path (alertsEnabled, shouldAlert,
+	// realertMin, resolveDestinations) reads this snapshot lock-free;
+	// reloadAlertSettings keeps the last good snapshot on a read error,
+	// so a hiccup here leaves the previous snapshot in place rather than
+	// installing a half-read state. History: docs/DECISIONS.md →
+	// alert-settings-snapshot, settings-put-snapshot-reload-deferred.
 	defer s.probeWorker.reloadAlertSettings()
 	if req.MaintMode != nil {
 		if *req.MaintMode {
 			if maintAlreadyOn {
 				// Already in maintenance: keep the ORIGINAL snapshot and
-				// the existing pause set — re-snapshotting would drop
-				// sensors resumed during maintenance from the restore set
-				// Nothing to write.
+				// the existing pause set (re-snapshotting would drop the
+				// sensors resumed during maintenance from the restore
+				// set). Nothing to write.
 				log.Printf("API: maintenance mode already ON (snapshot preserved)")
 			} else {
-				// Entering maintenance (off→on): the snapshot is read
-				// INSIDE the pause transaction —
-				// the read above is only the 400 pre-check; a sensor
-				// activated between that read and this transaction used to
-				// escape the pause and keep probing under mode=ON.
-				//
-				// Atomic: pause + snapshot + mode flag in ONE transaction
-				// so a crash can't leave sensors paused without the mode
-				// flag (or vice versa). See EnterMaintenanceWithFreshSnapshot in db.go.
+				// Entering maintenance (off→on): pause + snapshot + mode
+				// flag in ONE transaction
+				// (EnterMaintenanceWithFreshSnapshot). The snapshot is read
+				// INSIDE the tx, so a sensor activated between the
+				// pre-check above and the pause cannot escape it and keep
+				// probing under mode=ON; a crash cannot leave sensors
+				// paused without the mode flag (or vice versa).
 				ids, err := enterMaintenance(s.db, r.Context())
 				if err != nil {
 					respondInternal(w, "enter maintenance mode", err)
@@ -2347,15 +2338,11 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				}
 				maintIDs = ids
 				// Flip the in-memory pause flag immediately — the same
-				// SetPaused fast path the single-sensor PATCH uses. Without
-				// this the sensor loops keep probing until the next 5s
-				// syncSensors tick, landing up to one extra probe row (and
-				// a possible transition event) per sensor after maintenance
-				// is already ON. Alerts are already blocked in that window
-				// — alertGates re-reads the maintenance_mode flag from the
-				// DB on every decision — so this closes the probing half of
-				// the "paused = no packets, no rows, no alerts" contract
-				// (probe.go sensorLoop).
+				// SetPaused fast path the single-sensor PATCH uses: without
+				// it, each sensor lands up to one extra probe row (and a
+				// possible transition event) in the window before the next
+				// 5s syncSensors tick, breaking "paused = no packets, no
+				// rows, no alerts" (probe.go sensorLoop).
 				for _, id := range maintIDs {
 					s.probeWorker.SetPaused(id, true)
 				}
@@ -2366,21 +2353,15 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				log.Printf("API: maintenance mode ON (%d sensors paused)", len(maintIDs))
 			}
 		} else {
-			// Leaving maintenance: reactivate exactly the sensors that were
-			// active when maintenance started (the snapshot). Sensors paused
-			// BEFORE maintenance (not in the snapshot), or added during
-			// maintenance, stay paused. A snapshot sensor the user paused
-			// DURING maintenance is resumed with the rest — the snapshot is
-			// the restore set, applied wholesale. The snapshot is read
-			// INSIDE the resume transaction (the mirror of the enter path
-			// above): the pre-tx GetSetting read swallowed every failure
-			// into "", and a transient read error (or an undecodable value)
-			// then resumed NOTHING, wiped the snapshot and cleared the
-			// banner — stranding every maintenance-paused sensor in 'paused'
-			// with alerts silent and no record of the lost restore set
-			// (2026-11-16 review M1). A failed read/decode now 500s with
-			// mode still ON and the snapshot intact: the banner stays up,
-			// alerts stay gated, and the operator's retry can succeed.
+			// Leaving maintenance: reactivate exactly the snapshot set —
+			// sensors paused BEFORE maintenance (not in the snapshot) or
+			// added during it stay paused, and a snapshot sensor the user
+			// paused DURING maintenance is resumed with the rest. The
+			// snapshot is read INSIDE the resume tx
+			// (LeaveMaintenanceFromSnapshot): a failed read/decode 500s
+			// with mode still ON and the snapshot intact — banner up,
+			// alerts gated, the operator's retry can succeed. History:
+			// docs/DECISIONS.md → maintenance-leave-fails-loud.
 			ids, err := leaveMaintenance(s.db, r.Context())
 			if err != nil {
 				respondInternal(w, "leave maintenance mode", err)
@@ -2421,7 +2402,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// The save committed; only the read-back echo failed. Say so with
 		// a 500 (the write IS durable) rather than echoing fabricated
-		// defaults the UI would adopt as truth (2026-11-11 review).
+		// defaults the UI would adopt as truth
 		respondInternal(w, "settings echo", err)
 		return
 	}
@@ -2556,7 +2537,7 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 // storedProviderExtra returns the provider's currently-stored extra values
 // (only keys in extraFields[kind]), so validation can evaluate the
 // effective state of partial updates. Unknown kinds return nil. The read
-// is fail-loud (2026-11-13 review): this snapshot feeds the effective-
+// is fail-loud: this snapshot feeds the effective-
 // state validation, so a swallowed DB failure must not degrade it to
 // "nothing stored". The settings-PUT path shares its one bulk pre-flight
 // read via providerExtrasFrom; this is the standalone twin.

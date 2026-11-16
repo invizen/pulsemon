@@ -21,12 +21,11 @@ import (
 	"time"
 )
 
-// alertPanicRecovered guards the fire-and-forget alert paths (review
-// 2026-10-24): before this, NO alert goroutine had a recover — a panic in
-// one malformed payload crashed the entire monitor, and a panic inside a
-// gate consumer killed that sensor's alerting PERMANENTLY (the FIFO's 8
-// slots eventually fill and block alertMu for every sensor). A guarded
-// panic logs with a stack and sacrifices the one delivery, not monitoring.
+// alertPanicRecovered guards the fire-and-forget alert paths: a panicking
+// delivery logs with a stack and sacrifices that ONE delivery, never the
+// monitor — and never the goroutine owning shared alert machinery (a dead
+// gate consumer fills that sensor's FIFO and blocks alertMu for every
+// sensor). History: docs/DECISIONS.md → alert-gate.
 func alertPanicRecovered(label string) {
 	if r := recover(); r != nil {
 		log.Printf("ALERT PANIC recovered (%s): %v\n%s", label, r, debug.Stack())
@@ -44,24 +43,12 @@ func alertPanicRecovered(label string) {
 // healthy).
 var alertGateIdle = 10 * time.Minute
 
-// enqueueAlert queues job on the sensor's alert FIFO, creating the gate
-// and its consumer on first use. It reports false (and drops the job) when
-// the sensor's 8-slot buffer is full, instead of blocking.
-//
-// The map read, the gate creation, and the send are ONE critical section
-// under alertMu: the consumer's idle-exit check runs under the same lock,
-// so it can never observe an empty queue and exit while a send is in
-// flight — that window would orphan the job in the buffer with no reader
-// (a silently dropped alert). The send is a NON-BLOCKING select, not a
-// blocking one: holding alertMu across a blocking send (the old behavior)
-// meant a full buffer parked the caller under the GLOBAL lock, stalling
-// every other sensor's enqueue AND every idle consumer's exit check behind
-// one stuck sensor for up to ~5 minutes (8 pending jobs × ~42s of
-// webhook/SMTP I/O each) during provider degradation. Dropping when full
-// bounds that stall at zero; the dropped alert is reported to the caller,
-// which schedules a 1-minute-later retry once the queue drains. The
-// consumer drains WITHOUT holding alertMu (job() is alert delivery —
-// webhook/SMTP I/O), and no job takes alertMu, so there is no deadlock.
+// enqueueAlert queues job on the sensor's FIFO and reports false if the
+// 8-slot buffer is full (never blocks under alertMu — a stuck sensor must
+// not stall every other sensor's enqueue). Invariant: map lookup, gate
+// creation and the send are one alertMu critical section, so the consumer's
+// idle-exit check (also under alertMu) can never see an empty queue while a
+// send is in flight. History: docs/DECISIONS.md → alert-gate.
 func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 	pw.alertMu.Lock()
 	defer pw.alertMu.Unlock()
@@ -71,12 +58,8 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 		pw.alertOrderGates[id] = ch
 		// The idle duration is captured HERE, on the caller's goroutine,
 		// and passed in: the consumer must not read the package var
-		// itself. A test shrinks alertGateIdle and restores it in
-		// t.Cleanup, and a consumer spawned near test end can be
-		// unscheduled past that restore — the consumer reading the var
-		// concurrently with the restore is a data race (caught by -race).
-		// In production the var is never mutated, so the capture is
-		// invisible there.
+		// (tests swap it; a reader outliving the restore is a data race,
+		// caught by -race).
 		go pw.alertGateConsumer(id, ch, alertGateIdle)
 	}
 	select {
@@ -89,23 +72,18 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 }
 
 // alertGateConsumer drains one sensor's alert FIFO and exits after
-// alertGateIdle with no queued jobs. Idle exit reaps consumers of quiet
-// sensors (deleted, or simply healthy) — the channel is never closed
-// (an in-flight send on a closed channel panics), so a plain
-// `range ch` consumer would leak one goroutine per deleted sensor.
+// idleDur with no queued jobs, reaping consumers of quiet sensors — the
+// channel is never closed (a send on a closed channel panics), so a
+// plain `range ch` consumer would leak one goroutine per deleted sensor.
 //
 // Invariants (docs/DECISIONS.md → alert-gate): the exit check runs under
 // alertMu — the same lock enqueueAlert holds across its send — so
 // len(ch) == 0 under the lock means no job is queued AND no send is in
-// flight; exiting drops nothing. The idle timer is local to THIS
-// goroutine and idleDur arrives as a parameter — the consumer must NOT
-// read the alertGateIdle package var (tests swap it; a reader outliving
-// the restore is a data race, caught by -race). The Stop/drain/Reset
-// below is the complete canonical pattern: a Reset without draining a
-// fired value leaves a stale ready in idle.C read as a spurious
-// idle-fire, and the only exit (the <-idle.C branch) is entered only
-// after the timer fired AND its value was read, so no fired-but-unread
-// timer is left behind and a defer idle.Stop() would be a no-op.
+// flight; exiting drops nothing. idleDur arrives as a parameter (the
+// consumer must NOT read the alertGateIdle package var; tests swap it).
+// The Stop/drain/Reset timer lifecycle below is the canonical safe
+// pattern: a Reset that skips draining a fired value leaves a stale
+// ready in idle.C read as a spurious idle-fire.
 func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time.Duration) {
 	idle := time.NewTimer(idleDur)
 	for {
@@ -192,7 +170,7 @@ func defaultAlertSettings() *alertSettings {
 // URL/chat_id reads. Swallowing Enabled/HasURL (GetSetting) let a transient
 // lock silently DROP a provider from an installed snapshot — alerts for it
 // stopped until the next settings save, the exact half-read state the
-// snapshot design forbids (2026-11-13 review).
+// snapshot design forbids
 func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
 	m, err := getAllSettings(db)
 	if err != nil {
@@ -484,7 +462,7 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 }
 
 // recoveryRetryDelay is how long to wait before re-offering a recovery
-// alert whose first delivery failed (review 2026-11-10 M1). It mirrors
+// alert whose first delivery failed. It mirrors
 // alertRetryAfter (the error direction re-alerts ~1m later), so both
 // directions get their second chance on the same cadence. A var so tests
 // can shorten it.
@@ -493,7 +471,7 @@ var recoveryRetryDelay = time.Minute
 // scheduleRecoveryRetry re-offers a recovery / partial-recovery alert
 // (error -> up, error -> warning) whose first delivery failed — dropped on
 // a full per-sensor FIFO during provider degradation, or every provider
-// down (review 2026-11-10 M1). The error direction self-heals through
+// down. The error direction self-heals through
 // scheduleAlertRetry + the re-alert tick; recovery has NO such path:
 // setAlertState has already stamped "up", and maybeRealert only runs on
 // sustained-error ticks — so a dropped recovery was permanently lost, and
@@ -576,8 +554,7 @@ type providerMeta struct {
 // settingGet reads one settings key. Contract: absent key is ("", nil);
 // a read FAILURE is ("", err) and must abort the caller's evaluation —
 // "unset" and "read failed" must never look the same on the alert paths
-// (the class the 2026-10-30 chat_id fix and the 2026-11-11 settings-GET
-// fail-loud refactor established).
+// (the fail-loud settings-read contract).
 type settingGet = func(key string) (string, error)
 
 // getAllSettings is the bulk-load seam (test seam, mirroring
@@ -772,7 +749,7 @@ func providerExtraGet(p providerMeta, get settingGet) (map[string]string, error)
 
 // providerStatuses builds the per-provider view for the settings API.
 // Every key comes from ONE bulk settings read and every read is fail-loud
-// (2026-11-13 review): settingsPayload() aborts on a transient DB failure
+// settingsPayload() aborts on a transient DB failure
 // for its own fields via GetSettingErr — a swallowed provider read here
 // used to answer 200 with providers claiming enabled:false/has_url:false,
 // a payload the settings PUT can echo back and write.
@@ -841,7 +818,7 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		// keep the loop alive), but a skipped `done <-` would park this
 		// caller on `<-done` forever — leaking the goroutine and its
 		// alertWG count, so DrainAlerts burns the full backstop at every
-		// shutdown (2026-10-24 review m1). The buffer-1 channel makes the
+		// shutdown. The buffer-1 channel makes the
 		// defer exact: the normal send fills it and the defer is a no-op;
 		// on panic the defer is the sole writer.
 		defer func() {
@@ -981,7 +958,7 @@ func (pw *ProbeWorker) flushStorm() {
 	// still see it in the storm that took it down. Read the status via
 	// currentStatus (in-memory first): during a storm the sensors are
 	// actively probed, so lastStatus is the freshest source and reading it
-	// avoids one SQLite round-trip per queued entry (2026-10-24 review).
+	// avoids one SQLite round-trip per queued entry
 	still := q[:0]
 	for _, id := range order {
 		if s, err := pw.currentStatus(id); err == nil && s == "up" {
@@ -1073,9 +1050,9 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 // tokens are NOT neutralized here: those paths carry the name verbatim, and
 // the invisible \u200b discordMentionSafe injects is pointless there and
 // corrupts copy-paste in email clients / renders as tofu in non-UTF-8
-// readers (2026-10-24 review). The Markdown path (stormSummaryMarkdown)
+// readers. The Markdown path (stormSummaryMarkdown)
 // builds its own line so it can escape the name without escaping the URL
-// target (2026-10-28 review n4).
+// target
 func stormSummaryLine(e stormEntry) string {
 	return fmt.Sprintf("%s: %s → %s (%s)", e.name, e.oldState, e.state, alertTarget(e.target))
 }
@@ -1088,15 +1065,15 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 		// Escape the emphasis chars in the NAME only (free text — a name like
 		// db_primary_01 would otherwise render "primary" in italics, and a
 		// raw * in the name renders as literal formatting), with mention
-		// tokens neutralized (2026-10-24 review n2 + markdown). The TARGET is
+		// tokens neutralized. The TARGET is
 		// a URL/hostname and stays VERBATIM: mdEscape would inject backslashes
-		// into _ and ~ in the path and break the clickable link (2026-10-28
-		// review n4) — but it IS mention-neutralized, exactly like the
+		// into _ and ~ in the path and break the clickable link
+		// — but it IS mention-neutralized, exactly like the
 		// per-sensor discordCard/discordCardRe: this summary goes to Discord
 		// (case "discord" in deliverStormSummary), and a target path like
 		// https://example.com/@everyone would mass-ping the channel on
-		// clients/bridges that ignore allowed_mentions.parse = [] (review
-		// 2026-11-10 #5). The emphasis markers come from the format string.
+		// clients/bridges that ignore allowed_mentions.parse = []
+		// The emphasis markers come from the format string.
 		b.WriteString("*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + discordMentionSafe(alertTarget(e.target)) + ")*\n")
 	}
 	return b.String()
@@ -1128,8 +1105,7 @@ func stormSummaryPlain(entries []stormEntry) string {
 // error-awareness as the URL: the old code re-read it live in the
 // delivery goroutine via the swallow-to-"" GetSetting, so a transient
 // DB lock at delivery time posted an empty chat_id (Telegram 400) —
-// fatal on the storm-summary path, which has no retry (2026-10-30
-// review #3).
+// fatal on the storm-summary path, which has no retry.
 type dest struct {
 	p      providerMeta
 	url    string
@@ -1202,7 +1178,7 @@ func (pw *ProbeWorker) sendWebhookDeliver(id, name, target, oldState, state stri
 // carries everything resolved up front in resolveDestinations (URL and, for
 // telegram, the chat_id) — deliverOne must not re-read settings live: a
 // transient DB lock at delivery time would otherwise degrade into a
-// half-configured payload (2026-10-30 review #3).
+// half-configured payload
 func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
 	p, url := d.p, d.url
 	switch p.Kind {
@@ -1291,7 +1267,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	}
 	if p.Kind == "smtp" {
 		// SMTP has no URL field; the host+recipient gate is smtpHasURL —
-		// evaluated fail-loud through the same seam (2026-11-13 review):
+		// evaluated fail-loud through the same seam
 		// a transient DB lock at test time must surface as a database
 		// error, not masquerade as "no SMTP host and recipient
 		// configured" — the same fix the URL/chat_id reads above got.
@@ -1468,7 +1444,7 @@ func alertTarget(target string) string {
 	// for a scheme-relative URL) to the first path/query/fragment
 	// separator, and userinfo ENDS AT THE LAST '@' in it — net/url's
 	// validUserinfo permits a raw '@', so the cut MUST mirror net/url's
-	// boundary (2026-11-11 review): cutting at the FIRST '@' of
+	// boundary: cutting at the FIRST '@' of
 	// https://admin:p@ss@nas.lan/health left "ss@nas.lan" in the card —
 	// a password fragment shipped to Discord/Telegram/SMTP, and the
 	// scheme-relative form leaked the whole credential verbatim.
@@ -1502,8 +1478,8 @@ func alertTarget(target string) string {
 // when the card posts. A zero-width space inserted right AFTER the @
 // breaks the token for Discord's mention parser while keeping the @
 // visible in the rendered card (the old code replaced the @ entirely,
-// so "@everyone" rendered as "‌everyone" with no @ — 2026-10-28 review
-// n4). Belt-and-braces with the payload's allowed_mentions.parse = []:
+// so "@everyone" rendered as "‌everyone" with no @).
+// Belt-and-braces with the payload's allowed_mentions.parse = []:
 // this covers clients/imports that ignore allowed_mentions.
 func discordMentionSafe(s string) string {
 	s = strings.ReplaceAll(s, "@everyone", "@\u200beveryone")
@@ -1512,10 +1488,10 @@ func discordMentionSafe(s string) string {
 }
 
 // mdEscape backslash-escapes the Markdown metacharacters that
-// validSensorName permits: the emphasis characters * _ ~ ` (2026-10-24
-// review: a sensor named db_primary_01 would otherwise render with
-// "primary" italicized) and the link brackets [ ] (2026-10-30 review #7:
-// a sensor named "[click here](https://evil.example)" is legal input and
+// validSensorName permits: the emphasis characters * _ ~ ` (a sensor
+// named db_primary_01 would otherwise render with
+// "primary" italicized) and the link brackets [ ] (a sensor named
+// "[click here](https://evil.example)" is legal input and
 // would otherwise render as a masked hyperlink in the Discord/Google Chat
 // cards and storm summary). The parens are deliberately unescaped: with
 // the brackets neutralized no link syntax can form, so escaping them would
@@ -1524,7 +1500,7 @@ func discordMentionSafe(s string) string {
 // Applied to SENSOR NAMES ONLY, never to targets: a target is a URL/hostname
 // whose path may legally contain _ and ~, and backslash-escaping those
 // injects visible backslashes into the URL and breaks the clickable link
-// (2026-10-28 review n4). The URL host carries no emphasis chars, and the
+// The URL host carries no emphasis chars, and the
 // intra-path _ / ~ do not trigger emphasis inside an auto-linked URL token
 // on either platform, so a verbatim target is both safe and clickable.
 //
@@ -1551,7 +1527,7 @@ var mdReplacer = strings.NewReplacer(
 func cardFor(oldState, state, name, target string, rttMs float64) string {
 	target = alertTarget(target)
 	// Escape the name (free text) only; the target is a URL/hostname and stays
-	// verbatim so it renders and auto-links cleanly (2026-10-28 review n4).
+	// verbatim so it renders and auto-links cleanly
 	name = mdEscape(name)
 	icon := statusIcon(state)
 	if icon == "" {
@@ -1587,7 +1563,7 @@ func cardForRe(state, name, target string, rttMs float64) string {
 func discordCard(oldState, state, name, target string, rttMs float64) string {
 	// Name: mention-neutralized + emphasis-escaped (free text). Target:
 	// mention-neutralized + credentials stripped, but VERBATIM (no mdEscape)
-	// so the URL renders and auto-links cleanly (2026-10-28 review n4).
+	// so the URL renders and auto-links cleanly
 	name = mdEscape(discordMentionSafe(name))
 	target = discordMentionSafe(alertTarget(target))
 	icon := statusIcon(state)
@@ -1646,7 +1622,7 @@ func redactErr(err error) error {
 
 // maxAlertRetryAfter caps a provider's Retry-After so one hostile or buggy
 // header can't park a delivery goroutine (and DrainAlerts) for hours. The cap
-// is deliberately SHORT (review 2026-11-11): in-band retries run on the
+// is deliberately SHORT: in-band retries run on the
 // sensor's alert-FIFO consumer, so every second slept here lengthens the
 // drain of EVERY later alert queued for that sensor — a 60s cap let one
 // 429-with-Retry-After job hold the FIFO for 150s (see the alertRetryDelays

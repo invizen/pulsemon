@@ -633,7 +633,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 	tagMap, err := pw.db.SensorTagsFor(ctx, ids)
 	if err != nil {
-		// Background reconcile: keep the 2026-10-24 tradeoff (affected
+		// Background reconcile: keep the tradeoff (affected
 		// sensors route as untagged this pass; the next sync re-reads),
 		// now with the store-level log moved to the caller and the error
 		// no longer swallowed inside the store.
@@ -1010,7 +1010,7 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 		timeout = pingNowTimeout
 	}
 	o := probeTarget(ctx, probeType, target, timeout)
-	// Cancelled-pulse guard (review 2026-11-10 m3): ctx is the REQUEST
+	// Cancelled-pulse guard: ctx is the REQUEST
 	// ctx, so a browser that closes the tab mid-pulse makes probeTarget
 	// fail instantly — o is then a pure cancellation artifact, not a
 	// measurement. doProbe has this same guard after its probe; without
@@ -1265,7 +1265,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 			// BOTH directions a second chance. The error direction is
 			// rewound so the re-alert path fires in ~1m; recovery has no
 			// re-alert path (state is already stamped), so it gets a
-			// dedicated delayed re-offer (review 2026-11-10 M1).
+			// dedicated delayed re-offer.
 			if newStatus == "error" {
 				pw.scheduleAlertRetry(c.id, newStatus)
 			} else {
@@ -1353,8 +1353,8 @@ const purgeBatchSize = 5000
 // bounded batches of purgeBatchSize rows, so the write lock is held only for
 // one batch (a few ms) and released between batches. A sensor whose rows are
 // all inside the window costs one cheap empty round trip.
-// purgeOld deletes rows older than the retention window. ctx (review
-// nit 2026-10-24) lets shutdown stop the sweep between batches: the old
+// purgeOld deletes rows older than the retention window. ctx
+// lets shutdown stop the sweep between batches: the old
 // context-free loop could run minutes of DELETEs uninterruptibly on a
 // large retention backlog, past the shutdown drain budget.
 func (pw *ProbeWorker) purgeOld(ctx context.Context) {

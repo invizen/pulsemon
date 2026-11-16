@@ -68,7 +68,7 @@ func acquireUpdateLock() (*os.File, error) {
 	// already exists (the process runs from it); in a throwaway/test
 	// environment the stubbed binary may point at a dir we should still be
 	// able to create. A missing dir must not turn every update into a hard
-	// "no such file or directory" failure (review F19 follow-up).
+	// "no such file or directory" failure.
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create update lock dir %s: %w", filepath.Dir(lockPath), err)
 	}

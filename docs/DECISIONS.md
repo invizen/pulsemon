@@ -1243,3 +1243,24 @@ TestFix_MaintenanceAndTagDeleteHonorRequestContext (leave is ctx-bound).
 Sabotage-verified: restoring the old read (decode error → ids = nil, no
 in-tx read) makes TestLeaveMaintenanceUndecodableSnapshotFailsLoud fail with
 "want an error, got nil" and mode/sensor-state assertions expose the wipe.
+
+## comment-convention (all .go, 2026-11-16)
+**Decision:** In-code comments state the CURRENT CONTRACT (invariant +
+one-line why) only. Review IDs, review dates, and incident narratives are
+stripped from code (63 dated citations + the phantom db.go refs removed;
+alertGate/enqueueAlert, the maintenance transitions, the probe-client
+redirect/TLS guard, blockedSubnets, the auth section header and the
+warmStats header compressed to invariant form — enqueueAlert 40 lines →
+6). History pointers in comments take the form
+`History: docs/DECISIONS.md → <slug>`; the Review ID map at the top of
+this file resolves older IDs. Behavior is unchanged: the sweep is
+comment-only, gated by comment-stripped token equality of every .go file
+before/after, plus the full gofmt/vet/-race gates.
+**Why:** dated review narration in comments costs review speed (a reader
+must parse history to find the rule), goes stale as DECISIONS.md and git
+already carry it, and cites a file (db.go) that no longer exists. The
+file header already mandated the contract-only convention; the sweep
+brings the code in line with it.
+**Pinned by:** comment-stripped token equality (a comment-only sweep must
+produce byte-identical code token streams); any future grep for
+`(2026-` review citations in non-test .go must find nothing.

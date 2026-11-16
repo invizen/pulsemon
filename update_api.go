@@ -109,7 +109,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// one, and restarts the service. On an auth-disabled install any LAN
 	// host could otherwise trigger a restart loop — and a compromised
 	// upstream release would auto-install on every auth-off box
-	// (2026-10-24 review M1; the earlier deferral in docs/DEFERRED.md is
+	// (the earlier deferral in docs/DEFERRED.md is
 	// lifted).
 	//
 	// Opt-in: an operator on a trusted LAN who runs auth-off can set
@@ -137,7 +137,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// rename. The file lock covers the whole download→install→restart span.
 	// It anchors to the executable's directory (see updateLockPath), the
 	// same location the CLI's `pulsemon update` locks, so the two processes
-	// serialize on the same file (review F19).
+	// serialize on the same file
 	lockFile, err := acquireUpdateLock()
 	if err != nil {
 		if errors.Is(err, errUpdateLockHeld) {
@@ -190,7 +190,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Anti-downgrade floor (2026-11-05): same rule as the CLI — a release
+	// Anti-downgrade floor: same rule as the CLI — a release
 	// tag below the highest version this install has ever run is refused
 	// (409). An EXPLICIT version pin in the request body is the API's
 	// opt-out, the dashboard's analog of the CLI's --allow-downgrade:
@@ -220,7 +220,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		// Intentionally NOT redacted: this text is a SHA-256 mismatch /
 		// missing-sidecar verdict — actionable, operator-facing, and
-		// carries no upstream detail (review triage 2026-10-24).
+		// carries no upstream detail.
 		respondWithError(w, http.StatusBadGateway, "refusing to update: "+err.Error()) // redaction-ok: actionable SHA verdict
 		return
 	}

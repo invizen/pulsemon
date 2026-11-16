@@ -43,7 +43,7 @@ type tlsInfo struct {
 // though the running listener was started before the last upload. The
 // parse is memoized on (path, mtime, size) — see tlsCertCached — so a
 // settings GET on the 5s cycle doesn't re-read and re-parse the cert
-// file every time (2026-10-24 review n3).
+// file every time
 func (s *Server) tlsPayload() tlsInfo {
 	c := loadListenerCfg(s.db)
 	info := tlsInfo{Port: c.httpsPort, HTTPAddr: listenAddr()}

@@ -134,40 +134,35 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 		log.Printf("stats warm: sensor list ended early: %v", err)
 	}
 
-	// The warm-up is two phases, matching exactly what the live series holds
-	// (the 24h window + the last-60 inspector tail):
+	// The warm-up is two phases, matching exactly what the live series
+	// holds (the 24h window + the last-60 inspector tail):
 	//
-	//   Phase 1: the full 24h retention window for every sensor — a plain
-	//   index range scan on idx_probes_sensor_ts (no window function, no
-	//   dedupe). This is the bulk of the data and gives correct 24h counters
-	//   for EVERY sensor (the 24h counters count exactly the 24h rows).
+	//   Phase 1: the full 24h window for every sensor — a plain index
+	//   range scan on idx_probes_sensor_ts. The bulk of the data, and it
+	//   gives correct 24h counters for EVERY sensor.
 	//
-	//   Phase 2: for the few SLOW sensors (fewer than 60 probes in 24h —
-	//   long-interval ones whose 60-probe inspector window spans past the
-	//   24h cutoff), a per-sensor LIMIT 60 backfill of their last 60 probes.
-	//   The last-60 is a superset of the sensor's 24h rows, so it REPLACES
-	//   the phase-1 series (no dedupe). A fast sensor's last 60 are all
-	//   inside 24h, so phase 1 already covers it and it is skipped.
+	//   Phase 2: SLOW sensors only (fewer than 60 probes in 24h, so their
+	//   60-probe inspector window spans past the 24h cutoff): a per-sensor
+	//   LIMIT 60 backfill of their last 60 probes. The last-60 is a
+	//   superset of that sensor's 24h rows, so it REPLACES the phase-1
+	//   series. A fast sensor's last 60 are all inside 24h — phase 1
+	//   covers it.
 	//
-	// The old query ran ROW_NUMBER() over every sensor's full history plus a
-	// deduping UNION — a temp B-tree over the whole 24h set (~1.7M rows at
-	// 100 sensors / 5s). Splitting it this way drops both the window function
-	// and the dedupe; phase 2 is a handful of small per-sensor queries (only
-	// the slow sensors need it), so a large fleet of fast sensors pays just
-	// the phase-1 scan.
+	// (The pre-split query ran ROW_NUMBER() over every sensor's full
+	// history plus a dedupe UNION: a temp B-tree over the whole 24h set,
+	// ~1.7M rows at 100 sensors / 5s. The split drops both.)
 	//
-	// manual MUST be selected: warmed Pulse-Now rows default to manual=false
-	// otherwise and re-enter the aggregates + status derivation as scheduled
-	// probes for up to 24h after every restart — the exact class the
-	// 2026-10-23 manual-exclusion batch closed on the live and DB paths.
+	// manual MUST be selected: warmed Pulse-Now rows that defaulted to
+	// manual=false re-entered the aggregates + status derivation as
+	// scheduled probes for up to 24h after every restart.
 	//
-	// Phase 1 runs in store.InQueryChunk batches (see db.go): one IN-clause
-	// per chunk stays far under the driver's 32,766 host-parameter limit, so
-	// a very large fleet can't fail the warm-up with "too many SQL variables".
-	// Partitioning by sensor id keeps each sensor's rows in exactly one chunk,
-	// so per-sensor order is preserved. The closure defers the cursor close
-	// per chunk — top-level defer, not a bare close below a loop — so no
-	// pooled connection is held across chunks.
+	// Phase 1 runs in store.InQueryChunk batches — one IN-clause per chunk
+	// stays far under the driver's 32,766 host-parameter limit —
+	// partitioned by sensor id so each sensor's rows land in exactly one
+	// chunk and per-sensor order is preserved. The closure defers the
+	// cursor close per chunk (top-level defer, not a bare close below the
+	// loop) so no pooled connection is held across chunks. History:
+	// docs/DECISIONS.md → probe-series-memory-tiers, purge-tail-exemption.
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	type acc struct {
 		series *probeSeries
@@ -612,7 +607,7 @@ func computeSensorStats(entries []probeEntry, nowUnix int64, total24, lost24 int
 
 // Graph returns sensorID's graph buckets (same contract as
 // probeSeries.graphPoints) under the cache lock, so API handlers never
-// reach into statsMu/statsCache (2026-11-11 nit: the series lock discipline
+// reach into statsMu/statsCache (the series lock discipline
 // lives inside the worker). nil means no series — an unknown sensor, or one
 // added after boot that has not been probed yet.
 func (pw *ProbeWorker) Graph(sensorID string, bucketSecs, rangeSecs int) []GraphPoint {

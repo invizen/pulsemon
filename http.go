@@ -48,83 +48,50 @@ const probeHTTPTimeout = 60 * time.Second
 const maxHTTPRedirects = 5
 
 // httpClient is shared by every HTTP sensor: the transport reuses
-// keep-alive connections per host, so N HTTP sensors hitting one host pay
-// one TCP handshake, not N. HTTPS probes reuse the pooled connection when
-// the cert is fresh (< certFreshness, 10 min — the same window as
-// IdleConnTimeout, so a pooled conn's cert is at most that old):
+// keep-alive connections per host, so N sensors hitting one host pay one
+// TCP handshake. HTTPS probes reuse the pooled connection while the cert
+// is fresh (< certFreshness, 10 min — the same window as IdleConnTimeout):
 // probeHTTP sets req.Close only when the cert is stale, keeping the
-// displayed expiry current without paying one handshake per probe. A cert
-// renewal is rare (90 days for Let's Encrypt), so 10 min staleness is
-// negligible. Redirect hops always force a fresh conn (they're rare, and
-// the redirect target's cert is what we want to capture). The handshake
-// time is EXCLUDED from the reported latency (probeHTTP measures from
-// connection-established to response headers), so an HTTPS sensor's number
-// stays comparable to an HTTP sensor's. The pool stays bounded regardless
-// (100 conns total / 32 per host / 10 min idle), so the sensor list —
-// small and stable, not ephemeral — cannot exhaust it. Redirects
-// are followed (up to maxHTTPRedirects) so a target that 301/302s to its
-// real destination — the common case for a web UI behind a redirect — is
-// judged on where it ends up, not the redirect itself.
+// displayed expiry current without one handshake per probe (renewal is a
+// ~90-day event). Redirect hops always force a fresh conn — the redirect
+// target's cert is what we capture. Handshake time is EXCLUDED from
+// reported latency (measured from connection-established), so HTTPS
+// numbers stay comparable to HTTP ones. The pool stays bounded (100 conns
+// total / 32 per host / 10 min idle) regardless. Redirects are followed
+// (up to maxHTTPRedirects): a target that 301/302s to its real
+// destination is judged where it ends up. TLS is verified DURING the
+// handshake, before any request byte is written — see probeDialTLS; a
+// cert is accepted when system-trusted OR genuinely self-signed with
+// hostname and validity matching the target. History: docs/DECISIONS.md →
+// probe-tls-verify, cert-freshness-conn-reuse, req-close-fresh-dial.
 //
-// TLS: the probe client verifies the server certificate DURING the
-// handshake, before any request bytes are written — see probeDialTLS.
-// The policy is unchanged from the old InsecureSkipVerify + post-Do design:
-// a cert is accepted when it is trusted by the system roots OR genuinely
-// self-signed with a hostname and validity matching the target. What moved
-// is WHEN it runs: the old design verified after httpClient.Do returned,
-// by which point the full request had already been sent to whoever answered
-// the handshake — including an Authorization: Basic header derived from a
-// target's user:pass@ userinfo (docs/DEFERRED.md documents such targets),
-// so an ARP/DNS spoofer on the LAN collected the credentials while the
-// probe "correctly" read lost. The same held for every redirect hop, which
-// the post-hoc check never even verified (it judged only the final hop's
-// cert). Self-signed homelab web UIs stay monitorable; "allow self-signed"
-// does not become "allow anything".
+// redirectTargetAllowed judges a redirect hop for the probe client. A
+// monitored public host can 302 the probe anywhere — cloud metadata
+// (169.254.169.254), loopback services — the same pivot the webhook
+// client refuses outright, so hops are judged against the same
+// never-reachable ranges. Same-host hops pass untouched: router.local/ →
+// router.local/login is the shape of most real web UIs, and the operator
+// configured that host anyway. A cross-host hop is resolved and refused
+// if ANY resolved address is loopback, link-local (incl. cloud metadata),
+// unspecified, multicast, or a webhook blockedSubnets range — the CGNAT
+// 100.64/10 entry skipped under the PULSEMON_ALLOW_CGNAT opt-out (a
+// tailnet host is a legitimate redirect target there).
 //
-// Redirect guard: a monitored public host can 302 the probe anywhere,
-// including cloud metadata (169.254.169.254) or loopback services — the
-// same pivot the webhook client refuses outright. Redirect hops are judged
-// against the same never-reachable ranges (loopback, link-local,
-// unspecified, multicast, plus the webhook blocklist). RFC1918/ULA redirect
-// targets stay allowed on purpose: a LAN device redirecting to its LAN
-// UI is the common legitimate case, and the initial target is
-// admin-configured anyway. The INITIAL request is not guarded — it is the
-// operator's own configured target; only hops the operator did not choose
-// are vetted.
-// redirectTargetAllowed judges a redirect hop for the probe client.
-// Same-host hops (host == origHost, the host of the FIRST request in the
-// chain) pass untouched: router.local/ → router.local/login is the shape of
-// most real web UIs and the operator configured that host anyway. A
-// cross-host hop is resolved and refused if ANY resolved address is in a
-// never-monitorable range (loopback, link-local incl. cloud metadata
-// 169.254.169.254, unspecified, multicast, or a webhook blockedSubnets
-// range — with the CGNAT 100.64/10 entry skipped under the
-// PULSEMON_ALLOW_CGNAT opt-out, since a Tailscale/Headscale tailnet host
-// is a legitimate redirect target there). RFC1918/ULA cross-host hops
-// pass: LAN-to-LAN redirects are legitimate for monitoring.
+// The check-then-dial TOCTOU is closed: the checked IP is returned,
+// CheckRedirect records it in a per-probe pin map (redirectPins), and
+// the dial hooks dial that IP directly — no re-resolution. The pin
+// applies at dial time (not the URL), so the request keeps its hostname:
+// SNI, cert verification and later relative hops' Host header all use it.
+// The INITIAL target is never guarded or pinned — it is the operator's
+// own configured sensor.
 //
-// The check-then-dial TOCTOU is closed: redirectTargetAllowed returns the
-// checked IP, and CheckRedirect records it in a per-probe pin map
-// (redirectPins) that the dial hooks (probeDial / probeDialTLS) consult at
-// dial time — the transport dials that IP directly, no re-resolution. This
-// is the same pattern webhook.go's dialChecked uses, except the pin is
-// recorded where the check already ran (CheckRedirect) and applied at dial
-// time, so the request URL keeps its hostname: SNI and cert verification
-// use the hostname (a DNS-name cert verifies correctly), and a later
-// relative hop's Host header stays the hostname, not the IP. The initial
-// target is NOT pinned (it is the operator's own configured sensor, admin
-// privilege by design); only cross-host redirect hops are.
-//
-// Security-review note (deliberate): allowing RFC1918/ULA cross-host
-// redirect hops is INTENTIONAL, not an oversight — the initial target is
-// the operator's own configured sensor (no IP check by design), so the
-// redirect path grants no additional reach. The guard's real job is
-// stopping an EXTERNALLY-monitored public host from 302-ing the probe
-// into cloud metadata (169.254.169.254), loopback, or reserved space.
-// Do NOT "fix" this by blocking private ranges — it would regress the
-// pinned legitimate cases (split-horizon DNS, external→internal 302)
-// while shrinking the real attack surface by zero. Rationale +
-// measured numbers: docs/DECISIONS.md → probe-redirect-guard.
+// Deliberate, do NOT "fix": RFC1918/ULA cross-host hops stay ALLOWED.
+// LAN-to-LAN redirects are the common legitimate case, and the redirect
+// path grants no reach the operator's own target does not already have;
+// blocking private ranges would regress split-horizon DNS and
+// external→internal 302s while shrinking the real attack surface by zero.
+// History: docs/DECISIONS.md → probe-redirect-guard,
+// redirect-ssrf-dns-rebinding.
 func redirectTargetAllowed(ctx context.Context, host, origHost string) (net.IP, error) {
 	if host == "" {
 		return nil, errors.New("redirect with empty host")
