@@ -3,11 +3,13 @@
 # Plain `docker compose up -d --build` on an amd64 box builds an amd64 image;
 # on a Jetson/Pi it builds an arm64 image — no cross-tooling needed because
 # pulsemon is pure Go (CGO_ENABLED=0).
-# Go pin MUST track go.mod's `toolchain` (go1.27.4, 2026-11-11): a family pin here is a
-# fourth place the toolchain can drift behind a Go security release, and GOTOOLCHAIN=auto
-# inside the builder silently downloads a second toolchain per image build.
-FROM golang:1.27-alpine AS builder
-# F10 (2026-10-19 review): WITHOUT this ARG declaration, BuildKit leaves
+# Go pin MUST track go.mod's `toolchain` line (today go1.27.4) EXACTLY, and
+# CI pins the same version: a family pin here is a fourth place the toolchain
+# can drift behind a Go security release, and GOTOOLCHAIN=auto inside the
+# builder silently downloads a second toolchain per image build. Bump all four
+# (go.mod toolchain, this FROM, ci.yml, windows-release.yml) together.
+FROM golang:1.27.4-alpine AS builder
+# WITHOUT this ARG declaration, BuildKit leaves
 # ${TARGETARCH} EMPTY even for `docker buildx build --platform linux/arm64`,
 # so the `:-amd64` fallback silently shipped an AMD64 binary in an arm64
 # image (verified empirically). Declaring the ARG makes BuildKit populate it
@@ -39,7 +41,7 @@ EXPOSE 9299
 # /data volume must be writable by uid 1000 (the SQLite WAL needs write
 # access to the directory, not just the file):  chown -R 1000:1000 <data dir>.
 USER 1000:1000
-# K2 (2026-10-19 review): -healthz-http verifies the RUNNING server answers
+# -healthz-http verifies the RUNNING server answers
 # /api/healthz, not just that the store opens (a wedged listener would
 # otherwise read "healthy" to the container runtime).
 HEALTHCHECK --interval=30s --timeout=8s --retries=3 --start-period=10s CMD ["/pulsemon", "-healthz-http"]
