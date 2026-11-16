@@ -5,7 +5,9 @@
 #   ./install.sh v0.1.7       install a specific version
 #
 # What it does (all idempotent — safe to re-run, e.g. after an update):
-#   1. Downloads the release binary and verifies its SHA-256
+#   1. Downloads the release binary and verifies its SHA-256 AND its
+#      detached ed25519 release signature (manifest: tag + asset + digest,
+#      keys from the repo's release_pubkeys — same contract as the updater)
 #   2. Installs it to ~/pulsemon/pulsemon
 #   3. Installs ~/.config/systemd/user/pulsemon.service (only if absent)
 #   4. Adds ~/pulsemon to PATH in ~/.bashrc (guarded, no duplicates)
@@ -113,6 +115,97 @@ curl -sfL -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256" || {
 ( cd "$TMP" && sha256sum -c "$ASSET.sha256" ) || {
   echo "pulsemon: SHA-256 verification FAILED — aborting" >&2; exit 1; }
 echo "pulsemon: sha256 ok ($ASSET)"
+
+# --- 1b. release signature (exact parity with the in-app updater) -------------
+# The sidecar alone is NOT enough: the binary and its .sha256 come from the
+# SAME release, so a compromised release pipeline can swap both together.
+# The detached ed25519 .sig covers the manifest
+# "pulsemon-release-v1\n<tag>\n<asset>\n<sha256>\n" and is made by the
+# release-signing key, which lives OUTSIDE GitHub; the public keys live in
+# the repo's release_pubkeys, one per line (rotation = add line, ship,
+# retire later — any listed key verifying is accepted). This mirrors
+# verifyReleaseSignature in update.go: fail closed on a missing .sig, a
+# non-64-byte signature, an empty key set, or no key matching.
+#
+# Trust root: release_pubkeys is fetched from this repo's main branch over
+# TLS — the same channel install.sh itself is fetched from, so a FULL
+# account compromise defeats both (accepted: nothing install.sh ships with
+# can survive that). What this closes is the case manifest signing exists
+# for: compromised release/CI token WITHOUT a push to main — new binary +
+# new sidecar, no signing key, refused here.
+# PULSEMON_PUBKEYS_URL is a test hook (harness serves fixtures over
+# file://); production installs always use the repo's main.
+PUBKEYS_URL="${PULSEMON_PUBKEYS_URL:-https://raw.githubusercontent.com/$REPO/main/release_pubkeys}"
+
+if ! command -v openssl >/dev/null 2>&1; then
+  echo "pulsemon: openssl not found — cannot verify the release signature; refusing to install unverified" >&2
+  exit 1
+fi
+
+# hex2bin <hexfile> <outbin>: whitespace-tolerant hex decoder.
+hex2bin() {
+  if command -v xxd >/dev/null 2>&1; then
+    xxd -r -p "$1" > "$2"
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys,binascii;open(sys.argv[2],"wb").write(binascii.unhexlify("".join(open(sys.argv[1]).read().split())))' "$1" "$2"
+  elif command -v perl >/dev/null 2>&1; then
+    perl -pe 'BEGIN{binmode STDOUT} s/\s+//g; s/([0-9a-fA-F]{2})/chr hex $1/ge' "$1" > "$2"
+  else
+    echo "pulsemon: no hex decoder (xxd/python3/perl) — cannot verify the release signature" >&2
+    return 1
+  fi
+}
+
+curl -sfL -o "$TMP/release_pubkeys" "$PUBKEYS_URL" || {
+  echo "pulsemon: could not fetch release_pubkeys from main — refusing to install an unverifiable binary" >&2
+  exit 1; }
+curl -sfL -o "$TMP/$ASSET.sig" "$BASE/$ASSET.sig" || {
+  echo "pulsemon: release $VERSION has no published $ASSET.sig signature — refusing to install" >&2
+  echo "        (the in-app updater requires it; a first install must not be weaker)" >&2
+  exit 1; }
+
+hex2bin "$TMP/$ASSET.sig" "$TMP/sig.bin" || exit 1
+if [ "$(wc -c < "$TMP/sig.bin")" -ne 64 ]; then
+  echo "pulsemon: $ASSET.sig is not a 64-byte ed25519 signature — refusing to install" >&2
+  exit 1
+fi
+
+# Rebuild the manifest from the DOWNLOAD tag + asset + the digest of the
+# bytes actually on disk (the sidecar check above proved the sidecar
+# matches them; the signature below proves they are trusted for this tag).
+sha256sum "$TMP/$ASSET" | cut -d' ' -f1 |
+  { read -r bin_sha && printf 'pulsemon-release-v1\n%s\n%s\n%s\n' "$VERSION" "$ASSET" "$bin_sha"; } \
+  > "$TMP/manifest"
+
+SIG_OK=0
+KEYS_SEEN=0
+while read -r key _; do
+  case "$key" in ''|'#'*) continue ;; esac
+  case "$key" in *[!0-9a-fA-F]*) continue ;; esac
+  [ "${#key}" -eq 64 ] || continue
+  KEYS_SEEN=$((KEYS_SEEN+1))
+  # SPKI/DER wrapper for ed25519 (302a300506032b6570032100 || key), built as
+  # hex so hex2bin does the byte work (printf \x escapes are not POSIX).
+  printf '302a300506032b6570032100%s\n' "$key" > "$TMP/pub.der.hex"
+  hex2bin "$TMP/pub.der.hex" "$TMP/pub.der" || exit 1
+  if openssl pkeyutl -verify -pubin -keyform DER -inkey "$TMP/pub.der" \
+       -rawin -in "$TMP/manifest" -sigfile "$TMP/sig.bin" >/dev/null 2>&1; then
+    SIG_OK=1
+    break
+  fi
+done < "$TMP/release_pubkeys"
+
+if [ "$KEYS_SEEN" -eq 0 ]; then
+  echo "pulsemon: release_pubkeys lists no usable keys — refusing to install" >&2
+  exit 1
+fi
+if [ "$SIG_OK" -ne 1 ]; then
+  echo "pulsemon: release signature INVALID — $ASSET is not signed by a trusted" >&2
+  echo "        release key for $VERSION. The binary is not installed." >&2
+  echo "        If you are mid key-rotation, the key must be merged to main first." >&2
+  exit 1
+fi
+echo "pulsemon: release signature ok ($VERSION / $ASSET)"
 
 # --- 2. install binary --------------------------------------------------------
 install -m 0755 "$TMP/$ASSET" "$BIN"

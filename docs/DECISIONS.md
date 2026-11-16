@@ -1338,3 +1338,26 @@ keys, sabotage = resolver stops attaching → red),
 — sabotage = restore a live read → red),
 `TestTestWebhookSMTPSurfacesDBError` (bulk-read failure → "database
 error", not "not configured").
+
+## install-sh-sig-verify (install.sh, scripts/release-sig-harness.sh, 2026-11-16)
+**Decision:** install.sh verifies the release's detached ed25519 `.sig`
+with `openssl pkeyutl`, not just the SHA-256 sidecar. It mirrors
+`verifyReleaseSignature` (update.go) exactly: manifest =
+`pulsemon-release-v1\n<tag>\n<asset>\n<sha256>\n`, `.sig` = hex-encoded
+64-byte signature, keys = the repo's `release_pubkeys` (fetched over TLS
+from main; any listed key verifying is accepted, so rotation works),
+fail-closed on missing `.sig`, non-64-byte sig, empty key set, fetch
+failure, no openssl, no hex decoder — the binary is not installed.
+**Why:** the binary and its .sha256 come from the SAME release, so the
+sidecar alone verifies nothing against a compromised release/CI token —
+exactly the case manifest signing was designed for, and the case the
+in-app updater already refuses. A first install must not be weaker than
+self-update. Accepted caveat: install.sh itself is fetched from main, so
+a FULL account compromise (push to main + release) defeats the pin; the
+trust roots are then identical, and that residual is documented, not
+hidden.
+**Pinned by:** `scripts/release-sig-harness.sh` — extracts the block
+verbatim from install.sh and runs it over fixture releases: valid
+signature accepted; tampered binary, tag replay (sig made for an older
+tag), missing sig, unknown key, truncated sig, unreachable pubkeys, and
+comment-only keyset all refused. 8/8 on zentest.
