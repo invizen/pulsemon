@@ -1433,3 +1433,19 @@ whole-ms display.
 inside send must measure against the stamp, never the zero time) and
 TestDeliverRacesPublishStampSynchronized (reader hammer racing the
 publish — DATA RACE on the old shape under -race, silent on the fix).
+
+## tls-install-fd-cleanup (tls_settings.go, 2026-11-16)
+**Decision:** both temp pair files get `defer Close()` the moment they
+exist; `install()` keeps its explicit, error-checked closes (a Close
+error there is data loss and must gate the renames). The temp-file
+creator is a seam (`tlsCreateTemp = os.CreateTemp`).
+**Why:** install() early-returned on tmpCert.Write/Sync and
+tmpKey.Write/Sync failures, closing neither file; the caller's cleanup
+removed the NAMES (os.Remove), not the descriptors — a leaked fd per
+temp per failed PUT. Rare paths, but the handler is admin-triggered and
+retried installs compound it. Deferred Close after an explicit Close is
+a harmless ErrClosed, so success paths are unchanged.
+**Pinned by:** TestTLSInstallWriteFailureClosesTempFDs — seam hands
+out read-only temps so the first write fails with EBADF, and the test
+diffs /proc/self/fd around the PUT: +2 fds on the pre-fix shape
+(sabotage-verified), 0 on the fix.

@@ -249,6 +249,11 @@ func pubKeyFromAny(key any) any {
 	}
 }
 
+// tlsCreateTemp is the pair-install temp-file creator (os.CreateTemp;
+// tests inject a failing creator to exercise the write-failure cleanup
+// paths).
+var tlsCreateTemp = os.CreateTemp
+
 // handleTLSSettingsPut: POST /api/settings/tls
 // Body: {"cert": "<pem-or-base64>", "key": "<pem-or-base64>", "port": 443}
 // cert+key together = install/replace the pair; port alone = change port.
@@ -321,41 +326,45 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		// renames leaves the previously installed pair untouched — no
 		// mismatched pair, no boot crash loop.
 		//
-		// Crash safety (minimum-acceptable variant
-		// of the spec's F2): both temps are fsynced BEFORE close and the
-		// directory is fsynced after the renames, so a crash loses at most
-		// the window between the two renames (microseconds). CORRECTION
-		//: the earlier text claimed the old pair
-		// "stays loadable on either side" of that window — FALSE. The key
-		// rename OVERWRITES the old key, so inside the window (and after a
-		// crash inside it, or a cert-rename failure) the on-disk pair is
-		// NEW key + OLD cert: mismatched and not loadable; the next boot
-		// fails the pair check. Recovery is a re-install of the
+		// Crash safety (minimum-acceptable variant): both temps are
+		// fsynced BEFORE close and the directory is fsynced after the
+		// renames, so a crash loses at most the window between the two
+		// renames (microseconds) — and that window is NOT symmetric: the
+		// key rename OVERWRITES the old key, so inside the window (and
+		// after a crash inside it, or a cert-rename failure) the on-disk
+		// pair is NEW key + OLD cert: mismatched and not loadable; the
+		// next boot fails the pair check. Recovery is a re-install of the
 		// certificate — loud in the failure log below, and the mismatch
 		// cannot silently serve a wrong pair (LoadX509KeyPair refuses it).
-		// The spec's preferred generation-dir+symlink design was not used
+		// The generation-dir+symlink design was not used
 		// because the existing install test pins the flat-file rename
 		// contract (a directory at the key target must fail the install
 		// and leave the old pair).
-		tmpCert, err := os.CreateTemp(dir, ".cert.pem.tmp*")
+		tmpCert, err := tlsCreateTemp(dir, ".cert.pem.tmp*")
 		if err != nil {
 			respondInternal(w, "temp cert", err)
 			return
 		}
 		certName := tmpCert.Name()
-		tmpKey, err := os.CreateTemp(dir, ".key.pem.tmp*")
+		// Both temps get a deferred Close so EVERY early-return path
+		// (including install()'s write/sync failures) releases the fd;
+		// install()'s explicit closes stay, because a Close error there
+		// is data loss and must be checked. (*os.File).Close after an
+		// explicit Close is a harmless ErrClosed.
+		defer tmpCert.Close()
+		tmpKey, err := tlsCreateTemp(dir, ".key.pem.tmp*")
 		if err != nil {
-			tmpCert.Close()
 			os.Remove(certName)
 			respondInternal(w, "temp key", err)
 			return
 		}
 		keyName := tmpKey.Name()
+		defer tmpKey.Close()
 		install := func() error {
 			if _, err := tmpCert.Write([]byte(certFile)); err != nil {
 				return err
 			}
-			if err := tmpCert.Sync(); err != nil { // F18: durable before rename
+			if err := tmpCert.Sync(); err != nil { // durable before rename
 				return err
 			}
 			if err := tmpCert.Close(); err != nil {
@@ -364,7 +373,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			if _, err := tmpKey.Write([]byte(normPEM(key, keyPEMType(key)))); err != nil {
 				return err
 			}
-			if err := tmpKey.Sync(); err != nil { // F18: durable before rename
+			if err := tmpKey.Sync(); err != nil { // durable before rename
 				return err
 			}
 			if err := tmpKey.Close(); err != nil {
@@ -384,7 +393,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 				log.Printf("TLS: certificate install FAILED after the key was swapped — cert %s and key %s are now a MISMATCHED pair; re-install the certificate: %v", certPath, keyPath, err)
 				return err
 			}
-			// F18: make the two renames durable (best effort — some
+			// Make the two renames durable (best effort — some
 			// filesystems do not support directory fsync).
 			if d, derr := os.Open(dir); derr == nil {
 				if serr := d.Sync(); serr != nil {
