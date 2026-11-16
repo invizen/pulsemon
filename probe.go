@@ -367,6 +367,16 @@ type ProbeWorker struct {
 	// its entry anyway.
 	spawnedIDs map[string]bool
 
+	// wasPaused records ids the sync passes SAW with state='paused', so
+	// their FIRST spawn is also treated as a respawn (first tick capped at
+	// respawnFirstTickCap). Without it the cap missed one resume path: a
+	// sensor created paused (POST creates rows paused by design) and then
+	// resumed has never had a loop, so spawnedIDs is false and the full
+	// staggered phase left it dark for up to a whole interval after the
+	// operator clicked resume. A resume consumes the marker. Remove deletes
+	// the entry.
+	wasPaused map[string]bool
+
 	// gens is a per-sensor generation counter that closes the syncSensors
 	// read→apply TOCTOU WITHOUT holding pw.mu across a DB read. Restart and
 	// SetPaused bump it (under pw.mu); syncSensors captures a fingerprint of
@@ -487,6 +497,7 @@ func NewProbeWorker(db *store.Store) *ProbeWorker {
 		sensors:         make(map[string]*ProbeState),
 		loops:           make(map[string]context.CancelFunc),
 		spawnedIDs:      make(map[string]bool),
+		wasPaused:       make(map[string]bool),
 		gens:            make(map[string]int64),
 		db:              db,
 		syncReq:         make(chan struct{}, 1),
@@ -583,12 +594,12 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 	pw.mu.Unlock()
 
-	// state is NOT selected: the WHERE clause filters to 'active', so every
-	// row is active and a paused sensor never reaches this loop (its loop is
-	// dropped by the vanished pass). Selecting it would invite a reader to
-	// assume paused rows get reconciled here.
-	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after
-		FROM sensors WHERE state = 'active'`)
+	// paused rows ARE read (and their state selected): the reconcile loop
+	// drops their loop + state explicitly (what the vanished pass did
+	// implicitly when they were filtered out) and records wasPaused, so the
+	// first spawn after a resume is capped like any other respawn.
+	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
+		FROM sensors WHERE state IN ('active', 'paused')`)
 	if err != nil {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
 		return
@@ -596,6 +607,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	defer rows.Close() // top-level: closed on every return path, not just the happy one
 	type activeCfg struct {
 		sensorConfig
+		state string
 	}
 	var configs []activeCfg
 	// partial is true when the read could not be completed (a row failed to
@@ -606,7 +618,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	partial := false
 	for rows.Next() {
 		var c activeCfg
-		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter); err != nil {
+		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
 			log.Printf("ProbeWorker: skipping unreadable sensor row: %v", err)
 			partial = true
 			continue
@@ -668,23 +680,39 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 			// pass's configs, so the vanished-sensor pass owns it there).
 			continue
 		}
+		if c.state == "paused" {
+			// Explicit drop (formerly the vanished pass's job for filtered
+			// rows): stop the loop and forget the state; wasPaused marks the
+			// id so the resume's first spawn is capped, not staggered.
+			if cancel, ok := pw.loops[c.id]; ok {
+				cancel()
+				delete(pw.loops, c.id)
+			}
+			delete(pw.sensors, c.id)
+			if pw.wasPaused == nil { // bare test workers
+				pw.wasPaused = make(map[string]bool)
+			}
+			pw.wasPaused[c.id] = true
+			continue
+		}
 		ps, ok := pw.sensors[c.id]
 		if !ok {
-			// state='active' (the query filter), so a newly-seen sensor is not
-			// paused; isPaused defaults to false.
+			// active row (paused rows continued above), so a newly-seen
+			// sensor is not paused; isPaused defaults to false.
 			ps = &ProbeState{id: c.id, kick: make(chan struct{}, 1)}
 			pw.sensors[c.id] = ps
 		}
 		if _, ok := pw.loops[c.id]; !ok {
-			// First spawn vs RESPAWN (see the spawnedIDs field): a
-			// respawned loop — resume after a >5s pause, maintenance-mode
-			// end, config-edit Restart — caps its first tick at
-			// respawnFirstTickCap so the sensor is not dark for up to a
-			// whole interval.
+			// First spawn vs RESPAWN (see the spawnedIDs and wasPaused
+			// fields): resume after a >5s pause, resume of a
+			// created-paused sensor, maintenance-mode end, config-edit
+			// Restart — all cap the first tick at respawnFirstTickCap so
+			// the sensor is not dark for up to a whole interval.
 			if pw.spawnedIDs == nil { // bare test workers
 				pw.spawnedIDs = make(map[string]bool)
 			}
-			resumed := pw.spawnedIDs[c.id]
+			resumed := pw.spawnedIDs[c.id] || pw.wasPaused[c.id]
+			delete(pw.wasPaused, c.id) // the resume marker is consumed by the spawn
 			pw.spawnedIDs[c.id] = true
 			lctx, lcancel := context.WithCancel(ctx)
 			pw.loops[c.id] = lcancel
@@ -730,8 +758,9 @@ func (pw *ProbeWorker) bumpGen(id string) {
 // after a longer pause finds no entry here and the kick is a no-op — the
 // sensor is then RESPAWNED by the next syncSensors pass, and the respawn
 // path caps the first tick at respawnFirstTickCap (1s) so the resume delay
-// is bounded the same way (or after ANY maintenance
-// mode ended — waited up to an hour for its first probe).
+// is bounded the same way. This covers the sensor created paused and
+// resumed for the first time: syncSensors reads paused rows and marks
+// wasPaused, so its first spawn counts as a respawn.
 func (pw *ProbeWorker) SetPaused(id string, paused bool) {
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
@@ -792,6 +821,7 @@ func (pw *ProbeWorker) Remove(id string) {
 	}
 	delete(pw.sensors, id)
 	delete(pw.spawnedIDs, id) // nil-map delete is a safe no-op
+	delete(pw.wasPaused, id)  // nil-map delete is a safe no-op
 	delete(pw.gens, id)       // nil-map delete is a safe no-op
 	delete(pw.lastPulse, id)
 	// Drop the cached stats series too, or a deleted sensor's 24h history
@@ -829,10 +859,7 @@ func (pw *ProbeWorker) sensorLoop(ctx context.Context, c sensorConfig, resumed b
 	//
 	// RESPAWN exception (resumed, set by syncSensors via spawnedIDs):
 	// cap the first tick at respawnFirstTickCap (see that constant).
-	phase := staggerPhase(c.id, interval)
-	if resumed && phase > respawnFirstTickCap {
-		phase = respawnFirstTickCap
-	}
+	phase := firstTickPhase(c.id, interval, resumed)
 
 	// Timer (not ticker) so the next-tick delay can adapt: a sensor in
 	// ERROR re-checks on the fast-retry cadence (capped at the configured
@@ -919,6 +946,20 @@ func staggerPhase(id string, interval time.Duration) time.Duration {
 	phase := time.Duration(fnvHash([]byte(id)) % uint64(interval))
 	if phase < 250*time.Millisecond {
 		phase += 250 * time.Millisecond // never probe in the first instant
+	}
+	return phase
+}
+
+// firstTickPhase is the single decision point for the loop's first-tick
+// delay: FIRST spawns (process start, brand-new active sensor) get the full
+// staggered phase — that spread IS the steady-state anti-herd (probe times
+// are phase + k*interval, so capping first-spawn phases under a minute
+// would pack every hourly sensor's hourly probes into the same 60-second
+// window). RESPAWNS (resumed) get the cap.
+func firstTickPhase(id string, interval time.Duration, resumed bool) time.Duration {
+	phase := staggerPhase(id, interval)
+	if resumed && phase > respawnFirstTickCap {
+		phase = respawnFirstTickCap
 	}
 	return phase
 }

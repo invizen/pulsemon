@@ -86,6 +86,24 @@ with no data/status/alerts. Capping at 1s keeps the anti-herd property
 where it matters (N sensors respawning together land across ~1s, not
 the same instant) while bounding resume/edit delay.
 
+**Cap scope fixed 2026-11-16 (external re-flag m3):** the cap keyed on
+spawnedIDs only, so the resume of a sensor CREATED paused (POST creates
+paused by design, never spawned) was a first spawn and sat dark up to a
+whole interval after the operator clicked resume. syncSensors now reads
+paused rows (state IN ('active','paused')), drops their loop + state
+explicitly, and marks wasPaused; a spawn with wasPaused set counts as a
+respawn (marker consumed).
+**Rejected in the same re-flag: capping FIRST spawns** (proposed
+min(interval, 60s) at process start). Steady-state probe times are
+phase + k*interval; capping first-spawn phases under a minute packs every
+same-interval sensor's steady-state probes into one 60-second window per
+interval — manufacturing the herd the stagger exists to prevent. Startup
+darkness is bounded by the interval by design; warmStats serves status
+from history meanwhile.
+**Pinned by:** TestResumeCreatedPausedSensorProbesPromptly (sabotage =
+un-wire wasPaused → red) and TestFirstSpawnKeepsFullStagger (deterministic
+id, cap/phase equality).
+
 ## probe-tls-verify (http.go `probeDialTLS`)
 
 **Contract:** the probe client verifies the server cert DURING the
