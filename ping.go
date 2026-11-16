@@ -482,6 +482,15 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 	for ; tries < 16; tries++ {
 		pendingMu.Lock()
 		if _, busy := pending[key]; !busy {
+			// Stamp the start INSIDE the lock, at the publish point: the
+			// reader's time.Since(p.start) on a map hit must be ordered
+			// against this write (mutex release/acquire is the edge —
+			// stamping after the unlock raced the reader per the memory
+			// model; fdMutex in the send path made it benign in practice,
+			// not in law). Stamping here keeps the RTT free of the slot
+			// loop's bookkeeping: the stamp lands the instant the slot is
+			// claimed, and only the unlock + send syscall follow.
+			p.start = time.Now()
 			pending[key] = p
 			pendingMu.Unlock()
 			break
@@ -494,6 +503,7 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 		// Table full: no free (seq, dst) slot in 16 tries. Take the next
 		// counter value anyway (least-­bad option here).
 		pendingMu.Lock()
+		p.start = time.Now()
 		pending[key] = p
 		pendingMu.Unlock()
 	}
@@ -505,11 +515,6 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 		pendingMu.Unlock()
 	}()
 
-	// Stamp the start ONLY now — after the (seq,dst) slot-claim loop and the
-	// defer setup — so the measured RTT excludes local bookkeeping and covers
-	// the send + reply wait. Stamping it in the struct literal (before the
-	// slot loop) folded a few µs of local work into every RTT.
-	p.start = time.Now()
 	if err := e.send(dst, seq); err != nil {
 		if isBrokenSendErr(err) {
 			probeErrCount.Add(1)

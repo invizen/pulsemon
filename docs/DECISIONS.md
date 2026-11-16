@@ -1415,3 +1415,21 @@ for the destination it actually arrived from.
 **Pinned by:** TestDeliverStaleReplyDoesNotEvict and
 TestDeliverSameSeqDifferentDsts (both go red on a seq-only key —
 sabotage-verified).
+
+## icmp-demux (ping.go, m8 follow-up, 2026-11-16)
+**Decision:** a probe's start time is stamped under pendingMu at the
+publish point (both the slot-claim insert and the table-full fallback),
+not after the lock is released.
+**Why:** publishing p into `pending` under the mutex makes it visible to
+the reader goroutine, whose `time.Since(p.start)` on a map hit is then
+ordered against the stamp by the mutex itself. Stamping after the
+unlock left a formally unsynchronized write/read pair (the fdMutex
+atomics in the send path made it benign in practice, not in law — the
+reader can only exist after the send, which rides fdMutex). Stamping at
+insert excludes the slot loop's bookkeeping from the RTT exactly like
+the old comment intended; only the unlock + send syscall follow, µs on a
+whole-ms display.
+**Pinned by:** TestPingStartStampedAtPublish (loopback-style reply
+inside send must measure against the stamp, never the zero time) and
+TestDeliverRacesPublishStampSynchronized (reader hammer racing the
+publish — DATA RACE on the old shape under -race, silent on the fix).

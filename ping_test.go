@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -166,5 +168,56 @@ func TestResolveIPAddrWithTimeout(t *testing.T) {
 	now := runtime.NumGoroutine()
 	if now > base+5 {
 		t.Errorf("resolver leak: goroutines %d -> %d after timed-out lookup", base, now)
+	}
+}
+
+// TestPingStartStampedAtPublish pins that a probe's start time is stamped
+// before the pendingPing is visible to the reader, so a reply processed
+// inside the send path (the tightest possible reader/probe overlap)
+// measures against a stamped start — not the zero time. On the old shape
+// (stamp after publish) the synchronous reply read p.start before its
+// write and the RTT came out as the distance from January 1, 1970.
+// The mutex is the synchronization edge; the fdMutex atomics in the real
+// send path made the old order benign in practice, not in law.
+func TestPingStartStampedAtPublish(t *testing.T) {
+	dst := net.ParseIP("10.9.9.9").To4()
+	e := &Engine{}
+	e.send = func(d net.IP, seq uint16) error {
+		e.deliver(seq, d) // loopback-style reply: reader runs inside send
+		return nil
+	}
+	res := e.Ping(context.Background(), dst, time.Second)
+	if res.Lost {
+		t.Fatalf("synchronous reply did not deliver: %+v", res)
+	}
+	if res.RTT > time.Second {
+		t.Fatalf("RTT %v stamped against a zero start — start must be stamped under pendingMu at publish", res.RTT)
+	}
+}
+
+// TestDeliverRacesPublishStampSynchronized drives the memory-model edge
+// directly: with the start stamp taken under pendingMu at the publish
+// point, a reader that picks up the entry under the same mutex is ordered
+// against the stamp. Under the old shape (stamp after publish, outside
+// the lock) the reader's time.Since(p.start) and the stamp are two
+// unsynchronized accesses on different goroutines — -race fires.
+func TestDeliverRacesPublishStampSynchronized(t *testing.T) {
+	dst := net.ParseIP("10.9.9.8").To4()
+	e := &Engine{send: func(net.IP, uint16) error {
+		time.Sleep(20 * time.Millisecond) // hold the entry open for the hammer
+		return errors.New("test: send held")
+	}}
+	for round := 0; round < 20; round++ {
+		// Ping's first seq is the counter's next value after this Add.
+		seq := uint16(atomic.LoadUint32(&seqCounter) + 1)
+		done := make(chan struct{})
+		go func() {
+			for i := 0; i < 500; i++ {
+				e.deliver(seq, dst)
+			}
+			close(done)
+		}()
+		e.Ping(context.Background(), dst, 200*time.Millisecond)
+		<-done
 	}
 }
