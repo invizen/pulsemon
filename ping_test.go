@@ -27,7 +27,7 @@ func TestDeliverStaleReplyDoesNotEvict(t *testing.T) {
 	// Probe A is in flight to dstA.
 	chA := make(chan time.Duration, 1)
 	pendingMu.Lock()
-	pending[mkKey(seq, dstA)] = &pendingPing{dst: dstA, start: time.Now(), ch: chA}
+	pending[mkKey(seq, dstA)] = &pendingPing{start: time.Now(), ch: chA}
 	pendingMu.Unlock()
 
 	// A stale reply for the same seq but from a DIFFERENT destination must
@@ -74,8 +74,8 @@ func TestDeliverSameSeqDifferentDsts(t *testing.T) {
 	chA := make(chan time.Duration, 1)
 	chB := make(chan time.Duration, 1)
 	pendingMu.Lock()
-	pending[mkKey(seq, dstA)] = &pendingPing{dst: dstA, start: time.Now(), ch: chA}
-	pending[mkKey(seq, dstB)] = &pendingPing{dst: dstB, start: time.Now(), ch: chB}
+	pending[mkKey(seq, dstA)] = &pendingPing{start: time.Now(), ch: chA}
+	pending[mkKey(seq, dstB)] = &pendingPing{start: time.Now(), ch: chB}
 	pendingMu.Unlock()
 
 	e.deliver(seq, dstA)

@@ -104,7 +104,6 @@ func isBrokenSendErr(err error) bool {
 
 // pendingPing is one in-flight probe; the reader delivers its RTT by key.
 type pendingPing struct {
-	dst   net.IP
 	start time.Time
 	ch    chan time.Duration
 }
@@ -339,24 +338,19 @@ func (e *Engine) Close() {
 	})
 }
 
-// deliver hands a reply's RTT to its waiting probe (keyed by seq +
-// destination, source-IP verified). Called by the reader goroutine.
-//
-// The destination check runs BEFORE the map delete: a stale reply from a
-// previous probe that reused this seq must be dropped WITHOUT removing the
-// new probe's entry, or the new probe's genuine reply would later be
-// discarded as untracked (false loss).
+// deliver hands a reply's RTT to its waiting probe. Called by the reader
+// goroutine. The compound (seq, destination) key IS the source check: a
+// reply's src is part of its lookup key, so a stale reply that recycled a
+// seq can only match a slot for the destination it actually came from —
+// cross-destination stale replies miss the map and are dropped without
+// evicting the live probe's entry (the eviction bug the seq-only key had,
+// docs/DECISIONS.md → icmp-demux). A redundant p.dst.Equal(src) check
+// after the lookup was unconditionally true (net.IP.Equal normalizes the
+// same v4-in-v6 forms the key normalizes) and was removed as dead.
 func (e *Engine) deliver(seq uint16, src net.IP) {
 	key := mkKey(seq, src)
 	pendingMu.Lock()
 	p, ok := pending[key]
-	if ok && !p.dst.Equal(src) {
-		// Entry exists but is for a different destination: this reply is
-		// stale (belongs to a prior probe that recycled the seq). Drop it
-		// and keep the new probe's entry intact.
-		pendingMu.Unlock()
-		return
-	}
 	if ok {
 		delete(pending, key)
 	}
@@ -483,7 +477,7 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 	// 16 misses we fall through and take the next counter value unconditionally.
 	seq := uint16(atomic.AddUint32(&seqCounter, 1) & 0xffff)
 	key := mkKey(seq, dst)
-	p := &pendingPing{dst: dst, ch: make(chan time.Duration, 1)}
+	p := &pendingPing{ch: make(chan time.Duration, 1)}
 	tries := 0
 	for ; tries < 16; tries++ {
 		pendingMu.Lock()

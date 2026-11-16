@@ -1400,3 +1400,18 @@ exercised.
 **Pinned by:** gate convention — `go vet` + full suite; the sweep is
 behavior-free (moved functions byte-identical; deleted ones had zero
 references repo-wide, verified by grep before removal).
+
+## icmp-demux (ping.go, 2026-11-16)
+**Decision:** the compound (seq, destination) pingKey IS the reply
+source-check; deliver() has no separate destination check, and
+pendingPing carries no dst field.
+**Why:** the per-entry `p.dst.Equal(src)` check predates the compound key
+and became unconditionally true under it (net.IP.Equal normalizes the same
+v4-in-v6 forms mkKey normalizes, so a map hit implies equality) — a dead
+branch that read like live protection and sent the next reader hunting
+for the case it handled. The key match enforces the same invariant at
+lower cost: a stale reply that recycled a seq can only look up the slot
+for the destination it actually arrived from.
+**Pinned by:** TestDeliverStaleReplyDoesNotEvict and
+TestDeliverSameSeqDifferentDsts (both go red on a seq-only key —
+sabotage-verified).
