@@ -466,16 +466,24 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 // resurrected for a deleted sensor. The guard is explicit and
 // self-contained rather than relying on the alert_state FK — which IS
 // enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
-// store.NewStore), but only as a side effect whose violation the `_, _ =`
-// below would swallow silently. For a live sensor
+// store.NewStore) — and the write error is NOT swallowed: a failed
+// upsert is logged and the in-memory copy is deliberately NOT stamped,
+// so the durable row stays authoritative and the next tick's maybeRealert
+// re-reads it (cache miss), sees the status mismatch, and retries the
+// write — a transient DB failure self-heals, and a sustained one leaves a
+// log trail instead of silently resetting re-alert timing on the next
+// restart (review 2026-11-17 M1). For a live sensor
 // the SELECT yields exactly one row: behavior is identical to a plain
 // upsert, and the statement is atomic, so there is no delete/upsert
 // TOCTOU.
 func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
-	_, _ = pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts)
+	if _, err := pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts)
 		SELECT id, ?, ? FROM sensors WHERE id = ?
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		status, store.FormatTS(ts), id)
+		status, store.FormatTS(ts), id); err != nil {
+		log.Printf("alert: failed to persist alert_state for %s: %v", id, err)
+		return
+	}
 	// Write-through so the in-memory copy mirrors the durable row (it is
 	// seeded from writes, re-read from the DB only on miss).
 	pw.alertMemMu.Lock()
@@ -583,10 +591,16 @@ func (pw *ProbeWorker) realertMin() int {
 // maintenance mode is turned off. The in-memory copies are stamped with the
 // same instant (write-through): maintenance pauses sensors, so no probe tick
 // refreshes alertMem while paused — a stale pre-maintenance mem.ts would
-// survive to the first post-maintenance tick and re-alert immediately.
+// survive to the first post-maintenance tick and re-alert immediately. The
+// DB error is logged but the memory stamp is KEPT: the in-run behavior (no
+// immediate re-alert after maintenance ends) is the point of this function,
+// and a durable-row miss after a restart only re-exposes the pre-reset
+// timing, never a wrong state (review 2026-11-17 M1).
 func (pw *ProbeWorker) ResetAlertStates() {
 	now := time.Now().UTC()
-	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.FormatTS(now))
+	if _, err := pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.FormatTS(now)); err != nil {
+		log.Printf("alert: failed to reset alert_state rows: %v", err)
+	}
 	pw.alertMemMu.Lock()
 	for id, entry := range pw.alertMem {
 		entry.ts = now

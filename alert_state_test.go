@@ -125,3 +125,47 @@ func TestSetAlertStateDeletedSensorNoResurrection(t *testing.T) {
 		t.Fatalf("live sensor alert_state rows = %d, want 1", n)
 	}
 }
+
+// TestSetAlertStateWriteFailureDoesNotStampMemory pins review 2026-11-17 M1:
+// a FAILED alert_state upsert is logged and returns WITHOUT stamping the
+// in-memory copy, so the durable row stays authoritative and the next tick's
+// maybeRealert cache-misses, re-reads the stale row, sees the mismatch, and
+// retries the write. The old `_, _ =` stamped memory on failure too: memory
+// then said "stamped now" while the durable row stayed stale, and every
+// restart re-read the stale row — silently resetting re-alert timing with
+// nothing in the log.
+func TestSetAlertStateWriteFailureDoesNotStampMemory(t *testing.T) {
+	db := fcDB(t)
+	const id = "s-writefail"
+	fcSensor(t, db, id, "writefail", "active")
+	pw := NewProbeWorker(db)
+
+	// Positive control: a healthy write stamps both the durable row and the
+	// in-memory copy.
+	pw.setAlertState(id, "error", time.Now().UTC())
+	pw.alertMemMu.Lock()
+	_, inMem := pw.alertMem[id]
+	pw.alertMemMu.Unlock()
+	if !inMem {
+		t.Fatal("healthy write: alertMem entry missing, want stamped")
+	}
+
+	// Close the store: every subsequent Exec fails (fcDB's cleanup close is
+	// idempotent).
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failed upsert must NOT stamp memory: the pre-failure entry (the
+	// durable row's mirror) stays, so the next tick re-reads and retries.
+	pw.setAlertState(id, "up", time.Now().UTC())
+	pw.alertMemMu.Lock()
+	entry, ok := pw.alertMem[id]
+	pw.alertMemMu.Unlock()
+	if !ok {
+		t.Fatal("alertMem entry vanished after failed write, want the pre-failure entry retained")
+	}
+	if entry.status != "error" {
+		t.Fatalf("failed write stamped memory: status = %q, want %q (pre-failure value)", entry.status, "error")
+	}
+}
