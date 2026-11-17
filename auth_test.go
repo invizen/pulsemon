@@ -1343,10 +1343,11 @@ func TestCheckUserLockActive(t *testing.T) {
 }
 
 // TestKnownGoodIPExemptFromUserLock (review 2026-11-10 #4) pins the
-// known-good exemption: an IP bucket that has logged in successfully within
-// knownGoodTTL is EXEMPT from the per-username lockout, so a single LAN host
-// hammering the account can't lock the operator out. A new (never-seen) IP
-// bucket is NOT exempt — it is subject to the hard lockout.
+// known-good exemption: a (username, IP bucket) pair that has logged in
+// successfully within knownGoodTTL is EXEMPT from the per-username lockout,
+// so a single LAN host hammering the account can't lock the operator out.
+// A new (never-seen) IP bucket is NOT exempt — it is subject to the hard
+// lockout.
 func TestKnownGoodIPExemptFromUserLock(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
@@ -1354,8 +1355,9 @@ func TestKnownGoodIPExemptFromUserLock(t *testing.T) {
 	// An ACTIVE per-username lockout for "admin".
 	a.loginThrottle.userLock["admin"] = time.Now().Add(5 * time.Minute)
 
-	// A known-good IP bucket (logged in recently): EXEMPT.
-	a.loginThrottle.knownGood["10.1.1.5"] = time.Now()
+	// A known-good (admin, IP bucket) pair (admin logged in recently):
+	// EXEMPT.
+	a.loginThrottle.knownGood[knownGoodKey("admin", "10.1.1.5")] = time.Now()
 	if ok, _ := a.checkUserLock("admin", "10.1.1.5"); !ok {
 		t.Fatal("a known-good IP must be exempt from the per-username lockout")
 	}
@@ -1369,19 +1371,60 @@ func TestKnownGoodIPExemptFromUserLock(t *testing.T) {
 	}
 }
 
-// TestKnownGoodExemptionExpires (review 2026-11-10 #4): a known-good IP
-// bucket stops being exempt once knownGoodTTL elapses from its last
-// successful login — a stale IP (a device that hasn't logged in in a month)
-// must not keep a permanent pass on the per-username lockout.
+// TestKnownGoodExemptionExpires (review 2026-11-10 #4): a known-good
+// (username, IP bucket) pair stops being exempt once knownGoodTTL elapses
+// from its last successful login — a stale IP (a device that hasn't logged
+// in in a month) must not keep a permanent pass on the per-username
+// lockout.
 func TestKnownGoodExemptionExpires(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
 
 	a.loginThrottle.userLock["admin"] = time.Now().Add(5 * time.Minute)
 	// A known-good entry OLDER than knownGoodTTL.
-	a.loginThrottle.knownGood["10.1.1.5"] = time.Now().Add(-knownGoodTTL - time.Hour)
+	a.loginThrottle.knownGood[knownGoodKey("admin", "10.1.1.5")] = time.Now().Add(-knownGoodTTL - time.Hour)
 	if ok, _ := a.checkUserLock("admin", "10.1.1.5"); ok {
 		t.Fatal("a known-good IP past its TTL must NOT be exempt")
+	}
+}
+
+// TestKnownGoodExemptionScopedPerAccount (review 2026-11-17 #6) pins the
+// (username, ip) keying of the known-good exemption: a successful login by
+// ONE account from a shared IP (workstation, jump box, NAT exit) exempts
+// ONLY that account from the per-username lockout on that IP. A compromised
+// low-privilege session must not give its IP a pass to spray admin — the
+// per-username layer is what stops a multi-source account spray, and an
+// IP-wide exemption would void it for the 30-day TTL.
+func TestKnownGoodExemptionScopedPerAccount(t *testing.T) {
+	a := NewAuthState(newTestDB(t))
+	a.ensureThrottleMaps()
+
+	// An ACTIVE per-username lockout for "admin" (a multi-IP spray got
+	// here).
+	a.loginThrottle.userLock["admin"] = time.Now().Add(5 * time.Minute)
+
+	// A "viewer" account logs in successfully from 10.1.1.5.
+	a.loginSuccess("viewer", "10.1.1.5")
+
+	// admin on the SAME IP is NOT exempt: the viewer's success only
+	// exempts viewer there.
+	if ok, _ := a.checkUserLock("admin", "10.1.1.5"); ok {
+		t.Fatal("admin must NOT be exempt on an IP that is known-good only for viewer")
+	}
+	// viewer on its own known-good IP is exempt (the operator-signal
+	// contract for the account that actually logged in).
+	if ok, _ := a.checkUserLock("viewer", "10.1.1.5"); !ok {
+		t.Fatal("viewer must be exempt on the IP it logged in from")
+	}
+	// admin on ITS OWN known-good IP is exempt (the original self-DoS
+	// protection is intact)…
+	a.loginSuccess("admin", "10.1.1.50")
+	if ok, _ := a.checkUserLock("admin", "10.1.1.50"); !ok {
+		t.Fatal("admin must be exempt on its own known-good IP")
+	}
+	// …and not on any other IP.
+	if ok, _ := a.checkUserLock("admin", "10.1.1.99"); ok {
+		t.Fatal("admin must NOT be exempt on an IP it never logged in from")
 	}
 }
 
@@ -1412,7 +1455,7 @@ func TestLoginKnownGoodIPExemptFromAccountLockout(t *testing.T) {
 		t.Fatalf("operator login: got %d, want 200", resp.StatusCode)
 	}
 	srv.auth.loginThrottle.Lock()
-	_, isKnownGood := srv.auth.loginThrottle.knownGood[throttleKey(operatorIP)]
+	_, isKnownGood := srv.auth.loginThrottle.knownGood[knownGoodKey("admin", throttleKey(operatorIP))]
 	srv.auth.loginThrottle.Unlock()
 	if !isKnownGood {
 		t.Fatal("the operator's IP must be recorded known-good after a successful login")

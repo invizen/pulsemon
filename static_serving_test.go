@@ -7,6 +7,44 @@ import (
 	"testing"
 )
 
+// TestStaticMethodNotAllowed (2026-11-17 external review #11) pins the
+// method guard on the static catch-all: / is a bare ServeMux catch-all, so
+// a POST/PUT/DELETE against any static path falls through to handleStatic.
+// The assets are public and the bytes would be identical to a GET, so this
+// is HTTP hygiene, not a security fix — but every other handler in this
+// codebase guards its method, and a static file server answering DELETE
+// with 200 is a broken contract for proxies and scanners. GET/HEAD keep
+// working.
+func TestStaticMethodNotAllowed(t *testing.T) {
+	d := newTestDB(t)
+	mux := NewServer(d, NewProbeWorker(d)).Mux()
+
+	for _, m := range []string{"POST", "PUT", "DELETE", "PATCH"} {
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, httptest.NewRequest(m, "/", strings.NewReader("{}")))
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s / => %d, want 405", m, rr.Code)
+		}
+	}
+	// The guard applies to named assets too, not just the root.
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("DELETE", "/app.js", nil))
+	if rr.Code != http.StatusMethodNotAllowed {
+		t.Errorf("DELETE /app.js => %d, want 405", rr.Code)
+	}
+	// GET and HEAD keep working (the contract the dashboard depends on).
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("GET", "/", nil))
+	if rr.Code != http.StatusOK {
+		t.Errorf("GET / => %d, want 200", rr.Code)
+	}
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, httptest.NewRequest("HEAD", "/", nil))
+	if rr.Code != http.StatusOK {
+		t.Errorf("HEAD / => %d, want 200", rr.Code)
+	}
+}
+
 func TestFix_g7_StaticCharsetETag304(t *testing.T) {
 	d := newTestDB(t)
 	mux := NewServer(d, NewProbeWorker(d)).Mux()

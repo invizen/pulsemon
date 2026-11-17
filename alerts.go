@@ -494,7 +494,9 @@ var alertRetryAfter = time.Minute
 // re-alert path (maybeRealert) fires again in about alertRetryAfter. It is a
 // no-op for "alert once only" (realert_min = 0), and only touches the row if it
 // is still tracking the same status (a sensor that recovered meanwhile keeps
-// its newer state).
+// its newer state). The in-memory copy is backdated with it (write-through,
+// same status guard): maybeRealert reads alertMem first, so a DB-only
+// backdate would be invisible and the ~1-minute retry would never fire.
 func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 	m := pw.realertMin()
 	if m == 0 {
@@ -504,8 +506,19 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 	if back < 0 {
 		back = 0
 	}
-	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ? WHERE sensor_id = ? AND status = ?`,
-		store.FormatTS(time.Now().UTC().Add(-back)), id, status)
+	backdated := time.Now().UTC().Add(-back)
+	res, err := pw.db.Exec(`UPDATE alert_state SET last_ts = ? WHERE sensor_id = ? AND status = ?`,
+		store.FormatTS(backdated), id, status)
+	if err == nil {
+		if n, _ := res.RowsAffected(); n > 0 {
+			pw.alertMemMu.Lock()
+			if cur, ok := pw.alertMem[id]; ok && cur.status == status {
+				cur.ts = backdated
+				pw.alertMem[id] = cur
+			}
+			pw.alertMemMu.Unlock()
+		}
+	}
 }
 
 // recoveryRetryDelay is how long to wait before re-offering a recovery
@@ -567,9 +580,19 @@ func (pw *ProbeWorker) realertMin() int {
 
 // ResetAlertStates stamps every tracked sensor's alert_state to now, so
 // sensors already in a bad state do not immediately re-alert right after
-// maintenance mode is turned off.
+// maintenance mode is turned off. The in-memory copies are stamped with the
+// same instant (write-through): maintenance pauses sensors, so no probe tick
+// refreshes alertMem while paused — a stale pre-maintenance mem.ts would
+// survive to the first post-maintenance tick and re-alert immediately.
 func (pw *ProbeWorker) ResetAlertStates() {
-	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.Now())
+	now := time.Now().UTC()
+	_, _ = pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.FormatTS(now))
+	pw.alertMemMu.Lock()
+	for id, entry := range pw.alertMem {
+		entry.ts = now
+		pw.alertMem[id] = entry
+	}
+	pw.alertMemMu.Unlock()
 }
 
 // parseTSForRealert reads an alert_state.last_ts back into a time.Time for
@@ -1467,41 +1490,36 @@ var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "
 
 // alertTarget renders a sensor's target for third-party alert payloads,
 // stripping any userinfo: an HTTP target like
-// https://admin:hunter2@nas.lan/health used to go VERBATIM into the
+// https://admin:***@nas.lan/health used to go VERBATIM into the
 // Discord/Telegram/Chat/SMTP card — the password readable by everyone who
-// can see the channel. u.User = nil drops the credentials. A string that
-// doesn't parse as a URL (an IP, a hostname) is returned unchanged —
-// there is nothing to strip.
+// can see the channel.
+//
+// The strip is RAW-STRING based and deliberately does NOT depend on
+// neturl.Parse succeeding: a malformed target (backslash or control
+// character in the host, a bad percent-escape — legacy or hand-edited
+// rows) fails Parse, and a parse-failure fallback of "return verbatim"
+// would ship the credentials to the channel — the exact leak this
+// function exists to prevent. A string with no authority (a bare IP, a
+// hostname) has nothing to strip and is returned unchanged.
+//
+// Strip ONLY the userinfo, from the RAW string. Rebuilding via
+// u.String() would percent-encode the path/query — a target like
+// /<b>bold</b> would come back as /%3Cb%3Ebold%3C/b%3E, and the card's
+// HTML escaping would then show literal %3C… to the reader instead of
+// the escaped markup the target really is (telegram_test.go pins both
+// halves: & -> &amp; and <b> -> &lt;b&gt;, with the card's own tags
+// intact).
+//
+// The authority runs from after "scheme://" (or after a leading "//"
+// for a scheme-relative URL) to the first path/query/fragment
+// separator, and userinfo ENDS AT THE LAST '@' in it — net/url's
+// validUserinfo permits a raw '@', so the cut MUST mirror net/url's
+// boundary: cutting at the FIRST '@' of
+// https://admin:***@ss@nas.lan/health left "ss@nas.lan" in the card —
+// a password fragment shipped to Discord/Telegram/SMTP, and the
+// scheme-relative form leaked the whole credential verbatim.
 func alertTarget(target string) string {
-	u, err := neturl.Parse(target)
-	if err != nil || u.User == nil {
-		return target
-	}
-	// Strip ONLY the userinfo, from the RAW string. u.String() would
-	// percent-encode the path/query — a target like /<b>bold</b> would come
-	// back as /%3Cb%3Ebold%3C/b%3E, and the card's HTML escaping would then
-	// show literal %3C… to the reader instead of the escaped markup the
-	// target really is (telegram_test.go pins both halves: & -> &amp; and
-	// <b> -> &lt;b&gt;, with the card's own tags intact).
-	//
-	// The authority runs from after "scheme://" (or after a leading "//"
-	// for a scheme-relative URL) to the first path/query/fragment
-	// separator, and userinfo ENDS AT THE LAST '@' in it — net/url's
-	// validUserinfo permits a raw '@', so the cut MUST mirror net/url's
-	// boundary: cutting at the FIRST '@' of
-	// https://admin:p@ss@nas.lan/health left "ss@nas.lan" in the card —
-	// a password fragment shipped to Discord/Telegram/SMTP, and the
-	// scheme-relative form leaked the whole credential verbatim.
-	prefix := -1
-	if u.Scheme != "" {
-		// The scheme ends at the first ':' in the string, so the first
-		// "://" is exactly the authority boundary url.Parse used.
-		if i := strings.Index(target, "://"); i >= 0 {
-			prefix = i + 3
-		}
-	} else if strings.HasPrefix(target, "//") {
-		prefix = 2
-	}
+	prefix := authorityStart(target)
 	if prefix < 0 {
 		return target
 	}
@@ -1514,6 +1532,42 @@ func alertTarget(target string) string {
 		return target[:prefix] + rest[at+1:]
 	}
 	return target
+}
+
+// authorityStart returns the offset just past "scheme://" (or a leading
+// "//" for a scheme-relative URL) — where the authority
+// (userinfo@host[:port]) begins — or -1 when the string has no
+// authority (bare IP, hostname, path). The scheme check mirrors
+// net/url's grammar (a letter, then [A-Za-z0-9+.-]*), so the boundary
+// matches what neturl.Parse would have used.
+func authorityStart(target string) int {
+	if i := strings.Index(target, "://"); i > 0 && validScheme(target[:i]) {
+		return i + 3
+	}
+	if strings.HasPrefix(target, "//") {
+		return 2
+	}
+	return -1
+}
+
+// validScheme mirrors net/url's scheme grammar: a letter followed by any
+// run of letters, digits, '+', '-', '.'.
+func validScheme(s string) bool {
+	if s == "" {
+		return false
+	}
+	c := s[0]
+	if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) {
+		return false
+	}
+	for j := 1; j < len(s); j++ {
+		c := s[j]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
 }
 
 // discordMentionSafe neutralizes Discord mention tokens in free text

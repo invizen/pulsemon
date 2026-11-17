@@ -1499,3 +1499,244 @@ testable, and fail-loud (see DEFERRED).
 CA-signed leaf reads lost with no bundle, UP with PULSEMON_CA_FILE set;
 zero-cert bundle must fail initProbeCA — sabotage-verified: pool ignored
 (Roots nil) turns the UP leg red).
+
+## alert-retry-mem-write-through (alerts.go, webhook_retry_test.go, 2026-11-17)
+**Decision:** scheduleAlertRetry backdates the in-memory alert-state copy
+(pw.alertMem) WITH the alert_state row — under pw.alertMemMu, only when the
+DB UPDATE affected a row and the mem entry still tracks the same status
+(mirroring the SQL `WHERE status = ?` guard). Remove already deleted the mem
+entry (probe.go) — no change there.
+**Why:** setAlertState writes through to alertMem and maybeRealert reads the
+mem copy first whenever an entry exists — which is ALWAYS on the
+sustained-error path, because the initial alert seeded it. The DB-only
+backdate was invisible to the interval check: now.Sub(un-backdated mem.ts)
+< realert_min on every tick, so the ~1-minute all-providers-failed retry
+never fired.
+**Pinned by:** TestScheduleAlertRetryBackdatesMemCopy — (a) mem ts is
+backdated with the DB row, (b) a sustained-error tick ~alertRetryAfter later
+re-delivers (0 provider hits on the old shape), (c) a recovered sensor's mem
+entry is not backdated. Sabotage-verified: dropping the mem write turns (a)
+and (b) red.
+
+## reset-alert-states-mem-write-through (alerts.go, webhook_retry_test.go, 2026-11-17)
+**Decision:** ResetAlertStates stamps the in-memory alert-state copies
+(pw.alertMem) with the same instant as the alert_state rows.
+**Why:** maintenance mode pauses every sensor — no probe ticks, no
+maybeRealert, no setAlertState refresh while paused. A sensor already in
+error for longer than the re-alert interval therefore kept its
+pre-maintenance mem.ts in alertMem; the DB stamp was invisible (maybeRealert
+reads memory first), and the first post-maintenance tick fired an immediate
+re-alert — defeating the suppression contract ResetAlertStates exists for.
+**Pinned by:** TestResetAlertStatesStampsMemCopy — (a) mem ts stamped to now
+after reset, (b) the first sustained-error tick after maintenance delivers
+zero re-alerts (old shape: immediate re-alert). Sabotage-verified: dropping
+the mem loop turns (a) and (b) red.
+
+## allow-unauth-update-in-tx-user-count (api.go, settings_alert_filter_test.go, 2026-11-17)
+**Decision:** handleSettingsPut re-checks `SELECT COUNT(*) FROM users`
+INSIDE the settings write tx (under the `\x00pulsemon-txlock` pin) before
+persisting allow_unauth_update; count 0 → 403, deferred rollback leaves the
+store untouched. The pre-flight `s.auth.Enabled()` guard stays as the fast
+path.
+**Why:** Enabled() is a 2s-TTL cache; an out-of-band `pulsemon auth-user
+remove` of the last account is invisible to it for up to 2s (documented
+tradeoff in auth.go). In that stale-true window auth is effectively off and
+requireAuth stands down, so an unauthenticated PUT could persist
+allow_unauth_update=1 and then POST /api/update — the exact privilege the
+guard exists to block. The count under the write-lock pin is stable: a
+concurrent user removal serializes behind the pin and cannot commit between
+the count and the setting write.
+**Pinned by:** TestSettingsPutAllowUnauthLiveUserCountInTx — seeds the cache
+true with a live account, deletes the last user via direct DB write (no
+refreshEnabledNow), asserts the PUT is 403 with nothing written while
+Enabled() still reads stale-true. Sabotage-verified: dropping the in-tx
+count turns the PUT 200 + the value written (red).
+
+## events-feed global ts index (internal/store/store.go, api.go, events_feed_test.go) — REJECTED, decision 2026-11-17
+
+**Finding (external review 2026-11-17 #4):** GET /api/events runs
+`ORDER BY e.ts DESC LIMIT n` across the whole events table with no
+dedicated index (only the composite (sensor_id, ts) index), so every
+dashboard poll forces a full scan + temp B-tree sort; suggested fixes were
+`CREATE INDEX idx_events_ts ON events(ts DESC)` or `ORDER BY e.id DESC`.
+
+**Decision: REJECTED — stale: the index the finding says is missing
+already exists and serves the query.**
+- `idx_events_ts ON events(ts)` is in the base schema (store.go) with a
+  comment stating it exists for exactly this query; `CREATE INDEX IF NOT
+  EXISTS` runs at every startup, so pre-existing DBs carry it too.
+- SQLite serves `ORDER BY ts DESC` with a backward scan of the ASC index.
+  EXPLAIN QUERY PLAN (verified on a scratch DB with 500 rows AND the live
+  zentest DB): `SCAN e USING INDEX idx_events_ts` + a PK point-lookup for
+  the sensors JOIN — no full scan, no `USE TEMP B-TREE FOR ORDER BY`, and
+  LIMIT n stops the walk at n entries.
+- `ORDER BY e.id DESC` was not adopted: ts is the feed contract (fixed-
+  precision TSLayout makes TEXT order == chronological order), and
+  switching to insertion order buys nothing while weakening that contract.
+
+**Pinned by:** TestEventsFeedSortUsesTSGlobalIndex — asserts the feed query
+plan references idx_events_ts and contains no TEMP B-TREE; dropping the
+index in a future schema refactor turns it red.
+
+## alert-target parse-failure redaction (alerts.go, fuzz_validators_test.go, 2026-11-17)
+**Decision:** alertTarget no longer depends on neturl.Parse succeeding:
+the userinfo strip runs on the RAW string for every input (new
+authorityStart/validScheme helpers locate the authority exactly where
+net/url would), so a target that fails to parse is redacted with the same
+last-'@' boundary as a parseable one. No-authority strings (bare IP,
+hostname) are returned unchanged; '@' in the PATH (no userinfo) is
+preserved.
+**Why:** the old code returned the target VERBATIM when neturl.Parse
+failed, and malformed targets with credentials DO fail Parse — verified:
+backslash in host ("invalid character in host name"), control character
+("invalid control character in URL"), bad percent-escape ("invalid URL
+escape"). Any of them (legacy or hand-edited DB rows; the API write path
+validates new targets) shipped user:pass straight into
+Discord/Telegram/Chat/SMTP cards — the exact leak the function exists to
+prevent. The raw-string cut was already the mechanism (it mirrors
+net/url's authority boundary, including the last-'@' rule), so removing
+the parse gate is behavior-preserving on every parseable input and adds
+redaction only where Parse fails.
+**Pinned by:** FuzzAlertTarget seeds — backslash host, control char, bad
+escape, and scheme-relative parse-failure forms must come back with the
+userinfo stripped; path-only '@' must survive. Sabotage-verified:
+restoring the `err != nil -> return target` gate turns the four
+parse-failure pins red.
+
+## known-good exemption scoped per account (auth.go, auth_test.go, 2026-11-17)
+**Decision:** the loginThrottle knownGood exemption is keyed by
+(username, IP bucket) — `username + "\x00" + ipBucket` (new knownGoodKey
+helper) — instead of IP bucket alone. loginSuccess now takes the username
+(all three call sites: /api/auth/login passes the lowercased userKey, the
+setup-bootstrap path passes strings.ToLower(req.Username), the
+change-password path passes the session user); checkUserLock looks up the
+pair. The per-IP fails/lockout clearing inside loginSuccess stays IP-scoped
+(it is the per-IP layer, which is correctly IP-keyed). The sweep is
+key-agnostic and unchanged.
+**Why:** a successful login by ANY account marked the IP bucket known-good
+for 30 days, exempting that IP from the per-username lockout for ALL
+accounts. On a shared workstation, jump box, or NAT/VPN exit IP, a
+compromised low-privilege session gave its IP a permanent pass to spray
+admin: the cross-IP account lockout — the layer that exists precisely to
+stop a multi-source account spray — was voided for that IP for the whole
+TTL (the per-IP 7/60s budget still applied, but it is a rate cap, not an
+account lockout). Scoping to (account, IP) keeps the original
+self-DoS protection (the operator's own account/IP pair always gets
+through) while a success by another account no longer exempts this one.
+The \x00 separator is collision-free: usernames match
+^[a-zA-Z][a-zA-Z0-9._-]*$ and buckets are dotted/colon address strings,
+so neither side can contain \x00.
+**Pinned by:** TestKnownGoodExemptionScopedPerAccount — an active admin
+lockout + a viewer login from the same IP must NOT exempt admin on that IP
+(the pre-fix keying exempts it, turning the test red), while viewer is
+exempt on its own IP and admin is exempt on its own known-good IP.
+Pre-existing exemption tests updated to the composite key; the
+end-to-end operator self-DoS test now asserts the (admin, IP) entry.
+
+## origin gate fails closed on empty host (api.go, csrf_test.go, 2026-11-17)
+**Decision:** the authGate Origin arm now rejects when u.Host == "" OR
+r.Host == "" (in addition to the parse-error and mismatch cases). A
+present-but-hostless Origin (Origin: null parses with an empty host) must
+never read as equal to a Host-less request.
+**Why:** Origin: null + a Host-less HTTP/1.0 request (legal pre-HTTP/1.1;
+the Go server leaves r.Host empty) made EqualFold("", "") evaluate true
+and pass the gate — a fail-open corner in the check. Practical
+exploitability is low (browsers never send Host-less HTTP/1.0, and
+non-browser clients need no Origin to pass the arm at all), so this is
+fail-closed hygiene rather than a live-vector fix: the gate's contract is
+that an empty host on either side is never a match, and no legitimate
+client sends Origin: null + no Host header, so the extra rejection breaks
+nothing.
+**Pinned by:** TestOriginGateNullOriginEmptyHostRefused — a raw-socket
+HTTP/1.0 POST (no Host header) with Origin: null must 403, while the same
+request without an Origin header must pass (200), proving the 403 comes
+from the Origin arm. The pre-existing TestOriginGateNullOriginRefused
+(Origin: null against a normal Host-bearing request) still pins the
+common case.
+
+## settings-put log sourced from echo (api.go, settings_alert_filter_test.go, 2026-11-17)
+**Decision:** the tail of handleSettingsPut no longer runs three separate
+GetSetting reads (realert_min, alert_scope, alert_filter) solely to format
+the "settings updated" log line. It builds the response echo
+(settingsPayload) first and reads echo["alert_scope"],
+echo["alert_filter"], echo["realert_min"] for the log.
+**Why:** settingsPayload() immediately re-reads those exact keys (plus the
+rest of the payload), so the three pre-log reads were pure redundancy on
+every settings save. Sourcing the log from the echo is also a small
+correctness improvement: the line now shows the VALIDATED/DEFAULTED values
+the alert hot path actually uses (scope "all" when unset, realert clamped
+to 0-1440 with default 30, filter count) instead of raw stored strings an
+out-of-band edit could have left inconsistent (the old log had no range
+check on realert and no default on scope). Behavior change is limited to
+the log line; the response echo is unchanged. In the rare post-commit echo
+read failure the "settings updated" line is no longer printed before the
+500 — the 500 itself is still logged via respondInternal.
+**Pinned by:** TestSettingsPutLogUsesEffectiveValuesFromEcho — seeds the
+degenerate state the write path can never store (out-of-range
+realert_min=9999, unset alert_scope) out-of-band, does a no-op PUT, and
+asserts the captured log line is "scope=all filter=0 realert=30m"; the
+pre-fix raw-read shape logs "scope= ... realert=9999m" and turns it red.
+
+## alertMem + cookie-renewal coverage gaps — REJECTED, decision 2026-11-17
+**Decision:** REJECTED as stale. The finding claims three test-coverage
+gaps; all three are already covered by existing, passing tests.
+**Why:** (1) "no test exercising scheduleAlertRetry while pw.alertMem is
+populated" — TestScheduleAlertRetryBackdatesMemCopy (webhook_retry_test.go)
+does exactly the suggested shape: an initial failed alert seeds alertMem,
+all providers fail (500), and it asserts maybeRealert delivers one retry
+after alertRetryAfter (plus a direct mem-backdate pin and a status guard
+that a recovered sensor is not backdated). (2) "no test exercising
+ResetAlertStates while pw.alertMem is populated" —
+TestResetAlertStatesStampsMemCopy (webhook_retry_test.go) covers it: a
+sensor in error 45m (past the re-alert interval) is Reset, and the first
+sustained-error tick after must NOT re-alert (0 provider hits), with a
+direct mem-stamp pin. Both were added in this batch as the regression pins
+for findings #1 and #2, which are precisely the two bugs the finding says
+"slipped through" — the gap closed the moment those fixes landed. (3)
+"no test verifying CookieRenewalDue when a session approaches the 30-day
+authSessionMaxAge boundary" — TestFix_RenewalCookieCappedByMaxAge
+(session_cookie_slide_test.go) pins the boundary at method level (day-10
+renewal = full TTL; day-29+1h = capped to ≈23h remaining, not the full 7d;
+at/past the cap = no renewal) and at gate level (a day-29 Set-Cookie
+carries Max-Age ≈ 1d with the same token). All three pass under -race
+(verified 2026-11-17). No code or test change; the existing pins are the
+rejection's evidence.
+
+## inline audit-history readability — REJECTED, decision 2026-11-17
+**Decision:** REJECTED as stale/overstated. The finding claims many
+functions in alerts.go/api.go/auth.go carry 15–30 lines of inline audit
+history (review dates, external-review numbers, commit hashes, dead-bug
+post-mortems) that should move to DECISIONS.md. That description does not
+match the current tree.
+**Why:** measured across the three files (~2,650 comment lines total):
+zero references in the cited "review 2026-10-23" format, zero
+"external review #N" references, one commit hash (api.go:1599, a
+single-line pin naming where the clone rune-cap invariant was set — a
+pointer, not a post-mortem), and three 2026 date references, each a 1–2
+line attribution embedded in a 4–5 line comment whose body is an
+INVARIANT explanation (alerts.go:681 why production settings reads are
+fail-loud `*Get` predicates; api.go:1334 why the two large deletes are
+batched — one unbatched DELETE held the WAL write lock and stalled every
+probe loop to the 15s busy_timeout; api.go:1599 why clone truncates by
+runes not bytes). There is no 15–30 line audit block anywhere. The
+codebase already follows the practice the finding asks for: the why-an
+invariant-must-hold rationale stays at the point of use, and the detailed
+post-mortems live in docs/DECISIONS.md (which is where this batch's nine
+decisions were recorded). Stripping the brief attributions would remove
+the in-code pins that stop external reviews re-flagging intentional
+decisions (the standing convention, e.g. the update-check no-gate and
+host-gate pins) for no readability gain. No change.
+
+## static catch-all method guard (api.go, static_serving_test.go, 2026-11-17)
+**Decision:** handleStatic now rejects every method except GET/HEAD with
+405. The / route is a bare ServeMux catch-all, so POST/PUT/DELETE/PATCH
+against any static path (/, /app.js, ...) fell through to the static
+handler and returned 200 with the file contents.
+**Why:** HTTP hygiene, not a security fix — the assets are public and a
+POST serves byte-identical content to a GET, so nothing sensitive is
+exposed. But every other handler in the codebase guards its method, and a
+static file server answering DELETE with 200 is a broken contract for
+proxies, scanners, and anything treating 405 as the "not a resource for
+this method" signal. GET/HEAD are unaffected.
+**Pinned by:** TestStaticMethodNotAllowed — POST/PUT/DELETE/PATCH / and
+DELETE /app.js must 405; GET / and HEAD / must 200.

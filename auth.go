@@ -301,13 +301,19 @@ type AuthState struct {
 		// operator who typos once from two devices doesn't self-lock.
 		userFails map[string][]time.Time
 		userLock  map[string]time.Time
-		// knownGood: IP bucket → last successful login time.
-		// A previously-successful client is EXEMPT from the
+		// knownGood: (username, IP bucket) → last successful login time
+		// for that account from that bucket.
+		// A previously-successful (account, client) pair is EXEMPT from the
 		// per-username lockout, so a single LAN host hammering the account
-		// can't lock the operator out: the operator's own (known-good) IP
-		// always gets through the per-ACCOUNT layer, while a new-IP attacker
-		// is still subject to the hard lockout (and to the per-IP budget,
-		// which the exemption does NOT touch). Bounded by sweepThrottle.
+		// can't lock the operator out: the operator's own (known-good)
+		// account/IP pair always gets through the per-ACCOUNT layer, while
+		// a new-IP attacker is still subject to the hard lockout (and to
+		// the per-IP budget, which the exemption does NOT touch). Scoped
+		// to the account: a success by any OTHER account on the same
+		// shared IP (workstation, jump box, NAT exit) does not exempt
+		// this one — a compromised low-privilege session must not void
+		// the cross-IP account lockout for admin. Bounded by
+		// sweepThrottle.
 		knownGood map[string]time.Time
 		// nextSweep rate-limits the O(n) map GC:
 		// once a multi-IP spray pushes the map past the threshold, every
@@ -1161,17 +1167,29 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 	return true, 0
 }
 
-// loginSuccess clears all failure accounting for ip.
-func (a *AuthState) loginSuccess(ip string) {
+// knownGoodKey keys the knownGood exemption by (username, ip bucket).
+// Usernames match usernameRe (letters, digits, . _ -) and ip buckets are
+// dotted/colon address strings, so neither side can contain \x00 and the
+// pair is collision-free.
+func knownGoodKey(username, ip string) string {
+	return username + "\x00" + ip
+}
+
+// loginSuccess clears all failure accounting for ip and marks
+// (username, ip) as known-good.
+func (a *AuthState) loginSuccess(username, ip string) {
 	a.loginThrottle.Lock()
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	delete(a.loginThrottle.fails, ip)
 	delete(a.loginThrottle.lockout, ip)
-	// Mark this IP bucket known-good: a successful
-	// login is the signal that this is the operator (or a trusted client),
-	// so the per-username lockout must not block them on a later attempt.
-	a.loginThrottle.knownGood[ip] = time.Now()
+	// Mark this (username, IP bucket) pair known-good: a successful
+	// login is the signal that this is the operator (or a trusted
+	// client) for THAT account, so the per-username lockout must not
+	// block them on a later attempt. Scoped to the account — a success
+	// by any other user on the same shared IP must not exempt this one
+	// (see the knownGood field comment).
+	a.loginThrottle.knownGood[knownGoodKey(username, ip)] = time.Now()
 }
 
 // checkUserLock reports whether username is locked out by the per-username
@@ -1181,11 +1199,13 @@ func (a *AuthState) loginSuccess(ip string) {
 // cleared here so the next attempt starts fresh.
 //
 // ipBucket is the request's throttle bucket (throttleKey of the client IP).
-// A bucket that has logged in successfully within knownGoodTTL is EXEMPT from
+// A (username, bucket) pair that has logged in successfully within
+// knownGoodTTL is EXEMPT from
 // the per-username lockout: the per-ACCOUNT layer
 // exists to stop a MULTI-IP botnet, but as a side effect it let a single LAN
 // host lock the operator out — 7 bad guesses for admin → 429 for 5 minutes,
-// even for the CORRECT password. Exempting a previously-successful IP keeps
+// even for the CORRECT password. Exempting a previously-successful
+// account/IP pair keeps
 // the operator's own device always able to get through while a new-IP
 // attacker is still hard-locked. The exemption does NOT touch the per-IP
 // budget (beginAttempt), so a known-good IP is still capped at loginFailMax
@@ -1197,8 +1217,9 @@ func (a *AuthState) checkUserLock(username, ipBucket string) (bool, time.Duratio
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
-	// Known-good IP bucket: exempt from the per-username lockout.
-	if t, ok := a.loginThrottle.knownGood[ipBucket]; ok && now.Sub(t) < knownGoodTTL {
+	// Known-good (username, IP bucket) pair: exempt from the per-username
+	// lockout (see knownGoodKey).
+	if t, ok := a.loginThrottle.knownGood[knownGoodKey(username, ipBucket)]; ok && now.Sub(t) < knownGoodTTL {
 		return true, 0
 	}
 	if until, ok := a.loginThrottle.userLock[username]; ok {
@@ -1707,7 +1728,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusUnauthorized, "invalid username or password")
 		return
 	}
-	s.auth.loginSuccess(key)
+	s.auth.loginSuccess(userKey, key)
 	s.auth.clearUserFail(userKey) // success resets the account's budget
 	s.setAuthCookie(w, r, tok, false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
@@ -1883,7 +1904,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if setup {
-			s.auth.loginSuccess(setupKey) // bootstrap done; clear the bucket
+			s.auth.loginSuccess(strings.ToLower(req.Username), setupKey) // bootstrap done; clear the bucket
 		}
 		respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
 	default:
@@ -2020,7 +2041,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusForbidden, "current password incorrect")
 		return
 	}
-	s.auth.loginSuccess(key)
+	s.auth.loginSuccess(user, key)
 	s.auth.clearUserFail(user) // success resets the account's budget
 
 	keep := ""

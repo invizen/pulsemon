@@ -194,6 +194,26 @@ func FuzzAlertTarget(f *testing.F) {
 	if got := alertTarget("192.168.1.10"); got != "192.168.1.10" {
 		f.Errorf("alertTarget on a bare IP: %q", got)
 	}
+	// Parse-failure fallback: a malformed target (backslash/control char
+	// in the host, bad percent-escape) fails neturl.Parse and must NOT
+	// fall back to verbatim — the userinfo is stripped from the raw
+	// string using the same authority boundary as the parseable path.
+	if got := alertTarget("https://admin:***@nas.lan\\health"); got != "https://nas.lan\\health" {
+		f.Errorf("alertTarget on a backslash-host (parse failure): %q, want the userinfo stripped", got)
+	}
+	if got := alertTarget("https://admin:***@nas.lan/\x00"); got != "https://nas.lan/\x00" {
+		f.Errorf("alertTarget on a control-char target (parse failure): %q, want the userinfo stripped", got)
+	}
+	if got := alertTarget("https://admin:***@nas.lan/%zz"); got != "https://nas.lan/%zz" {
+		f.Errorf("alertTarget on a bad-escape target (parse failure): %q, want the userinfo stripped", got)
+	}
+	if got := alertTarget("//admin:***@nas.lan\\health"); got != "//nas.lan\\health" {
+		f.Errorf("alertTarget on a scheme-relative parse failure: %q, want the userinfo stripped", got)
+	}
+	// '@' only in the PATH (no userinfo) must survive the strip.
+	if got := alertTarget("https://nas.lan/path@with@at"); got != "https://nas.lan/path@with@at" {
+		f.Errorf("alertTarget on a path-only '@': %q, want it unchanged", got)
+	}
 	for _, seed := range []string{
 		"https://admin:secret@nas.lan/health",
 		"https://admin:p@ss@nas.lan/health",

@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"log"
 
 	"encoding/json"
 	"fmt"
@@ -199,5 +201,88 @@ func TestSettingsPutRejectsAllowUnauthWhenAuthOff(t *testing.T) {
 	}
 	if v := db.GetSetting("allow_unauth_update"); v != "0" {
 		t.Errorf("allow_unauth_update = %q after auth-on false PUT, want 0", v)
+	}
+}
+
+// TestSettingsPutAllowUnauthLiveUserCountInTx pins the in-tx user-count
+// re-check: the pre-flight guard reads s.auth.Enabled(), a 2s-TTL cache, so
+// an out-of-band `pulsemon auth-user remove` of the LAST account (a direct
+// DB delete that does not call refreshEnabledNow) stays invisible to it for
+// up to 2s. In that stale-true window auth is effectively off and
+// requireAuth stands down — without the in-tx count the PUT would persist
+// the unauth-update privilege unauthenticated. The count runs under the
+// settings write-lock pin, so it is the authoritative gate for the write.
+func TestSettingsPutAllowUnauthLiveUserCountInTx(t *testing.T) {
+	srv, db := fixServerWithDB(t)
+
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(body))
+		rr := httptest.NewRecorder()
+		srv.handleSettingsPut(rr, req)
+		return rr
+	}
+
+	// Seed the Enabled() cache as TRUE with a live account.
+	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatalf("AddUser: %v", err)
+	}
+	if !srv.auth.Enabled() {
+		t.Fatal("precondition: Enabled() = false after AddUser, want true (cache seeded)")
+	}
+
+	// Out-of-band removal of the last account (the auth-user remove path:
+	// direct DB delete, NO refreshEnabledNow) — the cache stays true for up
+	// to enabledTTL. This is the TOCTOU window.
+	if _, err := db.Exec(`DELETE FROM users`); err != nil {
+		t.Fatalf("delete last user: %v", err)
+	}
+	if n, _ := db.UserCount(); n != 0 {
+		t.Fatalf("precondition: UserCount = %d, want 0", n)
+	}
+	if !srv.auth.Enabled() {
+		t.Fatal("precondition: Enabled() cache must be stale-true here (the TOCTOU window)")
+	}
+
+	// The toggle must be refused by the LIVE in-tx count, not the stale
+	// cache, and nothing may be written.
+	if rr := put(`{"allow_unauth_update": true}`); rr.Code != http.StatusForbidden {
+		t.Fatalf("PUT allow_unauth_update with stale-true Enabled() cache: %d, want 403: %s", rr.Code, rr.Body.String())
+	}
+	if v := db.GetSetting("allow_unauth_update"); v != "" {
+		t.Errorf("allow_unauth_update = %q after a 403 PUT, want empty (nothing written)", v)
+	}
+}
+
+// TestSettingsPutLogUsesEffectiveValuesFromEcho (2026-11-17 external review
+// #8) pins the tail of handleSettingsPut: the "settings updated" log line is
+// sourced from the response echo (settingsPayload) instead of three
+// redundant GetSetting re-reads of the exact keys settingsPayload() just
+// read. The observable contract: the log shows the VALIDATED/DEFAULTED
+// values the alert hot path will use, not the raw stored strings. Seed a
+// degenerate state the write path can never produce (out-of-range
+// realert_min=9999, unset alert_scope) out-of-band, then a no-op PUT must
+// log scope=all (defaulted) and realert=30m (clamped to default) — the
+// old raw-read shape logged "scope= ... realert=9999m".
+func TestSettingsPutLogUsesEffectiveValuesFromEcho(t *testing.T) {
+	db := newTestDB(t)
+	_ = db.SetSetting("realert_min", "9999") // out-of-range; the PUT 400s this, so only an out-of-band edit leaves it
+	srv := NewServer(db, NewProbeWorker(db))
+
+	// Capture the standard logger for the duration of this (deliberately
+	// non-parallel) test; a contains-assertion tolerates unrelated lines.
+	var logBuf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prev)
+
+	req := httptest.NewRequest("PUT", "/api/settings", strings.NewReader(`{}`))
+	rr := httptest.NewRecorder()
+	srv.handleSettingsPut(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("no-op settings PUT: got %d, want 200: %s", rr.Code, rr.Body.String())
+	}
+	want := "API: settings updated (scope=all filter=0 realert=30m)"
+	if !strings.Contains(logBuf.String(), want) {
+		t.Fatalf("log missing the effective-values line %q; got:\n%s", want, logBuf.String())
 	}
 }

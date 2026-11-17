@@ -182,3 +182,120 @@ func TestFix_M9_FailedErrorAlertSchedulesRetry(t *testing.T) {
 		}
 	})
 }
+
+// TestScheduleAlertRetryBackdatesMemCopy pins the write-through: the
+// in-memory alert-state copy is backdated WITH the alert_state row.
+// maybeRealert reads alertMem first and the entry is ALWAYS present on the
+// sustained-error path (the initial alert seeded it), so a DB-only backdate
+// is invisible and the ~1-minute all-providers-failed retry never fires.
+func TestScheduleAlertRetryBackdatesMemCopy(t *testing.T) {
+	withPlainTransport(t, func() {
+		old := alertRetryDelays
+		alertRetryDelays = nil
+		defer func() { alertRetryDelays = old }()
+		oldAfter := alertRetryAfter
+		alertRetryAfter = 50 * time.Millisecond
+		defer func() { alertRetryAfter = oldAfter }()
+		db := fcDB(t)
+		fcSensor(t, db, "s", "s", "active")
+		var hits atomic.Int32
+		bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(500)
+		}))
+		defer bad.Close()
+		fcProviders(t, db, map[string]string{"discord": bad.URL})
+		pw := NewProbeWorker(db)
+
+		// Initial alert fails (provider 500) -> retry scheduled.
+		pw.setAlertState("s", "error", time.Now().UTC())
+		if pw.sendAlert("s", "s", "t", "up", "error", 0) {
+			t.Fatal("delivery must fail")
+		}
+		pw.scheduleAlertRetry("s", "error")
+
+		// Direct pin: the mem copy is backdated, not just the DB row.
+		pw.alertMemMu.Lock()
+		mem, ok := pw.alertMem["s"]
+		pw.alertMemMu.Unlock()
+		if !ok {
+			t.Fatal("alertMem entry missing after setAlertState")
+		}
+		if age := time.Since(mem.ts); age < 25*time.Minute {
+			t.Fatalf("alertMem ts only %v old; the mem copy must be backdated with the DB row", age)
+		}
+
+		// End-to-end pin: once ~alertRetryAfter has elapsed, the sustained
+		// error tick retries. (Old shape: mem ts un-backdated -> no retry
+		// delivery.)
+		base := hits.Load()
+		time.Sleep(100 * time.Millisecond)
+		c := sensorConfig{id: "s", name: "s", target: "t"}
+		pw.maybeRealert(c, "error", 0)
+		pw.DrainAlerts(5 * time.Second)
+		if hits.Load() != base+1 {
+			t.Fatalf("sustained-error tick after failed delivery: %d provider hits, want %d (the ~1m retry)", hits.Load(), base+1)
+		}
+
+		// Status guard: a recovered sensor's mem entry is not backdated.
+		pw.setAlertState("s", "up", time.Now().UTC())
+		pw.scheduleAlertRetry("s", "error")
+		pw.alertMemMu.Lock()
+		memUp, _ := pw.alertMem["s"]
+		pw.alertMemMu.Unlock()
+		if time.Since(memUp.ts) > time.Minute {
+			t.Fatal("scheduleAlertRetry backdated a mem entry whose status no longer matches")
+		}
+	})
+}
+
+// TestResetAlertStatesStampsMemCopy pins the maintenance-exit suppression
+// contract: ResetAlertStates stamps the in-memory alert-state copies WITH
+// the alert_state rows. Maintenance pauses every sensor (no probe ticks, no
+// setAlertState refresh), so a sensor in error longer than the re-alert
+// interval keeps a stale mem.ts through the window; without the
+// write-through the first post-maintenance tick re-alerts immediately.
+func TestResetAlertStatesStampsMemCopy(t *testing.T) {
+	withPlainTransport(t, func() {
+		old := alertRetryDelays
+		alertRetryDelays = nil
+		defer func() { alertRetryDelays = old }()
+		db := fcDB(t)
+		fcSensor(t, db, "s", "s", "active")
+		var hits atomic.Int32
+		bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits.Add(1)
+			w.WriteHeader(500)
+		}))
+		defer bad.Close()
+		fcProviders(t, db, map[string]string{"discord": bad.URL})
+		pw := NewProbeWorker(db)
+
+		// In error 45m (past the 30-min interval), then maintenance
+		// pauses it — no ticks to refresh the mem copy.
+		pw.setAlertState("s", "error", time.Now().UTC().Add(-45*time.Minute))
+		pw.ResetAlertStates()
+
+		// Direct pin: the mem copy is stamped to now, not 45m stale.
+		pw.alertMemMu.Lock()
+		mem, ok := pw.alertMem["s"]
+		pw.alertMemMu.Unlock()
+		if !ok {
+			t.Fatal("alertMem entry missing after setAlertState")
+		}
+		if age := time.Since(mem.ts); age > time.Minute {
+			t.Fatalf("alertMem ts %v old after ResetAlertStates; the mem copy must be stamped with the DB row", age)
+		}
+
+		// End-to-end pin: the first sustained-error tick after leaving
+		// maintenance must NOT re-alert. (Old shape: stale mem ts ->
+		// immediate re-alert.)
+		base := hits.Load()
+		c := sensorConfig{id: "s", name: "s", target: "t"}
+		pw.maybeRealert(c, "error", 0)
+		pw.DrainAlerts(5 * time.Second)
+		if hits.Load() != base {
+			t.Fatalf("first tick after maintenance: %d provider hits, want 0 (ResetAlertStates must suppress the immediate re-alert)", hits.Load()-base)
+		}
+	})
+}

@@ -326,7 +326,16 @@ func (s *Server) authGate() http.Handler {
 			}
 			if orig := r.Header.Get("Origin"); orig != "" {
 				u, err := url.Parse(orig)
-				if err != nil || !strings.EqualFold(u.Host, r.Host) {
+				// Fail closed on an empty host on EITHER side: Origin: null
+				// parses with u.Host == "", and an HTTP/1.0 request with no
+				// Host header (legal pre-HTTP/1.1) leaves r.Host == "".
+				// Without this, EqualFold("", "") reads the degenerate
+				// both-empty case as a MATCH. No browser sends Host-less
+				// HTTP/1.0, and a non-browser client needs no Origin to
+				// pass (the arm is skipped when Origin is absent), so
+				// rejecting it breaks nothing — the gate must never treat
+				// "no origin host" as equal to "no request host".
+				if err != nil || u.Host == "" || r.Host == "" || !strings.EqualFold(u.Host, r.Host) {
 					respondWithError(w, http.StatusForbidden, "cross-origin request blocked")
 					return
 				}
@@ -2079,7 +2088,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// /api/update. The stored VALUE is untouched — an
 	// install that already has it on keeps working; only the CHANGE is gated.
 	// A save that does NOT send the field (the general "save alerts" flow) is
-	// unaffected.
+	// unaffected. The in-tx user-count re-check below covers this guard's
+	// Enabled() cache staleness window (out-of-band last-account removal).
 	if req.AllowUnauth != nil && !s.auth.Enabled() {
 		respondWithError(w, http.StatusForbidden, "allow_unauth_update can only be changed while authentication is enabled")
 		return
@@ -2291,6 +2301,22 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if req.AllowUnauth != nil {
+		// In-tx re-check: the pre-flight guard's s.auth.Enabled() is a
+		// 2s-TTL cache — an out-of-band last-account removal stays
+		// invisible to it (stale true), and with 0 users requireAuth
+		// stands down, so the stale window would accept an
+		// unauthenticated change of the unauth-update privilege. The
+		// count under the write-lock pin is the authoritative gate for
+		// the write (a concurrent removal serializes behind the pin).
+		var userCount int
+		if err := tx.QueryRowContext(r.Context(), "SELECT COUNT(*) FROM users").Scan(&userCount); err != nil {
+			respondInternal(w, "check user count", err)
+			return
+		}
+		if userCount == 0 {
+			respondWithError(w, http.StatusForbidden, "allow_unauth_update can only be changed while authentication is enabled")
+			return
+		}
 		val := "0"
 		if *req.AllowUnauth {
 			val = "1"
@@ -2381,23 +2407,6 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	// (The alert settings snapshot was already reloaded by the defer after
 	// the settings tx committed — see there.)
-	realertLog := 30
-	if v := s.db.GetSetting("realert_min"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			realertLog = n
-		}
-	}
-	// Log the EFFECTIVE stored values (the request fields are pointers now:
-	// a partial save leaves the others untouched).
-	scopeLog := s.db.GetSetting("alert_scope")
-	filterLog := 0
-	if v := s.db.GetSetting("alert_filter"); v != "" {
-		var fl []string
-		if json.Unmarshal([]byte(v), &fl) == nil {
-			filterLog = len(fl)
-		}
-	}
-	log.Printf("API: settings updated (scope=%s filter=%d realert=%dm)", scopeLog, filterLog, realertLog)
 	echo, err := s.settingsPayload()
 	if err != nil {
 		// The save committed; only the read-back echo failed. Say so with
@@ -2406,6 +2415,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "settings echo", err)
 		return
 	}
+	// Log the EFFECTIVE stored values from the echo (the request fields are
+	// pointers: a partial save leaves the others untouched). Sourcing the
+	// log from echo drops three redundant GetSetting re-reads —
+	// settingsPayload() just read those exact keys — and logs the
+	// validated/defaulted values (scope "all", realert 0-1440 default 30,
+	// filter count) the alert hot path will actually use, instead of raw
+	// stored strings an out-of-band edit could have left inconsistent.
+	scopeLog, _ := echo["alert_scope"].(string)
+	filterLog, _ := echo["alert_filter"].([]string)
+	realertLog, _ := echo["realert_min"].(int)
+	log.Printf("API: settings updated (scope=%s filter=%d realert=%dm)", scopeLog, len(filterLog), realertLog)
 	respondWithJSON(w, http.StatusOK, echo)
 }
 
@@ -2801,6 +2821,10 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
 	path := r.URL.Path
 	if path == "/" {
 		path = "/index.html"
