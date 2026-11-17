@@ -1740,3 +1740,27 @@ proxies, scanners, and anything treating 405 as the "not a resource for
 this method" signal. GET/HEAD are unaffected.
 **Pinned by:** TestStaticMethodNotAllowed — POST/PUT/DELETE/PATCH / and
 DELETE /app.js must 405; GET / and HEAD / must 200.
+
+## sync-reconcile-scale (probe.go `syncSensors`, 2026-11-17)
+**Decision:** `syncSensors` keeps its unconditional full reconcile
+(every sensor row + batched tag query) on every 5s tick. NO cheap
+pre-check is added at this time; this entry records the scaling ceiling
+and the exact fix to apply when it matters (external review 2026-11-17
+m5).
+**Why:** at homelab scale (tens of sensors) the pass is microseconds —
+two indexed SELECTs on a table the app already reads constantly — and
+the `sync-sensors-generation` design (2026-11-05) already removed the
+DB reads from under `pw.mu`, so the pass cannot stall the fleet. A
+pre-check only pays off when the table is large enough that the full
+pass is measurable, which is not this project's scale.
+**The ceiling (when to revisit):** if the project ever targets 1000+
+sensors, the fix is a single-row pre-check —
+`SELECT COUNT(*), MAX(updated_at) FROM sensors` — run BEFORE the full
+pass; skip the pass when the (count, max_updated_at) fingerprint is
+unchanged AND no `syncReq` is pending. COUNT (not just MAX) is
+required: a DELETE lowers no max. It requires (a) an additive
+`updated_at` column migration on `sensors` and (b) stamping it on EVERY
+write path — POST/PATCH/clone/state-patch AND `doProbe`'s hot-path
+`UPDATE sensors SET status` (a status flip is the most frequent
+write; it need not force a re-sync, it only costs one extra pass).
+Until then: no code change, no migration.

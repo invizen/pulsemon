@@ -92,7 +92,12 @@ async function refreshAdminState() {
     const users = await api('/api/auth/users');
     const me = (users || []).find(u => u.username === authState.user);
     meIsAdmin = !!(me && me.is_admin);
-  } catch { meIsAdmin = true; }
+  } catch {
+    // Fail CLOSED (review 2026-11-17 m2): the server is the authority on
+    // admin-ness (requireAdmin 403s the same surface), so a failed fetch
+    // hides the admin UI until the next poll succeeds — never the reverse.
+    meIsAdmin = false;
+  }
   applyAdminVisibility();
   // Re-render: the per-sensor mutation buttons (edit/clone/delete/pause)
   // are built in cardHtml()/renderTable() from meIsAdmin, so the grid
@@ -1015,8 +1020,11 @@ async function startUpdate() {
 }
 
 // Full-screen status shown while the service restarts (or when the wait times
-// out). kind: 'work' (spinner) | 'error'.
-function updateOverlay(kind, title, sub) {
+// out). kind: 'work' (spinner) | 'error'. subRaw (review 2026-11-17 m3):
+// when true, `sub` is inserted as-is — reserved for trusted, operator-
+// authored constant strings that need markup (the <b> journalctl hints);
+// every other caller keeps the esc() path.
+function updateOverlay(kind, title, sub, subRaw) {
   let ov = $('update-overlay');
   if (!ov) {
     ov = document.createElement('div');
@@ -1030,7 +1038,7 @@ function updateOverlay(kind, title, sub) {
     '<div class="flex flex-col items-center gap-3 text-center px-6">' +
       '<i class="' + icon + ' text-4xl ' + color + '"></i>' +
       '<div class="text-[15px] font-semibold text-slate-100">' + esc(title) + '</div>' +
-      (sub ? '<div class="text-[12px] font-mono text-slate-400 max-w-[460px] leading-relaxed">' + esc(sub) + '</div>' : '') +
+      (sub ? '<div class="text-[12px] font-mono text-slate-400 max-w-[460px] leading-relaxed">' + (subRaw ? sub : esc(sub)) + '</div>' : '') +
     '</div>';
 }
 function hideUpdateOverlay() { const ov = $('update-overlay'); if (ov) ov.remove(); }
@@ -1052,7 +1060,7 @@ async function waitForUpdateRestart(target) {
     }
     if (Date.now() > deadline) {
       updateOverlay('error', 'Timed out waiting for ' + target,
-        'The new binary is installed, but healthz has not confirmed it yet. On the host: <b>journalctl --user -u pulsemon</b> (system-wide: <b>journalctl -u pulsemon</b>). If it failed to start, restore the previous binary and restart the service.');
+        'The new binary is installed, but healthz has not confirmed it yet. On the host: <b>journalctl --user -u pulsemon</b> (system-wide: <b>journalctl -u pulsemon</b>). If it failed to start, restore the previous binary and restart the service.', true);
       return;
     }
   }
