@@ -1440,14 +1440,19 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 				// (transitions are sparse; nothing mirrors a tail).
 				var res sql.Result
 				var err error
-				if table == "probes" {
-					res, err = pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
-					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ?
-					AND id NOT IN (SELECT id FROM `+table+` WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?)
+				// Literal table name per branch (no string concat): the two
+				// queries differ only in the probes tail-exemption, and a
+				// `switch` on literals is what static analyzers expect when
+				// a table name appears inside a statement.
+				switch table {
+				case "probes":
+					res, err = pw.db.ExecContext(ctx, `DELETE FROM probes WHERE id IN (
+					SELECT id FROM probes WHERE sensor_id = ? AND ts < ?
+					AND id NOT IN (SELECT id FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?)
 					LIMIT ?)`, id, cutoff, id, seriesTailProbes, purgeBatchSize)
-				} else {
-					res, err = pw.db.ExecContext(ctx, `DELETE FROM `+table+` WHERE id IN (
-					SELECT id FROM `+table+` WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
+				case "events":
+					res, err = pw.db.ExecContext(ctx, `DELETE FROM events WHERE id IN (
+					SELECT id FROM events WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
 				}
 				if err != nil {
 					log.Printf("retention: failed to purge %s for sensor %s: %v", table, id, err)
