@@ -111,6 +111,23 @@ const (
 	// an online attacker gets at most ~5 guesses/second per IP.
 	loginSlowDown = 200 * time.Millisecond
 
+	// loginHourFailMax / loginHourWindow / loginHourLockout are a SECOND,
+	// SLOWER per-username limit alongside the 60s rolling budget above. The
+	// rolling window only catches bursts: an attacker pacing 6 guesses/minute
+	// stays under loginFailMax/60s forever (~8.6k guesses/day/account), so the
+	// rolling layer alone is not a password-cracking deterrent. The hourly
+	// budget caps a single account's total failed checks at loginHourFailMax
+	// per loginHourWindow, then locks the account for loginHourLockout. It
+	// PERSISTS across the 5-min rolling lockouts (a rolling expiry wipes
+	// userFails, not userHour), so 7-fail bursts every 6 min (~70/hr) can't
+	// outrun the 30/hr cap. The operator is unaffected: their known-good
+	// (account, IP) pair is exempt from the whole per-username layer
+	// (checkUserLock), and any successful login clears the budget
+	// (clearUserFail).
+	loginHourFailMax = 30
+	loginHourWindow  = time.Hour
+	loginHourLockout = time.Hour
+
 	// knownGoodTTL bounds how long a previously-successful IP bucket stays
 	// exempt from the per-username lockout. It matches the session's ABSOLUTE
 	// cap (authSessionMaxAge), not the sliding idle TTL: a session can stay
@@ -301,6 +318,15 @@ type AuthState struct {
 		// operator who typos once from two devices doesn't self-lock.
 		userFails map[string][]time.Time
 		userLock  map[string]time.Time
+		// userHour: the per-username HOURLY budget (loginHourFailMax). The
+		// rolling userFails window only catches bursts; userHour caps the
+		// account's total failed checks per hour so a paced multi-IP attack
+		// can't stay under the 60s threshold indefinitely. It PERSISTS across
+		// rolling lockouts (a rolling expiry wipes userFails, not userHour)
+		// and self-resets by wall clock once the window elapses. Bounded by
+		// account count — recordUserFail only counts EXISTING users — so it
+		// never grows unboundedly and needs no sweep of its own.
+		userHour map[string]*userHourBudget
 		// knownGood: (username, IP bucket) → last successful login time
 		// for that account from that bucket.
 		// A previously-successful (account, client) pair is EXEMPT from the
@@ -509,6 +535,12 @@ var (
 	// (ErrPasswordTooLong) — pre-check it so create maps to a 400 instead of
 	// a 500 and change-password returns our text, not the library's
 	errPasswordTooLong = fmt.Errorf("password exceeds 72 bytes")
+	// errPasswordCommon: the password is one of the most common passwords
+	// (see isCommonPassword). Rejected at creation so an internet-reachable
+	// install can't be a free password-cracking target — the 8-char minimum
+	// alone still admits "password" and "qwerty123", the first entries of any
+	// cracking list. Maps to a 400 (a client error, not a 500).
+	errPasswordCommon = fmt.Errorf("password is too common — choose one not in the most-used passwords list")
 	// errUserExists is the ONLY db error AddUser maps to a user-facing
 	// message; every other db failure propagates as a raw error so the
 	// handler can 500 it (respondInternal) instead of misreporting it as
@@ -570,6 +602,16 @@ func (a *AuthState) AddUserMode(ctx context.Context, username, password string, 
 	}
 	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
+	}
+	// Reject the most common passwords at creation: the 8-char minimum alone
+	// still admits "password" and "qwerty123", the first entries of any
+	// cracking list. A set lookup (isCommonPassword) — cheap, before the
+	// bcrypt KDF, so it costs the unauthenticated setup surface nothing. The
+	// operator can always pick a password outside the list (it's the top-N
+	// offenders, not all of password space); the hourly login budget is the
+	// binding runtime cap for accounts that do exist.
+	if isCommonPassword(password) {
+		return errPasswordCommon
 	}
 	if setupMode {
 		// Cheap pre-check BEFORE paying bcrypt: setup mode is
@@ -1052,6 +1094,15 @@ func throttleKey(ip string) string {
 	return p.Mask(net.CIDRMask(64, 128)).String()
 }
 
+// userHourBudget is one account's slow (hourly) failed-login budget: the
+// window anchor (start) and the failed-check count since it opened. A fail
+// at/after start+loginHourWindow re-anchors the window (count resets to 0),
+// so the budget is a rolling 1-hour total, not a fixed clock-aligned hour.
+type userHourBudget struct {
+	start time.Time
+	count int
+}
+
 // ensureThrottleMaps lazily initializes the throttle maps (cheap, idempotent).
 func (a *AuthState) ensureThrottleMaps() {
 	if a.loginThrottle.fails == nil {
@@ -1065,6 +1116,9 @@ func (a *AuthState) ensureThrottleMaps() {
 	}
 	if a.loginThrottle.userLock == nil {
 		a.loginThrottle.userLock = map[string]time.Time{}
+	}
+	if a.loginThrottle.userHour == nil {
+		a.loginThrottle.userHour = map[string]*userHourBudget{}
 	}
 	if a.loginThrottle.knownGood == nil {
 		a.loginThrottle.knownGood = map[string]time.Time{}
@@ -1135,6 +1189,9 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 			// so the wipe is all-or-nothing.
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
+			// userHour shares the same fail-open bound (bounded by account
+			// count in practice, but the wipe is all-or-nothing).
+			a.loginThrottle.userHour = map[string]*userHourBudget{}
 			// knownGood shares the same fail-open bound:
 			// a wide spray that grows the maps past the
 			// cap resets ALL throttle state, so the wipe is all-or-nothing.
@@ -1243,6 +1300,7 @@ func (a *AuthState) recordUserFail(username string) {
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
 	now := time.Now()
+	// Fast layer: the rolling 60s window (unchanged).
 	cutoff := now.Add(-loginFailWindow)
 	fails := a.loginThrottle.userFails[username]
 	kept := fails[:0]
@@ -1253,7 +1311,28 @@ func (a *AuthState) recordUserFail(username string) {
 	}
 	kept = append(kept, now)
 	a.loginThrottle.userFails[username] = kept
-	if len(kept) >= loginFailMax {
+	// Slow layer: the hourly budget. It PERSISTS across rolling lockouts —
+	// checkUserLock's expiry wipes userFails (the rolling window) but NOT
+	// userHour, so a 7-fails/60s → 5-min burst repeated every 6 min (~70/hr)
+	// can't outrun the 30/hr cap. The window re-anchors by wall clock; >=
+	// (not >) so the budget is already reset the instant a 1h lockout lifts,
+	// never re-locking the account on the very next fail.
+	b := a.loginThrottle.userHour[username]
+	if b == nil {
+		b = &userHourBudget{}
+		a.loginThrottle.userHour[username] = b
+	}
+	if now.Sub(b.start) >= loginHourWindow {
+		b.start, b.count = now, 0
+	}
+	b.count++
+	// The hourly budget is the binding cap, so it outranks the rolling
+	// threshold: a paced attack that never trips 7/60s still locks at 30/hr.
+	// A rolling trip while UNDER the hourly cap takes the shorter 5-min
+	// lockout (the hourly counter keeps climbing in the background).
+	if b.count >= loginHourFailMax {
+		a.loginThrottle.userLock[username] = now.Add(loginHourLockout)
+	} else if len(kept) >= loginFailMax {
 		a.loginThrottle.userLock[username] = now.Add(loginLockout)
 	}
 }
@@ -1265,6 +1344,7 @@ func (a *AuthState) clearUserFail(username string) {
 	defer a.loginThrottle.Unlock()
 	delete(a.loginThrottle.userFails, username)
 	delete(a.loginThrottle.userLock, username)
+	delete(a.loginThrottle.userHour, username)
 }
 
 // refundAttempt releases ONE counted admission (the timestamp
@@ -1881,7 +1961,8 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 				// BEFORE bcrypt. (The in-tx bootstrap race loss DID pay
 				// the KDF — it is deliberately not refunded.)
 				if errors.Is(err, errBootstrappedEarly) || errors.Is(err, errUsernameInvalid) ||
-					errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
+					errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
+					errors.Is(err, errPasswordCommon) {
 					s.auth.refundAttempt(setupKey)
 				}
 			}
@@ -1892,7 +1973,8 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			// bootstrap race is a 409: the winner's account already
 			// exists.
 			if errors.Is(err, errUserExists) || errors.Is(err, errUsernameInvalid) ||
-				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
+				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
+				errors.Is(err, errPasswordCommon) {
 				respondWithError(w, http.StatusBadRequest, err.Error())
 				return
 			}

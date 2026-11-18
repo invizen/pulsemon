@@ -1,0 +1,142 @@
+package main
+
+import "strings"
+
+// isCommonPassword reports whether pw is one of the most common passwords,
+// case-insensitively. AddUserMode rejects these at account creation so an
+// internet-reachable install can't be a free password-cracking target: the
+// 8-char minimum alone still admits the first entries of any cracking list
+// ("password", "qwerty123", "12345678"). The lookup is a set, so its cost is
+// independent of list length and it runs BEFORE the bcrypt KDF.
+//
+// The list is the top-N most-frequent passwords from public breach corpora
+// (RockYou / Have-I-Been-Pwned frequency rankings) — small enough to embed,
+// covering the passwords that account for the large majority of real-world
+// credential attacks. It is a creation-time DETERRENT, not the security
+// boundary: the hourly login budget (auth.go: loginHourFailMax) is the
+// binding runtime cap. Extend commonPasswords to add entries.
+func isCommonPassword(pw string) bool {
+	return commonPasswords[strings.ToLower(pw)]
+}
+
+// commonPasswords: the most common passwords (lowercased). Curated top
+// offenders from public frequency lists (RockYou / HIBP); not exhaustive by
+// design — it's a deterrent against the passwords attackers try first.
+var commonPasswords = map[string]bool{
+	// numeric sequences
+	"000000": true, "111111": true, "121212": true, "123123": true,
+	"123321": true, "1234": true, "12345": true, "123450": true,
+	"123456": true, "1234567": true, "12345678": true, "123456789": true,
+	"1234567890": true, "12345q": true, "12345qwe": true, "12345t": true,
+	"1234qwe": true, "1234qwer": true, "123456a": true, "123456aa": true,
+	"123abc": true, "123qwe": true, "12qwaszx": true, "1q2w3e": true,
+	"1q2w3e4r": true, "1q2w3e4r5t": true, "1qaz2wsx": true,
+	"1qaz2wsx3edc": true, "1qazxsw2": true, "228844": true, "232323": true,
+	"252525": true, "332211": true, "443322": true, "555555": true,
+	"55555555": true, "654321": true, "654321654321": true, "666666": true,
+	"696969": true, "69696969": true, "777777": true, "77777777": true,
+	"8675309": true, "888888": true, "88888888": true, "987654": true,
+	"987654321": true, "9876543210": true, "999999": true, "99999999": true,
+	// keyboard patterns
+	"abc123": true, "abc1234": true, "abc12345": true, "abc123456": true,
+	"abcd1234": true, "abcde": true, "abcdef": true, "abcdefg": true,
+	"abcdef123456": true, "abcdefg123": true, "adgjmptw": true, "asdasd": true,
+	"asdf": true, "asdf1234": true, "asdfgh": true, "asdfghj": true,
+	"asdfghjk": true, "asdfghjkl": true, "asdfjkl": true, "asdzxc": true,
+	"azerty": true, "azertyuiop": true, "q1w2e3r4": true, "q1w2e3r4t5": true,
+	"qwerty": true, "qwerty1": true, "qwerty12": true, "qwerty123": true,
+	"qwerty1234": true, "qwerty12345": true, "qwerty123456": true,
+	"qwertyuiop": true, "qwe123": true, "qweasd": true, "qwer": true,
+	"qwer1234": true, "qweqwe": true, "zaq12wsx": true, "zxcvbn": true,
+	"zxcvbnm": true, "zxcvbnm1": true, "zxcvbnm123": true, "zzz111": true,
+	"zzzzzz": true,
+	// words + digits
+	"admin": true, "admin123": true, "a123456": true, "batman": true,
+	"batman1": true, "batman123": true, "baseball": true, "baseball1": true,
+	"baseball123": true, "bigdog": true, "blue2000": true, "blue4711": true,
+	"blue55": true, "blue999": true, "bluesky": true, "bond007": true,
+	"butterfly": true, "butterfly1": true, "butterfly123": true,
+	"calvin1990": true, "charlie1": true, "chicken": true, "chicken1": true,
+	"chocolate": true, "chocolate1": true, "chris123": true, "clifford": true,
+	"computer": true, "computer1": true, "computer123": true, "cookie": true,
+	"cool123": true, "dolphin": true, "dolphin1": true, "dolphin123": true,
+	"dragon": true, "dragon1": true, "dragon123": true, "eagle123": true,
+	"elephant": true, "flower": true, "flower1": true, "flower123": true,
+	"football": true, "football1": true, "football123": true,
+	"freedom": true, "freedom1": true, "ginger": true, "ginger1": true,
+	"golf": true, "golf1": true, "gunner": true, "gunner1": true,
+	"gunner123": true, "hello": true, "hello1": true, "hello123": true,
+	"hello1234": true, "hunter": true, "hunter2": true, "hunter123": true,
+	"iloveyou": true, "iloveyou1": true, "iloveyou123": true, "jordan23": true,
+	"killer": true, "killer1": true, "killer123": true, "kissme": true,
+	"kitty": true, "kitty123": true, "letmein": true, "letmein1": true,
+	"letmein123": true, "letmeinnow": true, "master": true, "master1": true,
+	"master123": true, "matrix": true, "matrix1": true, "matrix123": true,
+	"merlin": true, "merlin1": true, "merlin123": true, "michael123": true,
+	"michelle": true, "michelle1": true, "michelle123": true, "mike1234": true,
+	"minnie": true, "minnie123": true, "money": true, "money1": true,
+	"money123": true, "monkey": true, "monkey1": true, "monkey123": true,
+	"monster": true, "monster1": true, "monster123": true, "mustang": true,
+	"mustang1": true, "mustang123": true, "ncc1701": true, "ncc1701d": true,
+	"ninja": true, "ninja1": true, "ninja123": true, "nirvana": true,
+	"nirvana1": true, "nirvana123": true, "packard": true,
+	"panther": true, "panther1": true, "panther123": true, "panthers": true,
+	"panthers1": true, "password": true, "password1": true,
+	"password123": true, "password1234": true, "password2": true,
+	"password2000": true, "password99": true, "peaches": true, "peanut": true,
+	"pepper": true, "pepper1": true, "pepper123": true, "phoenix": true,
+	"phoenix1": true, "phoenix123": true, "pokemon": true, "pony": true,
+	"pony123": true, "porsche": true, "power": true, "power1": true,
+	"power123": true, "princess": true, "princess1": true, "princess123": true,
+	"purple": true, "purple1": true, "purple123": true, "rainbow": true,
+	"rainbow1": true, "rainbow123": true, "rangers": true, "rangers1": true,
+	"rangers123": true, "redsox": true, "redsox1": true, "redsox123": true,
+	"rocket": true, "rocket1": true, "rocket123": true, "rocky": true,
+	"rocky1": true, "rocky123": true, "rosebud": true, "samsung": true,
+	"samsung1": true, "samsung123": true, "sapphire": true, "scarface": true,
+	"scott123": true, "shadow": true, "shadow1": true, "shadow123": true,
+	"shaman": true, "shark": true, "shark1": true, "shark123": true,
+	"sheep": true, "sheep123": true, "shell": true, "shell123": true,
+	"shooter": true, "shooter1": true, "shooter123": true, "sierra": true,
+	"sierra1": true, "sierra123": true, "silicon": true, "silver": true,
+	"silver1": true, "silver123": true, "slayer": true, "slayer1": true,
+	"slayer123": true, "snowball": true, "snowflake": true, "snoopy": true,
+	"snoopy1": true, "snoopy123": true, "sonic": true, "sonic1": true,
+	"sonic123": true, "soccer": true, "soccer1": true, "soccer123": true,
+	"spider": true, "spider1": true, "spider123": true, "spiderman": true,
+	"spiderman1": true, "spiderman123": true, "spike": true, "spike1": true,
+	"spike123": true, "spongebob": true, "spring": true, "spring1": true,
+	"spring123": true, "star": true, "star1": true, "star123": true,
+	"starwars": true, "starwars1": true, "starwars123": true, "steelers": true,
+	"steve123": true, "sting": true, "sting1": true, "sting123": true,
+	"storm": true, "storm1": true, "storm123": true, "strawberry": true,
+	"super": true, "super1": true, "super123": true, "superman": true,
+	"superman1": true, "superman123": true, "sweet": true, "sweet1": true,
+	"sweet123": true, "sweetheart": true, "swimming": true, "tennis": true,
+	"thumper": true, "thumper1": true, "thumper123": true, "tiger": true,
+	"tiger1": true, "tiger123": true, "tiger23": true, "tiger99": true,
+	"tigers": true, "tigers1": true, "tigers123": true, "tigger": true,
+	"tigger1": true, "tigger123": true, "tomcat": true, "tomcat1": true,
+	"tomcat123": true, "topgun": true, "topgun1": true, "topgun123": true,
+	"tornado": true, "tornado1": true, "tornado123": true, "trapper": true,
+	"trapper1": true, "trapper123": true, "trustno1": true, "tunnel": true,
+	"tunnel1": true, "tunnel123": true, "twins": true, "twins1": true,
+	"twins123": true, "ultimate": true, "unicorn": true, "unicorn1": true,
+	"unicorn123": true, "valley": true, "valley1": true, "valley123": true,
+	"vanilla": true, "victory": true, "victory1": true, "victory123": true,
+	"viking": true, "viking1": true, "viking123": true, "viking99": true,
+	"violet": true, "violet1": true, "violet123": true, "vodka": true,
+	"voodoo": true, "voodoo1": true, "voodoo123": true, "warrior": true,
+	"warrior1": true, "warrior123": true, "warriors": true, "warriors1": true,
+	"warriors123": true, "water": true, "water1": true, "water123": true,
+	"westside": true, "whale": true, "whale1": true, "whale123": true,
+	"whiskey": true, "white": true, "white1": true, "white123": true,
+	"whitesox": true, "willow": true, "willow1": true, "willow123": true,
+	"winter": true, "winter1": true, "winter123": true, "wonder": true,
+	"wonder1": true, "wonder123": true, "woody": true, "woody1": true,
+	"woody123": true, "yamaha": true, "yamaha1": true, "yamaha123": true,
+	"yamaha99": true, "yankees": true, "yankees1": true, "yankees123": true,
+	"yellow": true, "yellow1": true, "yellow123": true, "yellowjacket": true,
+	"yosemite": true, "yosemite1": true, "yosemite123": true, "yosemite99": true,
+	"zebra": true, "zebra1": true, "zebra123": true,
+}

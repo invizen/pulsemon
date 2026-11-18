@@ -722,6 +722,15 @@ func runServer(stop <-chan struct{}) {
 	}()
 
 	server := NewServer(db, pw)
+	// Auth off (set up, then all accounts deleted) with no
+	// PULSEMON_ALLOWED_HOSTS means the dashboard is fully open to any
+	// reachable host — including a DNS-rebinding page reading
+	// /api/sensors (targets + creds) and /api/settings (SMTP user,
+	// Telegram chat ID). Warn loudly so the operator knows the exposure
+	// and can set the allowlist (docs/DECISIONS.md → auth-off-rebinding).
+	if server.auth.Bootstrapped() && !server.auth.Enabled() && len(server.allowedHosts) == 0 {
+		log.Println("WARNING: auth is off (all accounts deleted) and PULSEMON_ALLOWED_HOSTS is unset — the dashboard is fully open to any reachable host, including DNS-rebinding reads of sensor targets and settings. Set PULSEMON_ALLOWED_HOSTS to restrict it.")
+	}
 	// authGate re-checks the enabled state (user count) per request: a
 	// host `pulsemon auth-user add/remove` must take effect on the very
 	// next request without a restart.

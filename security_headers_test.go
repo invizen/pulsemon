@@ -23,8 +23,9 @@ func TestFix_g1_SecurityHeaders(t *testing.T) {
 	defer httpSrv.Close()
 
 	d.SetSetting("auth_bootstrapped", "1")
-	// Enable auth by adding a user
-	if err := srv.auth.AddUser(context.Background(), "admin", "password123"); err != nil {
+	// Enable auth by adding a user (non-common password: AddUserMode rejects
+	// the most-frequent passwords — docs/DECISIONS.md → password-common-blocklist).
+	if err := srv.auth.AddUser(context.Background(), "admin", "correct-horse-battery-staple9"); err != nil {
 		t.Fatalf("failed to add admin user: %v", err)
 	}
 

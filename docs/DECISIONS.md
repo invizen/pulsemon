@@ -1764,3 +1764,80 @@ write path — POST/PATCH/clone/state-patch AND `doProbe`'s hot-path
 `UPDATE sensors SET status` (a status flip is the most frequent
 write; it need not force a re-sync, it only costs one extra pass).
 Until then: no code change, no migration.
+
+## login-hourly-budget (auth.go, auth_hourly_budget_test.go, 2026-11-18)
+**Decision:** a SECOND, slower per-username limit runs alongside the 60s
+rolling budget. `recordUserFail` now also updates a per-account hourly budget
+(`userHour map[string]*userHourBudget`); when the in-hour failed-check count
+reaches `loginHourFailMax` (30) the account is locked for `loginHourLockout`
+(1h) via the SAME `userLock` field the rolling layer uses. The hourly budget
+PERSISTS across rolling lockouts: `checkUserLock`'s expiry wipes `userFails`
+(the rolling window) but NOT `userHour`, and the window re-anchors by wall
+clock with `>=` (so an elapsed 1h lockout never re-locks the account on the
+very next fail). The operator is unaffected — their known-good (account, IP)
+pair is exempt from the whole per-username layer, and a success clears the
+budget (`clearUserFail`).
+**Why:** the rolling 7-fails/60s → 5-min lockout only catches bursts. An
+attacker pacing 6 guesses/minute stays under the threshold forever — ~8,640
+guesses/day/account — which puts a common-list password within days,
+contradicting the file's own "must not be a free online password-cracking
+target" comment. The hourly budget caps any single account at 30 failed
+checks/hour. Persistence across rolling lockouts is the load-bearing detail:
+without it, 7-fail bursts every 6 min (~70/hr) would outrun a 30/hr cap.
+The known-good exemption (already in the code) is what keeps the stricter
+limit from locking out the real operator.
+**Pinned by:** TestRecordUserFailHourlyBudgetLocks (30th paced fail → 1h
+lockout), TestHourlyBudgetPersistsAcrossRollingLockout (burst + 23 paced =
+30 → 1h; the budget survives the rolling expiry),
+TestHourlyBudgetSelfResetsAfterWindow (elapsed budget resets to 1, no
+re-lock), TestClearUserFailClearsHourlyBudget, TestKnownGoodExemptFromHourlyLock.
+Sabotage-verified: deleting the `userHour` update in recordUserFail (or
+wiping it in checkUserLock's expiry) turns
+TestHourlyBudgetPersistsAcrossRollingLockout red — the 30th fail no longer
+locks for an hour.
+
+## password-common-blocklist (auth.go, password_blocklist.go, 2026-11-18)
+**Decision:** `AddUserMode` rejects the most common passwords at creation
+(new sentinel `errPasswordCommon` → 400, mapped in `handleAuthUsers` for both
+the setup and in-app paths and refunded on the setup throttle like the other
+no-KDF validation errors). The check is a set lookup (`isCommonPassword`,
+case-insensitive) BEFORE the bcrypt KDF. `AddUserMode` is the single choke
+point, so the CLI `auth-user add` and the API both enforce it.
+**Why:** the 8-char minimum alone still admits "password" and "qwerty123" —
+the first entries of any cracking list — so a creation-time floor on the
+most-frequent passwords removes the cheapest account-takeover path before the
+runtime throttle ever matters. The list is a curated top-N from public breach
+corpora (a deterrent, not the security boundary — the hourly login budget is);
+it's small, embedded, and O(1) to check, so the unauthenticated setup surface
+pays nothing.
+**Pinned by:** TestAddUserRejectsCommonPassword (errPasswordCommon, no row
+written), TestAddUserAcceptsUncommonPassword,
+TestIsCommonPasswordCaseInsensitive, TestSetupRejectsCommonPassword (400, no
+row). Sabotage-verified: removing the `isCommonPassword` check in AddUserMode
+makes TestAddUserRejectsCommonPassword red (the account is created).
+
+## auth-off-rebinding (api.go, main.go, 2026-11-18)
+**Decision:** in the auth-off (operator-disabled, `Bootstrapped() &&
+!Enabled()`) branch of `authGate`, the `PULSEMON_ALLOWED_HOSTS` allowlist now
+applies to EVERY `/api/` request from a non-allowlisted Host — reads included,
+not just the POST/PUT/DELETE/PATCH mutations the old `switch` gated. A
+non-allowlisted `/api/` read is 421; `/api/healthz` is served above it (the
+container healthcheck must reach it in every state) and the static UI
+(non-`/api/`) carries no data. With the allowlist unset the LAN-trust default
+stands (fully open). `runServer` (main.go) also logs a startup WARNING when
+auth is off and no allowlist is set, naming the exposure.
+**Why:** a DNS-rebinding page's whole attack is a same-origin GET — the browser
+treats the rebound origin as same-origin, so it reads `/api/sensors` (targets
+with `user:pass@` creds) and `/api/settings` (SMTP user, from/to, Telegram chat
+ID) with a plain GET. Gating only the mutations left those reads wide open, so
+the allowlist — which exists specifically to defend against rebinding — did not
+close the data-leak vector. `migrateAuthBootstrapped` puts every older
+never-accounts install into exactly this auth-off state. The startup warning
+closes the "operator forgot the allowlist" case for the no-allowlist default.
+**Pinned by:** TestAuthOffRebindingReadBlocked (GET /api/sensors + /api/settings
+from a non-allowlisted host → 421; allowlisted host → 200; healthz → 200 from
+any host), TestAuthOffRebindingUnsetStaysOpen (no allowlist → read 200),
+TestAuthOffRebindingMutationStillBlocked (POST from a non-allowlisted host →
+421, no sensor created). Sabotage-verified: reverting the gate to the old
+mutation-only `switch` turns TestAuthOffRebindingReadBlocked red (the
+/api/sensors GET returns 200, not 421).

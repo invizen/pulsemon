@@ -355,15 +355,20 @@ func (s *Server) authGate() http.Handler {
 			if s.auth.Bootstrapped() {
 				// Auth was disabled by the operator (all accounts deleted):
 				// the documented "auth off = fully open" behavior applies.
-				// With PULSEMON_ALLOWED_HOSTS set, mutating requests from a
-				// non-allowlisted Host are 403 (see
-				// unauthMutateAllowed); reads stay open.
-				switch r.Method {
-				case http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch:
-					if !s.unauthMutateAllowed(r) {
-						respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
-						return
-					}
+				// With PULSEMON_ALLOWED_HOSTS set, EVERY /api/ request from a
+				// non-allowlisted Host is refused — reads included. A DNS-
+				// rebinding page's whole attack is a same-origin GET: it reads
+				// /api/sensors (targets with user:pass@ creds) and
+				// /api/settings (SMTP user, Telegram chat ID), so gating only
+				// the mutations left the data wide open. healthz is served
+				// above (the container healthcheck must reach it in every
+				// state), and the static UI carries no data. With the
+				// allowlist unset the LAN-trust default stands (fully open);
+				// the startup warning names that exposure.
+				if strings.HasPrefix(r.URL.Path, "/api/") &&
+					len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
+					respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
+					return
 				}
 				s.mux.ServeHTTP(w, r)
 				return
