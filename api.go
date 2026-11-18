@@ -181,7 +181,26 @@ func requestBodyErr(err error) (int, string) {
 func respondWithJSON(w http.ResponseWriter, code int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
-	json.NewEncoder(w).Encode(payload)
+	// The status line is already written, so an Encode failure can't change
+	// it — log it so a payload that can't be marshalled to JSON surfaces as
+	// a visible error + truncated body instead of a silent empty response.
+	if err := json.NewEncoder(w).Encode(payload); err != nil {
+		log.Printf("respondWithJSON: encode: %v", err)
+	}
+}
+
+// respondThrottled answers a 429 with a Retry-After header derived from
+// wait (ceiling to whole seconds, minimum 1) and a caller-supplied message.
+// The throttle/lockout sites (login per-IP, login per-username, setup,
+// password-change per-IP, password-change per-username) share this instead
+// of copy-pasting the secs computation + header + body.
+func respondThrottled(w http.ResponseWriter, wait time.Duration, msg string) {
+	secs := int((wait + time.Second - 1) / time.Second)
+	if secs < 1 {
+		secs = 1
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	respondWithError(w, http.StatusTooManyRequests, msg)
 }
 
 type Server struct {
@@ -768,7 +787,9 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			DownAfter int      `json:"down_after"`
 			SpikeMult int      `json:"spike_mult"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
 			code, msg := requestBodyErr(err)
 			respondWithError(w, code, msg)
 			return
@@ -957,7 +978,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			SpikeMult *int      `json:"spike_mult"`
 			State     *string   `json:"state"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
 			code, msg := requestBodyErr(err)
 			respondWithError(w, code, msg)
 			return
@@ -2134,7 +2157,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		MaintMode   *bool     `json:"maintenance_mode"`
 		AllowUnauth *bool     `json:"allow_unauth_update"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
 		respondWithError(w, code, msg)
 		return
@@ -2860,7 +2885,9 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Kind string `json:"kind"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
 		respondWithError(w, code, msg)
 		return

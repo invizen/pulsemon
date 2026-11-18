@@ -756,6 +756,15 @@ func resolveICMPTarget(ctx context.Context, target string) (net.IP, error) {
 // (DNS + reply wait) so a cancelled probe (shutdown, remove, restart)
 // aborts immediately instead of running out its full timeout.
 func pingHost(ctx context.Context, target string, timeout time.Duration) PingResult {
+	// Bound DNS + reply wait TOGETHER by `timeout` (mirror of probeTCP and
+	// probeHTTP, which wrap their ctx in WithTimeout before resolving).
+	// Without this, the DNS lookup (up to its own 5s cap) runs IN ADDITION
+	// to the `timeout` passed to Ping, so an ICMP Pulse Now at 30s can run
+	// ~35s and outlast the server's 30s WriteTimeout — the client gets
+	// nothing.
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
 	dst, err := resolveICMPTarget(ctx, target)
 	if err != nil {
 		return PingResult{Lost: true, Error: err, DNS: true}

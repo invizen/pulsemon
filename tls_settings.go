@@ -263,7 +263,9 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		Key  string `json:"key"`
 		Port *int   `json:"port"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
 		respondWithError(w, code, msg)
 		return

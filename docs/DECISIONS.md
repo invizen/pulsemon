@@ -2063,3 +2063,44 @@ deliberate test-simplicity tradeoff.
 TestAuthRemoveLastUserProtected, TestRemoveUserConcurrentNeverZero,
 TestIsAdminInvalidatedOnPromotion) now pass a ctx; the sensor fetch/clone
 tests exercise the deduped `sensorCols`/`scanSensorRow` path.
+
+## review-nits-batch (api.go, auth.go, ping.go, tcp.go, tls_settings.go, update_api.go, 2026-11-18)
+**Decision:** four small external-review nits, all behavior-preserving:
+(1) the 429-with-Retry-After block was copy-pasted 5× in auth.go;
+(2) `timeout_ms` meant different things per probe type — TCP/HTTP included the
+DNS lookup in the budget, ICMP did not, so a 30s ICMP Pulse Now could run ~5s
+longer and outlast the server's 30s WriteTimeout (client got nothing);
+(3) `probeTCP` didn't guard a nil IP from `resolveICMPTarget` (an IPv6 literal
+in a hand-edited row dialed `":port"` = localhost);
+(4) the JSON decoders never called `DisallowUnknownFields` (a misspelled PATCH
+field was silently dropped when a valid one was present) and `respondWithJSON`
+dropped `Encode` errors.
+**Done:**
+- (1) `respondThrottled(w, wait, msg)` in api.go (next to `respondWithJSON` /
+  `respondWithError`) derives `Retry-After` by ceiling to whole seconds (min 1)
+  and answers 429; all five auth.go throttle/lockout sites now call it. The
+  per-site messages are unchanged.
+- (2) `pingHost` wraps its ctx in `context.WithTimeout(ctx, timeout)` at the
+  top, mirroring `probeTCP`/`probeHTTP`, so the DNS lookup and the reply-wait
+  are bounded TOGETHER by the probe timeout. `e.Ping` already honors
+  `ctx.Done()`, and `dnsLookup`'s `DoChan` select returns on the caller's ctx,
+  so the bound propagates to both phases (the shared singleflight call keeps
+  running in the background, but the caller stops waiting at `timeout`).
+- (3) `probeTCP` returns a clean loss (`no IPv4 address for <host>`) when
+  `resolveICMPTarget` yields a nil IP, mirroring `pingHost`'s existing check.
+- (4) all 9 production `json.NewDecoder` sites now call `DisallowUnknownFields`
+  (api.go ×4, auth.go ×3, tls_settings.go, update_api.go). Verified safe: every
+  frontend payload in web/app.js is a strict subset of the Go struct fields.
+  `respondWithJSON` now logs `Encode` errors (the status line is already
+  written, so it can't change the response — it's observability only).
+**Why (4 is a contract change, handled deliberately):** strict decode turns a
+silent no-op into a 400. That's the right call for a single-client API (the
+frontend is the only producer, and its payloads are field-exact), and it's what
+the finding asked for. `update_api.go` keeps its `err == nil && body.Version
+!= ""` tolerance so a malformed update body still falls through to "latest".
+**Pinned by:** nits_20261118_test.go — TestRespondThrottledSetsRetryAfter
+(Retry-After ceiling), TestPingHostBoundsDNSToTimeout (1s-slow resolver on a
+200ms probe returns a DNS loss in <800ms; drains the singleflight call so the
+stub-swap cleanup doesn't race the shared-call goroutine),
+TestProbeTCPIPv6LiteralIsCleanLoss, TestPatchSensorRejectsUnknownField
+(misspelled field = 400, valid field = 200). Full `-race` suite green.

@@ -14,7 +14,6 @@ import (
 	"os"
 	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1708,7 +1707,9 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		// Route through the shared mapper like every other JSON handler:
 		// an oversized body (authGate's MaxBytesReader) is a 413, any other
 		// decode error a 400.
@@ -1757,12 +1758,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	ip := s.auth.ClientIP(r)
 	key := throttleKey(ip)
 	if ok, wait := s.auth.beginAttempt(key); !ok {
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		respondWithError(w, http.StatusTooManyRequests, "too many failed login attempts — try again in a few minutes")
+		respondThrottled(w, wait, "too many failed login attempts — try again in a few minutes")
 		return
 	}
 
@@ -1785,12 +1781,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		// IP's budget and trip its own 5-minute lockout. refundAttempt's
 		// n6 arm also clears a lockout the appends already tripped.
 		s.auth.refundAttempt(key)
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		respondWithError(w, http.StatusTooManyRequests, "too many failed login attempts — try again in a few minutes")
+		respondThrottled(w, wait, "too many failed login attempts — try again in a few minutes")
 		return
 	}
 
@@ -1923,7 +1914,9 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			Username string `json:"username"`
 			Password string `json:"password"`
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
 			code, msg := requestBodyErr(err)
 			respondWithError(w, code, msg)
 			return
@@ -1970,12 +1963,7 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		if setup {
 			setupKey = "setup|" + throttleKey(s.auth.ClientIP(r))
 			if ok, wait := s.auth.beginAttempt(setupKey); !ok {
-				secs := int((wait + time.Second - 1) / time.Second)
-				if secs < 1 {
-					secs = 1
-				}
-				w.Header().Set("Retry-After", strconv.Itoa(secs))
-				respondWithError(w, http.StatusTooManyRequests, "too many setup attempts — try again in a few minutes")
+				respondThrottled(w, wait, "too many setup attempts — try again in a few minutes")
 				return
 			}
 		}
@@ -2060,7 +2048,9 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		Current  string `json:"current_password"`
 		Password string `json:"password"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
 		code, msg := requestBodyErr(err)
 		respondWithError(w, code, msg)
 		return
@@ -2098,12 +2088,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 	ip := s.auth.ClientIP(r)
 	key := throttleKey(ip)
 	if ok, wait := s.auth.beginAttempt(key); !ok {
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		respondWithError(w, http.StatusTooManyRequests, "too many failed attempts — try again in a few minutes")
+		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
 		return
 	}
 
@@ -2121,12 +2106,7 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		// caller's per-IP budget and self-lock a fresh IP holding a valid
 		// session.
 		s.auth.refundAttempt(key)
-		secs := int((wait + time.Second - 1) / time.Second)
-		if secs < 1 {
-			secs = 1
-		}
-		w.Header().Set("Retry-After", strconv.Itoa(secs))
-		respondWithError(w, http.StatusTooManyRequests, "too many failed attempts — try again in a few minutes")
+		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
 		return
 	}
 

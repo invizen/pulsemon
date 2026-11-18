@@ -90,6 +90,12 @@ func probeTCP(ctx context.Context, target string, timeout time.Duration) tcpProb
 	if rerr != nil {
 		return tcpProbeResult{Lost: true, Err: rerr, DNS: true}
 	}
+	if ip == nil {
+		// An IPv6 literal (a hand-edited row; save-time validation rejects
+		// these) resolves to no IPv4 — a clean loss, not a dial of ":port"
+		// (an empty host is localhost). Mirrors pingHost's nil check.
+		return tcpProbeResult{Lost: true, Err: fmt.Errorf("no IPv4 address for %s", host)}
+	}
 
 	addr := net.JoinHostPort(ip.String(), portStr)
 	start := time.Now()

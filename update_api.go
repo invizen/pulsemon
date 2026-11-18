@@ -155,7 +155,9 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		AllowDowngrade bool   `json:"allow_downgrade"`
 	}
 	if r.ContentLength > 0 {
-		if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Version != "" {
+		dec := json.NewDecoder(r.Body)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&body); err == nil && body.Version != "" {
 			version = body.Version
 		}
 	}
