@@ -1907,3 +1907,23 @@ loop + ProbeState dropped) and TestDeleteSensorNotFound (a missing id returns
 cascade removal, 404, loop stop); the bounded-lock batching is the same
 `deleteRowsBatched` idiom already pinned by the clear-history tests, so it is not
 re-proven here.
+
+## auth-bootstrapped-latch (auth.go, auth_bootstrapped_test.go, 2026-11-18)
+**Decision:** `AuthState.Bootstrapped()` now latches its answer. A one-way
+`atomic.Bool` (`bootstrapped`) is set the first time a read sees
+`auth_bootstrapped=1`; every later call returns true without touching SQLite.
+A not-yet-latched read always re-queries (a `bootstrappedFn` seam defaults to
+`db.GetSetting("auth_bootstrapped")`), so an out-of-band `pulsemon auth-user
+add` (a separate process writing the setting) is picked up on the next call.
+**Why:** `Bootstrapped()` sits on the per-request auth gate (api.go — every
+request, static assets included) and on the unauthenticated
+`/api/auth/status`. It used to run `GetSetting("auth_bootstrapped")` on every
+call. The flag never goes back to false (set by AddUser, never cleared —
+including when the operator later disables auth), so caching only the TRUE
+value is safe: the latch ratchets false→true and can never mask a real
+bootstrap, because a not-yet-latched state always re-queries.
+**Pinned by:** TestAuthBootstrappedLatchesTrue (a counting `bootstrappedFn`
+seam proves the query stops after the latching read — reads stays at 2 across
+further calls) and TestAuthBootstrappedPicksUpCLIAdd (a fresh, un-latched
+AuthState observes an out-of-band DB write of the setting on the next read —
+the latch never caches false).

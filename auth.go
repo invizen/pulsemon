@@ -295,6 +295,22 @@ type AuthState struct {
 	enabled   bool
 	enabledAt time.Time
 
+	// bootstrapped: one-way ratchet — true once this install has ever had an
+	// account (settings auth_bootstrapped=1, set by AddUser and never cleared,
+	// including when the operator later disables auth). The flag never goes
+	// back to false, so caching only the TRUE value stays correct even for an
+	// out-of-band `pulsemon auth-user add` (a separate process that writes the
+	// setting without touching this AuthState): the latch only ratchets
+	// false→true, and a not-yet-latched read always re-queries, so it picks up
+	// the CLI's write on the next call. atomic so the per-request auth gate
+	// reads it lock-free.
+	bootstrapped atomic.Bool
+
+	// bootstrappedFn is the read source Bootstrapped() uses. Defaults to
+	// db.GetSetting("auth_bootstrapped"); a test may substitute a counting
+	// stub to prove the latch stops the per-request query.
+	bootstrappedFn func() string
+
 	// loginThrottle: per-client-IP login failure accounting. Keyed by the
 	// request's source IP as resolved by ClientIP — the TCP peer by default,
 	// or the first X-Forwarded-For entry ONLY when the immediate TCP peer is
@@ -700,8 +716,26 @@ func (a *AuthState) AddUserMode(ctx context.Context, username, password string, 
 // pick between the two zero-user states: a fresh install gets the
 // bootstrap-only surface (no unauthenticated sensor create/pulse before the
 // first account exists), an intentionally-disabled install stays fully open.
+//
+// The answer latches: the flag never goes back to false, so once a read sees
+// "1" the in-memory bootstrapped is set and every later call returns true
+// without touching SQLite (the per-request auth gate used to pay a GetSetting
+// on every request, static assets included). A not-yet-latched read always
+// re-queries, so an out-of-band `pulsemon auth-user add` (a separate process
+// writing the setting) is picked up on the next call.
 func (a *AuthState) Bootstrapped() bool {
-	return a.db.GetSetting("auth_bootstrapped") == "1"
+	if a.bootstrapped.Load() {
+		return true
+	}
+	read := func() string { return a.db.GetSetting("auth_bootstrapped") }
+	if a.bootstrappedFn != nil {
+		read = a.bootstrappedFn
+	}
+	if read() == "1" {
+		a.bootstrapped.Store(true)
+		return true
+	}
+	return false
 }
 
 // IsAdmin reports whether the username holds the admin flag — the gate for
