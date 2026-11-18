@@ -59,6 +59,25 @@ type Sensor struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// sensorCols is the canonical full-sensor column list, shared by every
+// full-sensor SELECT (fetchSensors, handleSensorByID, handleSensorClone) so
+// the column order stays in lockstep with scanSensorRow. Adding a column to
+// the sensors table means updating this list and scanSensorRow in ONE place
+// (the list used to be copy-pasted at all three SELECT sites).
+const sensorCols = "id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at"
+
+// sensorScanner is the narrow interface both *sql.Row and *sql.Rows satisfy,
+// so scanSensorRow serves the single-row and list queries alike.
+type sensorScanner interface{ Scan(dest ...any) error }
+
+// scanSensorRow reads one full-sensor row (the sensorCols columns) into sn.
+// The 12-field scan lives here once instead of being repeated at every
+// full-sensor SELECT site.
+func scanSensorRow(sc sensorScanner, sn *Sensor) error {
+	return sc.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS,
+		&sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
+}
+
 // SensorView is what GET /api/sensors returns: sensor + window stats.
 type SensorView struct {
 	Sensor
@@ -655,7 +674,7 @@ func (s *Server) cachedSensorCount(ctx context.Context) (int, error) {
 }
 
 func (s *Server) fetchSensors(ctx context.Context) []Sensor {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors ORDER BY name`)
+	rows, err := s.db.QueryContext(ctx, "SELECT "+sensorCols+" FROM sensors ORDER BY name")
 	if err != nil {
 		return nil
 	}
@@ -669,7 +688,7 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 		// app-controlled so this shouldn't happen — but log it so a real
 		// corruption event is visible in the service log instead of "one
 		// sensor silently vanished from the fleet view".
-		if err := rows.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt); err != nil {
+		if err := scanSensorRow(rows, &sn); err != nil {
 			log.Printf("API: skipping corrupt sensor row: %v", err)
 			continue
 		}
@@ -902,8 +921,7 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		var sn Sensor
-		err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-			Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS, &sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
+		err := scanSensorRow(s.db.QueryRowContext(r.Context(), "SELECT "+sensorCols+" FROM sensors WHERE id = ?", id), &sn)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
@@ -1562,8 +1580,7 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
 	var src Sensor
-	err := s.db.QueryRowContext(r.Context(), "SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at FROM sensors WHERE id = ?", id).
-		Scan(&src.ID, &src.Name, &src.Target, &src.Type, &src.IntervalS, &src.TimeoutMS, &src.LossWarn, &src.DownAfter, &src.SpikeMult, &src.State, &src.Status, &src.CreatedAt)
+	err := scanSensorRow(s.db.QueryRowContext(r.Context(), "SELECT "+sensorCols+" FROM sensors WHERE id = ?", id), &src)
 	if err != nil {
 		// Existence-check contract (pinned by
 		// TestSensorExistenceCheckDistinguishesErrors): only sql.ErrNoRows

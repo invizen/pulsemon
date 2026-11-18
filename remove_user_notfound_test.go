@@ -36,7 +36,7 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 		}
 	}
 	// Multi-user install: nonexistent name → store.ErrUserNotFound, users intact.
-	if err := a.RemoveUser("ghost"); !errors.Is(err, store.ErrUserNotFound) {
+	if err := a.RemoveUser(context.Background(), "ghost"); !errors.Is(err, store.ErrUserNotFound) {
 		t.Fatalf("RemoveUser(ghost) with 3 users = %v, want store.ErrUserNotFound", err)
 	} else if !strings.Contains(err.Error(), "ghost") {
 		t.Fatalf("RemoveUser(ghost) = %q, want the name in the message", err)
@@ -47,15 +47,15 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 	// Single-user install: nonexistent name is the not-found error, NOT
 	// the last-user guard (the guard only protects a REAL last user).
 	for _, u := range []string{"admin", "temp"} {
-		if err := a.RemoveUser(u); err != nil {
+		if err := a.RemoveUser(context.Background(), u); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := a.RemoveUser("ghost"); !errors.Is(err, store.ErrUserNotFound) {
+	if err := a.RemoveUser(context.Background(), "ghost"); !errors.Is(err, store.ErrUserNotFound) {
 		t.Fatalf("RemoveUser(ghost) with 1 user = %v, want store.ErrUserNotFound (not the last-user guard)", err)
 	}
 	// The real last user is still protected.
-	if err := a.RemoveUser("third"); !errors.Is(err, store.ErrLastUser) {
+	if err := a.RemoveUser(context.Background(), "third"); !errors.Is(err, store.ErrLastUser) {
 		t.Fatalf("RemoveUser(third) with 1 user = %v, want store.ErrLastUser", err)
 	}
 

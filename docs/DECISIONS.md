@@ -2030,3 +2030,36 @@ true; a syntax error, a plain text error carrying the old wording, and nil
 all classify false — the plain-text case fails loudly if anyone reverts to
 message matching). The existing 409 integration tests (TestFix_M7_PatchDuplicateName409,
 clone_name_test, the auth duplicate-user test) now exercise the code path.
+
+## store-data-access-layer (internal/store + api.go, 2026-11-18)
+**Decision:** finding #11 (external review) — `Store` embeds `*sql.DB`, so
+every handler writes raw SQL; the full-sensor column list + its 12-field scan
+were copy-pasted 3×; and the store methods were inconsistent about context
+(`RemoveUser` hid a `context.Background()` while `UserCount`/`GetSetting`
+took none). BOUNDED fix applied; the full data-access-layer refactor is
+deferred as a known ceiling.
+**Done (bounded, behavior-preserving):**
+- Dedup: `sensorCols` const + `scanSensorRow(sc sensorScanner, *Sensor)` in
+  api.go now serve all three full-sensor SELECTs (fetchSensors,
+  handleSensorByID, handleSensorClone). Adding a sensors column is a one-place
+  edit (list + scan) instead of a three-site copy-paste.
+- Context: `Store.RemoveUser` and `AuthState.RemoveUser` now take a
+  `context.Context` (the caller's request context reaches the DELETE +
+  last-admin promotion; the CLI passes `context.Background()`), so no store
+  method hides a Background context. The consistency RULE is documented:
+  methods that span a transaction (RemoveUser, ImmediateTx, SetSettingInTx)
+  take a ctx; single autocommit helpers (GetSetting, SetSetting, UserCount,
+  UserHash, SetUserPassword) take none (short, called from handlers +
+  background + CLI + tests).
+**Deferred (known ceiling):** un-embedding the field (private `db *sql.DB` +
+named methods for every production raw-SQL site) so handlers *can't* write
+raw SQL. Blast radius measured: 13 raw-SQL sites in api.go, promoted-method
+use across 7 production files, and 70 of 165 test files call `db.QueryRow` /
+`db.Exec` directly (tests assert state by querying the DB, which the embedded
+field makes trivial). That churn is a large, high-risk, behavior-preserving
+refactor not justified for a single-dev homelab tool; the embedded field is a
+deliberate test-simplicity tradeoff.
+**Pinned by:** the existing RemoveUser tests (TestRemoveUserNonexistentReportsNotFound,
+TestAuthRemoveLastUserProtected, TestRemoveUserConcurrentNeverZero,
+TestIsAdminInvalidatedOnPromotion) now pass a ctx; the sensor fetch/clone
+tests exercise the deduped `sensorCols`/`scanSensorRow` path.

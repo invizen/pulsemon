@@ -122,7 +122,7 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 	if err := a.AddUser(context.Background(), "only", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RemoveUser("only"); err == nil {
+	if err := a.RemoveUser(context.Background(), "only"); err == nil {
 		t.Fatal("removing the last user must fail")
 	}
 	if n, _ := db.UserCount(); n != 1 {
@@ -131,7 +131,7 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 	if err := a.AddUser(context.Background(), "second", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if err := a.RemoveUser("only"); err != nil {
+	if err := a.RemoveUser(context.Background(), "only"); err != nil {
 		t.Fatalf("RemoveUser with two users: %v", err)
 	}
 	if err := a.Disable(); err != nil {
@@ -2119,7 +2119,7 @@ func TestRemoveUserConcurrentNeverZero(t *testing.T) {
 			wg.Add(1)
 			go func(u string) {
 				defer wg.Done()
-				_ = a.RemoveUser(u)
+				_ = a.RemoveUser(context.Background(), u)
 			}(u)
 		}
 		wg.Wait()
@@ -2130,7 +2130,7 @@ func TestRemoveUserConcurrentNeverZero(t *testing.T) {
 	// Direct DB call on the last user is refused too.
 	if n, _ := db.UserCount(); n == 1 {
 		users, _ := db.ListUsers()
-		if err := db.RemoveUser(users[0].Username); err == nil {
+		if err := db.RemoveUser(context.Background(), users[0].Username); err == nil {
 			t.Fatal("db.RemoveUser of the last user succeeded, want error")
 		}
 	}
@@ -2753,7 +2753,7 @@ func TestIsAdminInvalidatedOnPromotion(t *testing.T) {
 	if a.IsAdmin("bob") {
 		t.Fatal("seed: bob must not be admin (this call primes bob's cached false)")
 	}
-	if err := a.RemoveUser("alice"); err != nil {
+	if err := a.RemoveUser(context.Background(), "alice"); err != nil {
 		t.Fatalf("remove last admin: %v", err)
 	}
 	if !a.IsAdmin("bob") {

@@ -581,7 +581,7 @@ func runAuthUser(args []string) dispatchKind {
 			fmt.Fprintln(os.Stderr, "usage: pulsemon auth-user remove <username>")
 			return dExit2
 		}
-		if err := a.RemoveUser(args[1]); err != nil {
+		if err := a.RemoveUser(context.Background(), args[1]); err != nil {
 			fmt.Fprintln(os.Stderr, "auth-user remove:", err)
 			return dExit1
 		}

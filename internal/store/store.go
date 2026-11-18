@@ -1073,8 +1073,16 @@ func (db *Store) SetUserPassword(username, passwordHash string) error {
 // ErrLastUser) or no such user (ErrUserNotFound): the sentinel replaced the
 // silent no-op, which made the API answer 200 and the
 // CLI print "User removed" for a mistyped name).
-func (db *Store) RemoveUser(username string) error {
-	ctx := context.Background()
+//
+// ctx bounds the transaction: the caller's request context reaches the
+// DELETE + last-admin promotion, so a client disconnect fails fast instead of
+// running the transaction to completion on a hidden Background context. This
+// is the transactional side of the Store context rule — methods that span a
+// transaction (RemoveUser, ImmediateTx, SetSettingInTx) take a
+// context.Context; single autocommit helpers (GetSetting, SetSetting,
+// UserCount, UserHash, SetUserPassword) take none because they're short and
+// called from handlers, background goroutines, the CLI, and tests alike.
+func (db *Store) RemoveUser(ctx context.Context, username string) error {
 	return db.ImmediateTx(ctx, func(c *sql.Conn) error {
 		res, err := c.ExecContext(ctx,
 			"DELETE FROM users WHERE username = ? AND (SELECT COUNT(*) FROM users) > 1", username)

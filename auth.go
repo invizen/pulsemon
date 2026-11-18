@@ -777,7 +777,7 @@ func (a *AuthState) IsAdmin(username string) bool {
 // conditional DELETE in db.RemoveUser. Removing the
 // last admin promotes the oldest remaining user in the same transaction, so
 // the install is never left without an admin.
-func (a *AuthState) RemoveUser(username string) error {
+func (a *AuthState) RemoveUser(ctx context.Context, username string) error {
 	username = strings.ToLower(username)
 	n, err := a.db.UserCount()
 	if err != nil {
@@ -792,7 +792,7 @@ func (a *AuthState) RemoveUser(username string) error {
 		}
 		return store.ErrLastUser
 	}
-	if err := a.db.RemoveUser(username); err != nil {
+	if err := a.db.RemoveUser(ctx, username); err != nil {
 		return err
 	}
 	a.dropUserSessions(username)
@@ -2194,7 +2194,7 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	// db.RemoveUser stops it from ever locking the install out, and
 	// removing the last admin promotes the oldest remaining user.
 	user := strings.ToLower(r.PathValue("username"))
-	if err := s.auth.RemoveUser(user); err != nil {
+	if err := s.auth.RemoveUser(r.Context(), user); err != nil {
 		// A name that doesn't exist is a 404 — the same policy as the
 		// password endpoint (unknown username → 404, not 403, so the
 		// endpoint doesn't confirm which names exist). Checked before
