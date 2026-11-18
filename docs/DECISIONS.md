@@ -1944,3 +1944,33 @@ to queuing.
 **Pinned by:** TestPingNowFleetLimit (filling `pulseSem` to its cap makes
 PingNow return `errPulseBusy` without probing; freeing one slot lets it
 proceed past the cap).
+
+## scale-ceiling (gzip.go, api.go, gzip_test.go, 2026-11-18)
+**Decision:** `/api/` responses are gzip-compressed for clients that accept
+it. `authGate` wraps the ResponseWriter with a streaming `gzipResponseWriter`
+(only for `/api/` + `Accept-Encoding: gzip`); the wrapper supports
+`http.Flusher` (so the update-progress and TLS-settings streaming endpoints
+keep working) and suppresses `Content-Length` (the compressed size differs, so
+the server falls back to chunked encoding). This is the one cheap piece of the
+scale ceiling: every open dashboard tab re-pulls the whole uncompressed fleet
+every 5s, and the payload grows with sensor count — compressing the JSON cuts
+that per-tab, per-poll traffic (~5-10x on JSON).
+**Deferred (known ceiling, not a defect at homelab scale):** the two heavier
+fixes the external review named for 1000s of sensors are documented here and
+NOT implemented — they carry real regression risk for zero benefit at the
+current 22-sensor fleet:
+- **Per-sensor history locks.** `statsMu` is one `sync.RWMutex` guarding the
+  whole `statsCache` map (every probe append + every dashboard read). At
+  1000s of sensors + many tabs this serializes the read path; the fix is one
+  lock per sensor's series.
+- **Batched probe writes.** Each probe writes its own `INSERT` through the
+  single-connection probe-write handle. At 1000s of sensors the fix is a
+  writer goroutine that batches outcomes and flushes every ~250ms in one
+  transaction. This touches the write path's ts-ascending ordering, shutdown
+  flush, and the stats-cache lockstep, so it is the riskier of the two.
+The `syncSensors` full re-read every 5s is trivially cheap at homelab scale
+and would get a `MAX(updated_at)` pre-check only if targeting 1000+ sensors.
+**Pinned by:** TestGzipAPIResponses (a gzip-accepting client gets
+`Content-Encoding: gzip` + a body that decompresses to the sensor JSON; a
+client with no Accept-Encoding gets a raw body with no Content-Encoding; an
+explicit `gzip;q=0` is served raw).

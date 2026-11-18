@@ -1,6 +1,7 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"database/sql"
 	"embed"
@@ -292,6 +293,21 @@ func (s *Server) authGate() http.Handler {
 		// no-cache in serveStatic and keep that contract.
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
+		}
+		// gzip /api/ responses when the client accepts them (finding #8):
+		// every open dashboard tab re-pulls the whole uncompressed fleet
+		// every 5s, and the payload grows with sensor count. Compressing the
+		// JSON cuts that per-tab, per-poll traffic (it compresses ~5-10x).
+		// Only /api/ is wrapped — static assets set their own caching and are
+		// served raw. This is the one cheap piece of finding #8's scale
+		// ceiling; the two heavier fixes (per-sensor history locks, batched
+		// probe writes) are documented in docs/DECISIONS.md → scale-ceiling
+		// and deferred — they only pay off at 1000s of sensors.
+		if strings.HasPrefix(r.URL.Path, "/api/") && acceptsGzip(r) {
+			w.Header().Set("Content-Encoding", "gzip")
+			gz := gzip.NewWriter(w)
+			defer gz.Close()
+			w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
 		}
 		// Cross-port CSRF gate (RFC 6265bis): the session cookie is
 		// SameSite=Strict, but "same-site" is scheme+host — the PORT is
