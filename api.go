@@ -796,9 +796,9 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			return nil
 		})
 		if err != nil {
-			// Exact constraint text, not a bare "UNIQUE" substring
-
-			if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
+			// A UNIQUE-constraint violation (by result code) is a name
+			// collision → 409; any other failure is a 500.
+			if isUniqueConstraintErr(err) {
 				respondWithError(w, http.StatusConflict, "sensor name already exists")
 				return
 			}
@@ -1114,9 +1114,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 				res, err := c.ExecContext(ctx, "UPDATE sensors SET "+strings.Join(sets, ", ")+" WHERE id = ?", args...)
 				if err != nil {
 					// A rename hitting the UNIQUE name constraint is a 409,
-					// exactly like POST — not a 500 with raw SQL text. Exact
-					// constraint text.
-					if strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
+					// exactly like POST — not a 500 with raw SQL text.
+					if isUniqueConstraintErr(err) {
 						return errPatchNameConflict
 					}
 					return err
@@ -1716,9 +1715,9 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 			created = true
 			break
 		}
-		// Only a name collision is retryable — exact constraint text
-
-		if !strings.Contains(err.Error(), "UNIQUE constraint failed: sensors.name") {
+		// Only a name collision (UNIQUE-constraint violation, by result
+		// code) is retryable; anything else is a real failure.
+		if !isUniqueConstraintErr(err) {
 			respondInternal(w, "clone sensor "+id, err)
 			return
 		}

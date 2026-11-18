@@ -2000,3 +2000,33 @@ benchmarks are deliberately opt-in per ci.yml).
 **Pinned by:** TestRestartRebuilds24hGraphAndUptime (a fresh worker with an
 empty cache warms from the DB; Uptime24h ≈ the seeded 90% and the 24h graph is
 rebuilt with its loss/reply shape intact).
+
+## unique-constraint-by-code (auth.go + api.go, 2026-11-18)
+**Decision:** unique-constraint detection is by SQLite RESULT CODE, not by
+driver message text. Finding #10 (external review): four sites matched the
+string `"UNIQUE constraint failed: <table>.<column>"`, which breaks silently
+if a modernc.org/sqlite upgrade rewords the message.
+**Verified against modernc.org/sqlite v1.29.1 (go.mod):** `*sqlite.Error`
+exposes `Code() int` (sqlite.go:68); the constant is
+`SQLITE_CONSTRAINT_UNIQUE == 2067`, in import path `modernc.org/sqlite/lib`
+whose package name is `sqlite3` (the driver imports it as
+`sqlite3 "modernc.org/sqlite/lib"`). The result codes are stable ABI; the
+message string is not.
+**PK vs UNIQUE (verified empirically):** SQLite emits the SAME
+"UNIQUE constraint failed: <t>.<c>" message for a UNIQUE-index violation
+(`SQLITE_CONSTRAINT_UNIQUE` = 2067, the sensors.name case) AND a PRIMARY
+KEY violation (`SQLITE_CONSTRAINT_PRIMARYKEY` = 1555, the users.username
+case). The old text match caught both, so the code check must too.
+**Change:** one helper `isUniqueConstraintErr(err)` (errors.As to
+`*sqlite.Error`, match `Code()` against 2067/1555) replaces all four text
+matches:
+auth.go (users.username INSERT), api.go POST sensor + PATCH rename + clone
+retry (sensors.name). Each site's context makes the sensors.name /
+users.username index the only realistically violable constraint (id is a
+generated UUID), so the code alone is sufficient; a theoretical id PK
+collision now also 409s (benign mislabel, not a crash).
+**Pinned by:** TestIsUniqueConstraintErr (a real duplicate INSERT classifies
+true; a syntax error, a plain text error carrying the old wording, and nil
+all classify false — the plain-text case fails loudly if anyone reverts to
+message matching). The existing 409 integration tests (TestFix_M7_PatchDuplicateName409,
+clone_name_test, the auth duplicate-user test) now exercise the code path.

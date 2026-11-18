@@ -677,10 +677,10 @@ func (a *AuthState) AddUserMode(ctx context.Context, username, password string, 
 		if _, err := c.ExecContext(txCtx,
 			"INSERT INTO users (username, password_hash, created_at, is_admin) VALUES (?, ?, ?, ?)",
 			username, string(hash), store.Now(), admin); err != nil {
-			// Only the exact UNIQUE-constraint text means "account
-			// exists" — any other db failure must surface as a 500, not
-			// be misreported as a duplicate.
-			if strings.Contains(err.Error(), "UNIQUE constraint failed: users.username") {
+			// Only a UNIQUE-constraint violation (by result code) means
+			// "account exists" — any other db failure must surface as a
+			// 500, not be misreported as a duplicate.
+			if isUniqueConstraintErr(err) {
 				if n == 0 {
 					// Lost the bootstrap race to a concurrent first user
 					// that committed between our BEGIN and our INSERT.
