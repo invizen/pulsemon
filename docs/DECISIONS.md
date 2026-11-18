@@ -1860,3 +1860,23 @@ probes is loaded into statsCache with its full series after a fresh warmStats;
 an active-sensor control guards the query edit). Sabotage-verified: reverting
 the query to `WHERE state = 'active'` turns the test red (the paused sensor is
 absent from statsCache).
+
+## comment-hygiene-stale-fixes (api.go, status.go, auth.go, internal/store/store.go, internal/store/db_test.go, 2026-11-18)
+**Decision:** Corrected a batch of comments that had drifted from the code they
+describe (a stale cross-reference, a wrong interval default, a mislabeled
+column, and three garbled sentences from earlier edits). Comment-only: the code
+is byte-identical to v1.1.16 after stripping comments.
+**Why:** In auth and concurrency code a wrong comment is worse than none —
+reviewers trust it, and some of these explain why a lock or ordering is safe.
+The specific fixes: (1) the clear-history / `deleteRowsBatched` batching
+rationale cited "syncSensors' under-lock fresh reads," which probe.go removed
+(replaced by a generation fingerprint) — reworded to the real reason (a
+whole-table DELETE holds the WAL write lock and stalls probe INSERTs /
+concurrent readers); (2) DELETE /api/tags claimed "per-sensor edits stay
+operator-scoped," but PATCH is admin-only — corrected to destructive +
+fleet-wide → admin surface; (3) `statusWindow` assumed a 15s default interval;
+it is 60s; (4) `spike_mult` was called a "(deprecated, unread) compatibility
+column" whose seed matches UI defaults (3x) — it is a LIVE dashboard-only
+display knob and the UI default is 5.
+**Pinned by:** comment-stripped code-token equality vs the prior release (proves
+zero behavior change); gofmt/vet/build clean; full `-race` green.

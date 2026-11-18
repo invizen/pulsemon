@@ -1,26 +1,40 @@
-# pulsemon v1.1.16
+# pulsemon v1.1.17
 
 ## What's new
 
-One fix: paused sensors keep their history across a restart.
+Comment hygiene: fixed a batch of stale and garbled comments. **No behavior
+change** — the code is byte-identical to v1.1.16 after stripping comments
+(verified by comment-stripped code-token equality).
 
-### Fixed: paused sensors lose their history after a restart
-At startup, only **active** sensors had their 24h probe history loaded into
-memory. A paused sensor that was resumed later (the very likely sequence:
-maintenance mode on → `pulsemon update --restart` → maintenance off) started
-its in-memory series from empty — and nothing else ever re-loads a sensor's
-history from the database. The result: blank 24h graphs, uptime that counted
-only the probes since the resume, and an empty 60-probe inspector window,
-while `/history` (which reads the database directly) still showed the data —
-the two views disagreed.
+### Fixed: comments that contradicted the code
+Several comments had drifted from the code they describe. In auth and
+concurrency code a wrong comment is worse than none, so each was corrected to
+state the current invariant:
 
-`warmStats` now loads history for **active and paused** sensors at startup.
-Memory per sensor is already capped (the raw tier holds at most the 1h window
-or the last 60 probes, whichever is wider), so warming the extra sensors is
-memory-safe.
+- `api.go` (clear-history + `deleteRowsBatched`): the batching rationale
+  pointed at "syncSensors' deliberate under-lock fresh reads" — reads that
+  probe.go removed (it now reconciles under the lock with no DB reads, via a
+  generation fingerprint). Reworded to the actual reason: a whole-table DELETE
+  holds the WAL write lock and stalls probe INSERTs / concurrent readers up to
+  the 15s busy_timeout.
+- `api.go` (DELETE /api/tags): claimed "per-sensor edits stay operator-scoped"
+  — but per-sensor edits (PATCH) are admin-only. Corrected to the real
+  rationale (destructive + fleet-wide → admin surface).
+- `status.go`: the `statusWindow` comment assumed a "default 15s interval"; the
+  actual default is 60s (so 8 probes is ~8 min of history, not ~2 min).
+- `internal/store/store.go` + `internal/store/db_test.go`: `spike_mult` was
+  called a "(deprecated, unread) compatibility column" whose seed "matches UI
+  defaults (3x)" — it is a LIVE dashboard-only display knob and the UI default
+  is 5, not 3. Corrected both.
+- Garbled sentences from earlier edits: the `setSensorTagsInConn` doc
+  ("…BEGIN IMMEDIATE ImmediateTxa *sql.Tx…"), the tag-DELETE body
+  ("…the new setwithout this…"), and the `AddUser` doc (missing sentence break
+  after "BEGIN IMMEDIATE transaction").
 
 ## Verification
+- **Comment-only, proven:** comment-stripped code tokens are identical to
+  v1.1.16 for every changed file (string/rune/backtick-aware stripper,
+  whitespace-normalized).
+- `gofmt -l` clean, `go vet` clean, `go build` OK on the gate box.
 - Full `-race` on the release tree, zero data races, no failures.
-- Dedicated regression test, sabotage-verified (fails when the query is
-  reverted to active-only).
-- Rationale: docs/DECISIONS.md → `warmstats-paused-sensors`.
+- Rationale: docs/DECISIONS.md → `comment-hygiene-stale-fixes`.
