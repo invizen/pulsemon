@@ -1974,3 +1974,29 @@ and would get a `MAX(updated_at)` pre-check only if targeting 1000+ sensors.
 `Content-Encoding: gzip` + a body that decompresses to the sensor JSON; a
 client with no Accept-Encoding gets a raw body with no Content-Encoding; an
 explicit `gzip;q=0` is served raw).
+
+## structure-split-rejudicated (repo-wide, 2026-11-18)
+**Decision:** the 2026-11-18 external review (finding #9) re-raised the
+package split (`internal/{auth,probe/icmp,probe/http,alert,api,update}` +
+constructor-injected dependencies) and `t.Parallel`. REJECTED again — the
+original decision (→ structure-and-comment-density, 2026-11-11) stands.
+**Re-open conditions check (none fired):**
+- Test time > 8 min: the full `-race` suite is ~5.7 min (341s) — under the bar.
+- Recurring globals `-race` hit: the suite is green (0 failures); no recurring
+  globals-related race.
+- Second developer: single-developer repo.
+**Why (unchanged):** the package-level vars the review names as the problem
+(`probeTarget`, `certReadTimes`, the throttle maps, …) ARE the test seams the
+single-package suite stubs; `internal/*` + constructor DI rewrites the whole
+harness surface for zero behavior change. `t.Parallel` is a consequence of that
+refactor (shared ICMP socket, throttle maps, per-test SQLite files, bind
+ports), not an independent win.
+**Additive gap closed:** the review's "resume after a restart shows the 24h
+graph and uptime" test was the one genuine gap — added as an end-to-end test.
+The other three suggested tests were already covered (paced-login →
+`TestHourlyBudgetPersistsAcrossRollingLockout`; delete-cascade →
+`TestDeleteSensorRemovesCascade`) or are a policy call (CI benchmark smoke —
+benchmarks are deliberately opt-in per ci.yml).
+**Pinned by:** TestRestartRebuilds24hGraphAndUptime (a fresh worker with an
+empty cache warms from the DB; Uptime24h ≈ the seeded 90% and the 24h graph is
+rebuilt with its loss/reply shape intact).
