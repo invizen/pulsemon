@@ -439,6 +439,13 @@ type ProbeWorker struct {
 	// can't starve the probe queue. Guarded by mu; cleaned up in Remove.
 	lastPulse map[string]time.Time
 
+	// pulseSem is a fleet-wide in-flight cap for manual pulses: a bounded
+	// semaphore (capacity pulseMaxInFlight) that PingNow acquires (non-
+	// blocking) before probing. The per-sensor cooldown only bounds one
+	// sensor, so this stops a many-sensor fan-out from tying up a large pool
+	// of request handlers (each held for up to the sensor's timeout) at once.
+	pulseSem chan struct{}
+
 	// alertOrderGates serializes each sensor's alert deliveries in LAUNCH ORDER
 	// an "error" alert whose webhook attempt fails
 	// and retries must not be delivered AFTER the sensor's later
@@ -511,6 +518,7 @@ func NewProbeWorker(db *store.Store) *ProbeWorker {
 		syncReq:         make(chan struct{}, 1),
 		statsCache:      make(map[string]*probeSeries),
 		lastPulse:       make(map[string]time.Time),
+		pulseSem:        make(chan struct{}, pulseMaxInFlight),
 		alertOrderGates: make(map[string]chan func()),
 		alertMem:        make(map[string]alertMemEntry),
 		stopCtx:         ctx,
@@ -1020,9 +1028,22 @@ const dbWriteTimeout = 8 * time.Second
 // before the per-sensor cooldown elapses; the handler maps it to 429.
 var errPulseCoolingDown = errors.New("pulse too soon")
 
+// errPulseBusy is returned by PingNow when the fleet-wide in-flight pulse cap
+// is reached; the handler maps it to 429. The per-sensor cooldown only bounds
+// one sensor, so a viewer with many sensors could otherwise fan out a large
+// burst of concurrent outbound probes.
+var errPulseBusy = errors.New("too many pulses in flight")
+
 // pulseNowCooldown bounds how often a sensor may be manually pulsed. A
 // human's click rate is far below this; an unthrottled loop is not.
 const pulseNowCooldown = 2 * time.Second
+
+// pulseMaxInFlight caps the total number of manual pulses in flight across ALL
+// sensors at once. A manual pulse is a quick diagnostic (one human clicking a
+// few sensors), so a small cap is ample; it bounds a many-sensor fan-out so a
+// viewer can't tie up a large pool of request handlers (each held for up to
+// the sensor's timeout) and stamp the probe table.
+const pulseMaxInFlight = 8
 
 // PingNow performs one immediate "Pulse Now" probe and RECORDS it: the row
 // lands in probes (history + dashboard sparkline) and the in-memory stats
@@ -1042,6 +1063,17 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	var timeoutMS int
 	if err := pw.db.QueryRow("SELECT target, type, timeout_ms FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
+	}
+	// Fleet-wide in-flight cap: the per-sensor cooldown below only bounds one
+	// sensor, so a viewer with N sensors could otherwise fan out ~N/2
+	// concurrent outbound probes. A small shared semaphore caps the total;
+	// when it's full the pulse is refused (429) rather than queued — a manual
+	// pulse is a quick diagnostic, and "try again" is better than waiting.
+	select {
+	case pw.pulseSem <- struct{}{}:
+		defer func() { <-pw.pulseSem }()
+	default:
+		return probeOutcome{}, errPulseBusy
 	}
 	// Per-sensor cooldown: a manual pulse is a quick diagnostic, and an
 	// unthrottled stream of them would starve the probe queue. 2s is well

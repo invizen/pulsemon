@@ -1241,6 +1241,10 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusTooManyRequests, "pulse too soon — try again in a moment")
 			return
 		}
+		if errors.Is(err, errPulseBusy) {
+			respondWithError(w, http.StatusTooManyRequests, "too many pulses in flight — try again in a moment")
+			return
+		}
 		respondInternal(w, "pulse sensor "+id, err)
 		return
 	}

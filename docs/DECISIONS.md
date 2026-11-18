@@ -1927,3 +1927,20 @@ seam proves the query stops after the latching read — reads stays at 2 across
 further calls) and TestAuthBootstrappedPicksUpCLIAdd (a fresh, un-latched
 AuthState observes an out-of-band DB write of the setting on the next read —
 the latch never caches false).
+
+## pulse-now-fleet-limit (probe.go, ping_now_fleet_limit_test.go, 2026-11-18)
+**Decision:** `PingNow` now acquires a fleet-wide in-flight cap before
+probing: a bounded semaphore `pulseSem` (capacity `pulseMaxInFlight` = 8). The
+non-blocking acquire returns `errPulseBusy` (→ 429) when the cap is full;
+otherwise the slot is held for the probe + write and released by defer. The
+per-sensor 2s cooldown is unchanged and is checked after the cap.
+**Why:** The cooldown bounds ONE sensor, so a viewer with N sensors could fan
+out ~N/2 concurrent outbound probes at once (100 sensors ≈ 50/s), each holding
+a request handler for up to the sensor's timeout and writing a probe row. The
+shared semaphore caps the total concurrent manual pulses at 8, so a many-sensor
+fan-out can't tie up a large handler pool. A manual pulse is a quick
+diagnostic, so refusing with 429 (which the UI already handles) is preferable
+to queuing.
+**Pinned by:** TestPingNowFleetLimit (filling `pulseSem` to its cap makes
+PingNow return `errPulseBusy` without probing; freeing one slot lets it
+proceed past the cap).
