@@ -109,15 +109,24 @@ type probeSeries struct {
 	lost24  int
 }
 
-// warmStats loads every active sensor's 24h probe history into the cache so a
-// fresh process (deploy/restart) serves populated cards immediately instead of
-// blanking them until each sensor re-accumulates a window. Runs once, before
-// probing starts.
+// warmStats loads every active AND paused sensor's 24h probe history into the
+// cache so a fresh process (deploy/restart) serves populated cards immediately
+// instead of blanking them until each sensor re-accumulates a window. Paused
+// sensors are included because a resume after a restart (the maintenance →
+// update --restart → resume sequence) must not start from an empty series —
+// and the raw tier is capped per sensor (max(1h, last 60)), so the extra
+// sensors are memory-safe. Runs once, before probing starts.
+// History: docs/DECISIONS.md → warmstats-paused-sensors.
 func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// ctx: the warm UNION query on a large DB is
 	// the first thing Run does; a shutdown landing during it must be able
 	// to abort the load instead of serving from a half-warmed process.
-	ids, err := pw.db.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active'")
+	// Paused sensors are warmed too: recordProbe starts a resumed sensor from
+	// whatever is already in the cache, and nothing else ever re-loads a
+	// sensor's history, so a paused-then-resumed sensor would otherwise come
+	// back with a blank 24h graph and an empty 60-probe inspector while
+	// /history (a direct DB read) still shows the data.
+	ids, err := pw.db.QueryContext(ctx, "SELECT id FROM sensors WHERE state IN ('active','paused')")
 	if err != nil {
 		log.Printf("stats warm: failed to list sensors: %v", err)
 		return

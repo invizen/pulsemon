@@ -1841,3 +1841,22 @@ TestAuthOffRebindingMutationStillBlocked (POST from a non-allowlisted host →
 421, no sensor created). Sabotage-verified: reverting the gate to the old
 mutation-only `switch` turns TestAuthOffRebindingReadBlocked red (the
 /api/sensors GET returns 200, not 421).
+
+## warmstats-paused-sensors (stats.go, warmstats_paused_test.go, 2026-11-18)
+**Decision:** `warmStats` (the startup history warm-load) now loads every ACTIVE
+AND PAUSED sensor's 24h probe history (`WHERE state IN ('active','paused')`,
+was `WHERE state = 'active'`). Runs once, before probing starts.
+**Why:** `recordProbe` starts a resumed sensor from whatever is already in the
+in-memory cache, and nothing else ever re-loads a sensor's history from the DB.
+So a paused sensor that was paused across a restart (the very likely
+maintenance → `update --restart` → resume sequence) resumed with an EMPTY
+series: blank 24h graphs, uptime counting only post-resume probes, and an empty
+60-probe inspector — while `/history` (a direct DB read) still showed the data,
+so the two views disagreed. The raw tier is capped per sensor (max(1h, last 60)
+entries), so warming paused sensors too is memory-safe — the extra sensors add
+no unbounded growth.
+**Pinned by:** TestWarmStatsLoadsPausedSensors (a paused sensor with recent
+probes is loaded into statsCache with its full series after a fresh warmStats;
+an active-sensor control guards the query edit). Sabotage-verified: reverting
+the query to `WHERE state = 'active'` turns the test red (the paused sensor is
+absent from statsCache).
