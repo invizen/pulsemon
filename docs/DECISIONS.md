@@ -1865,7 +1865,7 @@ absent from statsCache).
 **Decision:** Corrected a batch of comments that had drifted from the code they
 describe (a stale cross-reference, a wrong interval default, a mislabeled
 column, and three garbled sentences from earlier edits). Comment-only: the code
-is byte-identical to v1.1.16 after stripping comments.
+is byte-identical to the prior tree after stripping comments.
 **Why:** In auth and concurrency code a wrong comment is worse than none —
 reviewers trust it, and some of these explain why a lock or ordering is safe.
 The specific fixes: (1) the clear-history / `deleteRowsBatched` batching
