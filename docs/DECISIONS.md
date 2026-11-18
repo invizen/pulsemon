@@ -1880,3 +1880,30 @@ column" whose seed matches UI defaults (3x) — it is a LIVE dashboard-only
 display knob and the UI default is 5.
 **Pinned by:** comment-stripped code-token equality vs the prior release (proves
 zero behavior change); gofmt/vet/build clean; full `-race` green.
+
+## delete-sensor-batched-cascade (api.go, delete_sensor_test.go, 2026-11-18)
+**Decision:** `DELETE /api/sensors/{id}` no longer runs a single
+`DELETE FROM sensors` that cascades the sensor's whole footprint in one
+statement. It now: (1) checks the sensor row exists (a PK lookup;
+`sql.ErrNoRows` → 404), (2) stops the probe loop first via
+`probeWorker.Remove`, (3) `deleteRowsBatched`-deletes the two large cascade
+tables (`probes`, then `events`) in `purgeBatchSize` chunks, and (4) deletes the
+sensor row, whose `ON DELETE CASCADE` clears the small tables (`sensor_tags`,
+`alert_state` — a few rows each).
+**Why:** A 5s sensor's `probes` table is ~17k rows; the single cascading DELETE
+held the WAL write lock across the entire sweep — the exact class of long
+lock-holder that `clear-history` and the retention purge were rewritten to avoid
+with `deleteRowsBatched` (each statement is its own bounded autocommit, so the
+lock is held for milliseconds per chunk, and probe INSERTs / concurrent readers
+stay responsive). Stopping the loop first means no new probe/event/alert rows
+land mid-delete; if a delete fails and the sensor survives, `syncSensors`
+respawns the loop on its next 5s pass (`Remove` only drops the in-memory loop +
+state, not the DB row), so a partial delete converges on retry rather than
+stranding the sensor with no loop.
+**Pinned by:** TestDeleteSensorRemovesCascade (a sensor with probes + events + a
+tag + an alert_state row is fully removed — every cascade table empty — and its
+loop + ProbeState dropped) and TestDeleteSensorNotFound (a missing id returns
+404 and leaves other sensors untouched). These pin the behavioral contract (full
+cascade removal, 404, loop stop); the bounded-lock batching is the same
+`deleteRowsBatched` idiom already pinned by the clear-history tests, so it is not
+re-proven here.

@@ -1155,16 +1155,42 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 
 	case http.MethodDelete:
-		res, err := s.db.ExecContext(r.Context(), "DELETE FROM sensors WHERE id = ?", id)
-		if err != nil {
+		// Existence check up front drives the 404 (and skips the batched
+		// no-op deletes) — the sensor row's PK lookup is cheap. Scan yields
+		// sql.ErrNoRows (not a zero value) when the id is absent, so that
+		// error is the 404 signal.
+		var one int
+		if err := s.db.QueryRowContext(r.Context(), "SELECT 1 FROM sensors WHERE id = ?", id).Scan(&one); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				respondWithError(w, http.StatusNotFound, "sensor not found")
+				return
+			}
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			respondWithError(w, http.StatusNotFound, "sensor not found")
+		// Stop the probe loop FIRST so no new probe/event/alert rows land
+		// mid-delete. If a delete below fails and the sensor survives,
+		// syncSensors respawns the loop on its next 5s pass — Remove only
+		// drops the in-memory loop + state, not the DB row.
+		s.probeWorker.Remove(id)
+		// Batched deletes for the two large cascade tables (a 5s sensor's
+		// probes table is ~17k rows) — the purgeOld idiom: each statement is
+		// its own bounded autocommit, so the WAL write lock is held for
+		// milliseconds per chunk instead of one long lock over the whole
+		// cascade. The small cascade tables (sensor_tags, alert_state — a
+		// few rows each) ride the final sensor-row DELETE's ON DELETE CASCADE.
+		if _, err := deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
-		s.probeWorker.Remove(id)
+		if _, err := deleteRowsBatched(r.Context(), s.db, "events", "sensor_id = ?", []any{id}); err != nil {
+			respondInternal(w, "delete sensor "+id, err)
+			return
+		}
+		if _, err := s.db.ExecContext(r.Context(), "DELETE FROM sensors WHERE id = ?", id); err != nil {
+			respondInternal(w, "delete sensor "+id, err)
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 
 	default:
