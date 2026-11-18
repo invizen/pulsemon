@@ -566,9 +566,9 @@ func validUsername(u string) bool {
 // AddUser validates and creates an account. The first AddUser is what
 // enables authentication.
 //
-// The check-and-create runs in ONE BEGIN IMMEDIATE transaction
-// on a fresh install the unauthenticated
-// bootstrap POST is open to the whole LAN, and with a DEFERRED begin
+// The check-and-create runs in ONE BEGIN IMMEDIATE transaction. On a fresh
+// install the unauthenticated bootstrap POST is open to the whole LAN, and
+// with a DEFERRED begin
 // every concurrent first-user POST reads user_count=0 before any of them
 // writes — N racers, N "first" accounts. BEGIN IMMEDIATE serializes the
 // writers: the winner commits the account (and the auth_bootstrapped flag

@@ -10,7 +10,7 @@ import (
 // statusWindow is the probe count used for loss% detection. It must also be
 // >= down_after (the API allows down_after down to 1; the window read takes
 // the max) so the consecutive-loss test always has enough history. At the
-// default 15s interval, 8 probes is ~2 min of history — short enough that a
+// default 60s interval, 8 probes is ~8 min of history — short enough that a
 // recovered sensor's status washes out in minutes, not an hour.
 const statusWindow = 8
 

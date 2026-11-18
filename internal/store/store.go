@@ -1191,14 +1191,15 @@ func (db *Store) SeedSensors() error {
 	}
 
 	// Fresh-install demo sensors. Tuning matches the UI-created defaults in
-	// the API (POST /api/sensors: 60s / 1000ms / 25% / 2 / 3x) so a seeded
-	// sensor and a dashboard-created one behave identically. They start
-	// PAUSED — like UI-created sensors — because the targets are
-	// environment-independent placeholders (127.0.0.1: not every host runs
-	// a router or a server on 192.168.1.x, and a wrong active target would
-	// fire down alerts on day one). The user edits the targets and resumes.
-	// spike_mult is written explicitly so the seed row keeps a stable
-	// value in the (deprecated, unread) compatibility column.
+	// the API (POST /api/sensors: 60s / 1000ms / 25% / 2) so a seeded sensor
+	// and a dashboard-created one behave identically. They start PAUSED —
+	// like UI-created sensors — because the targets are environment-neutral
+	// placeholders (127.0.0.1: not every host runs a router or a server on
+	// 192.168.1.x, and a wrong active target would fire down alerts on day
+	// one). The user edits the targets and resumes. spike_mult is a
+	// dashboard-only display knob (sparkline spike tint; the probe engine
+	// never reads it, so it never affects status); the seed writes it
+	// explicitly (3) for a stable row, below the column default of 5.
 	sensors := []struct {
 		name, target, tags string
 	}{

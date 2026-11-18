@@ -1174,13 +1174,12 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 
 // setSensorTagsInConn replaces the sensor's tags (DELETE + INSERTs) on the
 // CALLER's pinned connection, for the PATCH sensor write path that runs
-// inside a BEGIN IMMEDIATE ImmediateTxa *sql.Tx
-// from db.Begin can't join it because the transaction lives on the pinned
-// connection (db.SetSensorTags keeps its own transaction and can't join one
-// either, so the in-conn twin lives here rather than in the store
-// package). The caller's
-// ctx is threaded through: every statement on
-// this path honors request cancellation, matching the ImmediateTx boundary.
+// inside a BEGIN IMMEDIATE transaction. A *sql.Tx from db.Begin can't join
+// it because the transaction lives on the pinned connection, and
+// db.SetSensorTags keeps its own transaction (so it can't join one either);
+// that is why this in-conn twin lives here rather than in the store package.
+// The caller's ctx is threaded through, so every statement on this path
+// honors request cancellation, matching the ImmediateTx boundary.
 func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
 	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
 		return err
@@ -1335,17 +1334,15 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 
 	var probes, events int64
 	var err error
-	// The two LARGE deletes run batched (the purgeOld idiom, review
-	// 2026-10-24): one DELETE of a long-lived sensor's rows held the WAL
-	// write lock for its whole duration, stalling probe INSERTs and (via
-	// syncSensors' deliberate under-lock fresh reads) every probe loop up
-	// to the 15s busy_timeout. Batching caps each statement at a few ms.
-	// Partial completion is harmless here — the target is a WIPE, so a
-	// retry just deletes the remainder — so atomicity of these two is NOT
-	// worth the lock hold. The small state-consistency steps below stay
-	// atomic: alert_state removal and the status reset either all commit
-	// or none (the old code ran everything autocommit and ignored the last
-	// two errors — that is the half-cleared bug the tx still fixes).
+	// The two LARGE deletes run batched (the purgeOld idiom): one DELETE of
+	// a long-lived sensor's rows would hold the WAL write lock for its whole
+	// duration, stalling probe INSERTs and any concurrent reader up to the
+	// 15s busy_timeout. Batching caps each statement at a few ms. Partial
+	// completion is harmless — the target is a WIPE, so a retry just deletes
+	// the remainder — so atomicity of these two is NOT worth the lock hold.
+	// The small state-consistency steps below stay atomic: alert_state
+	// removal and the status reset commit all-or-none (the old autocommit
+	// code ignored their errors — the half-cleared bug the tx fixes).
 	if probes, err = deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
 		respondInternal(w, "clear probes "+id, err)
 		return
@@ -1393,10 +1390,9 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // purgeBatchSize chunks — the purgeOld idiom (probe.go): each statement is
 // its own autocommit delete of a bounded row set, so the WAL write lock is
 // held for milliseconds per statement instead of for a whole-million-row
-// sweep (probe INSERTs and syncSensors' under-lock reads stay responsive
-// up to, but not through, the 15s busy_timeout). Returns the total rows
-// deleted. The table/where strings are fixed call-site literals, never
-// user input.
+// sweep (probe INSERTs and any concurrent reader stay responsive up to, but
+// not through, the 15s busy_timeout). Returns the total rows deleted. The
+// table/where strings are fixed call-site literals, never user input.
 //
 // The `id IN (SELECT id …)` shape is optimal as written (verified by
 // EXPLAIN QUERY PLAN): both probes.id and events.id are
@@ -1717,11 +1713,9 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, tags)
 		return
 	case http.MethodDelete:
-		// Destructive and fleet-wide: strips the tag from EVERY sensor
-		// and respawns every affected probe loop. Admin-only for
-		// consistency with DELETE /api/history —
-		// per-sensor edits stay operator-scoped; all-sensors rewrites
-		// are admin surface.
+		// Destructive and fleet-wide: strips the tag from EVERY sensor and
+		// respawns every affected probe loop, so it is admin-only (like the
+		// other fleet-wide mutations, e.g. DELETE /api/history).
 		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
 			respondWithError(w, http.StatusForbidden, "admin only")
 			return
@@ -1734,10 +1728,10 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		// Collect the tagged sensors BEFORE the delete: each probe loop
 		// holds a spawn-time copy of its tag set (alert routing reads
 		// c.tags from that copy), so every affected loop must be respawned
-		// to pick up the new setwithout this, a
-		// sensor that just left the alert_filter's tag scope keeps the
-		// stale routing (alerts it shouldn't send, or silence it should
-		// have) until the next process restart.
+		// to pick up the new set. Without this, a sensor that just left the
+		// alert_filter's tag scope keeps the stale routing (alerts it
+		// shouldn't send, or silence it should have) until the next process
+		// restart.
 		var tagged []string
 		rows, err := s.db.QueryContext(r.Context(), "SELECT sensor_id FROM sensor_tags WHERE tag = ?", tag)
 		if err != nil {

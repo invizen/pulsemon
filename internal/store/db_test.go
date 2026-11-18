@@ -334,9 +334,11 @@ func TestStatusRenameMigrationIsNoOpWhenMigrated(t *testing.T) {
 }
 
 // TestSeedSensorsFreshInstallTuning locks the fresh-install demo sensors:
-// they must match the UI-created defaults (POST /api/sensors: 60s /
-// 1000ms / 25% / 2, spike_mult 3) so a seeded sensor behaves identically
-// to a dashboard-created one. They start PAUSED with environment-neutral
+// they must match the UI-created defaults for interval/timeout/loss_warn/
+// down_after (POST /api/sensors: 60s / 1000ms / 25% / 2) so a seeded sensor
+// behaves identically to a dashboard-created one; spike_mult is written
+// explicitly (3, below the column default of 5). They start PAUSED with
+// environment-neutral
 // 127.0.0.1 targets (not every host runs a router or server on
 // 192.168.1.x; a wrong ACTIVE target would fire down alerts on day one),
 // and they must carry their tags.
