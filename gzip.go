@@ -43,8 +43,10 @@ func acceptsGzip(r *http.Request) bool {
 
 // gzipPool reuses deflate compressors across requests: a fresh
 // gzip.NewWriter allocates ~800 KB of window + hash state, and every /api/
-// response on the 5s dashboard poll used to pay that allocation.
-var gzipPool = sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
+// response on the 5s dashboard poll used to pay that allocation. A pointer
+// (not a value) so tests can swap in an instrumented pool without copying
+// the noCopy Pool.
+var gzipPool = &sync.Pool{New: func() any { return gzip.NewWriter(io.Discard) }}
 
 // gzipResponseWriter streams the response body through gzip. The
 // compressor is initialized LAZILY on the first body write, so a

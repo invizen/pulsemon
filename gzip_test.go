@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -188,6 +190,22 @@ func TestGzipNormalResponseDecodes(t *testing.T) {
 // request, instead of a fresh allocation per /api/ response on the 5s
 // dashboard poll.
 func TestGzipWriterPooledAndReused(t *testing.T) {
+	// Reuse is asserted through the pool's New count, NOT pointer
+	// identity: under -race, sync.Pool.Put intentionally drops the item
+	// at random (~25%, "Randomly drop x on floor") to stress callers
+	// that don't rely on retention, so an identity assertion across
+	// Put/Get flakes (2026-11-19 CI failure on a 2-core runner). A
+	// broken Close (no Put) calls New on every Get; a healthy pool
+	// returns a pooled writer within a few Put/Get cycles even with
+	// drops (P(32 straight drops) ≈ 3e-19).
+	var newCount atomic.Int64
+	orig := gzipPool
+	gzipPool = &sync.Pool{New: func() any {
+		newCount.Add(1)
+		return gzip.NewWriter(io.Discard)
+	}}
+	defer func() { gzipPool = orig }()
+
 	rec := httptest.NewRecorder()
 	gzw := &gzipResponseWriter{ResponseWriter: rec}
 	gzw.Write([]byte("x"))
@@ -195,17 +213,42 @@ func TestGzipWriterPooledAndReused(t *testing.T) {
 	if first == nil {
 		t.Fatal("no compressor was taken from the pool on Write")
 	}
+	if n := newCount.Load(); n != 1 {
+		t.Fatalf("New called %d times for the first write on an empty pool, want 1", n)
+	}
 	if err := gzw.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	if gzw.gz != nil {
 		t.Fatal("Close did not release the compressor")
 	}
-	second := gzipPool.Get().(*gzip.Writer)
-	if second != first {
-		t.Fatal("the pool did not reuse the returned compressor — per-request allocation is back")
+	reused := 0
+	for i := 0; i < 20; i++ {
+		rec := httptest.NewRecorder()
+		gzw := &gzipResponseWriter{ResponseWriter: rec}
+		gzw.Write([]byte("x"))
+		if gzw.gz == nil {
+			t.Fatal("no compressor was taken from the pool on Write")
+		}
+		if err := gzw.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if gzw.gz != nil {
+			t.Fatal("Close did not release the compressor")
+		}
+		// One Get per cycle, and the taken writer is NOT put back: the
+		// pool stays drained, so a broken Close (no Put) can never
+		// manufacture a New-free Get.
+		before := newCount.Load()
+		gz := gzipPool.Get().(*gzip.Writer)
+		if newCount.Load() == before {
+			reused++ // Close's Put survived — the pooled writer came back
+		}
+		_ = gz
 	}
-	gzipPool.Put(second)
+	if reused == 0 {
+		t.Fatalf("20 Write/Close/Get cycles, zero pooled reuses (New on every Get) — per-request allocation is back")
+	}
 }
 
 // TestAcceptsGzipCaseInsensitive pins the RFC 9110 §8.4 contract (d):
