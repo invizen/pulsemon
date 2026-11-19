@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -333,5 +335,94 @@ func TestWaitHealthyTimesOutOnDeadPort(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("waitHealthy took %v, want < 5s (bounded by healthzTimeout)", elapsed)
+	}
+}
+
+// TestBuildWatchdogCommandPrefersPrevBinary pins the watchdog spawn
+// contract (a): the watchdog must execute <exe>.prev — the known-good
+// previous binary — not <exe>, which at spawn time is the freshly
+// installed (possibly broken) binary. A wrong-arch new binary or an
+// init() crash made the old spawn fail in exactly the failure modes the
+// watchdog exists for, after which the restart proceeded with no guardian.
+// History: docs/DECISIONS.md → watchdog-prev-and-scope
+func TestBuildWatchdogCommandPrefersPrevBinary(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "pulsemon")
+	prev := exe + ".prev"
+	for _, p := range []string{exe, prev} {
+		if err := os.WriteFile(p, []byte("#!/bin/sh\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	oldRun := systemdRunPath
+	systemdRunPath = func() string { return "" } // plain command shape
+	t.Cleanup(func() { systemdRunPath = oldRun })
+
+	cmd := buildWatchdogCommand(exe, "user")
+	if cmd.Args[0] != prev {
+		t.Fatalf("watchdog binary = %q, want the previous binary %q (the new one may be the broken one)", cmd.Args[0], prev)
+	}
+	want := []string{prev, "update", "watchdog", "--prev", prev, "--dst", exe,
+		"--timeout", watchdogTimeout().String(), "--old-pid", strconv.Itoa(os.Getpid())}
+	if !reflect.DeepEqual(cmd.Args, want) {
+		t.Fatalf("args = %v, want %v", cmd.Args, want)
+	}
+}
+
+// TestBuildWatchdogCommandFallsBackToExe: no .prev (first update from a
+// pre-.prev release) — the spawn must not fail for lack of a binary; it
+// runs <exe> itself. There is nothing to roll back to, but the watchdog
+// can still observe and log the outcome.
+func TestBuildWatchdogCommandFallsBackToExe(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "pulsemon")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRun := systemdRunPath
+	systemdRunPath = func() string { return "" }
+	t.Cleanup(func() { systemdRunPath = oldRun })
+	if cmd := buildWatchdogCommand(exe, ""); cmd.Args[0] != exe {
+		t.Fatalf("watchdog binary = %q, want %q (no .prev to prefer)", cmd.Args[0], exe)
+	}
+}
+
+// TestBuildWatchdogCommandSystemdScope pins the cgroup isolation (b): on
+// systemd the watchdog must be spawned through `systemd-run [--user]
+// --scope` so it lives in an independent transient cgroup — a plain
+// Setsid detach stays in pulsemon.service's cgroup, where
+// KillMode=control-group (the default) kills it on the very restart the
+// watchdog is guarding.
+// History: docs/DECISIONS.md → watchdog-prev-and-scope
+func TestBuildWatchdogCommandSystemdScope(t *testing.T) {
+	dir := t.TempDir()
+	exe := filepath.Join(dir, "pulsemon")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	oldRun := systemdRunPath
+	systemdRunPath = func() string { return "/usr/bin/systemd-run" }
+	t.Cleanup(func() { systemdRunPath = oldRun })
+
+	cases := []struct {
+		bus    string
+		prefix []string // args between systemd-run and the watchdog binary
+	}{
+		{"user", []string{"--user", "--scope"}},
+		{"system", []string{"--scope"}},
+		{"", nil}, // unknown bus: no scope wrapping
+	}
+	for _, tc := range cases {
+		cmd := buildWatchdogCommand(exe, tc.bus)
+		if tc.bus == "" {
+			if cmd.Args[0] != exe {
+				t.Fatalf("bus=%q: args[0] = %q, want the plain binary %q (no scope wrapping)", tc.bus, cmd.Args[0], exe)
+			}
+			continue
+		}
+		want := append([]string{"/usr/bin/systemd-run"}, append(tc.prefix, exe, "update", "watchdog")...)
+		if !reflect.DeepEqual(cmd.Args[:len(want)], want) {
+			t.Fatalf("bus=%q: args = %v, want prefix %v", tc.bus, cmd.Args, want)
+		}
 	}
 }

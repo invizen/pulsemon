@@ -274,9 +274,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// I2: this process dies with the restart, so a
 	// broken new binary would stay broken with no one to roll it back.
 	// Spawn a detached watchdog that polls healthz after the restart and
-	// restores <exe>.prev if the new binary never comes up. If the spawn
-	// fails, proceed with the restart and log it (per spec).
-	if werr := spawnUpdateWatchdog(exe); werr != nil {
+	// restores <exe>.prev if the new binary never comes up. The watchdog
+	// runs the PREVIOUS binary (exe may now be the broken one) and, on
+	// systemd, in its own scope cgroup so the restart cannot kill it. If
+	// the spawn fails, proceed with the restart and log it (per spec).
+	if werr := spawnUpdateWatchdog(exe, d); werr != nil {
 		fmt.Fprintf(os.Stderr, "pulsemon: watchdog spawn failed (proceeding without it): %v\n", werr)
 	}
 	if err := performRestart(d); err != nil {

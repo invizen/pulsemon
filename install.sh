@@ -229,6 +229,12 @@ Environment=PULSEMON_ADDR=$PULSEMON_ADDR
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=yes
+# The self-update watchdog detaches into its own `systemd-run --scope`
+# cgroup, but KillMode=process is the belt-and-suspenders: a
+# stop/restart kills only the main process, so a watchdog that did not
+# make it into a scope (no systemd-run) survives the restart it guards.
+# pulsemon has no other long-lived children, so nothing leaks.
+KillMode=process
 
 [Install]
 WantedBy=default.target

@@ -38,3 +38,7 @@ func detachSpawn(cmd *exec.Cmd) error {
 	}
 	return cmd.Start()
 }
+
+// systemdRunPath: no systemd-run on Windows — the plain detach above is the
+// only isolation there, so the watchdog spawner never scope-wraps.
+var systemdRunPath = func() string { return "" }

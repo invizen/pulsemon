@@ -2170,3 +2170,37 @@ must not stamp over a pending token; sabotaged no-bail shape fails with
 "bootstrapped latched on a token-pending install"),
 TestStartupAuthMigrationsCompletesPendingToken (boot sequence migrates +
 clears + latches, idempotent — no duplicate admin on a second boot).
+
+## watchdog-prev-and-scope (update.go, update_api.go, update_detach_linux.go, update_detach_windows.go, install.sh, update_restart_test.go, 2026-11-19)
+
+**Decision:** The post-restart watchdog is spawned from `<exe>.prev`
+(the known-good previous binary) when it exists, falling back to `<exe>`
+when it does not (first update from a pre-.prev release — nothing to roll
+back to, but the spawn must not fail for lack of a binary). On systemd
+with a known bus, the spawn is wrapped in `systemd-run [--user] --scope`
+(path resolved from fixed system locations via the testable
+`systemdRunPath` var, "" when absent → plain detach) so the watchdog
+lives in an independent transient cgroup. The install.sh-generated unit
+now sets `KillMode=process` as belt-and-suspenders. Command construction
+is factored into `buildWatchdogCommand(exe, bus)` so the contract is
+pinned without starting a process.
+
+**Why:** `spawnUpdateWatchdog` ran `exec.Command(exe, ...)` after
+`installBinary` had already swapped `exe` to the NEW binary — a
+wrong-arch binary or an init() crash failed the spawn and the restart
+proceeded with no guardian at all. Separately, a plain Setsid detach
+leaves the watchdog in pulsemon.service's cgroup and the unit (no
+`KillMode=`) defaults to `KillMode=control-group`, so `systemctl
+restart` killed the watchdog with the service — auto-rollback was dead
+in exactly the failure modes it was built to recover from.
+
+**Pinned by:** TestBuildWatchdogCommandPrefersPrevBinary (old shape
+fails: "watchdog binary = <exe>, want the previous binary"),
+TestBuildWatchdogCommandFallsBackToExe, TestBuildWatchdogCommandSystemdScope
+(user bus → `--user --scope` prefix, system bus → `--scope`, unknown bus
+→ plain binary, no wrapping). Sabotage-verified: with
+buildWatchdogCommand restored to the old exec.Command(exe, ...) shape,
+TestBuildWatchdogCommandPrefersPrevBinary fails ("want the previous
+binary ... (the new one may be the broken one)") and
+TestBuildWatchdogCommandSystemdScope fails ("want prefix
+[/usr/bin/systemd-run --user --scope ...]").

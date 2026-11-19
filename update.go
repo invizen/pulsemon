@@ -613,11 +613,51 @@ func watchdogTimeout() time.Duration {
 // watchdog polls healthz and rolls back to <exe>.prev if the new binary
 // never comes up. --old-pid is us: the watchdog must not lock-acquire or
 // health-poll until THIS process is gone.
-func spawnUpdateWatchdog(exe string) error {
-	cmd := exec.Command(exe, "update", "watchdog",
-		"--prev", exe+".prev", "--dst", exe, "--timeout", watchdogTimeout().String(),
-		"--old-pid", strconv.Itoa(os.Getpid()))
-	return detachSpawn(cmd)
+//
+// bus is the systemd bus detectRestart reported ("user"/"system"): on
+// systemd the watchdog is spawned through `systemd-run --scope` so it lives
+// in its own transient cgroup — a plain detach (Setsid) keeps it inside
+// pulsemon.service's cgroup, where KillMode=control-group (the default)
+// kills it with the service on the very restart it was guarding.
+func spawnUpdateWatchdog(exe, bus string) error {
+	return detachSpawn(buildWatchdogCommand(exe, bus))
+}
+
+// buildWatchdogCommand returns the command that spawns the detached
+// watchdog, factored out of spawnUpdateWatchdog so the spawn contract is
+// testable without starting a process. Two invariants:
+//
+//  1. It executes <exe>.prev when that file exists — the binary at <exe>
+//     is the one we JUST installed, i.e. possibly the broken one (wrong
+//     arch, crash in init). Spawning IT to guard itself failed in exactly
+//     the failure modes the watchdog exists for; the previous binary is
+//     the known-good one that also carries a working `update watchdog`
+//     implementation. No .prev (first update from a pre-.prev release)
+//     falls back to <exe>: nothing to roll back to, but the spawn must
+//     not fail for lack of a binary.
+//  2. On systemd with a known bus it wraps the spawn in
+//     `systemd-run [--user] --scope`, placing the watchdog in an
+//     independent transient cgroup that `systemctl restart pulsemon`
+//     cannot kill (KillMode=control-group kills only the unit's own
+//     cgroup). Without systemd-run (non-systemd host) the plain command
+//     is returned and the caller's detach is all the isolation there is.
+func buildWatchdogCommand(exe, bus string) *exec.Cmd {
+	watchdogBin := exe + ".prev"
+	if _, err := os.Stat(watchdogBin); err != nil {
+		watchdogBin = exe
+	}
+	args := []string{"update", "watchdog",
+		"--prev", exe + ".prev", "--dst", exe,
+		"--timeout", watchdogTimeout().String(),
+		"--old-pid", strconv.Itoa(os.Getpid())}
+	if run := systemdRunPath(); bus != "" && run != "" {
+		prefix := []string{"--scope"}
+		if bus == "user" {
+			prefix = []string{"--user", "--scope"}
+		}
+		return exec.Command(run, append(prefix, append([]string{watchdogBin}, args...)...)...)
+	}
+	return exec.Command(watchdogBin, args...)
 }
 
 // handleRestart is the post-install restart decision, factored out of
