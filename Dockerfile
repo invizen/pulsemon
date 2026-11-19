@@ -40,6 +40,13 @@ EXPOSE 9299
 # gated by the host's ping_group_range (no CAP_NET_RAW / root needed). The
 # /data volume must be writable by uid 1000 (the SQLite WAL needs write
 # access to the directory, not just the file):  chown -R 1000:1000 <data dir>.
+#
+# NO /tmp and a non-writable / : anything that needs a temp file must use
+# memory, which the store's DSN enforces with temp_store(MEMORY)
+# (internal/store/store.go → dsnWithPragmas). Without it, a query that
+# spills a temp B-tree (a big sort, a materialized CTE) fails with
+# SQLITE_CANTOPEN. Do not "simplify" this image back to an alpine base
+# without re-checking that pragma.
 USER 1000:1000
 # -healthz-http verifies the RUNNING server answers
 # /api/healthz, not just that the store opens (a wedged listener would

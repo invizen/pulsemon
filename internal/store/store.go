@@ -67,14 +67,24 @@ func NewStore(dsn string) (*Store, error) {
 	// other pooled connections would run with the defaults (no busy_timeout),
 	// and concurrent probe writes would fail instantly with SQLITE_BUSY.
 	//
-	//   journal_mode(WAL)   — concurrent readers alongside a writer
 	//   busy_timeout(15000) — a blocked writer waits up to 15s instead of
-	//                         failing immediately (critical under write bursts)
+	//                         failing immediately (critical under write bursts).
+	//                         FIRST in the DSN: journal_mode is the only
+	//                         pragma that writes, so the timeout must already
+	//                         be in effect when it runs (see dsnWithPragmas).
+	//   journal_mode(WAL)   — concurrent readers alongside a writer
 	//   foreign_keys(ON)    — enforce ON DELETE CASCADE on probes/events/tags
 	//   synchronous(NORMAL) — with WAL, commits no longer fsync each time. The
 	//                         Store stays consistent across an app crash; only the
 	//                         last few commits can be lost on a power cut, which
 	//                         is acceptable for probe samples.
+	//   temp_store(MEMORY)  — no /tmp exists in the scratch container; temp
+	//                         B-trees must not spill to disk (see Dockerfile).
+	//   journal_size_limit  — the WAL is truncated to 64 MiB after checkpoints
+	//                         instead of staying at its post-purge high-water
+	//                         mark (hundreds of MB) for the process lifetime.
+	//   cache_size(-8000)   — 8 MiB page cache per connection (default 2 MiB
+	//                         churns on the warmStats 24h-window read).
 	//
 	// NOTE: the '?' is load-bearing. modernc.org/sqlite treats everything after
 	// it as query params; omit it and the whole string becomes a filename and
@@ -136,8 +146,33 @@ func NewStore(dsn string) (*Store, error) {
 
 // dsnWithPragmas appends the per-connection pragmas to dsn with the given
 // busy_timeout in ms. The '?' semantics are the ones documented in NewStore.
+//
+// ORDER IS LOAD-BEARING: the driver executes _pragma params in the order
+// they appear, and journal_mode(WAL) is the ONLY one that writes (it flips
+// the file's mode and creates -wal/-shm) — so busy_timeout must be in
+// effect BEFORE it. With the old order (journal_mode first), a lazy pool
+// connection — and the 30s -healthz-http probe, which opens its own
+// connection on every check — that landed while another connection held
+// the write lock ran the mode switch with busy_timeout = 0 and failed
+// immediately with SQLITE_BUSY. The remaining pragmas are read-only
+// connection settings; their order is immaterial.
+//
+//	temp_store(MEMORY) — the FROM-scratch image runs unprivileged with no
+//	                      /tmp and a non-writable / (Dockerfile); a query
+//	                      that spills a temp B-tree (a big sort, a
+//	                      materialized CTE) would fail with SQLITE_CANTOPEN
+//	                      on temp-file creation.
+//	journal_size_limit — without it a large delete (clear-all-history, a
+//	                      multi-million-row purge) checkpoints into a WAL
+//	                      that stays hundreds of MB on disk forever; 64 MiB
+//	                      is the cap (0 = unlimited).
+//	cache_size(-8000)  — 8 MiB page cache per connection (negative = KiB,
+//	                      1 KiB pages); the default 2 MiB churns on the
+//	                      warmStats 24h-window read (~1.7M rows).
+//
+// History: docs/DECISIONS.md → sqlite-scalability-container-hazards.
 func dsnWithPragmas(dsn string, busyMs int64) string {
-	q := fmt.Sprintf("_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)", busyMs)
+	q := fmt.Sprintf("_pragma=busy_timeout(%d)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(1)&_pragma=temp_store(MEMORY)&_pragma=journal_size_limit(67108864)&_pragma=cache_size(-8000)", busyMs)
 	if strings.Contains(dsn, "?") {
 		return dsn + "&" + q
 	}
@@ -182,7 +217,13 @@ func (db *Store) InitSchema() error {
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts ON probes(sensor_id, ts);
+	-- Covering index for the probes read path: warmStats Phase 1/2 and
+	-- recentFromDB select (sensor_id, ts, rtt_ms, manual) — the old
+	-- (sensor_id, ts) index served the range but forced a random table
+	-- B-tree lookup per row for rtt_ms + manual (~1.7M lookups at 100
+	-- sensors / 5s, ~6.3s on the live fleet). The covering index reads
+	-- everything from the leaf pages.
+	CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts_cov ON probes(sensor_id, ts, rtt_ms, manual);
 	CREATE INDEX IF NOT EXISTS idx_events_sensor_ts ON events(sensor_id, ts);
 	-- /api/events sorts the whole feed by e.ts (across all sensors), which the
 	-- composite (sensor_id, ts) index above cannot serve. The table is 24h-
@@ -451,6 +492,28 @@ var schemaMigrations = []schemaMigration{
 		// History: docs/DECISIONS.md → legacy-token-startup-step
 		name: "users.is_admin + oldest-admin promotion",
 		run:  func(db *Store, tx *sql.Tx) error { return db.migrateUserAdminColumn(tx) },
+	},
+	{
+		// 13: probes index → covering. The (sensor_id, ts) index served
+		// the range but not the SELECT list: warmStats Phase 1 (the 24h
+		// window, ~1.7M rows at 100 sensors / 5s) and every
+		// recentFromDB/history read paid a random table B-tree lookup
+		// per row for rtt_ms + manual (~6.3s on the live fleet, against
+		// the default 2 MiB page cache). The covering index reads
+		// straight from the leaf pages. Runs in the step tx with the
+		// version stamp (a few seconds of write lock at boot, once);
+		// the CREATE/DROP guards keep replay a no-op.
+		// History: docs/DECISIONS.md → sqlite-scalability-container-hazards
+		name: "idx_probes_sensor_ts -> covering",
+		run: func(db *Store, tx *sql.Tx) error {
+			if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts_cov ON probes(sensor_id, ts, rtt_ms, manual)`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_probes_sensor_ts`); err != nil {
+				return err
+			}
+			return nil
+		},
 	},
 }
 

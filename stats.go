@@ -147,7 +147,8 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// holds (the 24h window + the last-60 inspector tail):
 	//
 	//   Phase 1: the full 24h window for every sensor — a plain index
-	//   range scan on idx_probes_sensor_ts. The bulk of the data, and it
+	//   range scan on idx_probes_sensor_ts_cov (covering: the SELECT list
+	//   is the index itself, no table lookups). The bulk of the data, and it
 	//   gives correct 24h counters for EVERY sensor.
 	//
 	//   Phase 2: SLOW sensors only (fewer than 60 probes in 24h, so their

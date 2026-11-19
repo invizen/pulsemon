@@ -2428,3 +2428,51 @@ fails; with the vanished pass reverted to the partial
 cancel/delete-loops/delete-sensors cleanup, pin 3 fails; with the
 PingNow rejection removed, pin 2 fails; with the handler's mark removed,
 pin 4 fails (mid-window state is 'active').
+
+## sqlite-scalability-container-hazards (internal/store/store.go, internal/store/sqlite_tuning_test.go, internal/store/legacy_token_test.go, probe.go, stats.go, Dockerfile, 2026-11-19)
+
+**Decision:** `dsnWithPragmas` now emits
+`busy_timeout → journal_mode(WAL) → synchronous(NORMAL) →
+foreign_keys(1) → temp_store(MEMORY) →
+journal_size_limit(67108864) → cache_size(-8000)`, and migration 13
+replaces `idx_probes_sensor_ts(sensor_id, ts)` with the covering
+`idx_probes_sensor_ts_cov(sensor_id, ts, rtt_ms, manual)` (fresh DBs get
+the covering index straight from the base schema; the migration's
+CREATE/DROP guards make replay a no-op). The Dockerfile documents why
+the scratch image's missing /tmp makes `temp_store(MEMORY)` load-bearing.
+
+**Why:** (1) The driver executes `_pragma` params in DSN order, and
+`journal_mode(WAL)` is the only one that WRITES (mode flip + -wal/-shm
+creation). With journal_mode first, a lazy pool connection — and the 30s
+-healthz-http probe, which opens its own connection every check — that
+landed while another connection held the write lock ran the mode switch
+with busy_timeout = 0 and failed immediately with SQLITE_BUSY.
+(2) The FROM-scratch image runs as uid 1000 with no /tmp and a
+non-writable /; without `temp_store(MEMORY)` (modernc compiles with
+TEMP_STORE=1 = FILE), any query spilling a temp B-tree fails with
+SQLITE_CANTOPEN. (3) Without `journal_size_limit`, a large delete
+(clear-all-history, a multi-million-row purge) checkpoints into a WAL
+that stays at its hundreds-of-MB high-water mark on disk for the process
+lifetime; 64 MiB caps it. (4) The old (sensor_id, ts) index served the
+range but not the SELECT list: warmStats Phase 1 (~1.7M rows at 100
+sensors / 5s), Phase 2, and every recentFromDB/history read paid a
+random table B-tree lookup per row for rtt_ms + manual (~6.3s on the
+live fleet against the default 2 MiB page cache, which
+`cache_size(-8000)` raises to 8 MiB per connection).
+
+**Pinned by:** TestDSNPragmaOrderPinsBusyTimeoutFirst (busy_timeout
+strictly precedes journal_mode in the DSN; all seven pragmas present),
+TestPragmasReachEveryPooledConnection (pool-connection read-back:
+temp_store=2/MEMORY — the C enum, where 0 is the compile-time FILE
+default — journal_size_limit=67108864, cache_size=-8000),
+TestPragmasReachProbeHandle (the second handle carries temp_store too),
+TestProbesIndexCoveringFresh (fresh DB: the covering index exists with
+the exact 4-column order, the old index is gone, and EXPLAIN QUERY PLAN
+serves the warm-stats query from COVERING INDEX idx_probes_sensor_ts_cov),
+TestProbesCoveringIndexMigration (a DB stamped at version 12 with the
+old index boots through InitSchema into the covering index, old one
+dropped, version at the head). legacy_token_test's replay assertion
+moved from a hardcoded 12 to schemaVersionHead (a new head is expected).
+Sabotage-verified: old DSN order → pin 1 fails; stripped DSN → pins 2-3
+fail; old index + no migration 13 → pin 4 fails; migration 13 without
+the DROP → pin 5 fails.

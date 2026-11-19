@@ -186,7 +186,8 @@ func TestMigrateUserAdminColumnAtomicWithStamp(t *testing.T) {
 	} else if v != 11 {
 		t.Fatalf("user_version = %d after a failed step, want 11 (the stamp must not commit on failure)", v)
 	}
-	// Recovery: the step replays whole and succeeds.
+	// Recovery: the step replays whole and succeeds (and any later steps
+	// — added after slot 12 — replay to the head too).
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("replay InitSchema: %v", err)
 	}
@@ -196,8 +197,8 @@ func TestMigrateUserAdminColumnAtomicWithStamp(t *testing.T) {
 	if col != 1 {
 		t.Fatal("is_admin column missing after the replayed step")
 	}
-	if v, _ := db.schemaVersion(); v != 12 {
-		t.Fatalf("user_version = %d after replay, want 12", v)
+	if v, _ := db.schemaVersion(); v != schemaVersionHead {
+		t.Fatalf("user_version = %d after replay, want head %d", v, schemaVersionHead)
 	}
 }
 

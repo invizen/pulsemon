@@ -1480,7 +1480,8 @@ const purgeBatchSize = 5000
 //
 // PLAN: the old body was one
 // `DELETE FROM <table> WHERE ts < ?` per table. ts is the SECOND column of
-// idx_probes_sensor_ts(sensor_id, ts), so the planner cannot range-seek it
+// idx_probes_sensor_ts_cov(sensor_id, ts, rtt_ms, manual), so the planner
+// cannot range-seek it
 // (SQLite will not skip-scan a non-leading column without ANALYZE stats) and
 // the statement full-scanned the whole table — at 100 sensors @ 5s that is
 // ~1.7M rows — and deleted ~72k of them in ONE write transaction, with every
@@ -1519,7 +1520,7 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 				// purge deletes the tail warmStats phase 2 promises to
 				// rebuild, so a slow sensor's inspector window would
 				// shrink across every restart. The subquery reads the
-				// tail off idx_probes_sensor_ts (sensor_id, ts) —
+				// tail off idx_probes_sensor_ts_cov (sensor_id, ts prefix) —
 				// ~60 index probes per batch. events need no exemption
 				// (transitions are sparse; nothing mirrors a tail).
 				var res sql.Result
