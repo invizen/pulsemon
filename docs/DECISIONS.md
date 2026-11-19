@@ -2798,3 +2798,62 @@ individually reverted → its pin fails; tree MD5-verified restored.
 Windows side compile-checked via GOOS=windows cross-build
 (ensureDataDir/hardenDataPath cannot be test-run on the Linux gate
 box).
+
+## frontend-ops-auth-ui-fixes (web/index.html, web/app.js, web/test/frontend.test.mjs, 2026-11-19)
+
+**Decision:** Four frontend rules now in force (external review 2026-11-19 F16):
+
+- `#f-tls-port` ships with NO hardcoded `value=` in index.html, and
+  `renderTLSStatus()` seeds it UNCONDITIONALLY (`port.value = t.port || 443`)
+  on every settings fetch. The old `if (port.value === '')` guard was dead
+  code behind the HTML `value="443"` default, so the box always read "443"
+  no matter what port the server had stored.
+- `saveAlerts()` now sends EVERY configured provider in `body.providers` —
+  a blank URL box is omitted from the payload (the server's nil-url "keep
+  stored" semantic, api.go `applyProviderUpdateInTx` `if url != nil`), while
+  a typed value replaces it. The old `.filter(p => input.value.trim() !==
+  '')` dropped any provider whose box was blank — which is exactly how
+  `renderProviderList()` renders a MASKED bot token (`urlVal = masked ? ''
+  : p.url`) — silently discarding the provider's extra-field edits.
+- SMTP `username`/`password` are read with new `valRaw()` (no `.trim()`):
+  the server stores credentials RAW because a leading/trailing space is
+  part of the SMTP AUTH value. `val()` keeps trimming every other field.
+- `doLogin()` now `await refreshAdminState(); refresh();` after
+  `startPolling()`: that call is idempotent and no-ops on a re-login in the
+  same tab, so its state refreshes never ran again and `meIsAdmin` stayed
+  stale across role switches. `renderUpdateUI()` gates the header pill on
+  `meIsAdmin` too — it opens the Settings modal, which the server 403s for
+  non-admin sessions (settings READ is gated), and the 10-minute update
+  poll used to re-show the pill to viewers.
+
+**Why:** Cert renewal on a custom port (e.g. 8443) silently re-saved 443
+(EACCES on non-root Linux); Telegram chat_id edits were lost on every save
+that didn't re-paste the masked bot token (and SMTP credential edits were
+trimmed before they reached the wire); after a same-tab role switch the
+admin surface stayed visible to a viewer — or hidden from a fresh admin —
+until a manual reload, and viewers saw an update pill that opens a modal
+their session can't read.
+
+**Pinned by:** `web/test/frontend.test.mjs` (Node `node --test`, loads the
+REAL app.js into a vm sandbox with a DOM shim; no Go involved):
+- `TLS port box: index.html ships no hardcoded 443 default` — static HTML
+  pin (the id must exist, the `value="443"` attribute must not).
+- `TLS port box: renderTLSStatus seeds it from the server port (custom
+  port survives)` — stale "443" in the box + `t.port 8443` → box ends
+  "8443".
+- `TLS port box: falls back to 443 when the server reports no port` —
+  positive control (the `removeTLSCert()` render shape).
+- `saveAlerts: masked-URL providers stay in the save and keep their extra
+  edits` — blank (masked) telegram URL box + edited chat_id → provider
+  present, `chat_id` preserved, `url` key ABSENT; SMTP username/password
+  with edge spaces arrive untrimmed; a typed (discord) url is still sent.
+- `doLogin: re-login in the same tab re-resolves admin state (role
+  switch)` — admin→viewer→admin logins in one tab; `meIsAdmin` must
+  follow the session each time (boot arms the pollers first, so every
+  login is the re-login path).
+- `renderUpdateUI: the update pill is gated on meIsAdmin` — pill hidden
+  for a viewer, shown for an admin with an available update, hidden for
+  everyone when up-to-date (positive control).
+Sabotage-verified: each of the four fix vectors individually reverted →
+its pin fails (port vector fails 3 pins, the others 1 each); tree
+MD5-verified restored.

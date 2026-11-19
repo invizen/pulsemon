@@ -150,6 +150,15 @@ async function doLogin(username, password) {
     // Arm the 5s pollers (idempotent; refresh()/refreshAdminState() run
     // inside it) — without this the post-login dashboard never updates.
     startPolling();
+    // Re-login in the SAME tab (role switch: admin → viewer, viewer →
+    // admin) must re-resolve the admin state: startPolling() is idempotent
+    // and no-ops on the second login, so its refresh()/refreshAdminState()
+    // never run again and meIsAdmin stays stale — the admin surface stays
+    // visible to a viewer (or hidden from a fresh admin) until the next
+    // manual reload (review 2026-11-19 F16). Awaiting it makes the state
+    // consistent before doLogin() resolves for its callers.
+    await refreshAdminState();
+    refresh();
     return true;
   } catch (e) {
     const err = $('auth-err');
@@ -904,6 +913,11 @@ const PROVIDER_META = {
 function providerMeta(kind) { return PROVIDER_META[kind] || { icon: '📡', name: kind.replace(/_/g, ' ') }; }
 // Safe value readers for the provider extra-field inputs (undefined → '').
 function val(id) { const el = $(id); return el ? el.value.trim() : ''; }
+// Untrimmed reader for CREDENTIAL fields: the server stores SMTP
+// username/password RAW (a leading/trailing space is part of the SMTP AUTH
+// value — api.go applyProviderUpdateInTx), so they must reach the wire
+// unmodified (review 2026-11-19 F16). Everything else keeps val()'s trim.
+function valRaw(id) { const el = $(id); return el ? el.value : ''; }
 function sel(id) { const el = $(id); return el ? el.value : ''; }
 
 async function openSettings() {
@@ -959,10 +973,15 @@ async function checkUpdate(force) {
 }
 function renderUpdateUI(r) {
   UPDATE_LATEST = r.latest || UPDATE_LATEST;
-  // Header pill: show only when an update is available and not dismissed.
+  // Header pill: show only when an update is available, not dismissed,
+  // AND the session is admin — the pill opens the Settings modal, which
+  // the server 403s for non-admin sessions (settings READ is gated,
+  // review 2026-10-30), and applyAdminVisibility() hides it for them.
+  // Without the meIsAdmin check, this call — fired by the 10-minute
+  // update poll — re-showed the pill to viewers (review 2026-11-19 F16).
   const pill = $('update-pill');
   const dismissed = localStorage.getItem('pulsemon_update_dismissed') === r.latest;
-  if (r.available && !dismissed) {
+  if (r.available && !dismissed && meIsAdmin) {
     $('update-pill-ver').textContent = r.latest;
     pill.classList.remove('hidden');
   } else if (pill) pill.classList.add('hidden');
@@ -1095,7 +1114,13 @@ function renderTLSStatus(t) {
   const port = $('f-tls-port');
   const rm = $('tls-remove-btn');
   if (!t) { badge.textContent = '—'; return; }
-  if (port.value === '') port.value = t.port || 443;
+  // UNCONDITIONAL seed: the input ships with no hardcoded value (see
+  // index.html), and openSettings() re-fetches /api/settings before every
+  // use — so the box always reflects the server's stored port. The old
+  // `if (port.value === '')` guard was dead behind the HTML default and
+  // let a cert renewed on a custom port (8443) be re-saved as 443, which
+  // EACCESes on non-root Linux (review 2026-11-19 F16).
+  port.value = t.port || 443;
   if (t.enabled) {
     badge.textContent = 'ON · ' + t.port;
     badge.className = 'text-[11px] font-mono px-2 py-0.5 rounded bg-ok/15 border border-ok/40 text-ok';
@@ -1475,13 +1500,19 @@ async function saveAlerts() {
     alert_filter: selectedFilterItems(),
     realert_min: +$('f-realert').value
   };
-  body.providers = (SETTINGS.providers || []).filter(p => {
-    // id is rendered esc()'d (see renderProviders) — read back the same
-    // transform so the lookup stays symmetric for any kind value.
-    const input = $('prov-url-' + esc(p.kind));
-    return input && input.value.trim() !== '';
-  }).map(p => {
-    const pb = { kind: p.kind, url: $('prov-url-' + esc(p.kind)).value.trim() };
+  // Every configured provider goes into the save — including ones whose URL
+  // box is BLANK: renderProviderList() renders a masked bot token (and a
+  // stored SMTP host) as an empty field, and the server leaves unlisted
+  // providers untouched, so the old blank-URL filter silently dropped the
+  // provider's extra-field edits (e.g. a Telegram chat_id change) whenever
+  // the masked token wasn't re-pasted (review 2026-11-19 F16). A blank url
+  // is omitted from the payload — the server's nil-url "keep stored"
+  // semantic — while a typed value replaces it.
+  body.providers = (SETTINGS.providers || []).map(p => {
+    const urlBox = $('prov-url-' + esc(p.kind));
+    const url = urlBox ? urlBox.value.trim() : '';
+    const pb = { kind: p.kind };
+    if (url !== '') pb.url = url;
     if (p.kind === 'telegram') {
       const ci = $('prov-chatid-telegram');
       pb.extra = { chat_id: ci ? ci.value.trim() : '' };
@@ -1493,8 +1524,9 @@ async function saveAlerts() {
         port:     val('prov-smtp-port'),
         from:     val('prov-smtp-from'),
         to:       val('prov-smtp-to'),
-        username: val('prov-smtp-user'),
-        password: val('prov-smtp-pass'),
+        // RAW (untrimmed) — see valRaw.
+        username: valRaw('prov-smtp-user'),
+        password: valRaw('prov-smtp-pass'),
         tls_mode: sel('prov-smtp-tls')
       };
     }

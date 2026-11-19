@@ -314,7 +314,12 @@
         </div>
         <div class="flex items-center justify-between gap-3">
           <span class="text-[12px] text-slate-400">HTTPS Port</span>
-          <input id="f-tls-port" type="number" min="1" max="65535" value="443" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200">
+          <!-- No value= here: renderTLSStatus() seeds it from the server's
+               stored port on every settings fetch. A hardcoded default made
+               the seed a no-op, so renewing a cert on a custom port (e.g.
+               8443) silently re-saved 443 (EACCES on non-root Linux).
+               History: docs/DECISIONS.md → frontend-ops-auth-ui-fixes -->
+          <input id="f-tls-port" type="number" min="1" max="65535" class="w-20 bg-surface-950 border border-surface-800 rounded-lg px-2 py-1 font-mono text-[12px] text-slate-200">
         </div>
         <div class="space-y-1.5">
           <div class="flex items-center gap-2">
