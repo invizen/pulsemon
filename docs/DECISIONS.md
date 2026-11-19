@@ -2377,3 +2377,54 @@ with the in-tx re-check removed, both snapshot pins fail (the second
 enter overwrites the snapshot with "null"); with the old handler
 ordering restored (pause/resume before the reload), the ordering pin
 fails on both transitions.
+
+## sensor-delete-deleting-state (api.go, probe.go, delete_sensor_test.go, 2026-11-19)
+
+**Decision:** `DELETE /api/sensors/{id}` marks the row `state = 'deleting'`
+BEFORE `probeWorker.Remove(id)` and the batched cascade deletes. The
+transient state is excluded from every reader that could resurrect the
+sensor: `syncSensors` still selects `state IN ('active','paused')`,
+`PingNow` rejects it with the `errSensorDeleting` sentinel (mapped to 409
+by the ping handler), the dashboard list query filters it out, and the
+maintenance/ActiveSensorIDs paths already excluded non-active states. If a
+cascade step fails, a compensating `UPDATE` restores the pre-delete state
+(captured at the existence check) so a surviving sensor is never stranded
+in `deleting` — no loop, invisible to sync, pulses refused — with no path
+back. The `syncSensors` vanished pass now calls the same full-cleanup
+helper as `Remove` (`removeSensorState`): loops, sensors, spawnedIDs,
+wasPaused, gens, lastPulse, statsCache, alertOrderGates, and alertMem.
+`deleteRowsBatched` is a var (seam) so the post-mark failure path is
+testable.
+
+**Why:** `Remove(id)` ran while the row was still `state = 'active'` for
+the whole cascade window (seconds — a 5s sensor carries ~17k probe rows
+across the two batched deletes). A 5s `syncSensors` tick (or a `syncReq`)
+landing in the window saw the sensor as active and RESPAWNED the loop
+`Remove` had just dropped: the respawned loop wrote new probe/alert rows
+for a sensor mid-deletion, repopulated `statsCache`, and logged FK
+errors once the sensor row finally vanished. When the row did disappear,
+`Remove` was not re-run, and the vanished pass only deleted
+`pw.loops[id]` + `pw.sensors[id]` — leaking `statsCache[id]` (~57 KB),
+`spawnedIDs`, `wasPaused`, `gens`, `lastPulse`, `alertOrderGates`, and
+`alertMem` for the process lifetime. The mark closes the whole window in
+one write (autocommit, before `Remove`), and the shared cleanup helper
+makes the vanished pass a real cleanup instead of a partial one. The
+compensation matters because the mark makes a cascade failure
+recoverable only via the restore — a stranded `deleting` row would be a
+silent dead sensor.
+
+**Pinned by:** TestSyncSensorsIgnoresDeletingSensor (a row in
+`deleting` gets no loop/ProbeState from a sync pass, control sensor
+spawns), TestPingNowRejectsDeletingSensor (PingNow returns
+errSensorDeleting, HTTP 409, zero manual probe rows written),
+TestVanishedSensorCleanupReleasesAllMaps (full footprint seeded in all
+eight maps + loop cancel; after row deletion + sync pass, every map is
+empty and the cancel fired), TestDeleteSensorRestoresStateOnBatchedDeleteFailure
+(cascade failure injected through the deleteRowsBatched seam: 500, state
+restored to 'active', the mid-window state observed by the cascade is
+'deleting', and the sensor respawns on the next sync pass).
+Sabotage-verified: with syncSensors made to see 'deleting' rows, pin 1
+fails; with the vanished pass reverted to the partial
+cancel/delete-loops/delete-sensors cleanup, pin 3 fails; with the
+PingNow rejection removed, pin 2 fails; with the handler's mark removed,
+pin 4 fails (mid-window state is 'active').

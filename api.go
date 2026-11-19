@@ -705,7 +705,11 @@ func (s *Server) cachedSensorCount(ctx context.Context) (int, error) {
 }
 
 func (s *Server) fetchSensors(ctx context.Context) []Sensor {
-	rows, err := s.db.QueryContext(ctx, "SELECT "+sensorCols+" FROM sensors ORDER BY name")
+	// 'deleting' rows are in-flight deletions (marked by the DELETE
+	// handler before the cascade runs — see sensor-delete-deleting-state):
+	// hide them so the dashboard drops the sensor the moment deletion
+	// starts instead of showing a zombie with an unknown state.
+	rows, err := s.db.QueryContext(ctx, "SELECT "+sensorCols+" FROM sensors WHERE state <> 'deleting' ORDER BY name")
 	if err != nil {
 		return nil
 	}
@@ -1226,9 +1230,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// Existence check up front drives the 404 (and skips the batched
 		// no-op deletes) — the sensor row's PK lookup is cheap. Scan yields
 		// sql.ErrNoRows (not a zero value) when the id is absent, so that
-		// error is the 404 signal.
+		// error is the 404 signal. The current state is captured for the
+		// compensating restore below.
 		var one int
-		if err := s.db.QueryRowContext(r.Context(), "SELECT 1 FROM sensors WHERE id = ?", id).Scan(&one); err != nil {
+		var curState string
+		if err := s.db.QueryRowContext(r.Context(), "SELECT 1, state FROM sensors WHERE id = ?", id).Scan(&one, &curState); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
 				return
@@ -1236,10 +1242,38 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
+		// Mark the row 'deleting' BEFORE stopping the loop and cascading
+		// the rows: the batched deletes below take seconds (a 5s sensor
+		// carries ~17k probe rows), and a 5s syncSensors tick (or a
+		// syncReq) landing mid-delete used to see the row still 'active'
+		// and RESPAWN the loop Remove had just dropped — the respawned
+		// loop wrote new probes/alerts, repopulated statsCache, and then
+		// logged FK errors once the sensor row finally went away.
+		// 'deleting' is excluded from every state filter (syncSensors,
+		// stats rescan, maintenance enter, ActiveSensorIDs) and from the
+		// dashboard list, so the sensor is dead to the whole system for
+		// the entire cascade window. History:
+		// docs/DECISIONS.md → sensor-delete-deleting-state.
+		if _, err := s.db.ExecContext(r.Context(), "UPDATE sensors SET state = 'deleting' WHERE id = ?", id); err != nil {
+			respondInternal(w, "mark sensor deleting", err)
+			return
+		}
+		// restoreState puts the sensor back to its pre-delete state if any
+		// cascade step below fails, so a surviving sensor is never
+		// stranded in 'deleting' (no loop, invisible to syncSensors,
+		// pulses rejected) with no path back. A concurrent state PATCH
+		// that landed in the window is lost — the operator's retry is the
+		// expected next action either way.
+		restoreState := func() {
+			if _, err := s.db.ExecContext(r.Context(), "UPDATE sensors SET state = ? WHERE id = ?", curState, id); err != nil {
+				log.Printf("delete sensor %s: restore state failed: %v", id, err)
+			}
+		}
 		// Stop the probe loop FIRST so no new probe/event/alert rows land
 		// mid-delete. If a delete below fails and the sensor survives,
-		// syncSensors respawns the loop on its next 5s pass — Remove only
-		// drops the in-memory loop + state, not the DB row.
+		// restoreState revives it and syncSensors respawns the loop on
+		// its next 5s pass — Remove only drops the in-memory loop +
+		// state, not the DB row.
 		s.probeWorker.Remove(id)
 		// Batched deletes for the two large cascade tables (a 5s sensor's
 		// probes table is ~17k rows) — the purgeOld idiom: each statement is
@@ -1248,14 +1282,17 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// cascade. The small cascade tables (sensor_tags, alert_state — a
 		// few rows each) ride the final sensor-row DELETE's ON DELETE CASCADE.
 		if _, err := deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
 		if _, err := deleteRowsBatched(r.Context(), s.db, "events", "sensor_id = ?", []any{id}); err != nil {
+			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
 		if _, err := s.db.ExecContext(r.Context(), "DELETE FROM sensors WHERE id = ?", id); err != nil {
+			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
@@ -1311,6 +1348,10 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 		}
 		if errors.Is(err, errPulseBusy) {
 			respondWithError(w, http.StatusTooManyRequests, "too many pulses in flight — try again in a moment")
+			return
+		}
+		if errors.Is(err, errSensorDeleting) {
+			respondWithError(w, http.StatusConflict, "sensor is being deleted")
 			return
 		}
 		respondInternal(w, "pulse sensor "+id, err)
@@ -1501,7 +1542,11 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // PK-B-tree or full-table scan. Rewriting it as `rowid IN (SELECT rowid …)`
 // is a byte-identical no-op (id IS rowid here), so the `id` form is kept
 // for clarity.
-func deleteRowsBatched(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
+// deleteRowsBatched: the batched cascade-delete as a var so a test can
+// force the post-mark failure path (sensor marked 'deleting' → batched
+// delete failed → compensating state restore) — the same seam pattern as
+// enterMaintenance/leaveMaintenance above.
+var deleteRowsBatched = func(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
 	w := ""
 	if where != "" {
 		w = " WHERE " + where

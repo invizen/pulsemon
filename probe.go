@@ -753,12 +753,15 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	}
 
 	// Stop loops for sensors that vanished or were deleted (only when we saw
-	// the complete set - see partial above).
-	for id, cancel := range pw.loops {
+	// the complete set - see partial above). Full cleanup through the same
+	// helper Remove uses: the old partial drop (loops+sensors only) leaked
+	// statsCache (~57 KB), spawnedIDs, wasPaused, gens, lastPulse,
+	// alertOrderGates, and alertMem for the process lifetime whenever a
+	// deletion's final row-DELETE landed between two sync passes.
+	// History: docs/DECISIONS.md → sensor-delete-deleting-state.
+	for id := range pw.loops {
 		if !partial && !seen[id] {
-			cancel()
-			delete(pw.loops, id)
-			delete(pw.sensors, id)
+			pw.removeSensorState(id)
 		}
 	}
 }
@@ -842,10 +845,21 @@ func (pw *ProbeWorker) Restart(id string) {
 	}
 }
 
-// Remove drops a deleted sensor's loop and state.
-func (pw *ProbeWorker) Remove(id string) {
-	pw.mu.Lock()
-	defer pw.mu.Unlock()
+// removeSensorState is the FULL in-memory cleanup for a sensor that no
+// longer exists in the DB: it stops the loop and releases every map entry
+// that would otherwise pin per-sensor state for the process lifetime —
+// including the ~57 KB stats series, the alert gate channel, and the
+// alert-memory row. Callers must hold pw.mu. Lock order: pw.mu (held) →
+// pw.statsMu → pw.alertMu → pw.alertMemMu, the same order Remove used
+// before the extraction.
+//
+// Both Remove (the DELETE handler) and syncSensors's vanished pass MUST go
+// through this: the vanished pass used to drop only loops+sensors, which
+// leaked spawnedIDs, wasPaused, gens, lastPulse, statsCache,
+// alertOrderGates, and alertMem for every sensor whose deletion raced a
+// sync pass (the DELETE-races-syncSensors window — History:
+// docs/DECISIONS.md → sensor-delete-deleting-state).
+func (pw *ProbeWorker) removeSensorState(id string) {
 	if cancel, ok := pw.loops[id]; ok {
 		cancel()
 		delete(pw.loops, id)
@@ -856,7 +870,7 @@ func (pw *ProbeWorker) Remove(id string) {
 	delete(pw.gens, id)       // nil-map delete is a safe no-op
 	delete(pw.lastPulse, id)
 	// Drop the cached stats series too, or a deleted sensor's 24h history
-	// stays pinned in memory for the process lifetime. Lock order: pw.mu (held) then pw.statsMu — see ResetStatsFor.
+	// stays pinned in memory for the process lifetime.
 	pw.statsMu.Lock()
 	delete(pw.statsCache, id)
 	pw.statsMu.Unlock()
@@ -871,6 +885,13 @@ func (pw *ProbeWorker) Remove(id string) {
 	pw.alertMemMu.Lock()
 	delete(pw.alertMem, id)
 	pw.alertMemMu.Unlock()
+}
+
+// Remove drops a deleted sensor's loop and state.
+func (pw *ProbeWorker) Remove(id string) {
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	pw.removeSensorState(id)
 }
 
 // ActiveCount is the number of sensor loops currently tracked (healthz).
@@ -1042,6 +1063,14 @@ const dbWriteTimeout = 8 * time.Second
 // before the per-sensor cooldown elapses; the handler maps it to 429.
 var errPulseCoolingDown = errors.New("pulse too soon")
 
+// errSensorDeleting is returned by PingNow when the sensor row is in the
+// transient 'deleting' state the DELETE handler sets before cascading the
+// probe/event rows (the window is seconds for a 5s sensor — a pulse fired
+// in it would write a row for a soon-to-be-orphaned sensor). Mapped to 409
+// by handleSensorPing. History: docs/DECISIONS.md →
+// sensor-delete-deleting-state.
+var errSensorDeleting = errors.New("sensor is being deleted")
+
 // errPulseBusy is returned by PingNow when the fleet-wide in-flight pulse cap
 // is reached; the handler maps it to 429. The per-sensor cooldown only bounds
 // one sensor, so a viewer with many sensors could otherwise fan out a large
@@ -1073,10 +1102,19 @@ const pulseMaxInFlight = 8
 // Works while paused (SPEC §2). Dispatches by sensor type, so an HTTP
 // sensor's manual pulse makes an HTTP request.
 func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
-	var target, probeType string
+	var target, probeType, state string
 	var timeoutMS int
-	if err := pw.db.QueryRow("SELECT target, type, timeout_ms FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS); err != nil {
+	if err := pw.db.QueryRow("SELECT target, type, timeout_ms, state FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS, &state); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
+	}
+	if state == "deleting" {
+		// The DELETE handler marks the row 'deleting' before cascading the
+		// probe/event rows — a window of seconds for a 5s sensor. A pulse
+		// fired mid-window would write a manual probe row for a sensor
+		// about to be FK-orphaned (and repopulate statsCache for a
+		// vanished sensor). Reject it. History:
+		// docs/DECISIONS.md → sensor-delete-deleting-state.
+		return probeOutcome{}, errSensorDeleting
 	}
 	// Fleet-wide in-flight cap: the per-sensor cooldown below only bounds one
 	// sensor, so a viewer with N sensors could otherwise fan out ~N/2
