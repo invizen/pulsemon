@@ -2248,3 +2248,45 @@ fails ("feature not supported"), TestGzipBodylessCarriesNoTrailer fails
 TestAPIUpdateResponsesAreNotGzipped fails (Content-Encoding: gzip on
 /api/update), and TestOversizedBody413ClosesConnection fails (the 413
 never closes the connection).
+
+## tls-selfsigned-gate (http.go, http_test.go, cert_shapes_test.go, tls_selfsigned_policy_test.go, 2026-11-19)
+
+**Decision:** The self-signed allowance in `verifyHTTPCert` (branch b) is now
+gated to homelab-shaped targets: it is skipped when (1) the target URL
+carries userinfo (`https://user:pass@host` — `probeHTTP` carries a
+`tlsUserinfoKey` context flag to `probeDialTLS` → `verifyHTTPCert`) or
+(2) the target is a public (globally routable) IP literal
+(`isPublicProbeIP`: RFC1918 / loopback / link-local / 0/8 / ULA are
+private; hostnames are out of scope). Refusals name the specific rule and
+the remedy (install a CA-signed cert, or pin the cert/CA via
+PULSEMON_CA_FILE, which branch (a) honors). The signature is now
+`verifyHTTPCert(presented, host, hasUserinfo)`.
+
+**Why:** An on-path attacker (ARP/DNS spoof on a LAN segment) minting a
+self-signed cert for the target takes milliseconds and passes the exact-SAN
+check. `probeDialTLS`'s pre-request verification exists precisely so an
+untrusted cert never sees the request — including the
+`Authorization: Basic *** header derived from a `user:pass@` target's
+userinfo. But branch (b) accepted the minted cert for EVERY https sensor,
+so the MITM threat model was negated exactly where the credentials ride:
+the attacker passes the SAN check, receives the Basic auth header, and the
+sensor reads UP. For a status-only private sensor the same attack is an
+availability spoof at worst, so the homelab self-signed convenience
+stays there; a self-signed cert on a public IP is not an operator's device
+in the first place (the homelab pattern is private targets), so it is
+refused too — pin it via PULSEMON_CA_FILE.
+
+**Pinned by:** TestVerifyHTTPCertRefusesSelfSignedWithUserinfo (same
+private-IP self-signed cert: accepted without userinfo, refused with),
+TestVerifyHTTPCertRefusesSelfSignedPublicIP (public IP refused, private
+control accepted), TestIsPublicProbeIP (the public/private classification,
+incl. 172.16/12 edges, IPv4-mapped IPv6, ULA), TestProbeHTTPSUserinfoRefusesSelfSigned
+(end-to-end: `https://user:pass@` probe of a matching self-signed server is
+a LOSS with the Authorization header NEVER reaching the server; the
+no-userinfo control stays UP). All pre-existing verifyHTTPCert call sites
+updated to the 3-arg form (`false` — they test credential-less targets).
+Sabotage-verified: with the branch-(b) gate removed (old policy),
+TestVerifyHTTPCertRefusesSelfSignedWithUserinfo,
+TestVerifyHTTPCertRefusesSelfSignedPublicIP, and
+TestProbeHTTPSUserinfoRefusesSelfSigned all fail (the minted cert is
+accepted and the Basic auth header reaches the server).

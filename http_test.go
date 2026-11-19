@@ -603,19 +603,19 @@ func TestVerifyHTTPCert(t *testing.T) {
 	expLeaf, _ := x509.ParseCertificate(expired.Certificate[0])
 
 	// Valid self-signed matching 127.0.0.1 -> accepted.
-	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "127.0.0.1"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "127.0.0.1", false); err != nil {
 		t.Errorf("valid self-signed rejected: %v", err)
 	}
 	// Expired self-signed -> rejected (self-signed acceptance enforces expiry).
-	if err := verifyHTTPCert([]*x509.Certificate{expLeaf}, "127.0.0.1"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{expLeaf}, "127.0.0.1", false); err == nil {
 		t.Error("expired self-signed accepted, want reject")
 	}
 	// No presented certs (plain HTTP) -> nothing to verify, accepted.
-	if err := verifyHTTPCert(nil, "127.0.0.1"); err != nil {
+	if err := verifyHTTPCert(nil, "127.0.0.1", false); err != nil {
 		t.Errorf("empty presented certs rejected: %v", err)
 	}
 	// Wrong host -> rejected.
-	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "10.9.9.9"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "10.9.9.9", false); err == nil {
 		t.Error("wrong-host self-signed accepted, want reject")
 	}
 }
@@ -659,23 +659,23 @@ func TestVerifyHTTPCertSelfSignedExactMatchOnly(t *testing.T) {
 	bareCert := certFor("example.com")
 
 	// Exact match still works (no fallback needed).
-	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "www.example.com"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "www.example.com", false); err != nil {
 		t.Errorf("exact match rejected: %v", err)
 	}
-	if err := verifyHTTPCert([]*x509.Certificate{bareCert}, "example.com"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{bareCert}, "example.com", false); err != nil {
 		t.Errorf("exact match rejected: %v", err)
 	}
 	// www-variant SAN vs bare target -> now REJECTED on the self-signed path
 	// (the www fallback is system-trusted-only).
-	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "example.com"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "example.com", false); err == nil {
 		t.Error("bare target vs www SAN accepted, want reject (no www fallback on self-signed)")
 	}
 	// bare SAN vs www target -> now REJECTED on the self-signed path.
-	if err := verifyHTTPCert([]*x509.Certificate{bareCert}, "www.example.com"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{bareCert}, "www.example.com", false); err == nil {
 		t.Error("www target vs bare SAN accepted, want reject (no www fallback on self-signed)")
 	}
 	// A different domain must NOT be accepted.
-	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "other.com"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{wwwCert}, "other.com", false); err == nil {
 		t.Error("unrelated host accepted, want reject")
 	}
 }
@@ -698,19 +698,19 @@ func TestVerifyHTTPCertNoWWWVariant(t *testing.T) {
 	bareOnly := selfSignedWithSANs(t, nil, []string{"example.com"})
 
 	// Control: exact match is accepted.
-	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "www.example.com"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "www.example.com", false); err != nil {
 		t.Errorf("exact www match rejected: %v", err)
 	}
-	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "example.com"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "example.com", false); err != nil {
 		t.Errorf("exact bare match rejected: %v", err)
 	}
 	// F13: www-only cert vs bare target -> REJECTED (was accepted pre-F13 on
 	// the system-trusted branch).
-	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "example.com"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{wwwOnly}, "example.com", false); err == nil {
 		t.Error("www-only cert accepted for bare target, want reject (F13: no www variant fallback)")
 	}
 	// F13: bare-only cert vs www target -> REJECTED.
-	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "www.example.com"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{bareOnly}, "www.example.com", false); err == nil {
 		t.Error("bare-only cert accepted for www target, want reject (F13: no www variant fallback)")
 	}
 }
@@ -769,16 +769,16 @@ func TestVerifyHTTPCertIPLiteral(t *testing.T) {
 	dnsCert := selfSignedWithSANs(t, nil, []string{"internal.example.com"})
 
 	// Matching IP SAN → accepted (branch (b), self-signed + IP SAN).
-	if err := verifyHTTPCert([]*x509.Certificate{ipCert}, "10.1.2.3"); err != nil {
+	if err := verifyHTTPCert([]*x509.Certificate{ipCert}, "10.1.2.3", false); err != nil {
 		t.Errorf("self-signed cert with matching IP SAN rejected: %v", err)
 	}
 	// Non-matching IP → rejected.
-	if err := verifyHTTPCert([]*x509.Certificate{ipCert}, "10.9.9.9"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{ipCert}, "10.9.9.9", false); err == nil {
 		t.Error("self-signed cert with non-matching IP SAN accepted")
 	}
 	// DNS-only SAN vs an IP target: the IP literal must be matched against
 	// IP SANs only; a DNS SAN for internal.example.com must NOT cover it.
-	if err := verifyHTTPCert([]*x509.Certificate{dnsCert}, "10.1.2.3"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{dnsCert}, "10.1.2.3", false); err == nil {
 		t.Error("DNS-only cert accepted for an IP target (DNS fallback must not exist)")
 	}
 	// Untrusted CA (throwaway, not in system roots) whose leaf carries a
@@ -790,7 +790,7 @@ func TestVerifyHTTPCertIPLiteral(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parse test leaf: %v", err)
 	}
-	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "127.0.0.1"); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{leaf}, "127.0.0.1", false); err == nil {
 		t.Error("untrusted-CA cert with matching IP SAN accepted (trust validation lost)")
 	}
 }

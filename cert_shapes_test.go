@@ -71,7 +71,7 @@ func TestFix_M6_SelfSignedShapes(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := verifyHTTPCert([]*x509.Certificate{leaf}, ip.String()); err != nil {
+			if err := verifyHTTPCert([]*x509.Certificate{leaf}, ip.String(), false); err != nil {
 				t.Errorf("SELFSIGNED %-10s %-20s => REJECT (%v), want ACCEPT (real self-signed server cert shape)", b.n, k.n, err)
 			}
 		}
@@ -116,7 +116,7 @@ func TestFix_M6_SelfSignedShapes(t *testing.T) {
 	if !bytes.Equal(forged.RawIssuer, forged.RawSubject) {
 		t.Fatalf("test setup: forged cert must have issuer==subject names")
 	}
-	if err := verifyHTTPCert([]*x509.Certificate{forged}, ip.String()); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{forged}, ip.String(), false); err == nil {
 		t.Error("FORGED cert (same names, signed by a different key) was ACCEPTED — the self-signed gate must verify the signature with the leaf's own key")
 	}
 
@@ -124,7 +124,7 @@ func TestFix_M6_SelfSignedShapes(t *testing.T) {
 	// self-signed cert for a DIFFERENT ip is still a reject.
 	other := fixSelfSignedCert(t, true, false, x509.KeyUsageDigitalSignature|x509.KeyUsageKeyEncipherment, net.ParseIP("10.1.2.3"))
 	otherLeaf, _ := x509.ParseCertificate(other.Certificate[0])
-	if err := verifyHTTPCert([]*x509.Certificate{otherLeaf}, ip.String()); err == nil {
+	if err := verifyHTTPCert([]*x509.Certificate{otherLeaf}, ip.String(), false); err == nil {
 		t.Error("self-signed cert for a different ip was ACCEPTED for this target — exact match must be preserved")
 	}
 }

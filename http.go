@@ -168,6 +168,18 @@ type redirectPins struct {
 // pinsKey is the context key for *redirectPins.
 type pinsKey struct{}
 
+// tlsUserinfoKey is the context key for the bool "this probe's target URL
+// carries userinfo (https://user:pass@host)". probeHTTP sets it from the
+// parsed target; probeDialTLS reads it and passes it to verifyHTTPCert,
+// which REFUSES self-signed certs for such targets. Rationale: a
+// credential-bearing target sends an Authorization: Basic *** header, and
+// an on-path attacker minting a matching self-signed cert takes milliseconds
+// — it passes the exact-SAN check and harvests the credentials. That is the
+// exact threat probeDialTLS's pre-request verification exists to stop, and
+// the self-signed allowance (a homelab convenience) negates it for
+// credential-bearing targets.
+type tlsUserinfoKey struct{}
+
 // probeTLSHandshakeTimeout caps the TLS handshake inside probeDialTLS. The
 // transport's TLSHandshakeTimeout does not apply to a custom
 // DialTLSContext (it only governs the transport's own addTLS path), so the
@@ -281,8 +293,11 @@ func probeDialTLS(ctx context.Context, network, addr string) (net.Conn, error) {
 	}
 	// Verify BEFORE the transport writes any request bytes. The failing
 	// leaf rides back on the typed certVerifyError so certNotAfterFromErr
-	// can surface its expiry on the card.
-	if err := verifyHTTPCert(tlsConn.ConnectionState().PeerCertificates, host); err != nil {
+	// can surface its expiry on the card. hasUserinfo (tlsUserinfoKey)
+	// tells verifyHTTPCert the target carries credentials — self-signed
+	// certs are refused for such targets.
+	hasUserinfo, _ := ctx.Value(tlsUserinfoKey{}).(bool)
+	if err := verifyHTTPCert(tlsConn.ConnectionState().PeerCertificates, host, hasUserinfo); err != nil {
 		tlsConn.Close()
 		return nil, err
 	}
@@ -492,9 +507,24 @@ func initProbeCA() error {
 // accepts the cert when EITHER
 // (a) it is trusted by the system roots, or
 // (b) it is genuinely self-signed (issuer == subject) AND its hostname and
-// validity hold for host. Everything else — a cert from an untrusted CA, an
-// expired cert, or a cert whose names don't match host — is rejected, so
-// "allow self-signed" never becomes "allow anything".
+// validity hold for host — AND the target is homelab-shaped: NO userinfo
+// on the target URL (no user:pass@) and, for IP-literal targets, a
+// PRIVATE ip. Everything else — a cert from an untrusted CA, an expired
+// cert, a cert whose names don't match host, or a self-signed cert on a
+// credential-bearing / public-IP target — is rejected, so "allow
+// self-signed" never becomes "allow anything" and never exposes
+// credentials.
+//
+// Why branch (b) is gated on hasUserinfo and private IPs: an on-path
+// attacker (ARP/DNS spoof on a LAN segment) minting a self-signed cert for
+// the target takes milliseconds and passes the exact-SAN check. For a
+// status-only sensor that is an availability spoof at worst; for a
+// user:pass@ target it harvests the Authorization: Basic *** header — the
+// exact threat probeDialTLS's pre-request verification exists to stop. A
+// self-signed cert presented on a globally routable IP is not an operator's
+// device (the homelab pattern is private targets); such a cert can be
+// pinned by adding it (CA:TRUE) or its issuing CA to PULSEMON_CA_FILE,
+// which branch (a) honors.
 //
 // Both branches require an EXACT hostname (or IP) match against host — the
 // same standard a browser applies. There is NO www/bare variant fallback:
@@ -512,7 +542,7 @@ func initProbeCA() error {
 // literal is normalized so x509 matches it against IP SANs, not DNS names.
 // A nil/empty presented slice (plain HTTP, or no certs) is accepted — there
 // is nothing to verify.
-func verifyHTTPCert(presented []*x509.Certificate, host string) error {
+func verifyHTTPCert(presented []*x509.Certificate, host string, hasUserinfo bool) error {
 	if len(presented) == 0 {
 		return nil
 	}
@@ -568,7 +598,12 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 	// the www fallback would widen the accepted set for no realistic benefit.
 	selfSigned := bytes.Equal(leaf.RawIssuer, leaf.RawSubject) &&
 		leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil
-	if selfSigned {
+	// Branch (b) is a homelab convenience, only safe for homelab-shaped
+	// targets: no credentials on the URL (a minted matching self-signed
+	// cert would harvest the Basic auth header) and no public IP literal
+	// (a self-signed cert on a globally routable IP is not an operator's
+	// device — pin it via PULSEMON_CA_FILE instead).
+	if selfSigned && !hasUserinfo && !isPublicProbeIP(host) {
 		roots := x509.NewCertPool()
 		roots.AddCert(leaf)
 		optsB := x509.VerifyOptions{Roots: roots, Intermediates: inter, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
@@ -577,10 +612,56 @@ func verifyHTTPCert(presented []*x509.Certificate, host string) error {
 			return nil
 		}
 	}
+	// Name the SPECIFIC refusal so the card tells the operator what to
+	// do, not just "not trusted".
+	var reason string
+	switch {
+	case selfSigned && hasUserinfo:
+		reason = "TLS certificate is self-signed, but the target carries credentials (user:pass@) — self-signed certs are refused for credential-bearing targets (an on-path attacker minting a matching cert would harvest the Basic auth header); install a CA-signed cert or pin the issuing CA via PULSEMON_CA_FILE"
+	case selfSigned && isPublicProbeIP(host):
+		reason = "TLS certificate is self-signed for a public IP — refused; pin the exact cert (CA:TRUE) or its issuing CA via PULSEMON_CA_FILE"
+	default:
+		reason = "TLS certificate is not trusted and is not a self-signed cert matching the target"
+	}
 	return &certVerifyError{
 		leaf: leaf,
-		err:  errors.New("TLS certificate is not trusted and is not a self-signed cert matching the target"),
+		err:  errors.New(reason),
 	}
+}
+
+// isPublicProbeIP reports whether host is an IP literal that is globally
+// routable — i.e. NOT loopback, RFC 1918, link-local, the 0.0.0.0/8
+// "this network" range, or IPv6 ULA (fc00::/7). An IPv4-mapped IPv6
+// address (::ffff:a.b.c.d) is judged as the embedded IPv4. Hostname
+// targets return false: self-signed acceptance is keyed on the
+// operator-controlled name (router.local), and the IP behind it is not
+// visible at cert-verify time (per-hop pins are a redirect-chain concern,
+// not a trust-store one).
+func isPublicProbeIP(host string) bool {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 10, // 10.0.0.0/8
+			ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31, // 172.16.0.0/12
+			ip4[0] == 192 && ip4[1] == 168,                // 192.168.0.0/16
+			ip4[0] == 127,                                 // loopback
+			ip4[0] == 169 && ip4[1] == 254,                // link-local
+			ip4[0] == 0:                                   // 0.0.0.0/8
+			return false
+		}
+		return true
+	}
+	switch {
+	case ip.IsLoopback(), ip.IsLinkLocalUnicast(), ip.IsLinkLocalMulticast():
+		return false
+	}
+	if ip[0]&0xfe == 0xfc { // ULA fc00::/7
+		return false
+	}
+	return true
 }
 
 // drainBodyCap bounds how much of a response body probeHTTP will read so
@@ -645,6 +726,13 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	origScheme := ""
 	if u, err := url.Parse(target); err == nil {
 		origScheme = strings.ToLower(u.Scheme)
+		// A user:pass@ target sends Authorization: Basic *** to every
+		// hop carrying the credentials — carry the flag to the dial hook
+		// so verifyHTTPCert refuses self-signed certs for this probe
+		// (see tlsUserinfoKey).
+		if u.User != nil {
+			ctx = context.WithValue(ctx, tlsUserinfoKey{}, true)
+		}
 	}
 
 	// The resolved_ip diagnostic comes from the ACTUAL connection
