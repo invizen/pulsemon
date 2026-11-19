@@ -2626,3 +2626,53 @@ pins fail; caps ignored → caps pin fails; each maintenance gate proven
 individually sufficient in a 2-gate matrix (flush on / deliver off →
 flush pin passes and the direct pin fails; flush off / deliver on →
 both pass; both off → flush pin fails).
+
+## webhook-ssrf-dialer-flaws (webhook.go, webhook_ssrf_dial_test.go, 2026-11-19)
+
+**Decision:** four SSRF/dialer fixes in the webhook path: (1)
+`dialChecked` now returns an explicit `no IP address for host` error when
+the resolver SUCCEEDS with an empty answer — the old shape returned
+`(nil, nil)`, which panicked at the first conn dereference (smtp.go's
+`conn.SetDeadline`, net/http inside the transport); `dialCheckedCleartext`
+already carried this guard. (2) `validateWebhookURLNoDNS` strips trailing
+dots (`strings.TrimRight(host, ".")`) BEFORE the .local/.localhost suffix
+checks — the FQDN form ("printer.local.", "localhost.") is the same name
+to DNS, so the dot was a pure save-time filter bypass of the only check
+keeping mDNS names out of the http-relay path. (3) The save-time http
+gate now requires ALL resolved answers to be private — the same rule
+`dialCheckedCleartext` enforces at dial time. The old any-private gate
+accepted mixed-A-record hosts at save that then failed EVERY delivery
+("resolved to a public address"): save-time and dial-time gates must
+agree. (4) `embeddedIPv4`'s ff ff 00 00 layout now ALSO requires the
+first 8 bytes to be zero — that is what the `::` in `::ffff:0:a.b.c.d`
+expands to. A genuine ULA/GUA with `ffff:0000` in bytes 8-11 and a
+non-zero prefix (e.g. `fd12:3456::ffff:0:a9fe:1`) is a legitimate IPv6
+destination; pre-fix its trailing 32 bits were judged as IPv4, so a
+trailing quad in a blocked IPv4 range (169.254/16, 0/8, …) produced a
+false "blocked address" on a perfectly good literal. Both embedded
+layouts keep working, and the blocked-trailing-quad detections
+(`::ffff:0:169.254.0.1`, `::169.254.0.1`, `::ffff:0:127.0.0.1`) are
+unchanged.
+
+**Why:** (1) is a crash on a poisoned/empty resolver answer — the
+dialer contract is "conn OR error", never a bare nil conn. (2)+(3) are
+save-vs-send inconsistencies: (2) lets a name the save-time check
+deliberately rejects reach delivery (where the blocklist on the
+mDNS-resolved private answer lets it THROUGH — the suffix check is the
+only gate for that class), and (3) lets a URL save that can never
+deliver, which looks like a pulsemon bug to the operator. (4) is a
+false positive on legitimate IPv6 literals — the zero prefix is part of
+what makes the layout an embedded form, not just the ff ff 00 00 bytes.
+
+**Pinned by:** TestDialCheckedEmptyResolverResult (empty-but-successful
+resolver answer → explicit no-IP error, nil conn),
+TestValidateWebhookURLTrailingDot (dotted .local/.localhost rejected in
+both schemes, multiple dots, undotted controls, and positive controls
+for ".local" inside a name), TestValidateWebhookURLCleartextAllPrivate
+(mixed A records over http rejected at save; all-private http accepted;
+same mixed name over https accepted), TestEmbeddedIPv4ZeroPrefixRequired
+(both embedded layouts still recognized; ULA/GUA with ffff:0000 in
+bytes 8-11 + non-zero prefix → no embedded view and no false block;
+blocked trailing quads in the real embedded forms still blocked).
+Sabotage-verified: each of the four fixes individually reverted → its
+pin fails; tree MD5-verified restored.

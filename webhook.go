@@ -105,6 +105,14 @@ func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 			return nil, err
 		}
 	}
+	// An empty (but successful) resolver result must be an ERROR, not a
+	// (nil, nil) return: both callers then dereference the conn (smtp.go's
+	// conn.SetDeadline, net/http inside the transport) and panic. A
+	// poisoned/empty resolver answer is a delivery failure, full stop.
+	// dialCheckedCleartext carries the same guard.
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no IP address for host %q", host)
+	}
 	for _, ip := range ips {
 		if err := checkWebhookIP(ip, host); err != nil {
 			return nil, err
@@ -252,8 +260,12 @@ func validateWebhookURLNoDNS(raw string) (string, string, error) {
 	// loopback or LAN addresses. This is NOT redundant with the blocklist:
 	// a .local name that mDNS-resolves to a private RFC1918 address PASSES
 	// checkWebhookIP (RFC1918 is allowed), so the suffix check is the only
-	// thing that keeps those out of the http-relay path.
-	lower := strings.ToLower(host)
+	// thing that keeps those out of the http-relay path. Trailing dots
+	// (FQDN form) are stripped BEFORE the suffix checks: "printer.local."
+	// and "localhost." would otherwise slip past the .local suffix test
+	// and the localhost equality, and DNS treats the dotted form as the
+	// same name — a pure save-time filter bypass.
+	lower := strings.TrimRight(strings.ToLower(host), ".")
 	if lower == "localhost" || strings.HasSuffix(lower, ".localhost") || strings.HasSuffix(lower, ".local") {
 		return "", "", fmt.Errorf("host %q cannot be used for alerts", host)
 	}
@@ -286,15 +298,16 @@ func validateWebhookURL(raw string) error {
 		return fmt.Errorf("cannot resolve host %q: %v", host, err)
 	}
 	if scheme == "http" {
-		private := false
+		// ALL answers must be private — the SAME rule
+		// dialCheckedCleartext enforces at dial time. The old any-private
+		// gate accepted a host with mixed A records (one private, one
+		// public) at save time that then failed EVERY delivery with
+		// "resolved to a public address": a URL that saved clean but could
+		// never deliver. Save-time and dial-time gates must agree.
 		for _, ip := range ips {
-			if ip.IsPrivate() {
-				private = true
-				break
+			if !ip.IsPrivate() {
+				return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 			}
-		}
-		if !private {
-			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
 		}
 	}
 	for _, ip := range ips {
@@ -427,30 +440,39 @@ func checkWebhookIP(ip net.IP, host string) error {
 //
 //   - ::a.b.c.d            — leading 12 bytes zero (deprecated
 //     IPv4-compatible form).
-//   - ::ffff:0:a.b.c.d     — bytes 8-11 are ff ff 00 00 (an IPv4-mapped
-//     form with an extra zero group; not recognized by net.IP.To4).
+//   - ::ffff:0:a.b.c.d     — leading 8 bytes zero AND bytes 8-11 are
+//     ff ff 00 00 (an IPv4-mapped form with an extra zero group; not
+//     recognized by net.IP.To4).
 //
-// A genuine IPv6 address (ULA, GUA, …) has non-zero leading bytes in other
-// positions and is left alone — only these two layouts carry an IPv4
-// destination that must be judged as IPv4.
+// A genuine IPv6 address is left alone. The zero-prefix requirement on
+// the ff ff 00 00 layout is load-bearing: it is what the :: in
+// ::ffff:0:a.b.c.d expands to, and a ULA/GUA with ffff:0000 in bytes
+// 8-11 and a non-zero prefix (e.g. fd12:3456::ffff:0:a9fe:1) is a
+// legitimate IPv6 destination — pre-fix its trailing 32 bits were judged
+// as IPv4, so a trailing quad that happened to sit in a blocked IPv4
+// range (169.254/16, 0/8, …) produced a false "blocked address" on a
+// perfectly good literal.
 func embeddedIPv4(ip net.IP) net.IP {
 	if len(ip) != 16 {
 		return nil
 	}
-	zero := true
-	for i := 0; i < 12; i++ {
-		if ip[i] != 0 {
-			zero = false
-			break
-		}
-	}
-	if zero {
+	if allZero(ip[0:12]) {
 		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
 	}
-	if ip[8] == 0xff && ip[9] == 0xff && ip[10] == 0x00 && ip[11] == 0x00 {
+	if allZero(ip[0:8]) && ip[8] == 0xff && ip[9] == 0xff && ip[10] == 0x00 && ip[11] == 0x00 {
 		return net.IPv4(ip[12], ip[13], ip[14], ip[15])
 	}
 	return nil
+}
+
+// allZero reports whether every byte of b is zero.
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // validateSMTPHost validates the SMTP mail-server host with the same
