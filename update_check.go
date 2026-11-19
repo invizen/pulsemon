@@ -99,17 +99,34 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 	if refresh && time.Since(updateCheckAttemptAt) < updateCheckRefreshMinInterval {
 		refresh = false
 	}
+	// Failure suppression: while a recent ATTEMPT failed, serve the last
+	// known result as stale — or a 503 when there is none — WITHOUT
+	// touching GitHub. The window is measured from updateCheckAttemptAt
+	// (set at flight start, so it advances on failures), NOT from
+	// updateCheckAt (the last SUCCESS): once the 30-minute cache has
+	// expired, the success age is always ≥ updateCheckTTL, and the old
+	// `time.Since(updateCheckAt) < updateCheckFailTTL` test was dead code
+	// — every 5s dashboard poll re-fetched during an outage, walking into
+	// GitHub's 60 req/hour limit. Cold-cache failures set the flag too
+	// (the flight below), so an outage from first boot cannot hammer the
+	// API either.
+	if !refresh && updateCheckFailed && time.Since(updateCheckAttemptAt) < updateCheckFailTTL {
+		if updateCheckCached != nil {
+			res := *updateCheckCached
+			res.Cached = true
+			updateCheckMu.Unlock()
+			respondWithJSON(w, http.StatusOK, res)
+			return
+		}
+		updateCheckMu.Unlock()
+		respondWithError(w, http.StatusServiceUnavailable, "update check failed (upstream unreachable); try again later")
+		return
+	}
 	var res updateCheckResult
 	if updateCheckCached != nil {
 		res = *updateCheckCached
 		age := time.Since(updateCheckAt)
-		switch {
-		case !refresh && !updateCheckFailed && age < updateCheckTTL:
-			updateCheckMu.Unlock()
-			respondWithJSON(w, http.StatusOK, res)
-			return
-		case !refresh && updateCheckFailed && age < updateCheckFailTTL:
-			res.Cached = true
+		if !refresh && age < updateCheckTTL {
 			updateCheckMu.Unlock()
 			respondWithJSON(w, http.StatusOK, res)
 			return
@@ -135,8 +152,12 @@ func (s *Server) handleUpdateCheck(w http.ResponseWriter, r *http.Request) {
 			// config — details belong in the log, not the response body
 			// (same contract as respondInternal).
 			log.Printf("update check: %v", err)
+			updateCheckFailed = true // CACHED and cold-cache failures both
+			// back off: the suppression window is measured from
+			// updateCheckAttemptAt (set at flight start), so the flag
+			// alone is enough — a cold outage must not re-fetch on every
+			// 5s poll.
 			if updateCheckCached != nil {
-				updateCheckFailed = true // updateCheckAt unchanged: it ages the stale entry
 				out := *updateCheckCached
 				out.Cached = true
 				return out, nil

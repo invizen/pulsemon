@@ -2676,3 +2676,58 @@ bytes 8-11 + non-zero prefix → no embedded view and no false block;
 blocked trailing quads in the real embedded forms still blocked).
 Sabotage-verified: each of the four fixes individually reverted → its
 pin fails; tree MD5-verified restored.
+
+## self-updater-flaws (update.go, update_linux.go, update_windows.go, update_check.go, selfupdater_test.go, 2026-11-19)
+
+**Decision:** three self-updater fixes: (1) The .prev backup in
+`installBinary` moved into a platform function `backupBinary`: Linux
+HARDLINKS (dst never disappears, so a power loss between backup and swap
+cannot boot an install with NO binary; rename fallback for filesystems
+without hardlink support), Windows RENAMES the running .exe aside (NTFS
+permits hardlinking a RUNNING exe — the old shared code path's
+os.Link(dst, prev) SUCCEEDED, leaving dst mapped, and swapBinary's
+rename of the new binary OVER the locked dst then failed with
+ERROR_ACCESS_DENIED, killing every Windows live update; renaming the
+running exe aside is the one move Windows allows on a locked .exe).
+(2) The /api/update-check failure backoff now measures its suppression
+window from `updateCheckAttemptAt` (set at flight start — advances on
+failures) instead of `updateCheckAt` (the last SUCCESS): after the
+30-minute cache expires, the success age is always ≥ TTL, so the old
+`time.Since(updateCheckAt) < updateCheckFailTTL` test was dead code and
+every 5s dashboard poll re-fetched during an outage, walking into
+GitHub's 60 req/hour limit. The suppression is now an early check that
+serves the stale result — or a 503 when there is no cache — and
+cold-cache failures set `updateCheckFailed = true` too, so an outage
+from first boot cannot hammer api.github.com either. (3)
+`pulsemon sign verify <file> <tag> <asset>` (4-arg manifest mode) no
+longer falls through to the legacy raw-bytes check when the manifest
+check fails (`if !verified` → `else`): a legacy raw-bytes .sig is
+uninstallable by the manifest client and unbound to the tag/asset, so
+the fall-through let an unbindable or tag-replayed signature pass
+release CI. 2-arg legacy mode is unchanged (raw-bytes is the only form
+for pre-manifest releases).
+
+**Why:** (1) is a hard break of Windows self-update — the NTFS
+hardlink-on-running-exe behavior makes the shared code path
+fundamentally wrong for that platform, and the swapBinary doc comment
+already described the rename-aside scheme the code was no longer doing.
+(2) is quota exhaustion on the worst possible schedule (a real outage):
+the backoff existed but could never fire in the shape that matters,
+and the cold-cache hole made first-boot outages worse. (3) weakens the
+release-pipeline authenticity gate: the whole point of the manifest
+form is the tag/asset binding, and a silent fall-through to the
+unbound form defeats it.
+
+**Pinned by:** TestBackupBinaryLinuxHardlinks (both names exist after
+backup, same inode — a rename scheme would leave dst missing),
+TestUpdateCheckColdCacheFailureBackoff (cold 503s suppress the next
+poll with NO upstream hit), TestUpdateCheckFailureBackoffAfterStaleCache
+(dead-code killer: the failed attempt happens after the cached success
+aged past the failure window — the next poll must NOT re-fetch),
+TestSignVerifyManifestModeRejectsLegacySig (raw-bytes .sig fails 4-arg
+verify), TestSignVerifyManifestModeAcceptsManifestSig (happy path),
+TestSignVerifyTagReplayRejected (v0.4.4-bound sig fails v0.4.5 verify),
+TestSignVerifyLegacyModeAcceptsRawSig (2-arg mode unchanged).
+Sabotage-verified: each of the four fix vectors individually reverted →
+its pin fails; tree MD5-verified restored. Windows side compile-checked
+via GOOS=windows cross-build.

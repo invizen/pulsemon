@@ -1078,25 +1078,19 @@ func installBinary(src, dst, wantSHA string) error {
 	// dst (no running binary to back up) is tolerated: there is simply no
 	// previous version to roll back to.
 	//
-	// HARDLINK, not rename: the old "rename dst→prev,
-	// then rename tmp→dst" left a window in which dst did NOT exist — a
-	// power loss between the two renames booted an install with NO binary.
-	// Linking makes .prev a second name for the old inode: dst never
-	// disappears at any point, and the swap below atomically replaces the
-	// dst name with the new inode. A stale .prev is removed first (Link
-	// fails on an occupied name; removing .prev cannot lose the running
-	// binary). Filesystems without hardlink support fall back to the old
-	// rename — no worse than before the fix.
+	// HOW the backup is made is platform-specific (backupBinary), because
+	// the two OSes disagree on what a running binary tolerates: Linux
+	// hardlinks (dst never disappears, so a power loss between backup and
+	// swap cannot boot an install with NO binary), Windows renames (NTFS
+	// happily hardlinks a RUNNING exe — the link succeeds and leaves dst
+	// mapped, so the rename of the new binary OVER the locked dst then
+	// fails with ERROR_ACCESS_DENIED and every Windows live update dies).
+	// The swap that follows is equally platform-specific (swapBinary).
 	prev := dst + ".prev"
 	if _, err := os.Lstat(dst); err != nil {
 		uWarn("no previous binary to keep at " + prev + " (nothing to roll back to later)")
-	} else {
-		_ = os.Remove(prev)
-		if lerr := os.Link(dst, prev); lerr != nil {
-			if rerr := os.Rename(dst, prev); rerr != nil && !os.IsNotExist(rerr) {
-				return fmt.Errorf("save previous binary as %s: %w", prev, rerr)
-			}
-		}
+	} else if err := backupBinary(dst, prev); err != nil {
+		return err
 	}
 	if err := swapBinary(tmpName, dst); err != nil {
 		// The previous binary was already moved to .prev; put it back so
@@ -1531,6 +1525,12 @@ func runSignRelease(args []string) int {
 		}
 		verified, form := false, "legacy raw-bytes"
 		if len(args) == 4 {
+			// Manifest mode verifies ONLY the manifest-bound message. The
+			// old code fell through to the raw-bytes check when this
+			// failed — letting a legacy raw-bytes .sig (uninstallable by
+			// the manifest client, and unbound to this tag/asset, so a
+			// signature replayed from another release passes) sail through
+			// release CI.
 			sum := sha256.Sum256(binBytes)
 			msg := releaseManifestMessage(args[2], args[3], hex.EncodeToString(sum[:]))
 			for _, pub := range keys {
@@ -1539,8 +1539,9 @@ func runSignRelease(args []string) int {
 					break
 				}
 			}
-		}
-		if !verified {
+		} else {
+			// 2-arg legacy mode: the raw-bytes check is the ONLY form
+			// (pre-manifest releases).
 			for _, pub := range keys {
 				if ed25519.Verify(pub, binBytes, sig) {
 					verified = true

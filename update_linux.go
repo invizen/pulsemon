@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"syscall"
 )
@@ -20,6 +21,29 @@ func binaryOwner(dst string) (uid, gid uint32, ok bool) {
 		return st.Uid, st.Gid, true
 	}
 	return 0, 0, false
+}
+
+// backupBinary keeps the running binary at prev (the M4 rollback artifact)
+// before swapBinary. On Linux a HARDLINK, not a rename: the old
+// "rename dst→prev, then rename tmp→dst" left a window in which dst did
+// NOT exist — a power loss between the two renames booted an install with
+// NO binary. Linking makes .prev a second name for the old inode: dst
+// never disappears at any point, and the swap atomically replaces the dst
+// name with the new inode. A stale .prev is removed first (Link fails on
+// an occupied name; removing .prev cannot lose the running binary).
+// Filesystems without hardlink support fall back to the rename — no worse
+// than before the fix. Windows cannot use this scheme (a hardlink to a
+// running .exe succeeds and leaves dst locked for the swap) — see
+// backupBinary in update_windows.go.
+func backupBinary(dst, prev string) error {
+	_ = os.Remove(prev)
+	if err := os.Link(dst, prev); err == nil {
+		return nil
+	}
+	if rerr := os.Rename(dst, prev); rerr != nil && !os.IsNotExist(rerr) {
+		return fmt.Errorf("save previous binary as %s: %w", prev, rerr)
+	}
+	return nil
 }
 
 // swapBinary atomically replaces dst with tmpName. On Linux the running
