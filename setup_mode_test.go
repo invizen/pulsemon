@@ -241,3 +241,65 @@ func TestSetupModeRejectsBeforeBcrypt(t *testing.T) {
 		t.Fatalf("non-setup AddUserMode: %v", err)
 	}
 }
+
+// TestAuthBootstrappedBailsOnPendingToken pins the latch bail: a
+// token-protected legacy install whose token migration is still pending
+// (0 users, token set, probe history) must NOT have auth_bootstrapped
+// stamped — stamping it opens the dashboard (0 users = auth off) on top of
+// the install, and the latch is monotonic. The bail is what keeps a
+// deferred migration from turning "token pending" into "fully open".
+// History: docs/DECISIONS.md → legacy-token-startup-step
+func TestAuthBootstrappedBailsOnPendingToken(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.SetSetting("auth_token", "$2a$10$dummybchashvalue"); err != nil {
+		t.Fatalf("set token: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 'legacy', '10.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensor: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('s1', '2026-10-13T00:00:00Z', 1.5)`); err != nil {
+		t.Fatalf("seed probe: %v", err)
+	}
+	migrateAuthBootstrapped(db)
+	if db.GetSetting("auth_bootstrapped") == "1" {
+		t.Fatal("bootstrapped latched on a token-pending install — a 0-user install is fully open (auth off), and the latch is monotonic")
+	}
+}
+
+// TestStartupAuthMigrationsCompletesPendingToken pins the boot sequence:
+// the startup step migrates a pending legacy token to the (admin) 'admin'
+// user, clears the token, and stamps auth_bootstrapped — and does so on
+// EVERY boot (idempotent), which is what makes a deferral retryable
+// instead of a version stamp making it permanent.
+// History: docs/DECISIONS.md → legacy-token-startup-step
+func TestStartupAuthMigrationsCompletesPendingToken(t *testing.T) {
+	db := newTestDB(t)
+	const tok = "$2a$10$dummybchashvalue"
+	if err := db.SetSetting("auth_token", tok); err != nil {
+		t.Fatalf("set token: %v", err)
+	}
+	startupAuthMigrations(db)
+	if got := db.GetSetting("auth_token"); got != "" {
+		t.Fatalf("token not cleared after the startup step (got %q)", got)
+	}
+	var admin int
+	if err := db.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'admin' AND is_admin = 1").Scan(&admin); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if admin != 1 {
+		t.Fatalf("migrated admin (is_admin=1) missing: count=%d", admin)
+	}
+	if db.GetSetting("auth_bootstrapped") != "1" {
+		t.Fatal("auth_bootstrapped not set after a successful token migration")
+	}
+	// Idempotent: a second boot is a no-op (no duplicate admin).
+	startupAuthMigrations(db)
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM users").Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("user count after a second boot = %d, want 1 (no duplicate admin)", n)
+	}
+}

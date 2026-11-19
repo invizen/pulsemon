@@ -428,26 +428,29 @@ var schemaMigrations = []schemaMigration{
 		},
 	},
 	{
-		// 11: auth pivoted from a single settings token to the users
-		// table. Runs on Store methods (deliberate log-and-continue
-		// deferral semantics: a failed migration KEEPS the legacy token
-		// and retries next boot — it must never fail InitSchema), so its
-		// own transaction stays read-only and carries only the stamp.
-		name: "legacy auth_token -> admin user",
-		run: func(db *Store, tx *sql.Tx) error {
-			return MigrateLegacyAuthToken(db)
-		},
+		// 11: no-op by design (number preserved — fleet DBs are stamped by
+		// position, never renumber). The legacy auth_token -> admin-user
+		// conversion is an idempotent STARTUP step (runServer calls
+		// MigrateLegacyAuthToken every boot), not a versioned step: a
+		// deferred pass must stay retryable, and a version stamp would
+		// commit on deferral and skip the retry forever — stamping a
+		// deferred pass opened token-protected installs (0 users + dead
+		// token = fully open dashboard).
+		// History: docs/DECISIONS.md → legacy-token-startup-step
+		name: "legacy auth_token -> admin user (no-op; startup step)",
+		run:  func(db *Store, tx *sql.Tx) error { return nil },
 	},
 	{
 		// 12: users.is_admin + promote the oldest user when no admin
 		// exists (the account panel is admin-gated; an existing install
 		// must never boot with zero admins). Runs AFTER the legacy token
-		// migration so the migrated 'admin' account (inserted without
-		// the flag) gets promoted. Idempotent by its own guards.
+		// slot so the migrated 'admin' account gets promoted. Idempotent
+		// by its own guards; runs ON the step tx so the column, the
+		// promotion, and the version stamp commit atomically (a crash
+		// mid-step replays the whole step).
+		// History: docs/DECISIONS.md → legacy-token-startup-step
 		name: "users.is_admin + oldest-admin promotion",
-		run: func(db *Store, tx *sql.Tx) error {
-			return db.migrateUserAdminColumn()
-		},
+		run:  func(db *Store, tx *sql.Tx) error { return db.migrateUserAdminColumn(tx) },
 	},
 }
 
@@ -505,21 +508,21 @@ func (db *Store) applyMigration(v int, m schemaMigration) error {
 }
 
 // migrateUserAdminColumn adds users.is_admin to pre-admin-flag DBs and
-// promotes the oldest user when the table has no admin. Called from
-// InitSchema on every boot; both statements are idempotent.
-func (db *Store) migrateUserAdminColumn() error {
+// promotes the oldest user when the table has no admin. Runs inside the
+// migration step's transaction: the column, the promotion, and the version
+// stamp commit atomically, so a crash mid-step replays the whole step
+// (both statements are idempotent, so the replay is safe).
+func (db *Store) migrateUserAdminColumn(tx *sql.Tx) error {
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'is_admin'").Scan(&n); err != nil {
+	if err := tx.QueryRow("SELECT COUNT(*) FROM pragma_table_info('users') WHERE name = 'is_admin'").Scan(&n); err != nil {
 		return err
 	}
 	if n == 0 {
-		if _, err := db.Exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"); err != nil {
+		if _, err := tx.Exec("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
 	}
-	res, err := db.Exec(`UPDATE users SET is_admin = 1
-		WHERE rowid = (SELECT rowid FROM users ORDER BY created_at ASC, username ASC LIMIT 1)
-		AND (SELECT COUNT(*) FROM users WHERE is_admin = 1) = 0`)
+	res, err := tx.Exec(userAdminPromoteSQL)
 	if err != nil {
 		return err
 	}
@@ -528,6 +531,14 @@ func (db *Store) migrateUserAdminColumn() error {
 	}
 	return nil
 }
+
+// userAdminPromoteSQL promotes the oldest user when the table has no admin.
+// A var (not a literal) so tests can swap in a failing statement to prove
+// the step's atomicity — the WHOLE step (column + promotion + stamp) must
+// roll back, not just the stamp.
+var userAdminPromoteSQL = `UPDATE users SET is_admin = 1
+	WHERE rowid = (SELECT rowid FROM users ORDER BY created_at ASC, username ASC LIMIT 1)
+	AND (SELECT COUNT(*) FROM users WHERE is_admin = 1) = 0`
 
 // SensorTags returns the sorted tag list for a sensor. ctx + error follow
 // the request-context contract: the old swallow-to-
@@ -895,28 +906,40 @@ func immediateTx(ctx context.Context, gdb *sql.DB, fn func(c *sql.Conn) error) e
 	return nil
 }
 
-// MigrateLegacyAuthToken converts a pre-accounts auth_token setting into the
-// "admin" user (the stored hash is already bcrypt, so it verifies exactly as
-// before) and then clears the setting — the users table is the source of
-// truth. The token is destroyed ONLY on a confirmed outcome (users already
-// exist, or the INSERT committed): on a UserCount error or an INSERT failure
-// the token stays in place and the migration retries next boot. Clearing it
-// unconditionally destroyed the operator's only
-// credential on a failed migration and left zero users + no
-// auth_bootstrapped flag — which the setup gate reads as a FRESH install,
-// downgrading the dashboard to unauthenticated setup mode.
+// legacyTokenUserCount is MigrateLegacyAuthToken's UserCount read,
+// swappable for tests (seam pattern): a failure here is exactly the
+// transient DB error the deferral semantics exist for.
+var legacyTokenUserCount = func(db *Store) (int, error) { return db.UserCount() }
+
+// MigrateLegacyAuthToken converts a pre-accounts auth_token setting into
+// the "admin" user (the stored hash is already bcrypt, so it verifies
+// exactly as before) and then clears the setting — the users table is the
+// source of truth.
+//
+// It is an idempotent STARTUP step (runServer calls it every boot, before
+// migrateAuthBootstrapped), not a versioned migration: a deferred pass
+// must stay retryable, and a version stamp would commit on deferral and
+// skip the retry forever — stamping a deferred pass left a token-protected
+// install with 0 users and a dead token, i.e. a fully open dashboard. The
+// token is destroyed ONLY on a confirmed outcome (users already exist, or
+// the INSERT committed): on a UserCount error or an INSERT failure the
+// token stays in place and the next boot retries.
+//
+// The migrated 'admin' is inserted with is_admin = 1 directly: this step
+// runs AFTER InitSchema's migration list, so slot 12's oldest-user
+// promotion (which the token user used to ride) has already passed.
 func MigrateLegacyAuthToken(db *Store) error {
 	if db.GetSetting("auth_token") == "" {
 		return nil
 	}
-	n, err := db.UserCount()
+	n, err := legacyTokenUserCount(db)
 	if err != nil {
 		log.Printf("WARNING: legacy auth_token migration deferred (user count failed: %v); token kept, retried next start", err)
 		return nil
 	}
 	if n == 0 {
-		if _, err := db.Exec(`INSERT INTO users (username, password_hash, created_at)
-			VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), ?)`,
+		if _, err := db.Exec(`INSERT INTO users (username, password_hash, is_admin, created_at)
+			VALUES ('admin', (SELECT value FROM settings WHERE setting_key = 'auth_token'), 1, ?)`,
 			Now()); err != nil {
 			log.Printf("WARNING: legacy auth_token migration to users table failed: %v; token kept, retried next start", err)
 			return nil
@@ -927,6 +950,14 @@ func MigrateLegacyAuthToken(db *Store) error {
 			log.Println("WARNING: failed to set auth_bootstrapped flag:", err)
 		}
 		log.Println("Migrated legacy auth token to the 'admin' user; set a new password in Settings")
+	} else {
+		// The token's owner may already exist as a plain (non-admin)
+		// user — e.g. created via the CLI before any server boot, when
+		// slot 12's promotion pass had no rows to promote. An existing
+		// install must never end up with zero admins, so guarantee one.
+		if _, err := db.Exec(userAdminPromoteSQL); err != nil {
+			log.Printf("WARNING: legacy auth_token migration: admin promotion failed: %v", err)
+		}
 	}
 	if err := db.SetSetting("auth_token", ""); err != nil {
 		return err

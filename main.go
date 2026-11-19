@@ -542,6 +542,12 @@ func runAuthUser(args []string) dispatchKind {
 		log.Printf("auth-user: schema: %v", err)
 		return dExit1
 	}
+	// Legacy-token migration (the server's startup step, also run here so
+	// a CLI-driven account on a pre-server legacy install doesn't strand
+	// the token or leave a zero-admin install).
+	if err := store.MigrateLegacyAuthToken(db); err != nil {
+		log.Printf("auth-user: legacy token migration: %v", err)
+	}
 	a := NewAuthState(db)
 	switch args[0] {
 	case "add":
@@ -611,6 +617,18 @@ func runAuthUser(args []string) dispatchKind {
 	}
 }
 
+// startupAuthMigrations is the post-InitSchema auth boot sequence: the
+// legacy-token migration (idempotent, EVERY boot — a deferral must stay
+// retryable, which a version stamp would make impossible) and then the
+// bootstrapped latch (which bails while a token is pending).
+// History: docs/DECISIONS.md → legacy-token-startup-step
+func startupAuthMigrations(db *store.Store) {
+	if err := store.MigrateLegacyAuthToken(db); err != nil {
+		log.Printf("WARNING: legacy auth_token migration failed: %v", err)
+	}
+	migrateAuthBootstrapped(db)
+}
+
 // migrateAuthBootstrapped marks legacy installs as bootstrapped so the
 // setup-mode gate (authGate) only applies to genuinely fresh installs.
 //
@@ -622,8 +640,18 @@ func runAuthUser(args []string) dispatchKind {
 // install keeps its documented "auth off = fully open" behavior; a fresh
 // install stays in setup mode until the first account exists.
 //
+// A PENDING legacy token bails the latch: stamping auth_bootstrapped=1 on a
+// 0-user install opens the dashboard (auth off) on top of a token-protected
+// install whose migration deferred, and the latch is monotonic. The token
+// migration stamps the flag itself on success, so a successful boot still
+// latches. A token READ failure bails too: fail closed, not open.
+// History: docs/DECISIONS.md → legacy-token-startup-step
+//
 // Idempotent: once a user exists or the flag is set, it is a no-op.
 func migrateAuthBootstrapped(db *store.Store) {
+	if tok, err := db.GetSettingErr("auth_token"); err != nil || tok != "" {
+		return
+	}
 	n, err := db.UserCount()
 	if err != nil || n > 0 {
 		return
@@ -691,8 +719,9 @@ func runServer(stop <-chan struct{}) {
 
 	// Legacy-install migration (v0.3.10 incident): pre-setup-mode installs
 	// that ran with auth off must stay fully open — see
-	// migrateAuthBootstrapped.
-	migrateAuthBootstrapped(db)
+	// startupAuthMigrations (token migration first: a pending token must
+	// not have the bootstrapped latch stamped on top of it).
+	startupAuthMigrations(db)
 	// Anti-downgrade bookkeeping: record this version as the
 	// highest this install has ever run (monotonic, best-effort). The
 	// self-update paths (CLI + dashboard) refuse release tags below this

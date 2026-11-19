@@ -812,15 +812,17 @@ func TestAuthLegacyTokenMigration(t *testing.T) {
 	if err := db.SetSetting("auth_token", string(hash)); err != nil {
 		t.Fatal(err)
 	}
-	// Re-init the schema: this is what a server boot does on the old DB.
-	// Versioned regime (finding #9): the seeded legacy row simulates a
-	// pre-versioning DB, whose first boot replays from user_version 0.
+	// Re-init the schema + run the startup auth migrations: this is what a
+	// server boot does on the old DB (versioned regime: pre-versioning DBs
+	// replay from user_version 0; the token conversion is the post-InitSchema
+	// startup step, not a versioned slot).
 	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("InitSchema on legacy DB: %v", err)
 	}
+	startupAuthMigrations(db)
 	if n, _ := db.UserCount(); n != 1 {
 		t.Fatalf("UserCount after migration = %d, want 1", n)
 	}
@@ -831,13 +833,14 @@ func TestAuthLegacyTokenMigration(t *testing.T) {
 	if got := db.GetSetting("auth_token"); got != "" {
 		t.Fatalf("legacy auth_token row not cleared: %q", got)
 	}
-	// Idempotent: a second InitSchema must not fail or add a user.
+	// Idempotent: a second boot must not fail or add a user.
 	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatalf("second InitSchema: %v", err)
 	}
+	startupAuthMigrations(db)
 	if n, _ := db.UserCount(); n != 1 {
 		t.Fatalf("UserCount after re-migration = %d, want 1", n)
 	}
@@ -2371,14 +2374,17 @@ func TestLegacyTokenMigrationUserIsAdmin(t *testing.T) {
 	if err := db.SetSetting("auth_token", string(hash)); err != nil {
 		t.Fatal(err)
 	}
-	// Re-init the schema: this is what a server boot does on the old DB
-	// (versioned regime: pre-versioning DBs replay from user_version 0).
+	// Re-init the schema + run the startup auth migrations: this is what a
+	// server boot does on the old DB (versioned regime: pre-versioning DBs
+	// replay from user_version 0; the token conversion is the post-InitSchema
+	// startup step, not a versioned slot).
 	if _, err := db.Exec(`PRAGMA user_version = 0`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.InitSchema(); err != nil {
 		t.Fatal(err)
 	}
+	startupAuthMigrations(db)
 	admin, ok := userByName(t, db, "admin")
 	if !ok {
 		t.Fatal("legacy 'admin' account missing after migration")

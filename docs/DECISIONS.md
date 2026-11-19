@@ -2132,3 +2132,41 @@ return the old join shape produced), TestSharedEngineConcurrentInit
 no engine+error pair). Sabotage-verified: restoring the `Do(func(){})`
 join makes TestEngineReadsBeforeInitDoNotConsumeInit fail with
 "SharedEngine returned (nil, nil) — the read consumed the one-shot init".
+
+## legacy-token-startup-step (internal/store/store.go, main.go, legacy_token_test.go, auth_test.go, setup_mode_test.go, 2026-11-19)
+
+**Decision:** The legacy `auth_token` → admin-user conversion is no longer a
+versioned migration — slot 11 is a no-op (number preserved), and
+`MigrateLegacyAuthToken` runs as an idempotent STARTUP step on every boot
+(`startupAuthMigrations` in main.go, right after `InitSchema`; also in the
+`auth-user` CLI path). The migrated 'admin' is inserted with `is_admin = 1`
+directly (the step runs after slot 12, so it no longer rides slot 12's
+promotion), and its n>0 path runs the oldest-user promotion to guarantee an
+admin exists (zero-admin installs are forbidden). `migrateUserAdminColumn`
+(slot 12) now runs on the step's tx, so column + promotion + version stamp
+commit atomically. `migrateAuthBootstrapped` bails while `auth_token` is
+non-empty OR unreadable (fail closed, not open).
+
+**Why:** `MigrateLegacyAuthToken` returns nil on a deferred DB failure
+(UserCount/INSERT error) to retry next boot, but `applyMigration` treats nil
+as success and commits `PRAGMA user_version = 11` (+12). Every later boot
+skips the migration forever, and `migrateAuthBootstrapped` (0 users + probe
+history) stamps `auth_bootstrapped = 1` — a token-protected install with no
+runtime token consumer booted fully unauthenticated; one transient DB error
+on the upgrade boot was enough. `TestLegacyTokenMigratesOnRetry` masked the
+defect by resetting `PRAGMA user_version = 0` by hand. Slot 12's two
+statements also ran on pool connections, so the ALTER could commit
+independently of the step's stamp, leaving a half-migrated schema on a
+failed step. A deferred pass must stay retryable, which is impossible while
+it is versioned.
+
+**Pinned by:** TestDeferredLegacyTokenMigrationRetriesNextBoot (replay
+defers → next boot's startup step completes; sabotaged old shape fails with
+"token not cleared after the retry"), TestMigrateUserAdminColumnAtomicWithStamp
+(a failing slot-12 statement rolls back the whole step — no column, stamp
+stays 11; sabotaged pool-conn shape fails with "is_admin column survived a
+failed slot-12 step"), TestAuthBootstrappedBailsOnPendingToken (the latch
+must not stamp over a pending token; sabotaged no-bail shape fails with
+"bootstrapped latched on a token-pending install"),
+TestStartupAuthMigrationsCompletesPendingToken (boot sequence migrates +
+clears + latches, idempotent — no duplicate admin on a second boot).
