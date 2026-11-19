@@ -2204,3 +2204,47 @@ TestBuildWatchdogCommandPrefersPrevBinary fails ("want the previous
 binary ... (the new one may be the broken one)") and
 TestBuildWatchdogCommandSystemdScope fails ("want prefix
 [/usr/bin/systemd-run --user --scope ...]").
+
+## gzip-lazy-pool-unwrap (gzip.go, api.go, gzip_test.go, 2026-11-19)
+
+**Decision:** `gzipResponseWriter` now (1) lazily initializes its
+compressor on the first body write from a `sync.Pool` (a fresh
+`gzip.NewWriter` allocates ~800 KB of deflate state per /api/ response),
+(2) implements `Unwrap() http.ResponseWriter` so `http.ResponseController`
+(handleUpdate's 90s SetWriteDeadline) and `http.MaxBytesReader`'s
+requestTooLarge connection-close reach the real connection, (3) bypasses
+gzip entirely for bodyless statuses (1xx/204/304 — no trailer, no
+Content-Encoding), (4) is excluded from POST /api/update (handleUpdate's
+synchronous performRestart SIGTERMs the process before the deferred gzip
+Close can write the trailer), and (5) advertises `Vary:
+Accept-Encoding` with case-insensitive encoding matching. The
+MaxBytesReader body bound now wraps `r.Body` BEFORE w is wrapped in the
+gzip writer (the hook's writer is the authoritative close path).
+
+**Why:** the old shape allocated a fresh compressor per 5s dashboard
+poll (GC churn), silently dropped the 90s update write deadline
+(ErrNotSupported without Unwrap → 30s WriteTimeout cut ~60s self-updates),
+wrote a 20-byte gzip footer after 204 No Content / 304 / HEAD (protocol
+violation), and left a truncated gzip trailer on the update 202
+(performRestart killed the process before the trailer —
+ERR_CONTENT_DECODING_FAILED in the browser). MaxBytesReader was also
+constructed with the gzip wrapper as its writer, so the 413
+connection-close hook could not reach the connection.
+
+**Pinned by:** TestGzipControllerReachesInnerWriter (SetWriteDeadline
+through the wrapper reaches the inner writer),
+TestGzipBodylessCarriesNoTrailer (204/304: zero body bytes, no
+Content-Encoding), TestGzipNormalResponseDecodes,
+TestGzipWriterPooledAndReused (same compressor instance round-trips the
+pool), TestAcceptsGzipCaseInsensitive ("GZIP" qualifies, "GZIP;q=0"
+declines), TestAPIUpdateResponsesAreNotGzipped (update identity + Vary on
+/api/healthz), TestOversizedBody413ClosesConnection (413 closes the
+connection — counting listener sees a second conn). Existing
+TestGzipAPIResponses (finding #8) still passes. Sabotage-verified: with the
+old behavioral shape restored (no Unwrap, no bodyless bypass, /api/update
+gzipped, body bound after the wrap), TestGzipControllerReachesInnerWriter
+fails ("feature not supported"), TestGzipBodylessCarriesNoTrailer fails
+("Close: ... does not allow body" — the 20-byte trailer on a 204),
+TestAPIUpdateResponsesAreNotGzipped fails (Content-Encoding: gzip on
+/api/update), and TestOversizedBody413ClosesConnection fails (the 413
+never closes the connection).

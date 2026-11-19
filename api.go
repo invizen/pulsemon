@@ -1,7 +1,6 @@
 package main
 
 import (
-	"compress/gzip"
 	"context"
 	"database/sql"
 	"embed"
@@ -332,6 +331,14 @@ func (s *Server) authGate() http.Handler {
 		if strings.HasPrefix(r.URL.Path, "/api/") {
 			w.Header().Set("Cache-Control", "no-store")
 		}
+		// Every request body is bounded to maxRequestBytes via
+		// http.MaxBytesReader BEFORE w is wrapped: the MaxBytesReader's
+		// requestTooLarge hook closes the connection through the writer
+		// it was given, so it gets the raw writer (the gzip wrapper is
+		// transparent via Unwrap, but this is the authoritative path).
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
+		}
 		// gzip /api/ responses when the client accepts them (finding #8):
 		// every open dashboard tab re-pulls the whole uncompressed fleet
 		// every 5s, and the payload grows with sensor count. Compressing the
@@ -341,11 +348,19 @@ func (s *Server) authGate() http.Handler {
 		// ceiling; the two heavier fixes (per-sensor history locks, batched
 		// probe writes) are documented in docs/DECISIONS.md → scale-ceiling
 		// and deferred — they only pay off at 1000s of sensors.
-		if strings.HasPrefix(r.URL.Path, "/api/") && acceptsGzip(r) {
-			w.Header().Set("Content-Encoding", "gzip")
-			gz := gzip.NewWriter(w)
-			defer gz.Close()
-			w = &gzipResponseWriter{ResponseWriter: w, gz: gz}
+		//
+		// POST /api/update is EXCLUDED: handleUpdate ends in a synchronous
+		// performRestart that SIGTERMs this process before the deferred
+		// gzip Close can write the trailer — a truncated gzip stream breaks
+		// the client's decode (ERR_CONTENT_DECODING_FAILED) on the 202. The
+		// update responses are a few hundred bytes; compression buys nothing.
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/update" && acceptsGzip(r) {
+			// The body now depends on Accept-Encoding: caches must not
+			// serve the gzip variant to an identity client (or vice versa).
+			w.Header().Add("Vary", "Accept-Encoding")
+			gzw := &gzipResponseWriter{ResponseWriter: w}
+			defer gzw.Close()
+			w = gzw
 		}
 		// Cross-port CSRF gate (RFC 6265bis): the session cookie is
 		// SameSite=Strict, but "same-site" is scheme+host — the PORT is
@@ -394,9 +409,6 @@ func (s *Server) authGate() http.Handler {
 					return
 				}
 			}
-		}
-		if r.Body != nil {
-			r.Body = http.MaxBytesReader(w, r.Body, maxRequestBytes)
 		}
 		// healthz is the container healthcheck and the external monitoring
 		// probe — it must be reachable in every state (setup, unauthenticated,
