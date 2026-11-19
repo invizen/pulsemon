@@ -4,6 +4,7 @@ package main
 // front of the re-alert SELECT, and the hot-reload cert stat memo.
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -40,22 +41,22 @@ func TestRealertUsesAlertMemCache(t *testing.T) {
 	// Cold cache: one lookup seeds via the miss path (row absent ->
 	// setAlertState writes DB + memory).
 	c := sensorConfig{id: id, name: "s1"}
-	pw.maybeRealert(c, "error", 0)
+	pw.maybeRealert(context.Background(), c, "error", 0)
 	if lookups != 1 {
 		t.Fatalf("cold tick did %d lookups, want 1", lookups)
 	}
 
 	// Steady state (same status, inside the re-alert interval): zero DB.
 	before := lookups
-	pw.maybeRealert(c, "error", 0)
-	pw.maybeRealert(c, "error", 0)
+	pw.maybeRealert(context.Background(), c, "error", 0)
+	pw.maybeRealert(context.Background(), c, "error", 0)
 	if lookups != before {
 		t.Fatalf("steady-state error ticks did %d alert_state lookups, want 0", lookups-before)
 	}
 
 	// Invalidation (single-sensor clear-history) forces one durable re-read.
 	pw.ResetStatsFor(id)
-	pw.maybeRealert(c, "error", 0)
+	pw.maybeRealert(context.Background(), c, "error", 0)
 	if lookups != before+1 {
 		t.Fatalf("after invalidation: %d lookups, want exactly 1 more", lookups-before)
 	}

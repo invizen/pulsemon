@@ -60,6 +60,14 @@ func (db *Store) Close() error {
 	return errors.Join(db.DB.Close(), db.probeDB.Close())
 }
 
+// NewStoreForTest wraps already-opened *sql.DB handles (main + probe
+// write) WITHOUT NewStore's DSN pragmas. For tests that need a specific
+// pragma shape (e.g. foreign_keys OFF, to prove a SQL-level guard does
+// not rely on the FK cascade). Production always uses NewStore.
+func NewStoreForTest(db, probeDB *sql.DB) *Store {
+	return &Store{DB: db, probeDB: probeDB}
+}
+
 func NewStore(dsn string) (*Store, error) {
 	// Pragma settings go in the DSN query string so modernc.org/sqlite applies
 	// them to EVERY connection the pool opens. Setting them via db.Exec() would

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"path/filepath"
 	"testing"
@@ -60,7 +61,7 @@ func TestSetAlertStateDeletedSensorNoResurrection(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { raw.Close() })
-	dbStore := &store.Store{DB: raw}
+	dbStore := store.NewStoreForTest(raw, raw)
 	if err := dbStore.InitSchema(); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +90,7 @@ func TestSetAlertStateDeletedSensorNoResurrection(t *testing.T) {
 	// An in-flight alert for the deleted sensor must not touch state:
 	// the surviving row keeps its OLD status (the old plain INSERT would
 	// have hit ON CONFLICT and updated it).
-	pw.setAlertState(id, "down", time.Now().UTC())
+	pw.setAlertState(context.Background(), id, "down", time.Now().UTC())
 	var status string
 	if err := raw.QueryRow(`SELECT status FROM alert_state WHERE sensor_id = ?`, id).Scan(&status); err != nil {
 		t.Fatal(err)
@@ -110,8 +111,8 @@ func TestSetAlertStateDeletedSensorNoResurrection(t *testing.T) {
 		VALUES (?,?,'10.0.0.3','icmp',60,1000,25,2,5,'active','up',?)`, live, "live", store.Now()); err != nil {
 		t.Fatal(err)
 	}
-	pw.setAlertState(live, "down", time.Now().UTC())
-	pw.setAlertState(live, "error", time.Now().UTC())
+	pw.setAlertState(context.Background(), live, "down", time.Now().UTC())
+	pw.setAlertState(context.Background(), live, "error", time.Now().UTC())
 	if err := raw.QueryRow(`SELECT status FROM alert_state WHERE sensor_id = ?`, live).Scan(&status); err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +143,7 @@ func TestSetAlertStateWriteFailureDoesNotStampMemory(t *testing.T) {
 
 	// Positive control: a healthy write stamps both the durable row and the
 	// in-memory copy.
-	pw.setAlertState(id, "error", time.Now().UTC())
+	pw.setAlertState(context.Background(), id, "error", time.Now().UTC())
 	pw.alertMemMu.Lock()
 	_, inMem := pw.alertMem[id]
 	pw.alertMemMu.Unlock()
@@ -158,7 +159,7 @@ func TestSetAlertStateWriteFailureDoesNotStampMemory(t *testing.T) {
 
 	// A failed upsert must NOT stamp memory: the pre-failure entry (the
 	// durable row's mirror) stays, so the next tick re-reads and retries.
-	pw.setAlertState(id, "up", time.Now().UTC())
+	pw.setAlertState(context.Background(), id, "up", time.Now().UTC())
 	pw.alertMemMu.Lock()
 	entry, ok := pw.alertMem[id]
 	pw.alertMemMu.Unlock()

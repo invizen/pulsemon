@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"pulsemon/internal/store"
@@ -148,7 +149,7 @@ func TestFix_M9_FailedErrorAlertSchedulesRetry(t *testing.T) {
 		defer bad.Close()
 		fcProviders(t, db, map[string]string{"discord": bad.URL})
 		pw := NewProbeWorker(db)
-		pw.setAlertState("s", "error", time.Now().UTC())
+		pw.setAlertState(context.Background(), "s", "error", time.Now().UTC())
 		pw.launchAlert(func() {
 			if !pw.sendAlert("s", "s", "t", "up", "error", 0) {
 				pw.scheduleAlertRetry("s", "error")
@@ -173,7 +174,7 @@ func TestFix_M9_FailedErrorAlertSchedulesRetry(t *testing.T) {
 		// settings commit).
 		db.SetSetting("realert_min", "0")
 		pw.reloadAlertSettings()
-		pw.setAlertState("s", "error", time.Now().UTC())
+		pw.setAlertState(context.Background(), "s", "error", time.Now().UTC())
 		pw.scheduleAlertRetry("s", "error")
 		db.QueryRow(`SELECT last_ts FROM alert_state WHERE sensor_id='s'`).Scan(&ts)
 		last, _ = parseTSForRealert(ts)
@@ -208,7 +209,7 @@ func TestScheduleAlertRetryBackdatesMemCopy(t *testing.T) {
 		pw := NewProbeWorker(db)
 
 		// Initial alert fails (provider 500) -> retry scheduled.
-		pw.setAlertState("s", "error", time.Now().UTC())
+		pw.setAlertState(context.Background(), "s", "error", time.Now().UTC())
 		if pw.sendAlert("s", "s", "t", "up", "error", 0) {
 			t.Fatal("delivery must fail")
 		}
@@ -231,14 +232,14 @@ func TestScheduleAlertRetryBackdatesMemCopy(t *testing.T) {
 		base := hits.Load()
 		time.Sleep(100 * time.Millisecond)
 		c := sensorConfig{id: "s", name: "s", target: "t"}
-		pw.maybeRealert(c, "error", 0)
+		pw.maybeRealert(context.Background(), c, "error", 0)
 		pw.DrainAlerts(5 * time.Second)
 		if hits.Load() != base+1 {
 			t.Fatalf("sustained-error tick after failed delivery: %d provider hits, want %d (the ~1m retry)", hits.Load(), base+1)
 		}
 
 		// Status guard: a recovered sensor's mem entry is not backdated.
-		pw.setAlertState("s", "up", time.Now().UTC())
+		pw.setAlertState(context.Background(), "s", "up", time.Now().UTC())
 		pw.scheduleAlertRetry("s", "error")
 		pw.alertMemMu.Lock()
 		memUp, _ := pw.alertMem["s"]
@@ -273,7 +274,7 @@ func TestResetAlertStatesStampsMemCopy(t *testing.T) {
 
 		// In error 45m (past the 30-min interval), then maintenance
 		// pauses it — no ticks to refresh the mem copy.
-		pw.setAlertState("s", "error", time.Now().UTC().Add(-45*time.Minute))
+		pw.setAlertState(context.Background(), "s", "error", time.Now().UTC().Add(-45*time.Minute))
 		pw.ResetAlertStates()
 
 		// Direct pin: the mem copy is stamped to now, not 45m stale.
@@ -292,7 +293,7 @@ func TestResetAlertStatesStampsMemCopy(t *testing.T) {
 		// immediate re-alert.)
 		base := hits.Load()
 		c := sensorConfig{id: "s", name: "s", target: "t"}
-		pw.maybeRealert(c, "error", 0)
+		pw.maybeRealert(context.Background(), c, "error", 0)
 		pw.DrainAlerts(5 * time.Second)
 		if hits.Load() != base {
 			t.Fatalf("first tick after maintenance: %d provider hits, want 0 (ResetAlertStates must suppress the immediate re-alert)", hits.Load()-base)

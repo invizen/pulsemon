@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -414,8 +415,12 @@ var alertStateSelect = func(db *store.Store, id string) (string, string, error) 
 // at most once per re-alert interval (default 30 min). The state read goes
 // through the in-memory alert-state copy first: a steady non-up sensor hits
 // no SELECT at all, and the DB row remains the durable copy (re-read on
-// miss: fresh process, deleted/evicted id).
-func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64) {
+// miss: fresh process, deleted/evicted id). A valid re-read STAMPS the
+// in-memory copy, so the miss happens at most once per sensor per process
+// — without that stamp, the early-return paths below (alert-once-only,
+// interval not elapsed) never write, and a cold cache would re-query
+// SQLite on every tick for the whole re-alert interval.
+func (pw *ProbeWorker) maybeRealert(ctx context.Context, c sensorConfig, status string, rttMs float64) {
 	now := time.Now().UTC()
 	var lastStatus, lastTs string
 	pw.alertMemMu.Lock()
@@ -426,13 +431,32 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	} else {
 		ls, lt, err := alertStateSelect(pw.db, c.id)
 		if err != nil {
-			pw.setAlertState(c.id, status, now)
+			// Only a genuinely MISSING row (sql.ErrNoRows) seeds: there is
+			// no durable state for this sensor, and stamping "now" is the
+			// correct first write. Any other error is transient (BUSY,
+			// I/O, deadline) — seeding would reset the re-alert clock and
+			// suppress an imminent re-alert, so return without touching
+			// state; the next tick retries the read.
+			if errors.Is(err, sql.ErrNoRows) {
+				pw.setAlertState(ctx, c.id, status, now)
+			}
 			return
+		}
+		// Stamp the in-memory copy so steady ticks hit no SELECT (see the
+		// function doc). Unparseable last_ts is not stamped: the parse
+		// failure below seeds a fresh state, which stamps on success.
+		if t, err := parseTSForRealert(lt); err == nil {
+			pw.alertMemMu.Lock()
+			if pw.alertMem == nil {
+				pw.alertMem = make(map[string]alertMemEntry)
+			}
+			pw.alertMem[c.id] = alertMemEntry{status: ls, ts: t}
+			pw.alertMemMu.Unlock()
 		}
 		lastStatus, lastTs = ls, lt
 	}
 	if lastStatus != status {
-		pw.setAlertState(c.id, status, now)
+		pw.setAlertState(ctx, c.id, status, now)
 		return
 	}
 	if pw.realertMin() == 0 {
@@ -445,13 +469,13 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	}
 	t, err := parseTSForRealert(lastTs)
 	if err != nil {
-		pw.setAlertState(c.id, status, now)
+		pw.setAlertState(ctx, c.id, status, now)
 		return
 	}
 	if now.Sub(t) < time.Duration(pw.realertMin())*time.Minute {
 		return
 	}
-	pw.setAlertState(c.id, status, now)
+	pw.setAlertState(ctx, c.id, status, now)
 	// A sustained error re-alerts on its own schedule (error -> error is
 	// not a transition); only the maintenance + routing gates apply.
 	if pw.alertGates(c) {
@@ -463,28 +487,45 @@ func (pw *ProbeWorker) maybeRealert(c sensorConfig, status string, rttMs float64
 	}
 }
 
-// setAlertState upserts a sensor's alert state. The INSERT is guarded by
-// SELECTing the sensor id: for a sensor deleted concurrently, the SELECT
-// yields no row and nothing is written, so alert state can never be
-// resurrected for a deleted sensor. The guard is explicit and
-// self-contained rather than relying on the alert_state FK — which IS
-// enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
+// setAlertState upserts a sensor's alert state. The write runs on the
+// capped probe-write handle (ProbeExecContext): setAlertState is on the
+// probe hot path (doProbe, maybeRealert), and a stalled writer must park
+// the sensor loop for at most store.ProbeWriteTimeout, not the main
+// pool's 15s busy_timeout — the same capping rationale as the probe
+// INSERT.
+//
+// The INSERT is guarded by SELECTing the sensor id: for a sensor deleted
+// concurrently, the SELECT yields no row and nothing is written, so alert
+// state can never be resurrected for a deleted sensor. The guard is
+// explicit and self-contained rather than relying on the alert_state FK —
+// which IS enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
 // store.NewStore) — and the write error is NOT swallowed: a failed
 // upsert is logged and the in-memory copy is deliberately NOT stamped,
 // so the durable row stays authoritative and the next tick's maybeRealert
 // re-reads it (cache miss), sees the status mismatch, and retries the
 // write — a transient DB failure self-heals, and a sustained one leaves a
 // log trail instead of silently resetting re-alert timing on the next
-// restart (review 2026-11-17 M1). For a live sensor
-// the SELECT yields exactly one row: behavior is identical to a plain
-// upsert, and the statement is atomic, so there is no delete/upsert
-// TOCTOU.
-func (pw *ProbeWorker) setAlertState(id, status string, ts time.Time) {
-	if _, err := pw.db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts)
+// restart (review 2026-11-17 M1).
+//
+// The in-memory stamp is gated on RowsAffected > 0: a guard that matched
+// no sensor row (concurrent delete) writes nothing, and stamping would
+// leave a ghost alertMem entry for a sensor that no longer exists. For a
+// live sensor the SELECT yields exactly one row: behavior is identical to
+// a plain upsert, and the statement is atomic, so there is no
+// delete/upsert TOCTOU.
+func (pw *ProbeWorker) setAlertState(ctx context.Context, id, status string, ts time.Time) {
+	res, err := pw.db.ProbeExecContext(ctx, `INSERT INTO alert_state (sensor_id, status, last_ts)
 		SELECT id, ?, ? FROM sensors WHERE id = ?
 		ON CONFLICT(sensor_id) DO UPDATE SET status = excluded.status, last_ts = excluded.last_ts`,
-		status, store.FormatTS(ts), id); err != nil {
+		status, store.FormatTS(ts), id)
+	if err != nil {
 		log.Printf("alert: failed to persist alert_state for %s: %v", id, err)
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n == 0 {
+		// The guard matched no sensor row (concurrent delete): nothing
+		// was written, so no in-memory copy is stamped either.
 		return
 	}
 	// Write-through so the in-memory copy mirrors the durable row (it is

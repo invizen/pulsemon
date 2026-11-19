@@ -1357,7 +1357,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 		// No transition: a sustained ERROR may be due for a re-alert.
 		// Warning is never re-alerted (loss flapping is dashboard noise).
 		if newStatus == "error" {
-			pw.maybeRealert(c, newStatus, rttMs)
+			pw.maybeRealert(ctx, c, newStatus, rttMs)
 		}
 		return
 	}
@@ -1389,7 +1389,7 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	}
 	pw.rememberStatus(c.id, newStatus) // only once the new status + event are durable
 
-	pw.setAlertState(c.id, newStatus, time.Now().UTC())
+	pw.setAlertState(ctx, c.id, newStatus, time.Now().UTC())
 	// Warning-only flapping is dashboard-only; everything involving error
 	// alerts (into error, partial recovery error -> warning, full recovery
 	// error -> up).

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"path/filepath"
 	"pulsemon/internal/store"
 	"strings"
@@ -96,7 +97,7 @@ func TestTimestampWritersAreUniform(t *testing.T) {
 	}
 	pw := NewProbeWorker(db)
 	fixed := time.Date(2026, 10, 4, 18, 7, 27, 123456789, time.UTC)
-	pw.setAlertState("a", "error", fixed)
+	pw.setAlertState(context.Background(), "a", "error", fixed)
 	var stored string
 	if err := db.QueryRow("SELECT last_ts FROM alert_state WHERE sensor_id = 'a'").Scan(&stored); err != nil {
 		t.Fatalf("read last_ts: %v", err)

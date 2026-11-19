@@ -2525,3 +2525,52 @@ the ghost survives). Sabotage-verified: forcing `reused = false`
 (pre-fix write shape) → both behavioral pins fail (the polling pin burns
 its full 5s budget); unthrottled per-write scan (pre-fix prune shape) →
 the throttle pin fails.
+
+## alert-state-hotpath-probe-handle-and-cache-warmth (alerts.go, probe.go, internal/store/store.go, alert_state_hotpath_test.go, alert_state_test.go, webhook_retry_test.go, nitround_pins_test.go, tsformat_test.go, 2026-11-19)
+
+**Decision:** `setAlertState` takes a ctx and runs its guarded upsert on
+the capped probe-write handle (`ProbeExecContext`, busy_timeout =
+store.ProbeWriteTimeout = 8s) instead of the main pool (busy_timeout
+15s), and stamps `alertMem` only when `RowsAffected() > 0`.
+`maybeRealert` takes a ctx; on a cache miss a VALID `alertStateSelect`
+read now stamps `alertMem` (so the miss happens at most once per sensor
+per process), and only `sql.ErrNoRows` seeds `alert_state` — any other
+db error returns without touching state. `certReadTimes`-style seams:
+`store.NewStoreForTest(db, probeDB)` wraps already-opened handles
+WITHOUT NewStore's pragmas (the FK-OFF no-resurrection test builds a
+Store whose probe handle is the raw pragma-less connection, since
+setAlertState now writes through the probe handle). All setAlertState /
+maybeRealert call sites thread the loop ctx (probe.go doProbe ×2,
+alerts.go ×4, test suites ×17).
+
+**Why:** (1) setAlertState is on the probe hot path (doProbe state
+transition + every sustained-error tick via maybeRealert); on the main
+pool a stalled writer parked the sensor loop for 15s on top of the 8s
+probe INSERT / 8s status-transition caps (up to ~31s of one tick under
+contention). The capped handle is the codebase's established answer to
+modernc's non-preemptable busy-handler. (2) Pre-fix, a cold alertMem
+(fresh process) re-read alert_state from SQLite and, on the early-return
+paths (alert-once-only, interval not elapsed) never wrote — so a
+steady-state errored sensor queried SQLite on EVERY tick for the whole
+re-alert interval. Stamping the in-memory copy on a valid read makes the
+durable read happen once per sensor per process. (3) Treating ANY
+db error like a missing row seeded alert_state with "now": a transient
+BUSY/I/O blip reset the re-alert clock and suppressed an imminent
+re-alert. Only a genuinely missing row has no state to preserve. (4)
+Stamping alertMem on a RowsAffected=0 upsert (guard matched no sensor
+row — concurrent delete) left a ghost in-memory entry for a deleted
+sensor; the durable no-resurrection guard (review 2026-11-10 #3) now has
+its memory-side counterpart.
+
+**Pinned by:** TestSetAlertStateRoutesCappedProbeHandle (the main pool
+is closed while the probe handle stays open: setAlertState still lands
+the durable row and stamps memory — a main-pool write would fail),
+TestSetAlertStateDeletedSensorNoMemGhost (no sensors row → no durable
+row AND no alertMem entry; live-sensor positive control stamps),
+TestMaybeRealertPopulatesAlertMemOnCacheMiss (cold cache + durable row
+inside the interval: exactly 1 SELECT on the cold tick, the entry is
+stamped, steady ticks do 0 SELECTs), TestMaybeRealertTransientDBErrorDoesNotSeed
+(a BUSY-shaped error seeds no row and stamps no memory; a restored real
+read with a genuinely missing row DOES seed). Sabotage-verified:
+main-pool write → pin 1 fails; unconditional stamp → pin 2 fails; no
+cache warming → pin 3 fails; any-error seeding → pin 4 fails.
