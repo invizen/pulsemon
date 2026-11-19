@@ -551,22 +551,30 @@ func (e *Engine) Ping(ctx context.Context, dst net.IP, timeout time.Duration) Pi
 var seqCounter uint32
 
 var (
+	sharedEngineMu   sync.RWMutex
 	sharedEngineInst *Engine
 	sharedEngineErr  error
-	sharedEngineOnce sync.Once
 )
 
 // SharedEngine returns the process-wide ICMP engine, opening it on first use.
+// The open is memoized under the write lock: concurrent callers block until
+// it settles, and a failed open (both transports down) is cached for the
+// process lifetime. Readers (EngineMode/EngineDead) take only the read lock —
+// they must never participate in the one-shot init, because a read that wins
+// the race would leave (nil engine, nil error) behind.
+// History: docs/DECISIONS.md → shared-engine-init
 func SharedEngine() (*Engine, error) {
-	sharedEngineOnce.Do(func() {
+	sharedEngineMu.Lock()
+	defer sharedEngineMu.Unlock()
+	if sharedEngineInst == nil && sharedEngineErr == nil {
 		e, err := NewEngine()
 		if err != nil {
 			sharedEngineErr = err
-			return
+			return nil, err
 		}
 		sharedEngineInst = e
 		e.run()
-	})
+	}
 	return sharedEngineInst, sharedEngineErr
 }
 
@@ -584,13 +592,11 @@ func getSharedConn() (*icmp.PacketConn, error) {
 
 // EngineMode reports which ICMP transport the shared engine is using
 // ("unprivileged-datagram", "raw", or "" if the engine has not started).
-// Shown in /api/healthz.
+// Shown in /api/healthz. Read-lock only: it must observe the state without
+// participating in the one-shot init. History: docs/DECISIONS.md → shared-engine-init
 func EngineMode() string {
-	// Join the Once first: sharedEngineInst is only written inside it, so
-	// reading it without having passed through Do is an unsynchronized
-	// read racing a concurrent first SharedEngine() call (healthz polled
-	// vs first probe tick). Do on an already-run Once is a no-op load.
-	sharedEngineOnce.Do(func() {})
+	sharedEngineMu.RLock()
+	defer sharedEngineMu.RUnlock()
 	if sharedEngineInst != nil {
 		return sharedEngineInst.mode
 	}
@@ -600,12 +606,15 @@ func EngineMode() string {
 // EngineDead reports whether the shared ICMP engine was attempted and BOTH
 // transports failed (datagram: gid outside net.ipv4.ping_group_range; raw:
 // no CAP_NET_RAW / root). Once dead it stays dead for the process lifetime
-// (the open is a sync.Once), so healthz can surface it as a stable condition
+// (the open is memoized once), so healthz can surface it as a stable condition
 // instead of the old silent behavior: server running, healthz "ok", no
 // pings. The probe worker warms the engine at startup precisely so this is
-// visible immediately, not after the first failed probe tick.
+// visible immediately, not after the first failed probe tick. Read-lock only:
+// it must observe the state without participating in the one-shot init.
+// History: docs/DECISIONS.md → shared-engine-init
 func EngineDead() bool {
-	sharedEngineOnce.Do(func() {}) // see EngineMode: synchronize with the Once's writes
+	sharedEngineMu.RLock()
+	defer sharedEngineMu.RUnlock()
 	return sharedEngineErr != nil
 }
 

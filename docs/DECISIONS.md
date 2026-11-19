@@ -2104,3 +2104,31 @@ the finding asked for. `update_api.go` keeps its `err == nil && body.Version
 stub-swap cleanup doesn't race the shared-call goroutine),
 TestProbeTCPIPv6LiteralIsCleanLoss, TestPatchSensorRejectsUnknownField
 (misspelled field = 400, valid field = 200). Full `-race` suite green.
+
+## shared-engine-init (ping.go, healthz_icmp_test.go, 2026-11-19)
+
+**Decision:** `SharedEngine` memoizes the one-shot open under
+`sharedEngineMu` (write lock + nil-check guard) instead of `sync.Once`;
+`EngineMode`/`EngineDead` read the state under the read lock and no longer
+participate in the init (the `Do(func(){})` join is gone). `getSharedConn`
+and `pingHost` are unchanged — the contract "nil error ⇒ non-nil engine"
+is now guaranteed by the memo itself.
+
+**Why:** The no-op `Do(func(){})` join consumed the Once whenever a reader
+won the startup race — `runServer` starts the probe worker (which warms
+the engine via `getSharedConn`) in a goroutine CONCURRENTLY with
+`startListener`, so a `GET /api/healthz` landing in that window left
+`(sharedEngineInst == nil, sharedEngineErr == nil)` permanently: the next
+`SharedEngine()` returned `(nil, nil)` and `getSharedConn` panicked on
+`e.rawConn` (server crash on boot; `pingHost` panics on `e.Ping`). The
+same poisoned state had already bitten the test suite (a re-zeroed Once
+consumed by a later test's join). The mutex memo keeps the exact-once +
+cached-failure semantics with no consumable join left to win.
+
+**Pinned by:** TestEngineReadsBeforeInitDoNotConsumeInit (reads in the
+fresh state, then SharedEngine must still open — fails on the (nil, nil)
+return the old join shape produced), TestSharedEngineConcurrentInit
+(32-goroutine reader/writer hammer under -race; asserts no (nil, nil) and
+no engine+error pair). Sabotage-verified: restoring the `Do(func(){})`
+join makes TestEngineReadsBeforeInitDoNotConsumeInit fail with
+"SharedEngine returned (nil, nil) — the read consumed the one-shot init".

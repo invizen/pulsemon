@@ -13,28 +13,27 @@ import (
 )
 
 // resetSharedEngine rewinds the process-wide engine state so a test can
-// simulate each outcome of the startup warm-up. SharedEngine is a
-// sync.Once, so the Once must be re-zeroed between tests (tests in this
-// package run sequentially by default — no t.Parallel here).
+// simulate each outcome of the startup warm-up. The state is a
+// mutex-guarded memo (sharedEngineMu), so rewinding is a locked write
+// (tests in this package run sequentially by default — no t.Parallel here).
 //
 // It also restores a clean "not yet opened" state when the test (or subtest)
-// ends. Without that, a re-zeroed Once can be consumed by a LATER test's
-// EngineMode()/EngineDead() no-op join (Do(func(){})) and left as
-// (done, nil, nil) — a state SharedEngine() can't recover from, because
-// sync.Once can't re-run NewEngine(). A later icmp probe then panics on a
-// nil engine (TestProbeTargetDispatch in the full -race run hit exactly this).
+// ends, so a later test that warms the engine (e.g. TestProbeTargetDispatch)
+// starts from the same fresh state.
 func resetSharedEngine(t *testing.T, mode string, err error) {
 	t.Helper()
-	sharedEngineOnce = sync.Once{}
+	sharedEngineMu.Lock()
 	sharedEngineInst = nil
 	sharedEngineErr = err
 	if mode != "" {
 		sharedEngineInst = &Engine{mode: mode}
 	}
+	sharedEngineMu.Unlock()
 	t.Cleanup(func() {
-		sharedEngineOnce = sync.Once{}
+		sharedEngineMu.Lock()
 		sharedEngineInst = nil
 		sharedEngineErr = nil
+		sharedEngineMu.Unlock()
 	})
 }
 
@@ -120,10 +119,9 @@ func TestHealthzIcmpMode(t *testing.T) {
 //     on and the whole dashboard is open to the LAN anyway, so blanking it
 //     would leave the dashboard's version pill empty.
 func TestHealthzVersionGated(t *testing.T) {
-	// handleHealthz reads EngineMode()/EngineDead(), which join the shared
-	// engine's sync.Once. Rewind + restore the state so a later icmp test
-	// (TestProbeTargetDispatch) can open a real engine instead of hitting the
-	// (done, nil, nil) state this test would otherwise leave behind.
+	// handleHealthz reads EngineMode()/EngineDead(), which observe the shared
+	// engine's memoized state. Rewind + restore the state so a later icmp test
+	// (TestProbeTargetDispatch) can open a real engine from a fresh state.
 	resetSharedEngine(t, "", nil)
 
 	newServer := func(t *testing.T) *Server {
@@ -180,4 +178,82 @@ func TestHealthzVersionGated(t *testing.T) {
 			t.Fatalf("auth-disabled healthz version = %v, want %q (the dashboard's version pill would be blank)", v, Version)
 		}
 	})
+}
+
+// TestEngineReadsBeforeInitDoNotConsumeInit pins the startup ordering:
+// startListener is up before the probe worker's first warm-up pass, so a
+// healthz poll (EngineMode/EngineDead) can land BEFORE the first
+// SharedEngine() call. A read in that window must observe "not started"
+// without consuming the one-shot init — SharedEngine() afterwards must
+// still open the engine (or report a transport failure), never the
+// (nil, nil) state that made getSharedConn() dereference a nil engine and
+// crash the server on boot. History: docs/DECISIONS.md → shared-engine-init
+func TestEngineReadsBeforeInitDoNotConsumeInit(t *testing.T) {
+	resetSharedEngine(t, "", nil) // fresh, never-opened state
+
+	// The healthz window: reads land before any SharedEngine() call.
+	if m := EngineMode(); m != "" {
+		t.Fatalf("EngineMode before init = %q, want \"\"", m)
+	}
+	if EngineDead() {
+		t.Fatal("EngineDead before init = true, want false (no open attempted yet)")
+	}
+
+	e, err := SharedEngine() // must still initialize
+	if e == nil && err == nil {
+		t.Fatal("SharedEngine returned (nil, nil) — the read consumed the one-shot init")
+	}
+	if e == nil {
+		// Both ICMP transports unavailable on this host — a legitimate
+		// outcome; the poisoned (nil, nil) state is already excluded above.
+		return
+	}
+	if err != nil {
+		t.Fatalf("SharedEngine: engine %v alongside error %v", e, err)
+	}
+	defer e.Close()
+
+	if m := EngineMode(); m != e.mode {
+		t.Fatalf("EngineMode after init = %q, want %q", m, e.mode)
+	}
+	if EngineDead() {
+		t.Fatal("EngineDead after a successful open = true, want false")
+	}
+	// getSharedConn is the warm-up's entry point: in the poisoned
+	// (nil, nil) state it dereferenced a nil engine and panicked.
+	if _, cerr := getSharedConn(); cerr != nil {
+		t.Fatalf("getSharedConn: %v", cerr)
+	}
+}
+
+// TestSharedEngineConcurrentInit hammers the reader/writer boundary under
+// -race: concurrent EngineMode/EngineDead reads racing the first open must
+// all observe a consistent state — "not started" (""/false) or the settled
+// engine — never (nil engine, nil error).
+func TestSharedEngineConcurrentInit(t *testing.T) {
+	resetSharedEngine(t, "", nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = EngineMode()
+			_ = EngineDead()
+			e, err := SharedEngine()
+			if e == nil && err == nil {
+				t.Error("SharedEngine: (nil, nil) — a reader consumed the one-shot init")
+			}
+			if e != nil && err != nil {
+				t.Errorf("SharedEngine: engine %v alongside error %v", e, err)
+			}
+		}()
+	}
+	wg.Wait()
+	e, err := SharedEngine()
+	if e == nil && err == nil {
+		t.Fatal("settled SharedEngine: (nil, nil)")
+	}
+	if e != nil {
+		e.Close()
+	}
 }
