@@ -2731,3 +2731,70 @@ TestSignVerifyLegacyModeAcceptsRawSig (2-arg mode unchanged).
 Sabotage-verified: each of the four fix vectors individually reverted →
 its pin fails; tree MD5-verified restored. Windows side compile-checked
 via GOOS=windows cross-build.
+
+## tls-upload-delete-race-and-data-dir-hardening (tls_settings.go, main.go, main_linux.go, main_windows.go, tls_race_test.go, 2026-11-19)
+
+**Decision:** (1) A package-level `tlsSettingsMu` now serializes the
+disk/DB/restart critical section of both /api/settings/tls handlers —
+the POST install (temp writes, pair re-validation, the two renames,
+port persistence, restart scheduling) and the DELETE (source check +
+removals + restart scheduling). Validation stays OUTSIDE the lock (pure
+in-memory work); the lock is held only for state mutation. Two test
+seams ride along: `tlsRemoveTemp` (the failure-path remover, recorded
+by tests) and `tlsInstallBetweenRenames` (a no-op hook between the key
+and cert renames so a test can pause the install mid-window). (2) The
+install-failure cleanups now Close the temp files BEFORE removing them
+(previously the deferred Close ran after the `os.Remove` return). (3)
+`runAuthUser` calls a new platform helper `hardenDataPath(dbPath)`
+before opening the store: on Linux that is `syscall.Umask(0o077)` +
+`hardenDataDirFiles` (the same contract as `ensureDataDir`, minus
+directory creation — the store only opens files in an existing data
+dir), on Windows it is a documented no-op (no umask; the data dir ACL
+is the installer's). (4) Windows `ensureDataDir` now operates on
+`dbPathFromEnv()` (PULSEMON_DB-aware — the old code hardcoded
+`defaultDBPath()`), refuses relative paths (the old comment claimed the
+path "is always absolute", which only covered the default), and returns
+the `os.MkdirAll` error instead of swallowing it.
+
+**Why:** (1) Concurrent admin clicks (POST/DELETE) interleaved a
+DELETE's `os.Remove` with a POST's `os.Rename`, leaving a mismatched
+certA+keyB pair — or a half-installed single file — on disk, which is a
+certFatal at the next boot, and each concurrent request also scheduled
+its own restart. (2) On Windows, `os.Remove` on a still-open file is a
+sharing violation: the removal silently fails and the `.key.pem.tmp*`
+residue — PRIVATE KEY material — is left on disk. (3) `auth-user add`
+before first boot (or while the service is stopped) ran before
+`ensureDataDir`, so the store was created under the process's default
+umask: 0644 world-readable pulsemon.db/-wal/-shm holding bcrypt hashes
+and webhook/SMTP secrets on multi-user Linux hosts. (4) A
+PULSEMON_DB override on Windows was never honored by the dir bootstrap
+(the DB's parent was never created), a relative PULSEMON_DB would have
+planted the secret-holding database in the process CWD, and a
+non-creatable data dir failed later with an opaque store error instead
+of a loud startup one.
+
+**Pinned by:** TestTLSConcurrentInstallAndRemoveStayConsistent
+(deterministic barrier round: the install is paused between the key and
+cert renames via tlsInstallBetweenRenames while a DELETE runs in the
+window — unlocked code leaves exactly one of cert.pem/key.pem behind;
+locked code's DELETE blocks on the mutex and removes the complete pair
+— plus 15 randomized PUT/DELETE race rounds asserting the on-disk pair
+always loads via tls.X509KeyPair),
+TestTLSInstallFailureClosesTempBeforeRemove (injected read-only temp
+files make the install's Write fail; the recorded remover proves each
+temp file is CLOSED before it is removed — on an open file, Windows
+leaves the residue — and no .tmp files survive),
+TestAuthUserHardensDataDirBeforeFirstBoot (Linux: with a 0o022
+interactive umask, `pulsemon auth-user add` on a fresh PULSEMON_DB must
+leave pulsemon.db at 0600, not 0644). The umask now set by the
+auth-user CLI path is process-global, which exposed a latent
+umask-dependency in two pre-existing mode-exact fixtures
+(TestInstallBinaryPreservesModeAndNeverLosesDst,
+TestFix_M4_InstallKeepsPrev: `os.WriteFile(dst, …, 0750/0755)` is
+umask-filtered, so under a leaked 077 the fixture was 0700 and the
+preservation assertion misfired) — both fixtures now Chmod to pin the
+exact mode. Sabotage-verified: each of the three fix vectors
+individually reverted → its pin fails; tree MD5-verified restored.
+Windows side compile-checked via GOOS=windows cross-build
+(ensureDataDir/hardenDataPath cannot be test-run on the Linux gate
+box).

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -19,15 +20,33 @@ func defaultDBPath() string {
 	return filepath.Join(os.Getenv("ProgramData"), "Pulsemon", "pulsemon.db")
 }
 
-// ensureDataDir creates the Windows data dir if missing. The Inno installer
-// also creates it (and locks its ACL down — see M1 in installer/pulsemon.iss);
-// this makes a manual/console run work without it. The Windows data path is
-// always absolute (%ProgramData% is absolute), so the relative-path refusal
-// in the Linux variant cannot trigger here.
+// ensureDataDir creates the Windows data dir if missing. The Inno
+// installer also creates it (and locks its ACL down — see M1 in
+// installer/pulsemon.iss); this makes a manual/console run work without
+// it. It operates on the directory of the DB actually in use
+// (dbPathFromEnv — PULSEMON_DB when set): the old code hardcoded
+// defaultDBPath(), so an operator who pointed PULSEMON_DB elsewhere was
+// left with a DB whose parent nothing ever created, and a RELATIVE
+// PULSEMON_DB would have planted the database in the process's working
+// directory (the "%ProgramData% is always absolute" reasoning only
+// covered the default path). MkdirAll failures are returned: a data dir
+// that cannot be created means the server cannot start, and that must be
+// loud.
 func ensureDataDir() error {
-	_ = os.MkdirAll(filepath.Dir(defaultDBPath()), 0o755)
+	dbPath := dbPathFromEnv()
+	if !filepath.IsAbs(dbPath) {
+		return fmt.Errorf("PULSEMON_DB must be an absolute path (got %q): a relative path would put the database — and its secrets — in the process's working directory", dbPath)
+	}
+	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
+		return fmt.Errorf("create data dir %s: %w", filepath.Dir(dbPath), err)
+	}
 	return nil
 }
+
+// hardenDataPath is a no-op on Windows: there is no umask, and the data
+// directory's ACL is the installer's (M1 in installer/pulsemon.iss), not
+// the process's.
+func hardenDataPath(dbPath string) {}
 
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.
 func icmpHint() string {

@@ -92,6 +92,13 @@ func TestInstallBinaryPreservesModeAndNeverLosesDst(t *testing.T) {
 	if err := os.WriteFile(dst, []byte("OLD"), 0750); err != nil {
 		t.Fatal(err)
 	}
+	// Chmod to pin 0750 exactly: WriteFile's mode is umask-filtered and
+	// an earlier CLI test in this binary leaves umask 077 behind (the
+	// auth-user path hardens the secret store — F15). The assertion
+	// below is mode-exact, so the fixture must be umask-independent.
+	if err := os.Chmod(dst, 0750); err != nil {
+		t.Fatal(err)
+	}
 	src := filepath.Join(dir, "new")
 	if err := os.WriteFile(src, []byte("NEWBINARY"), 0600); err != nil {
 		t.Fatal(err)

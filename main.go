@@ -529,7 +529,16 @@ func runAuthUser(args []string) dispatchKind {
 		fmt.Fprintln(os.Stderr, authUserUsage)
 		return dExit2
 	}
-	db, err := store.NewStore(dbPathFromEnv())
+	dbPath := dbPathFromEnv()
+	// The same data-dir hardening the server applies in ensureDataDir:
+	// this CLI path opens (and may CREATE) the secret-holding store before
+	// any server boot, so without the umask + file-tightening pass,
+	// `pulsemon auth-user add` on a fresh install leaves 0644
+	// world-readable pulsemon.db/-wal/-shm (bcrypt hashes, webhook/SMTP
+	// secrets) on multi-user Linux hosts.
+	hardenDataPath(dbPath)
+
+	db, err := store.NewStore(dbPath)
 	if err != nil {
 		log.Printf("auth-user: open: %v", err)
 		return dExit1

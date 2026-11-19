@@ -14,6 +14,14 @@ func fixWriteFile(t *testing.T, path string, data []byte, mode os.FileMode) {
 	if err := os.WriteFile(path, data, mode); err != nil {
 		t.Fatal(err)
 	}
+	// Pin the mode EXACTLY: WriteFile's mode is umask-filtered, and an
+	// earlier CLI test in this binary may have left a tighter umask
+	// behind (the auth-user path sets umask 077 for the secret store —
+	// F15). These fixtures assert exact modes, so they must be
+	// umask-independent.
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // TestFix_M4_InstallKeepsPrev pins the M4(a) fix: installBinary must keep

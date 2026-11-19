@@ -77,6 +77,18 @@ func hardenDataDirFiles(dbPath string) {
 	}
 }
 
+// hardenDataPath applies the data-dir hardening for CLI commands that
+// open the store outside runServer (auth-user): umask 0o077 so anything
+// this process creates from here on (the DB and its -wal/-shm sidecars)
+// is owner-only, plus the tightening pass over any existing files. Same
+// contract as ensureDataDir, minus directory creation — the store only
+// opens files inside an already-existing data dir, and a missing dir is
+// a loud store error, not a silent mkdir.
+func hardenDataPath(dbPath string) {
+	_ = syscall.Umask(0o077)
+	hardenDataDirFiles(dbPath)
+}
+
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.
 func icmpHint() string {
 	return "ICMP socket unavailable: this uid is outside net.ipv4.ping_group_range and CAP_NET_RAW is not granted. Fix: sudo sysctl -w net.ipv4.ping_group_range=\"0 65535\" (persist via /etc/sysctl.d/90-pulsemon-ping.conf) and restart pulsemon — or grant CAP_NET_RAW. See `journalctl -u pulsemon` for the exact error."

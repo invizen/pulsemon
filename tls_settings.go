@@ -254,6 +254,29 @@ func pubKeyFromAny(key any) any {
 // paths).
 var tlsCreateTemp = os.CreateTemp
 
+// tlsRemoveTemp is the temp-file remover on the install-failure cleanup
+// paths (tests inject a recorder to assert the file is CLOSED before it
+// is removed — on Windows a Remove of a still-open file is a sharing
+// violation and the .pem.tmp residue is left on disk).
+var tlsRemoveTemp = os.Remove
+
+// tlsInstallBetweenRenames is a no-op hook between the key and cert
+// renames (tests inject a barrier to deterministically interleave a
+// concurrent DELETE into the install window — the mismatched / one-file
+// state that tlsSettingsMu forbids).
+var tlsInstallBetweenRenames func()
+
+// tlsSettingsMu serializes TLS pair installs (POST) and removals
+// (DELETE). The disk mutations (temp writes, renames, removes) and the
+// restart scheduling must be atomic with respect to each other: a
+// DELETE's os.Remove interleaved with a PUT's os.Rename leaves a
+// MISMATCHED certA + keyB pair from two different uploads on disk
+// (certFatal on the next boot), and two concurrent requests each
+// schedule their own restart. Validation is pure in-memory work and
+// happens OUTSIDE the lock; the lock covers the disk/DB/restart
+// critical section only.
+var tlsSettingsMu sync.Mutex
+
 // handleTLSSettingsPut: POST /api/settings/tls
 // Body: {"cert": "<pem-or-base64>", "key": "<pem-or-base64>", "port": 443}
 // cert+key together = install/replace the pair; port alone = change port.
@@ -304,6 +327,11 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+
+	// Serialize the disk/DB/restart critical section against concurrent
+	// PUT/DELETE (tlsSettingsMu) — see the mutex's doc comment.
+	tlsSettingsMu.Lock()
+	defer tlsSettingsMu.Unlock()
 
 	if cert != "" {
 		// What lands on disk: the FULL chain (leaf + every intermediate),
@@ -356,7 +384,10 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		defer tmpCert.Close()
 		tmpKey, err := tlsCreateTemp(dir, ".key.pem.tmp*")
 		if err != nil {
-			os.Remove(certName)
+			_ = tmpCert.Close() // before the remove: on Windows a Remove of
+			// a still-open file is a sharing violation that leaves the
+			// .tmp residue behind (the deferred Close runs too late).
+			tlsRemoveTemp(certName)
 			respondInternal(w, "temp key", err)
 			return
 		}
@@ -387,6 +418,9 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			if err := os.Rename(keyName, keyPath); err != nil {
 				return err
 			}
+			if tlsInstallBetweenRenames != nil {
+				tlsInstallBetweenRenames()
+			}
 			if err := os.Rename(certName, certPath); err != nil {
 				// The key rename already landed: the on-disk pair is now
 				// NEW key + OLD cert — mismatched. Say so loudly; the
@@ -406,8 +440,14 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 		if err := install(); err != nil {
-			os.Remove(certName)
-			os.Remove(keyName)
+			// Close BEFORE remove: on Windows a Remove of a still-open
+			// file is a sharing violation that leaves the .pem.tmp
+			// residue on disk (the deferred Close runs after this return,
+			// which is too late).
+			_ = tmpCert.Close()
+			_ = tmpKey.Close()
+			tlsRemoveTemp(certName)
+			tlsRemoveTemp(keyName)
 			respondInternal(w, "install cert", err)
 			return
 		}
@@ -451,6 +491,11 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 // Refuses when the pair comes from env (PULSEMON_CERT) — that is an
 // install-time choice the dashboard must not clobber.
 func (s *Server) handleTLSSettingsDelete(w http.ResponseWriter, r *http.Request) {
+	// Same mutex as the PUT path: a DELETE interleaved with an install's
+	// renames is exactly the certA+keyB mismatch (plus a double restart).
+	tlsSettingsMu.Lock()
+	defer tlsSettingsMu.Unlock()
+
 	c := loadListenerCfg(s.db)
 	if c.source == "env" {
 		respondWithError(w, http.StatusConflict, "TLS is configured by environment (PULSEMON_CERT/PULSEMON_KEY); stop those to use the dashboard upload")
