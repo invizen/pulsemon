@@ -2476,3 +2476,52 @@ moved from a hardcoded 12 to schemaVersionHead (a new head is expected).
 Sabotage-verified: old DSN order → pin 1 fails; stripped DSN → pins 2-3
 fail; old index + no migration 13 → pin 4 fails; migration 13 without
 the DROP → pin 5 fails.
+
+## cert-readtimes-keepalive-refresh-and-per-probe-scan (http.go, cert_reuse_test.go, cert_freshness_test.go, nits_20261111_test.go, update_check_test.go, 2026-11-19)
+
+**Decision:** `probeHTTP` now records
+`certReadTimes[hostKey]` ONLY when the probe's final connection was
+freshly dialed (`httptrace.GotConn` `Reused == false`, captured in the
+existing trace closure alongside `connAt`/`resolved`). The stale-entry
+scan moved from every write to at most once per `certFreshness` window,
+gated by a new `certReadLastPrune` timestamp under the same
+`certReadMu`. `certFreshness` became a var (was const) so tests can
+shrink the window and exercise the force-fresh cadence in seconds.
+`TestCertReadTimesPrunedOnWrite` now sets the prune-window precondition
+explicitly (window elapsed) and restores `certReadLastPrune` in
+Cleanup, making it order-independent. The dangling duplicate
+`TestCertFreshnessReusesConn` comment at the end of update_check_test.go
+(test body lives in cert_freshness_test.go) was removed, and that test's
+step-2 comment now states the real behavior: probe 2 dials fresh on the
+pooled transport because probe 1's conn was on the no-reuse transport.
+
+**Why:** (1) A keep-alive reuse reports the cert from the pooled conn's
+ORIGINAL handshake — no new TLS data exists to record. Overwriting the
+timestamp with time.Now() on every successful probe meant that for any
+sensor polling faster than certFreshness/IdleConnTimeout (10 min),
+`time.Since(lastRead)` never exceeded the poll interval, `req.Close` was
+never set, the pooled conn never recycled (a fast poller keeps it from
+ever going idle), and a renewed or expired cert stayed stale for the
+connection's whole lifetime — in practice, indefinitely. Recording only
+on a real handshake makes the gate mean "the cert was last seen from a
+handshake at most certFreshness ago," which is the property the display
+and verifyHTTPCert both depend on. (2) The prune walked the entire
+certReadTimes map under the global certReadMu on every HTTPS probe —
+O(hosts) per probe, a scaling bottleneck as the fleet grows. Stale
+entries carry no information (the only reader treats "stale" exactly
+like "absent" — both force a fresh handshake), so window-granularity
+pruning is loss-free and the map stays bounded by live sensor hosts.
+
+**Pinned by:** TestCertReadTimesNotRefreshedOnKeepAliveReuse (probe 3
+reuses the pooled conn — proven by the server seeing exactly 2 distinct
+connections over 3 probes — and the certReadTimes entry is bit-for-bit
+probe 2's timestamp, not advanced), TestCertFreshnessForcesHandshakeUnderContinuousPolling
+(window shrunk to 150ms via the certFreshness seam: 4 distinct
+connections must appear within a 5s budget of ~40ms polling; pre-fix
+only 2 ever appear and the gate never fires), TestCertReadTimesPruneThrottledToWindow
+(elapsed window → the write scans and prunes the stale ghost and
+advances certReadLastPrune; fresh window → the write skips the scan and
+the ghost survives). Sabotage-verified: forcing `reused = false`
+(pre-fix write shape) → both behavioral pins fail (the polling pin burns
+its full 5s budget); unthrottled per-write scan (pre-fix prune shape) →
+the throttle pin fails.

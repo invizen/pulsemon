@@ -278,9 +278,3 @@ func TestUpdateCheckConcurrentPollsCoalesce(t *testing.T) {
 	}
 	<-slow
 }
-
-// TestCertFreshnessReusesConn verifies the cert-freshness optimization:
-// after a successful HTTPS probe with cert data, certReadTimes records the
-// host; a subsequent probe within certFreshness reuses the pooled
-// connection (no forced fresh handshake). After the threshold expires, a
-// fresh handshake is forced again.

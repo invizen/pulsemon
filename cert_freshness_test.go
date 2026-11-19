@@ -58,8 +58,12 @@ func TestCertFreshnessReusesConn(t *testing.T) {
 	}
 
 	// 2. Second probe (immediately after): cert is fresh → req.Close =
-	//    false (reuses the pooled conn). The entry timestamp should be
-	//    updated (newer than the first read).
+	//    false (pooled transport). Probe 1's conn was on the no-reuse
+	//    transport (probe 1 had no entry → req.Close), so nothing is
+	//    pooled yet — this probe dials fresh ON the pooled transport, a
+	//    real handshake, so the timestamp advances. The keep-alive-reuse
+	//    case (which must NOT advance it) is pinned in
+	//    TestCertReadTimesNotRefreshedOnKeepAliveReuse.
 	time.Sleep(5 * time.Millisecond) // ensure a distinguishable timestamp
 	res = probeHTTP(context.Background(), srv.URL, 5*time.Second)
 	if res.Lost {

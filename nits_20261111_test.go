@@ -105,15 +105,20 @@ func TestCertReadTimesPrunedOnWrite(t *testing.T) {
 	hostKey := "https://" + srv.Listener.Addr().String()
 	certReadMu.Lock()
 	oldMap := certReadTimes
+	oldPrune := certReadLastPrune
 	certReadTimes = map[string]time.Time{
 		"https://ghost-a.invalid:443": time.Now().Add(-certFreshness - time.Minute),
 		"https://ghost-b.invalid:443": time.Now().Add(-certFreshness - time.Hour),
 		"https://ghost-c.invalid:443": time.Now().Add(-time.Second), // fresh: must survive
 	}
+	// Prune-window precondition: the window has elapsed, so this write
+	// MUST run the scan (pruning is throttled to once per window).
+	certReadLastPrune = time.Time{}
 	certReadMu.Unlock()
 	t.Cleanup(func() {
 		certReadMu.Lock()
 		certReadTimes = oldMap
+		certReadLastPrune = oldPrune
 		certReadMu.Unlock()
 	})
 

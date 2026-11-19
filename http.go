@@ -435,21 +435,39 @@ var httpClient = &http.Client{
 // IdleConnTimeout (10 min): a pooled connection's cert is at most that
 // old, so reusing it keeps the displayed expiry as current as the pool
 // itself. A cert renewal is rare (90 days for Let's Encrypt, a year for
-// a CA cert), so 10 min staleness is negligible.
-const certFreshness = 10 * time.Minute
+// a CA cert), so 10 min staleness is negligible. A var (not const) so
+// tests can shrink the window and exercise the force-fresh cadence in
+// seconds (TestCertFreshnessForcesHandshakeUnderContinuousPolling).
+var certFreshness = 10 * time.Minute
 
-// certReadTimes tracks when each HTTPS host's cert was last read, keyed
-// by scheme://host (the same key the transport uses for connection
-// pooling). probeHTTP consults it before deciding whether to force a
-// fresh handshake; a successful probe with cert data updates it. The map
-// is pruned on every write: an entry older than certFreshness carries no
-// information (its only reader treats "stale" exactly like "absent" — both
-// force a fresh handshake), so dropping stale entries at write time is
-// loss-free and keeps the map bounded by the set of LIVE sensor hosts.
-// Without the prune, edited or deleted sensor targets accumulate forever.
+// certReadTimes tracks when each HTTPS host's cert was last read from a
+// REAL handshake, keyed by scheme://host (the same key the transport uses
+// for connection pooling). probeHTTP consults it before deciding whether
+// to force a fresh handshake; a probe whose final connection was freshly
+// dialed (httptrace.GotConn Reused == false) updates it.
+//
+// The update is conditional on a fresh handshake on purpose: a keep-alive
+// reuse reports the cert from the pooled conn's ORIGINAL handshake, so
+// recording "now" on every successful probe would refresh the timestamp
+// forever for any sensor polling faster than certFreshness — the stale
+// gate (time.Since(lastRead) > certFreshness) would never fire, and a
+// renewed or expired cert would stay stale for the lifetime of the pooled
+// connection, which never goes idle while a fast poller keeps it warm.
+// Recording only on a real handshake makes the gate mean "the cert was
+// last seen from a handshake at most certFreshness ago."
+//
+// The map is pruned at most once per certFreshness window
+// (certReadLastPrune): a full scan under the global certReadMu on every
+// HTTPS probe is O(hosts) per probe at fleet scale. Stale entries carry
+// no information anyway — the only reader treats "stale" exactly like
+// "absent" (both force a fresh handshake) — so window-granularity
+// pruning is loss-free and keeps the map bounded by the set of LIVE
+// sensor hosts. Without any prune, edited or deleted sensor targets
+// would accumulate forever.
 var (
-	certReadMu    sync.Mutex
-	certReadTimes = make(map[string]time.Time)
+	certReadMu        sync.Mutex
+	certReadTimes     = make(map[string]time.Time)
+	certReadLastPrune time.Time
 )
 
 // certVerifyError is a TLS verification failure carrying the leaf
@@ -752,13 +770,18 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// The httptrace docs allow hooks on other goroutines (h2 does); a
 	// small mutex makes the captures future-proof even though h1 + the
 	// custom DialTLSContext (no h2) call GotConn on the caller goroutine.
+	// connReused (info.Reused) feeds the certReadTimes write gate: only a
+	// freshly dialed conn re-read the cert, so only it may advance the
+	// freshness timestamp.
 	var mu sync.Mutex
 	var resolved string
 	var connAt time.Time
+	var connReused bool
 	trace := &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			mu.Lock()
 			connAt = time.Now()
+			connReused = info.Reused
 			if info.Conn != nil && info.Conn.RemoteAddr() != nil {
 				if h, _, err := net.SplitHostPort(info.Conn.RemoteAddr().String()); err == nil {
 					resolved = h
@@ -842,22 +865,41 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	if len(presented) > 0 {
 		na := presented[0].NotAfter
 		certExp = &na
-		// Record the cert read so the next probe can reuse the pooled
-		// connection (and its cert) instead of forcing a fresh handshake.
-		// Key on the ORIGINAL target (req.URL, before redirects) — the same
-		// key probeHTTP reads above — so a redirecting HTTPS target does not
-		// force a fresh handshake on every probe, and the map stays bounded
-		// by the sensor count (not the number of redirect hops). Go's Client
-		// does not mutate req.URL across redirects, so this is stable.
-		hostKey := req.URL.Scheme + "://" + req.URL.Host
-		certReadMu.Lock()
-		certReadTimes[hostKey] = time.Now()
-		for k, v := range certReadTimes {
-			if time.Since(v) > certFreshness {
-				delete(certReadTimes, k)
+		// Record the cert read ONLY when this probe's final connection
+		// was freshly dialed (GotConn Reused == false). A keep-alive
+		// reuse reports the cert from the pooled conn's ORIGINAL
+		// handshake, so refreshing the timestamp on every successful
+		// probe would defeat the freshness gate for any sensor polling
+		// faster than certFreshness (see the certReadTimes doc).
+		//
+		// Key on the ORIGINAL target (req.URL, before redirects) — the
+		// same key probeHTTP reads above — so a redirecting HTTPS target
+		// does not force a fresh handshake on every probe, and the map
+		// stays bounded by the sensor count (not the number of redirect
+		// hops). Go's Client does not mutate req.URL across redirects, so
+		// this is stable.
+		mu.Lock()
+		reused := connReused
+		mu.Unlock()
+		if !reused {
+			hostKey := req.URL.Scheme + "://" + req.URL.Host
+			certReadMu.Lock()
+			now := time.Now()
+			certReadTimes[hostKey] = now
+			// Prune at most once per certFreshness window: a full map
+			// scan under the global lock on every HTTPS probe is O(N)
+			// per probe at fleet scale, and stale entries are
+			// indistinguishable from absent to the only reader.
+			if now.Sub(certReadLastPrune) > certFreshness {
+				certReadLastPrune = now
+				for k, v := range certReadTimes {
+					if now.Sub(v) > certFreshness {
+						delete(certReadTimes, k)
+					}
+				}
 			}
+			certReadMu.Unlock()
 		}
-		certReadMu.Unlock()
 	}
 	if resp.Request == nil || !resp.Request.Close {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, drainBodyCap))
