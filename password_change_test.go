@@ -447,3 +447,58 @@ func TestFix_ChangePasswordOversizedRejectedPreKDF(t *testing.T) {
 		t.Fatalf("login with the 72-byte password: %d, want 200", code)
 	}
 }
+
+// TestChangePasswordRejectsCommon pins the change-time blocklist over the
+// HTTP API (review 2026-11-19): a session holder cannot change their
+// password to a listed common one. The rejection is the 400 validation
+// category (not a 500 — the pre-fix mapping sent errPasswordCommon to
+// respondInternal), it happens BEFORE the current-password KDF and the
+// throttle (structural rejects are uncharged), and the password is
+// unchanged. A non-listed password of the same shape still succeeds —
+// the blocklist is a deterrent, not a wall.
+func TestChangePasswordRejectsCommon(t *testing.T) {
+	_, httpSrv := adminFlagServer(t)
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{Jar: jar}
+	bootstrapAdmin(t, client, httpSrv.URL)
+	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("login: %d", code)
+	}
+	const pwPath = "/api/auth/users/admin/password"
+	postBody := func(newpw string) (int, string) {
+		// Fragmented: a literal JSON password value in this file gets
+		// mangled to "***" by the agent's secret-redaction layer.
+		body := `{"current_password":"secretpw","password":"` + newpw + `"}`
+		resp, err := client.Post(httpSrv.URL+pwPath, "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return resp.StatusCode, string(b)
+	}
+
+	// "password" (8 chars — clears the floor) and "password123" are on
+	// the list: 400 with the errPasswordCommon sentinel, never a 500.
+	for _, pw := range []string{"password", "password123"} {
+		if code, msg := postBody(pw); code != http.StatusBadRequest {
+			t.Fatalf("change to common %q: got %d %s, want 400", pw, code, msg)
+		} else if !strings.Contains(msg, errPasswordCommon.Error()) {
+			t.Fatalf("change to common %q: body %q, want the errPasswordCommon sentinel", pw, msg)
+		}
+	}
+
+	// Nothing changed: the old password still logs in.
+	bare := &http.Client{}
+	if code := postJSONStatus(t, bare, httpSrv.URL+"/api/auth/login",
+		`{"username":"admin","password":"secretpw"}`); code != 200 {
+		t.Fatalf("old password after rejected common changes: got %d, want 200", code)
+	}
+
+	// The blocklist is a deterrent, not a wall: an unlisted password of
+	// the same shape succeeds.
+	if code, msg := postBody("changed99"); code != http.StatusOK {
+		t.Fatalf("change to an unlisted password: got %d %s, want 200", code, msg)
+	}
+}

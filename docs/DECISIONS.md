@@ -2290,3 +2290,41 @@ TestVerifyHTTPCertRefusesSelfSignedWithUserinfo,
 TestVerifyHTTPCertRefusesSelfSignedPublicIP, and
 TestProbeHTTPSUserinfoRefusesSelfSigned all fail (the minted cert is
 accepted and the Basic auth header reaches the server).
+
+## common-password-change-gate (auth.go, auth_hourly_budget_test.go, password_change_test.go, 2026-11-19)
+
+**Decision:** The common-password blocklist now applies to password
+CHANGES, not just creation. `SetUserPassword` returns
+`errPasswordCommon` for a listed password (mirroring `AddUser`'s
+creation-time check, same order: weak → common → too-long),
+`handleAuthUserPassword` pre-rejects a listed new password with 400
+BEFORE beginAttempt and before the current-password KDF (structural
+rejects are uncharged — same category as the min-length pre-rejection),
+and the handler's error mapping routes `errPasswordCommon` to 400 (it
+previously fell through to `respondInternal` → 500).
+`TestSetupRejectsCommonPassword`'s payload was replaced: it carried a
+3-char password that failed minPasswordLen before ever reaching
+isCommonPassword (a false green — the blocklist contract was untested),
+and it now uses "password123" (on the list, clears the 8-char floor)
+and asserts the errPasswordCommon sentinel in the 400 body.
+
+**Why:** A user created under the hardening rule could change their
+password to "password" in the very next request — the creation-time
+check was a formality. The API contract (common → 400, not 500) was
+untested because the only test hit the length check first and asserted
+status only, not the sentinel. The pre-throttle placement keeps the
+endpoint's invariant: structurally doomed requests never run the KDF on
+req.Current and never charge the per-IP / per-username throttle.
+
+**Pinned by:** TestSetUserPasswordRejectsCommonPassword (AuthState:
+"password" and "password123" refused with errPasswordCommon, old
+password still verifies, the new one does not),
+TestChangePasswordRejectsCommon (HTTP: 400 + errPasswordCommon sentinel
+for both, never a 500; old password unchanged; an unlisted password of
+the same shape succeeds — deterrent, not a wall),
+TestSetupRejectsCommonPassword (fixed payload + sentinel assertion).
+Sabotage-verified: with the change path ungated (old code),
+TestSetUserPasswordRejectsCommonPassword fails (SetUserPassword("password")
+= nil) and TestChangePasswordRejectsCommon fails (200 {"ok":true} on a
+change to "password"); TestSetupRejectsCommonPassword stays green (it
+pins the setup path, which was never broken).

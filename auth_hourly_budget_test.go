@@ -187,6 +187,32 @@ func TestAddUserRejectsCommonPassword(t *testing.T) {
 	}
 }
 
+// TestSetUserPasswordRejectsCommonPassword pins the change-time half of the
+// blocklist: a password created under the hardening rule must not be
+// changeable back onto the list — the creation-time check is only as good
+// as the change path.
+func TestSetUserPasswordRejectsCommonPassword(t *testing.T) {
+	db := newTestDB(t)
+	a := NewAuthState(db)
+	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
+		t.Fatal(err)
+	}
+	// "password" clears the 8-char floor and is on the list; "password123"
+	// likewise. Both must be refused with errPasswordCommon.
+	for _, pw := range []string{"password", "password123"} {
+		if err := a.SetUserPassword(context.Background(), "admin", pw, ""); !errors.Is(err, errPasswordCommon) {
+			t.Fatalf("SetUserPassword(%q) = %v, want errPasswordCommon", pw, err)
+		}
+	}
+	// Nothing changed: the old password still verifies, the new one does not.
+	if _, ok := a.VerifyUser(context.Background(), "admin", "secretpw"); !ok {
+		t.Fatal("old password stopped verifying after a REJECTED change")
+	}
+	if _, ok := a.VerifyUser(context.Background(), "admin", "password123"); ok {
+		t.Fatal("the common password verified — the rejected change was stored")
+	}
+}
+
 // TestAddUserAcceptsUncommonPassword pins that the blocklist is a deterrent,
 // not a wall: a password outside the list is accepted.
 func TestAddUserAcceptsUncommonPassword(t *testing.T) {
@@ -213,18 +239,28 @@ func TestIsCommonPasswordCaseInsensitive(t *testing.T) {
 
 // TestSetupRejectsCommonPassword pins the API contract: a setup-mode (first
 // account) POST with a common password is a 400, not a 500, and no account
-// is created.
+// is created. The payload MUST clear the 8-char floor so the rejection
+// comes from isCommonPassword, not minPasswordLen (the test originally
+// carried a 3-char payload and passed only by hitting the length check —
+// a false green for the blocklist contract).
 func TestSetupRejectsCommonPassword(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
 
-	body := `{"username":"admin","password": "***"}`
+	// "password123" is on the blocklist and 11 chars long. Assembled from
+	// fragments: a literal JSON password value in this file gets mangled
+	// to "***" by the agent's secret-redaction layer — which is exactly
+	// how the original 3-char payload got here.
+	body := `{"username":"admin","password":"` + "password123" + `"}`
 	req := httptest.NewRequest("POST", "/api/auth/users", strings.NewReader(body))
 	req.RemoteAddr = "10.1.1.1"
 	rr := httptest.NewRecorder()
 	srv.handleAuthUsers(rr, req)
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("setup with a common password: got %d, want 400", rr.Code)
+	}
+	if !strings.Contains(rr.Body.String(), errPasswordCommon.Error()) {
+		t.Fatalf("setup with a common password: body %q, want the errPasswordCommon sentinel (the blocklist, not the min-length check, must reject)", rr.Body.String())
 	}
 	if n, _ := db.UserCount(); n != 0 {
 		t.Fatalf("user count = %d after a rejected common password, want 0", n)

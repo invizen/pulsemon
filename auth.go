@@ -808,6 +808,13 @@ func (a *AuthState) SetUserPassword(ctx context.Context, username, password, kee
 	if len(password) < minPasswordLen {
 		return errPasswordWeak
 	}
+	// Same blocklist as AddUser: a password created under the
+	// hardening rule must not be changeable back onto the list —
+	// otherwise the creation-time check is a formality (create with a
+	// strong password, change to "password" in the next request).
+	if isCommonPassword(password) {
+		return errPasswordCommon
+	}
 	if len(password) > 72 { // bcrypt input limit
 		return errPasswordTooLong
 	}
@@ -2072,6 +2079,16 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusBadRequest, errPasswordWeak.Error())
 		return
 	}
+	if isCommonPassword(req.Password) {
+		// Structurally doomed (same category as the min-length
+		// pre-rejection above): SetUserPassword enforces the same
+		// blocklist AddUser applies at creation, so this request can
+		// never succeed — reject (400, uncharged) BEFORE beginAttempt
+		// and before the KDF on req.Current. Same sentinel text as the
+		// SetUserPassword 400 it replaces.
+		respondWithError(w, http.StatusBadRequest, errPasswordCommon.Error())
+		return
+	}
 	if len(req.Password) > 72 || len(req.Current) > 72 {
 		// bcrypt rejects inputs over 72 bytes: a longer new password can
 		// never be stored, and a longer current password can never verify
@@ -2154,7 +2171,8 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		// failure (db, KDF) is a 500 with the detail logged — a raw
 		// driver string (e.g. "database is locked") is not a client
 		// fault and must not be echoed back as a 400 (same pattern as AddUser).
-		if errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) {
+		if errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
+			errors.Is(err, errPasswordCommon) {
 			respondWithError(w, http.StatusBadRequest, err.Error())
 			return
 		}
