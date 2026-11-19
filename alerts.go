@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 )
 
 // alertPanicRecovered guards the fire-and-forget alert paths: a panicking
@@ -1047,6 +1048,14 @@ func (pw *ProbeWorker) flushStorm() {
 	if len(q) == 0 {
 		return
 	}
+	// Maintenance mode silences every alert — the summary included. The
+	// individual alerts that filled this queue were each gated at launch,
+	// but maintenance can begin AFTER an entry was queued (the flush fires
+	// up to stormWindow later), so re-check at flush time: a storm summary
+	// must never land in a chat the operator has silenced.
+	if !pw.alertsEnabled() {
+		return
+	}
 	// Dedupe by sensor first: a sensor that flapped more than once inside
 	// the window (up -> error, then warning -> error) leaves one queue
 	// entry per transition. Only the latest transition per sensor is
@@ -1060,16 +1069,23 @@ func (pw *ProbeWorker) flushStorm() {
 		}
 		latest[e.id] = e
 	}
-	// Drop entries that recovered before the flush: a summary line for a
-	// sensor that is back up would contradict the recovery alert it raced.
-	// A vanished sensor (deleted mid-storm) is kept — the operator should
-	// still see it in the storm that took it down. Read the status via
-	// currentStatus (in-memory first): during a storm the sensors are
-	// actively probed, so lastStatus is the freshest source and reading it
-	// avoids one SQLite round-trip per queued entry
+	// Drop entries whose sensor has MOVED ON since the transition was
+	// queued: a summary line for a sensor that recovered (now "up") would
+	// contradict the recovery alert it raced, and one for a sensor that
+	// partially recovered (now "warning") would contradict the
+	// partial-recovery card — both recovery classes are always delivered
+	// individually (stormAdmit exempts them), so the individual alert is
+	// the operator's last word, not this summary. A sensor that degraded
+	// further (entry "warning", now "error") is dropped too: the newer
+	// error transition alerted individually, so the older line is stale.
+	// A vanished sensor (deleted mid-storm, read error) is kept — the
+	// operator should still see it in the storm that took it down. Read
+	// the status via currentStatus (in-memory first): during a storm the
+	// sensors are actively probed, so lastStatus is the freshest source
+	// and reading it avoids one SQLite round-trip per queued entry
 	still := q[:0]
 	for _, id := range order {
-		if s, err := pw.currentStatus(id); err == nil && s == "up" {
+		if s, err := pw.currentStatus(id); err == nil && s != latest[id].state {
 			continue
 		}
 		still = append(still, latest[id])
@@ -1087,17 +1103,25 @@ func (pw *ProbeWorker) flushStorm() {
 // global meta-alert — NOT queued on any sensor's alertGate — so it cannot
 // disturb a sensor's per-sensor ordering guarantee (F4).
 func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
+	// Maintenance can begin between flushStorm's check and this delivery
+	// (launchAlert queues the job, it does not run it inline): re-check so
+	// a summary never lands in a chat silenced in the gap.
+	if !pw.alertsEnabled() {
+		return
+	}
 	// Re-check each entry's status immediately before building the summary
 	//: flushStorm's filter ran earlier, and this delivery is
-	// async (launchAlert) — a sensor that recovered in the gap would otherwise
-	// be listed as "error" in a summary that lands AFTER its recovery alert
-	// (which is ordered on the per-sensor gate the summary bypasses). The
-	// re-check narrows the race to the instant before the post. currentStatus
-	// is in-memory (lastStatus) for an actively-probed sensor, so this is
-	// cheap — no per-entry SQLite round-trip on the hot path.
+	// async (launchAlert) — a sensor that moved on in the gap would
+	// otherwise be listed under a state it no longer holds, contradicting
+	// the individual alert (recovery / partial recovery) that the
+	// per-sensor gate ordered ahead of this summary, which bypasses that
+	// gate (F4). The re-check narrows the race to the instant before the
+	// post. currentStatus is in-memory (lastStatus) for an actively-probed
+	// sensor, so this is cheap — no per-entry SQLite round-trip on the hot
+	// path.
 	still := make([]stormEntry, 0, len(entries))
 	for _, e := range entries {
-		if s, err := pw.currentStatus(e.id); err == nil && s == "up" {
+		if s, err := pw.currentStatus(e.id); err == nil && s != e.state {
 			continue
 		}
 		still = append(still, e)
@@ -1111,9 +1135,16 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 		log.Printf("alert: storm summary (%d sensors) not delivered — provider list unreadable", len(entries))
 		return
 	}
-	md := stormSummaryMarkdown(entries)
+	// Render per provider, each under ITS content cap: over the cap the
+	// post is a non-retryable HTTP 400 and the WHOLE summary is dropped —
+	// the operator gets no outage alert at all. The capped formatters
+	// replace the overflow with a "… and N more" footer, so every
+	// provider receives a body it will accept (see truncateSummaryLines).
+	// SMTP has no practical limit: 0 = uncapped.
+	mdChat := stormSummaryMarkdown(entries, googleChatMax)
+	mdDiscord := stormSummaryMarkdown(entries, discordContentMax)
 	subject := fmt.Sprintf("pulsemon: alert storm — %d sensors changed state", len(entries))
-	body := stormSummaryPlain(entries)
+	body := stormSummaryPlain(entries, 0)
 	var wg sync.WaitGroup
 	var delivered atomic.Bool
 	for _, d := range dests {
@@ -1124,10 +1155,10 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 			var ok bool
 			switch d.p.Kind {
 			case "google_chat":
-				ok = pw.postJSON(d.url, map[string]any{"text": md}) == nil
+				ok = pw.postJSON(d.url, map[string]any{"text": mdChat}) == nil
 			case "discord":
 				ok = pw.postJSON(d.url, map[string]any{
-					"content":          md,
+					"content":          mdDiscord,
 					"allowed_mentions": map[string]any{"parse": []string{}},
 				}) == nil
 			case "telegram":
@@ -1135,7 +1166,7 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 				// (see dest) — never a live re-read here.
 				ok = pw.postJSON(d.url, map[string]any{
 					"chat_id":    d.chatID,
-					"text":       stormSummaryHTML(entries),
+					"text":       stormSummaryHTML(entries, telegramTextMax),
 					"parse_mode": "HTML",
 				}) == nil
 			case "smtp":
@@ -1152,6 +1183,48 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	}
 }
 
+// discordContentMax / telegramTextMax / googleChatMax are the providers'
+// message-content limits (the text field, not the whole request): Discord
+// 2,000 characters, Telegram sendMessage 4,096, Google Chat 4,096.
+// Exceeding them is a non-retryable HTTP 400 — the provider rejects the
+// WHOLE message — so an unbounded storm summary (a 50-sensor rack outage
+// easily exceeds 2,000) silently dropped the operator's only outage
+// alert. The formatters cap their output per provider; the overflow is
+// reported as a "… and N more" footer. Vars so a test can shrink them
+// without rendering 40-sensor bodies.
+var (
+	discordContentMax = 2000
+	telegramTextMax   = 4096
+	googleChatMax     = 4096
+)
+
+// truncateSummaryLines renders a storm summary: header, then one line per
+// sensor, capped at maxRunes (0 = uncapped). When the next line would push
+// the body over the cap, the remaining lines are replaced with a
+// "… and N more" footer — the body stays under the provider's limit, so
+// the post is accepted and the operator sees the outage (the first N lines
+// name the sensors; the header still counts ALL of them). The cap is on
+// RUNES, not bytes: the summaries are operator-facing prose and the
+// provider limits are character-based.
+func truncateSummaryLines(header string, lines []string, maxRunes int) string {
+	var b strings.Builder
+	b.WriteString(header)
+	runes := utf8.RuneCountInString(header)
+	shown := 0
+	for _, line := range lines {
+		lineRunes := utf8.RuneCountInString(line)
+		if maxRunes > 0 && runes+1+lineRunes > maxRunes {
+			fmt.Fprintf(&b, "\n… and %d more", len(lines)-shown)
+			break
+		}
+		b.WriteString("\n")
+		b.WriteString(line)
+		runes += 1 + lineRunes
+		shown++
+	}
+	return b.String()
+}
+
 // stormSummaryLine renders one entry as a readable transition for the
 // non-Markdown summary paths (Telegram HTML, SMTP plain), with the same
 // hygiene as the per-sensor cards: credentials stripped (F22). Mention
@@ -1166,10 +1239,12 @@ func stormSummaryLine(e stormEntry) string {
 }
 
 // stormSummaryMarkdown renders the summary for google_chat / discord.
-func stormSummaryMarkdown(entries []stormEntry) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*\n", len(entries)))
-	for _, e := range entries {
+// maxRunes is the destination provider's content cap (googleChatMax /
+// discordContentMax); 0 = uncapped (see truncateSummaryLines).
+func stormSummaryMarkdown(entries []stormEntry, maxRunes int) string {
+	header := fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*", len(entries))
+	lines := make([]string, len(entries))
+	for i, e := range entries {
 		// Escape the emphasis chars in the NAME only (free text — a name like
 		// db_primary_01 would otherwise render "primary" in italics, and a
 		// raw * in the name renders as literal formatting), with mention
@@ -1182,29 +1257,32 @@ func stormSummaryMarkdown(entries []stormEntry) string {
 		// https://example.com/@everyone would mass-ping the channel on
 		// clients/bridges that ignore allowed_mentions.parse = []
 		// The emphasis markers come from the format string.
-		b.WriteString("*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + discordMentionSafe(alertTarget(e.target)) + ")*\n")
+		lines[i] = "*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + discordMentionSafe(alertTarget(e.target)) + ")*"
 	}
-	return b.String()
+	return truncateSummaryLines(header, lines, maxRunes)
 }
 
 // stormSummaryHTML renders the summary for telegram (html-escaped).
-func stormSummaryHTML(entries []stormEntry) string {
-	var b strings.Builder
-	b.WriteString(html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))))
-	for _, e := range entries {
-		b.WriteString(html.EscapeString(stormSummaryLine(e)) + "\n")
+// maxRunes is the provider cap (telegramTextMax); 0 = uncapped. The cap is
+// measured on the ESCAPED output — that is what Telegram counts.
+func stormSummaryHTML(entries []stormEntry, maxRunes int) string {
+	header := html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)", len(entries)))
+	lines := make([]string, len(entries))
+	for i, e := range entries {
+		lines[i] = html.EscapeString(stormSummaryLine(e))
 	}
-	return b.String()
+	return truncateSummaryLines(header, lines, maxRunes)
 }
 
 // stormSummaryPlain renders the summary for SMTP (plain text).
-func stormSummaryPlain(entries []stormEntry) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)\n", len(entries))
-	for _, e := range entries {
-		b.WriteString(stormSummaryLine(e) + "\n")
+// maxRunes is 0 in production (email has no practical limit).
+func stormSummaryPlain(entries []stormEntry, maxRunes int) string {
+	header := fmt.Sprintf("pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)", len(entries))
+	lines := make([]string, len(entries))
+	for i, e := range entries {
+		lines[i] = stormSummaryLine(e)
 	}
-	return b.String()
+	return truncateSummaryLines(header, lines, maxRunes)
 }
 
 // dest is one configured provider with its resolved URL (a webhook POST

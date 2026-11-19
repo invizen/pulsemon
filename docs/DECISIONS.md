@@ -2574,3 +2574,55 @@ stamped, steady ticks do 0 SELECTs), TestMaybeRealertTransientDBErrorDoesNotSeed
 read with a genuinely missing row DOES seed). Sabotage-verified:
 main-pool write → pin 1 fails; unconditional stamp → pin 2 fails; no
 cache warming → pin 3 fails; any-error seeding → pin 4 fails.
+
+## storm-summary-caps-maintenance-gate-and-moved-on-filter (alerts.go, storm_test.go, storm_summary_limits_test.go, 2026-11-19)
+
+**Decision:** the storm-summary path now (1) is gated on
+`pw.alertsEnabled()` in BOTH `flushStorm` (after the queue drain) and
+`deliverStormSummary` (belt-and-braces at the post boundary: launchAlert
+queues the job, it does not run inline, so maintenance can flip in the
+gap), (2) drops every queued entry whose sensor no longer holds the
+entry's state — `currentStatus(id) != e.state` — not just `== "up"`, and
+(3) renders per provider under THAT provider's content cap
+(`discordContentMax` 2000 / `telegramTextMax` 4096 / `googleChatMax`
+4096, vars) via `truncateSummaryLines`: lines that no longer fit are
+replaced by a "… and N more" footer, and the header keeps counting ALL
+sensors. SMTP is uncapped (0). Caps are measured in runes of the FINAL
+(rendered/escaped) body — what the provider counts.
+
+**Why:** a rack/router outage is exactly the scenario storm coalescing
+exists for, and pre-fix the summary was lost in that scenario by all
+three defects at once: (1) ~20–25 downed sensors exceed Discord's
+2,000-char content limit and ~45–50 exceed Telegram/Google Chat's 4,096;
+over the limit the provider returns a non-retryable HTTP 400 and drops
+the WHOLE message — the operator's only outage alert vanished silently
+(delivery just logged "failed on all providers"). A capped, slightly
+lossy body gets delivered; an uncapped body gets lost. (2) The
+individual alerts that fill the queue are each gated at launch, but
+maintenance can begin AFTER an entry is queued (the flush fires up to
+stormWindow later), so the summary was the one alert class that could
+fire during maintenance mode. (3) The `== "up"` filter kept sensors that
+had PARTIALLY recovered (error -> warning): their partial-recovery card
+was already delivered individually (stormAdmit exempts recoveries from
+coalescing), so the operator got a card saying "X partially recovered"
+and, behind it, a summary saying "X: up → error". The same
+contradiction applies to a sensor that degraded further (entry
+"warning", now "error": the newer error alerted individually, the older
+warning line is stale). A vanished sensor (read error) is still kept —
+the storm that took it down should name it.
+
+**Pinned by:** TestStormSummaryCapsPerProvider (40-sensor body sized to
+straddle the two caps: the Discord render is ≤2,000 runes with an exact
+"… and N more" footer and a header that still counts 40; the Google
+Chat render is the full list with no footer; the Telegram HTML render is
+capped on the ESCAPED output; SMTP is uncapped), TestStormFlushSilencedInMaintenance
+(queued rack-outage shape + maintenance on at flush time → zero
+deliveries), TestStormSummarySilencedInMaintenance (maintenance on in
+the flush→post gap → zero deliveries), TestStormFlushDropsMovedOnSensors
+(partial recovery dropped, degrade-to-newer-error dropped, still-down
+control kept), TestStormSummaryDropsMovedOnBeforePost (same contract at
+the post boundary). Sabotage-verified: up-only filter → both moved-on
+pins fail; caps ignored → caps pin fails; each maintenance gate proven
+individually sufficient in a 2-gate matrix (flush on / deliver off →
+flush pin passes and the direct pin fails; flush off / deliver on →
+both pass; both off → flush pin fails).

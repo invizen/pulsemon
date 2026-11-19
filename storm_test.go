@@ -681,7 +681,7 @@ func TestStormSummaryMarkdownEscapesAsterisks(t *testing.T) {
 	entries := []stormEntry{
 		{id: "a", name: "nas*01", target: "https://nas.lan/x*y", oldState: "up", state: "error"},
 	}
-	md := stormSummaryMarkdown(entries)
+	md := stormSummaryMarkdown(entries, 0)
 	// Name's * is escaped; the URL target's * is verbatim (clickable).
 	want := "*nas\\*01: up → error (https://nas.lan/x*y)*"
 	if !strings.Contains(md, want) {
@@ -704,18 +704,18 @@ func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
 	}
 	const zwsp = "\u200b"
 	// Markdown (Discord/Google Chat): the mention IS neutralized.
-	if md := stormSummaryMarkdown(entries); !strings.Contains(md, zwsp) {
+	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, zwsp) {
 		t.Errorf("markdown summary must neutralize the mention (want %q present): %q", zwsp, md)
 	}
 	// Plain (SMTP) and HTML (Telegram): the mention is NOT neutralized.
-	if p := stormSummaryPlain(entries); strings.Contains(p, zwsp) {
+	if p := stormSummaryPlain(entries, 0); strings.Contains(p, zwsp) {
 		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
 	}
-	if h := stormSummaryHTML(entries); strings.Contains(h, zwsp) {
+	if h := stormSummaryHTML(entries, 0); strings.Contains(h, zwsp) {
 		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
 	}
 	// The plain summary carries the sensor name verbatim.
-	if p := stormSummaryPlain(entries); !strings.Contains(p, "@everyone") {
+	if p := stormSummaryPlain(entries, 0); !strings.Contains(p, "@everyone") {
 		t.Errorf("SMTP plain summary must carry the sensor name verbatim: %q", p)
 	}
 }
@@ -736,7 +736,7 @@ func TestStormSummaryMarkdownTargetMentionNeutralized(t *testing.T) {
 		{id: "a", name: "nas", target: "https://example.com/@everyone", oldState: "up", state: "error"},
 		{id: "b", name: "cam", target: "https://user:pass@nas.lan/@here", oldState: "up", state: "error"},
 	}
-	md := stormSummaryMarkdown(entries)
+	md := stormSummaryMarkdown(entries, 0)
 	// The target path's @everyone is neutralized (ZWSP right after the @).
 	if !strings.Contains(md, "https://example.com/@"+zwsp+"everyone") {
 		t.Errorf("storm markdown must neutralize the target's @everyone: %q", md)
@@ -750,10 +750,10 @@ func TestStormSummaryMarkdownTargetMentionNeutralized(t *testing.T) {
 		t.Errorf("target credentials must be stripped, mention neutralized: %q", md)
 	}
 	// Non-Markdown paths are untouched (no ZWSP — email/Telegram stay clean).
-	if p := stormSummaryPlain(entries); strings.Contains(p, zwsp) {
+	if p := stormSummaryPlain(entries, 0); strings.Contains(p, zwsp) {
 		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
 	}
-	if h := stormSummaryHTML(entries); strings.Contains(h, zwsp) {
+	if h := stormSummaryHTML(entries, 0); strings.Contains(h, zwsp) {
 		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
 	}
 }
@@ -789,14 +789,14 @@ func TestMarkdownEscapesEmphasisChars(t *testing.T) {
 		t.Errorf("discord re-alert card must escape the name's _ but keep the target verbatim: %q", dc)
 	}
 	// Storm summary (Markdown).
-	if md := stormSummaryMarkdown(entries); !strings.Contains(md, "db\\_primary\\_01") || !strings.Contains(md, "api_v1/health~check") {
+	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, "db\\_primary\\_01") || !strings.Contains(md, "api_v1/health~check") {
 		t.Errorf("storm markdown must escape the name's _ but keep the target verbatim: %q", md)
 	}
 	// The non-Markdown paths must NOT carry backslash escapes.
-	if p := stormSummaryPlain(entries); strings.Contains(p, "\\") {
+	if p := stormSummaryPlain(entries, 0); strings.Contains(p, "\\") {
 		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
 	}
-	if h := stormSummaryHTML(entries); strings.Contains(h, "\\") {
+	if h := stormSummaryHTML(entries, 0); strings.Contains(h, "\\") {
 		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
 	}
 }
@@ -819,14 +819,14 @@ func TestMarkdownEscapesLinkBrackets(t *testing.T) {
 	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, wantEscaped) {
 		t.Errorf("discord card must escape the name's link brackets: %q", dc)
 	}
-	if md := stormSummaryMarkdown(entries); !strings.Contains(md, wantEscaped) {
+	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, wantEscaped) {
 		t.Errorf("storm markdown must escape the name's link brackets: %q", md)
 	}
 	// The non-Markdown paths must NOT carry backslash escapes.
-	if p := stormSummaryPlain(entries); strings.Contains(p, "\\") {
+	if p := stormSummaryPlain(entries, 0); strings.Contains(p, "\\") {
 		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
 	}
-	if h := stormSummaryHTML(entries); strings.Contains(h, "\\") {
+	if h := stormSummaryHTML(entries, 0); strings.Contains(h, "\\") {
 		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
 	}
 }
