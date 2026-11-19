@@ -483,6 +483,17 @@ type ProbeWorker struct {
 	// hot path makes zero settings queries.
 	alertCfg atomic.Pointer[alertSettings]
 
+	// reloadObs / pausedObs are test-observation hooks (nil in
+	// production, zero cost): they record the ORDER of the alert-snapshot
+	// swap versus the in-memory pause flips around a maintenance
+	// transition. The order is a behavioral contract — a stale
+	// maintenance:true snapshot between resume and reload drops recovery
+	// alerts, and a stale maintenance:false between commit and pause
+	// fires alerts during maintenance (the maintenance-transition-ordering
+	// pins assert the relative order through these hooks).
+	reloadObs func()
+	pausedObs func(id string, paused bool)
+
 	// Storm budget: a global cap on individual
 	// non-recovery alerts per window. When the budget is exhausted (an
 	// upstream router dies and 23 sensors error within seconds), the
@@ -779,6 +790,9 @@ func (pw *ProbeWorker) bumpGen(id string) {
 // resumed for the first time: syncSensors reads paused rows and marks
 // wasPaused, so its first spawn counts as a respawn.
 func (pw *ProbeWorker) SetPaused(id string, paused bool) {
+	if pw.pausedObs != nil {
+		pw.pausedObs(id, paused)
+	}
 	pw.mu.Lock()
 	defer pw.mu.Unlock()
 	ps, ok := pw.sensors[id]

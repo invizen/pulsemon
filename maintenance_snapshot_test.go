@@ -52,6 +52,67 @@ func TestEnterMaintenanceWithFreshSnapshot(t *testing.T) {
 	}
 }
 
+// TestEnterMaintenanceAlreadyOnIsNoOp pins the in-tx mode re-check: a
+// second enter while maintenance is already ON (the double-click loser —
+// both requests read maintenance_mode "0" before their txs) must be a
+// no-op. Pre-fix it took a fresh snapshot, saw 0 active sensors (the
+// winner paused them all), and marshaled "null" over the winner's good
+// snapshot — leaving maintenance then resumed NOTHING and stranded the
+// whole fleet paused.
+func TestEnterMaintenanceAlreadyOnIsNoOp(t *testing.T) {
+	d := newTestDB(t)
+	ins := func(id, state string) {
+		if _, err := d.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+			VALUES (?, ?, '127.0.0.1', 60, 1000, 25, 3, 3, ?, 'up', ?)`,
+			id, id, state, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			t.Fatalf("insert %s: %v", id, err)
+		}
+	}
+	ins("a1", "active")
+	ins("a2", "active")
+
+	ids, err := d.EnterMaintenanceWithFreshSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("EnterMaintenanceWithFreshSnapshot: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("paused ids = %v, want the 2 active sensors", ids)
+	}
+
+	// The concurrent loser: mode is already ON under the write lock.
+	ids2, err := d.EnterMaintenanceWithFreshSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("second enter (already ON): %v", err)
+	}
+	if ids2 != nil {
+		t.Fatalf("second enter returned %v, want nil (no-op)", ids2)
+	}
+	raw := d.GetSetting("maintenance_active_ids")
+	var snap []string
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		t.Fatalf("snapshot is no longer valid JSON after a concurrent enter: %v (%q)", err, raw)
+	}
+	if len(snap) != 2 {
+		t.Fatalf("snapshot after a concurrent enter = %v, want the original 2 ids (pre-fix the loser overwrote it with null)", snap)
+	}
+
+	// Leave resumes the original set — the fleet is not stranded.
+	resumed, err := d.LeaveMaintenanceFromSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("LeaveMaintenanceFromSnapshot: %v", err)
+	}
+	if len(resumed) != 2 {
+		t.Fatalf("leave resumed %v, want the 2 snapshot ids", resumed)
+	}
+	var active int
+	if err := d.QueryRow(`SELECT COUNT(*) FROM sensors WHERE state='active'`).Scan(&active); err != nil {
+		t.Fatal(err)
+	}
+	if active != 2 {
+		t.Fatalf("active after leave = %d, want 2 (fleet stranded paused)", active)
+	}
+}
+
 // Leaving maintenance is the mirror: the restore-set snapshot is read
 // INSIDE the resume transaction. A snapshot that fails to decode is a
 // HARD failure — mode stays ON, the snapshot stays on disk, sensors stay

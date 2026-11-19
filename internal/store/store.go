@@ -676,6 +676,16 @@ const settingsTxLockKey = "\x00pulsemon-txlock"
 // mode flag. Returns the ids actually paused (the handler feeds them to the
 // SetPaused in-memory fast path). The handler's earlier read survives only
 // as a UX pre-check (400 "no active sensors"); this read is authoritative.
+//
+// The mode flag is re-checked UNDER the write lock: the handler's pre-tx
+// read (maintAlreadyOn) can be stale — two concurrent enters (a
+// double-click) both read "0" and both get here, and the loser's SELECT
+// active ids sees 0 rows (the winner paused them all) and would marshal
+// "null" over the winner's good snapshot. Leaving maintenance would then
+// decode "null" as an empty restore set and resume NOTHING — the whole
+// fleet stranded paused. Already ON: no-op, the original snapshot is
+// preserved (re-snapshotting would also drop sensors the operator resumed
+// during maintenance).
 func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]string, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
@@ -688,6 +698,16 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 	// settingsTxLockKey.
 	if _, err := tx.ExecContext(ctx, "UPDATE settings SET value = value WHERE setting_key = ?", settingsTxLockKey); err != nil {
 		return nil, err
+	}
+	// In-tx re-check of the mode flag (the pre-tx handler read is stale
+	// under a concurrent enter — see the doc note).
+	var cur string
+	err = tx.QueryRowContext(ctx, "SELECT value FROM settings WHERE setting_key = 'maintenance_mode'").Scan(&cur)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	if cur == "1" {
+		return nil, nil // already in maintenance; preserve existing snapshot
 	}
 	rows, err := tx.QueryContext(ctx, "SELECT id FROM sensors WHERE state = 'active' ORDER BY name")
 	if err != nil {

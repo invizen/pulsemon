@@ -2328,3 +2328,52 @@ TestSetUserPasswordRejectsCommonPassword fails (SetUserPassword("password")
 = nil) and TestChangePasswordRejectsCommon fails (200 {"ok":true} on a
 change to "password"); TestSetupRejectsCommonPassword stays green (it
 pins the setup path, which was never broken).
+
+## maintenance-transition-ordering (api.go, internal/store/store.go, probe.go, alerts.go; 2026-11-19)
+
+**Decision:** Two parts. (1) `EnterMaintenanceWithFreshSnapshot` now
+re-checks `maintenance_mode` INSIDE its write-locked tx (after pinning
+the lock): if the mode is already "1" it returns `(nil, nil)` — a no-op
+enter that leaves the winner's snapshot untouched. (2) The settings PUT
+handler now orders each maintenance transition explicitly and the
+handler-exit `defer reloadAlertSettings()` is demoted to an idempotent
+re-read:
+- enter: DB commit → `reloadAlertSettings()` → `SetPaused(id, true)` →
+  `ResetAlertStates()`
+- leave: DB commit → `ResetAlertStates()` → `reloadAlertSettings()` →
+  `SetPaused(id, false)`
+
+**Why:** `maintAlreadyOn` is a pre-tx read, so two back-to-back
+`PUT /api/settings {"maintenance_mode":true}` requests (a UI
+double-click) both see "0" and both run the enter tx; the second
+pauses 0 sensors (the first already did), marshals `nil` as `"null"`,
+and overwrites `maintenance_active_ids` — leaving maintenance then
+resumes NOTHING and the whole fleet is stranded paused. The pre-tx
+read can never be made authoritative (the read and the pause are not
+atomic), so the check moved under the write lock where the serialized
+enter sees the committed state. The ordering fix closes the stale
+snapshot window on both sides: pre-fix the alert-snapshot swap ran
+only in the handler-exit defer, so on enter, in-flight probes finishing
+after the commit fired alerts under a stale `maintenance:false` (an
+alert during a maintenance the operator just asked for), and on leave,
+a fast sensor recovering between the resume and the handler exit read a
+stale `maintenance:true` from the snapshot and dropped its recovery
+alert permanently (the alert timers were reset, so the next tick would
+not re-alert either). With the explicit order, the gate (snapshot)
+changes before the loops can observe the new pause state on both
+transitions. The deferred reload is kept: plain (non-maintenance) PUTs
+and the maintenance-tx 500 returns still rely on it.
+
+**Pinned by:** TestEnterMaintenanceAlreadyOnIsNoOp (store: a second
+enter while mode is ON returns nil, the snapshot stays the original 2
+ids — not "null" — and leave resumes both),
+TestConcurrentEnterMaintenancePreservesSnapshot (HTTP end-to-end,
+interleaving forced through the enterMaintenance seam so BOTH PUTs
+pre-read "0": second enter runs against the committed mode, snapshot
+survives, leave restores the full fleet), TestMaintenanceTransitionOrdering
+(worker observation hooks: the first reloadAlertSettings precedes the
+first SetPaused flip on BOTH enter and leave). Sabotage-verified:
+with the in-tx re-check removed, both snapshot pins fail (the second
+enter overwrites the snapshot with "null"); with the old handler
+ordering restored (pause/resume before the reload), the ordering pin
+fails on both transitions.

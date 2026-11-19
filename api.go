@@ -2438,6 +2438,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// so a hiccup here leaves the previous snapshot in place rather than
 	// installing a half-read state. History: docs/DECISIONS.md →
 	// alert-settings-snapshot, settings-put-snapshot-reload-deferred.
+	// The maintenance transitions below ALSO reload explicitly at the
+	// point their pause/resume ordering requires it; this defer is then
+	// an idempotent re-read of the same committed state.
 	defer s.probeWorker.reloadAlertSettings()
 	if req.MaintMode != nil {
 		if *req.MaintMode {
@@ -2461,6 +2464,14 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 				maintIDs = ids
+				// Swap the alert snapshot BEFORE the pause is visible to the
+				// loops: in-flight probes that finish after the swap read
+				// maintenance:true from the fresh snapshot and stay silent.
+				// The old order reloaded only in the handler-exit defer, so
+				// those probes fired under a stale maintenance:false — an
+				// alert during a maintenance the operator just asked for.
+				// History: docs/DECISIONS.md → maintenance-transition-ordering.
+				s.probeWorker.reloadAlertSettings()
 				// Flip the in-memory pause flag immediately — the same
 				// SetPaused fast path the single-sensor PATCH uses: without
 				// it, each sensor lands up to one extra probe row (and a
@@ -2474,7 +2485,14 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				// drift; reset it now so resume doesn't instantly re-alert
 				// on a stale bad state.
 				s.probeWorker.ResetAlertStates()
-				log.Printf("API: maintenance mode ON (%d sensors paused)", len(maintIDs))
+				if len(maintIDs) > 0 {
+					log.Printf("API: maintenance mode ON (%d sensors paused)", len(maintIDs))
+				} else {
+					// A concurrent enter already took the snapshot (the
+					// in-tx mode re-check no-op'd this one), or no sensors
+					// were active — the existing snapshot stands.
+					log.Printf("API: maintenance mode ON (no additional sensors paused — snapshot preserved)")
+				}
 			}
 		} else {
 			// Leaving maintenance: reactivate exactly the snapshot set —
@@ -2491,15 +2509,22 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 				respondInternal(w, "leave maintenance mode", err)
 				return
 			}
+			// Reset the alert state and swap the alert snapshot BEFORE
+			// the resume: SetPaused(false) kicks the loops, and a fast
+			// sensor recovering in the old window (between the resume
+			// and the handler-exit deferred reload) read a stale
+			// maintenance:true from the snapshot and dropped its
+			// recovery alert permanently. The sensors are still paused
+			// here, so nothing can recover before the gate opens.
+			// History: docs/DECISIONS.md → maintenance-transition-ordering.
+			s.probeWorker.ResetAlertStates()
+			s.probeWorker.reloadAlertSettings()
 			// Flip the in-memory unpause immediately (symmetric fast path, see
 			// the enable side above): without this the resumed sensors wait up
 			// to 5s for syncSensors before their next probe.
 			for _, id := range ids {
 				s.probeWorker.SetPaused(id, false)
 			}
-			// Snapshot cleared + alert timers reset, so a still-bad
-			// sensor doesn't instantly re-alert on the next tick.
-			s.probeWorker.ResetAlertStates()
 			log.Printf("API: maintenance mode off (%d sensors resumed)", len(ids))
 		}
 	}

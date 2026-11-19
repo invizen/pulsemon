@@ -295,6 +295,9 @@ func loadAlertSettings(db *store.Store) (*alertSettings, error) {
 // A nil DB (test workers that don't exercise settings) keeps the current
 // snapshot too: the default stands until a real DB is present.
 func (pw *ProbeWorker) reloadAlertSettings() {
+	if pw.reloadObs != nil {
+		pw.reloadObs()
+	}
 	if pw.db == nil {
 		return
 	}
