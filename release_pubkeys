@@ -16,10 +16,11 @@
 # .exe is signed offline like the Linux binaries (2026-11-20; see
 # docs/DECISIONS.md → windows-signing-offline). It is NEVER committed.
 #
-# c412b899… (2026-10-29, first key — its private key sat in the GitHub
-# RELEASE_SIGNING_KEY secret until 2026-11-20; retired in a later release
-# once the fleet is off it, and its private key is destroyed after the first
-# release signed by its successor ships)
-c412b899f4c2a4a7d96bc23ca0d0d5ca2ec5fef7464e0133355a534ea50b0bbe
-# 31449645… (2026-11-20, current signing key)
+# 31449645… (2026-11-20, current signing key). The first key (c412b899…,
+# 2026-10-29 — its private key sat in the GitHub RELEASE_SIGNING_KEY secret
+# until 2026-11-20) was RETIRED in v1.1.18: the R1 bridge release (v1.1.17)
+# brought the fleet to a binary trusting this key, so v1.1.18 — the first
+# release signed by it — dropped the old pubkey and the old private key was
+# destroyed after v1.1.18 shipped. Clients below v1.1.17 cannot install
+# v1.1.18 (they trust only the old key); their only forward step was v1.1.17.
 314496454cb31be11386950ec5fde4601c1939a0d5ced2260e68801d21a62fd3
