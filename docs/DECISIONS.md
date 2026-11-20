@@ -551,10 +551,11 @@ update instead of a full re-bootstrap. Pinned by
 `TestVerifyReleaseSignature_Rotation` (a sig from either of two embedded keys
 verifies).
 
-**Key custody:** the private key is the release-signing SECRET — it lives on
-the trusted release host (a 600-perm file) and, for the Windows CI path, as
-the `RELEASE_SIGNING_KEY` GitHub Actions secret. It is NEVER committed; only
-`release_pubkeys` (the pubkeys) is committed. Maintainer tools:
+**Key custody:** the private key is the release-signing SECRET — it lives ONLY
+on the trusted release host (a 600-perm file); it never lives in CI (the
+Windows `.exe` is signed offline there, same as Linux — see
+`windows-signing-offline`). It is NEVER committed; only `release_pubkeys`
+(the pubkeys) is committed. Maintainer tools:
 `pulsemon sign genkey` (new keypair), `pulsemon sign release <file>
 <keyfile> [tag asset-name]` (write a detached `.sig` — 2 args = legacy
 raw-bytes form, 4 args = manifest form bound to the tag + asset),
@@ -3365,3 +3366,57 @@ targeted, not the full suite.
 Gate (Go 1.27.4, the box): gofmt + `go vet` clean; the FULL `go test -race`
 suite passes (`ok pulsemon`); `node --test` 9/9. No new pin (behavior is
 unchanged — the existing settings/PATCH suites are the pin).
+
+## windows-signing-offline (windows-release.yml, release_pubkeys, update.go, 2026-11-20)
+
+**Decision:** the Windows `.exe` is now signed OFFLINE on the trusted release
+host, the same way as the Linux binaries. `windows-release.yml` builds and
+uploads the exe + `.sha256` + installer UNSIGNED (the "Sign the Windows
+binary" step and its `RELEASE_SIGNING_KEY` secret reference are removed; the
+secret is deleted from the repo), and the cut flow gains a step after the
+workflow goes green: download the published `.exe`, `pulsemon sign release
+<exe> <keyfile> vX.Y.Z pulsemon-windows-amd64.exe`, `pulsemon sign verify`,
+then `gh release upload vX.Y.Z <exe>.sig`. A release is NOT Windows-complete
+until that `.sig` is uploaded (clients are fail-closed until then). The
+signing key now lives ONLY on the release host (600-perm file) and never in
+GitHub, so the `install.sh` "lives OUTSIDE GitHub" comment is true again.
+**Key rotation (same finding):** the first key (2026-10-29, `c412b899…`) sat
+in the `RELEASE_SIGNING_KEY` repo secret from v0.4.0 (2026-10-30) until this
+change. It is replaced by the 2026-11-20 key (`31449645…`), added to
+`release_pubkeys` as a second line per the rotation model. **Bootstrap order
+(do not skip):** the NEXT release (R1) is signed with the OLD key — every
+installed client embeds only the old pubkey, and a `.sig` is a single 64-byte
+signature (no dual-sign in one asset), so a new-key signature would be
+refused by all of them. R1's binary carries BOTH pubkeys, so the release
+AFTER it (R2) is signed with the NEW key and verifies on every client that
+took R1. A client stranded on a pre-R1 version refuses R2 via self-update
+and is recovered with a manual `install.sh` run (it fetches the pubkeys
+live from main, which has both keys). The old pubkey is retired in a LATER
+release once the fleet is off it, and the old PRIVATE key is destroyed after
+R2 ships — it must be kept until R1 is cut (backup on the release host:
+`release-signing-key.hex.2026-11-20`).
+
+**Why:** with the key in a repo secret, the authenticity root was compromised
+in exactly the scenario it exists to survive. `windows-release.yml` ran on
+ANY `v*` tag push and on `workflow_dispatch` from ANY branch with a free-text
+`version` input, so anyone with push access (a leaked token is enough) could
+run it on a branch with their own code and have CI sign a trojaned
+`pulsemon-windows-amd64.exe` for any tag — Windows self-update would install
+it. Because `release_pubkeys` is a shared SET with no key-to-asset binding, a
+modified workflow could also print the key and sign Linux assets — permanent
+exposure of every client until rotation. The anti-downgrade floor does not
+help (the attacker picks the tag). A GitHub Environment + required reviewers
+only raises the bar (an admin token can also edit branch protection, and the
+key is still visible to every job on the runner); a per-platform key with
+asset binding is the most work and still leaves a key in CI. Signing offline
+removes the exposure class entirely and matches the Linux path; the cost is a
+few manual steps per release by the sole release operator.
+
+**Pinned by:** no new pin (workflow + docs + embedded key-set change; the
+signing/verification behavior is already pinned by `update_sig_test.go` and
+`update_manifest_test.go`, and `TestVerifyReleaseSignature_Rotation` pins the
+two-key bridge — a sig from either embedded key verifies). Standing checks:
+the `pulsemon-release` skill's release checklist (a release is not
+Windows-complete until the offline `.sig` is uploaded and verifies with the
+5-arg manifest form) and the grep gate `! grep -rn RELEASE_SIGNING_KEY
+.github/` (the workflow must not reference the secret again).

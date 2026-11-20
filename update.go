@@ -1436,8 +1436,8 @@ func runSignRelease(args []string) int {
 		}
 		fmt.Println("# pulsemon release-signing keypair (ed25519).")
 		fmt.Println("# Add the PUBLIC key to release_pubkeys (one line).")
-		fmt.Println("# Keep the PRIVATE key as the release-signing secret (release host,")
-		fmt.Println("# and the RELEASE_SIGNING_KEY CI secret for the Windows build).")
+		fmt.Println("# Keep the PRIVATE key ONLY on the trusted release host (600-perm")
+		fmt.Println("# file) — it never touches CI; Windows is signed offline like Linux.")
 		fmt.Println("# NEVER commit the private key.")
 		fmt.Println("PUBKEY=" + hex.EncodeToString(pub))
 		fmt.Println("PRIVKEY=" + hex.EncodeToString(priv))

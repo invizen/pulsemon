@@ -1,11 +1,17 @@
 name: Windows release
 
 # Builds the Windows amd64 binary + Inno Setup installer and attaches them to
-# the GitHub release. Composes with the existing Linux release flow (cut from
-# zenai via `gh release create`): this workflow just ADDS the Windows assets to
-# the same release. Triggered on a version tag push (automatic) or manually
-# (workflow_dispatch, e.g. to add Windows assets to an already-published
-# release).
+# the GitHub release UNSIGNED. The .exe's detached .sig is made OFFLINE on the
+# trusted release host (same key + flow as the Linux cut) and uploaded there
+# after this workflow finishes — the signing key never lives in GitHub
+# (2026-11-20: the CI-held RELEASE_SIGNING_KEY secret let any workflow
+# triggerer sign arbitrary code; docs/DECISIONS.md → windows-signing-offline).
+# Composes with the existing Linux release flow (cut from zenai via `gh
+# release create`): this workflow just ADDS the Windows assets to the same
+# release. A release is NOT Windows-complete until the offline .sig is
+# uploaded (clients are fail-closed until then). Triggered on a version tag
+# push (automatic) or manually (workflow_dispatch, e.g. to add Windows assets
+# to an already-published release).
 on:
   push:
     tags:
@@ -64,47 +70,6 @@ jobs:
           "$hash  pulsemon-windows-amd64.exe" | Out-File -Encoding ascii "dist/pulsemon-windows-amd64.exe.sha256"
           Write-Host "Built dist/pulsemon-windows-amd64.exe  sha256=$hash"
 
-      - name: Sign the Windows binary (release authenticity)
-        shell: pwsh
-        env:
-          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
-        run: |
-          # Detached ed25519 signature over the .exe, verified at update time
-          # against the embedded release_pubkeys — the authenticity root the
-          # SHA-256 (integrity) cannot provide. The raw .exe is the self-update
-          # asset (pulsemon update swaps it in place); the Inno Setup installer
-          # is a fresh-human-install path, not self-update, so it is out of scope
-          # here. The key is the SAME release-signing secret the Linux cut
-          # (release.sh) uses. The build FAILS if the secret is missing or the
-          # signature does not verify against the embedded pubkeys.
-          if (-not $env:RELEASE_SIGNING_KEY) {
-            throw "RELEASE_SIGNING_KEY secret is not set — refusing to ship an unsigned Windows release"
-          }
-          $keyfile = Join-Path $env:TEMP "pm-signing-key.hex"
-          Set-Content -Path $keyfile -Value $env:RELEASE_SIGNING_KEY -Encoding ascii -NoNewline
-          # Signature format (2026-11-05): "manifest" (default) signs the release
-          # manifest (tag + asset + sha256), binding the .sig to THIS release so
-          # an old signed .exe replayed under a new tag no longer verifies;
-          # "legacy" signs the raw .exe bytes (pre-manifest form) — used only for
-          # the first release that ships the manifest verifier, so v0.4.4-era
-          # clients can install it (set RELEASE_SIGN_FORMAT=legacy for that cut).
-          $signFormat = $env:RELEASE_SIGN_FORMAT
-          if (-not $signFormat) { $signFormat = "manifest" }
-          if ($signFormat -eq "manifest") {
-            & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile $env:VER "pulsemon-windows-amd64.exe"
-            if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
-            # Verify against the EMBEDDED release_pubkeys (the keys a client checks).
-            & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe" $env:VER "pulsemon-windows-amd64.exe"
-            if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
-          } else {
-            & "dist\pulsemon-windows-amd64.exe" sign release "dist\pulsemon-windows-amd64.exe" $keyfile
-            if ($LASTEXITCODE -ne 0) { throw "sign release failed" }
-            & "dist\pulsemon-windows-amd64.exe" sign verify "dist\pulsemon-windows-amd64.exe"
-            if ($LASTEXITCODE -ne 0) { throw "signature does not verify against release_pubkeys" }
-          }
-          Remove-Item $keyfile -Force
-          Write-Host "Signed dist\pulsemon-windows-amd64.exe -> .sig"
-
       - name: Install pinned Inno Setup 6.7.3
         shell: pwsh
         run: |
@@ -153,10 +118,13 @@ jobs:
         run: |
           $ver = $env:VER -replace '^v',''
           $tag = "v$ver"   # GitHub releases are always tagged with the v prefix
+          # No .sig here: it is signed OFFLINE on the release host (the key
+          # never touches CI) and uploaded after this workflow — see the
+          # header. The exe ships unsigned by design; clients are fail-closed
+          # until the .sig lands.
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",
-            "dist\pulsemon-windows-amd64.exe.sig",
             "installer\output\pulsemon-setup-$ver.exe",
             "installer\output\pulsemon-setup-$ver.exe.sha256"
           )
