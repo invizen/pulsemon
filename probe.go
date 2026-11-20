@@ -1010,23 +1010,31 @@ func staggerPhase(id string, interval time.Duration) time.Duration {
 // staggered phase — that spread IS the steady-state anti-herd (probe times
 // are phase + k*interval, so capping first-spawn phases under a minute
 // would pack every hourly sensor's hourly probes into the same 60-second
-// window). RESPAWNS (resumed) get the cap.
+// window). RESPAWNS (resumed) get hashed into the cap window.
 func firstTickPhase(id string, interval time.Duration, resumed bool) time.Duration {
-	phase := staggerPhase(id, interval)
-	if resumed && phase > respawnFirstTickCap {
-		phase = respawnFirstTickCap
+	if resumed && interval > respawnFirstTickCap {
+		// Hash into the capped window, never clamp to the cap: a hard
+		// clamp landed every resumed sensor whose phase exceeded the
+		// cap (~98% of 60s sensors) on the EXACT same instant — a bulk
+		// maintenance-resume of hundreds of sensors was one
+		// synchronized write burst against probeDB. staggerPhase(id,
+		// cap) spreads them across [250ms, cap+250ms), deterministic
+		// per id, while keeping the same upper bound. (2026-11-19
+		// external review F18)
+		// History: docs/DECISIONS.md -> respawn-stagger-hash-not-clamp
+		return staggerPhase(id, respawnFirstTickCap)
 	}
-	return phase
+	return staggerPhase(id, interval)
 }
 
-// respawnFirstTickCap caps the first-tick delay of a RESPAWNED loop (a
+// respawnFirstTickCap caps the first-tick window of a RESPAWNED loop (a
 // first spawn after the previous loop was dropped — resume after a >5s
 // pause, maintenance-mode end, config-edit Restart; see spawnedIDs). A
 // full stagger here would leave a resumed sensor dark for up to a whole
-// interval (an hour on an hourly sensor). Capping at 1s keeps the
-// anti-herd property in the one case that matters — N sensors respawning
-// together land across ~1s, not the same instant — while bounding the
-// resume/edit delay (docs/DECISIONS.md → stagger).
+// interval (an hour on an hourly sensor). The respawn phase is HASHED
+// into [250ms, cap+250ms) (firstTickPhase), so N sensors respawning
+// together land across that ~1s window, not on the same instant, while
+// the resume/edit delay stays bounded (docs/DECISIONS.md → stagger).
 const respawnFirstTickCap = time.Second
 
 // safeProbe runs one probe and contains a panic: one bad probe must not take

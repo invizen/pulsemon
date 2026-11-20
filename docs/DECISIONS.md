@@ -2888,3 +2888,31 @@ diagnose.
 Sabotage-verified: the classification reverted to the old
 `return errPatchSensorGone` shape (seam kept) → the 500 pin fails; tree
 MD5-verified restored.
+
+## respawn-stagger-hash-not-clamp (probe.go, respawn_stagger_spread_test.go, resume_firsttick_test.go, 2026-11-19)
+
+**Decision:** `firstTickPhase` no longer CLAMPS a respawned sensor's
+first-tick phase to `respawnFirstTickCap` — it HASHES it into the cap
+window: `resumed && interval > cap` → `staggerPhase(id, cap)`, which is
+uniform over [250ms, cap+250ms) and deterministic per id. First spawns
+keep the full staggered phase (untouched), and a sub-cap interval is
+never re-hashed (its already-small stagger stands).
+
+**Why:** The clamp `if phase > cap { phase = cap }` landed every resumed
+sensor whose staggered phase exceeded 1s (~98% of 60s sensors) on the
+EXACT same 1.000s instant, so a bulk maintenance-resume of hundreds of
+sensors was one synchronized write burst against probeDB
+(MaxOpenConns(1)) — the constant's own "lands across ~1s" comment was
+false. The hash preserves the same upper bound (resume delay ≤ cap+250ms)
+while spreading the burst across the window.
+
+**Pinned by:** `TestFirstTickPhaseRespawnSpread` — 200 resumed 60s
+sensors must produce ≥100 distinct first-tick phases, all within
+[250ms, cap+250ms) (pre-fix: 6 distinct, one of them a 195-sensor herd at
+exactly 1.000s), plus per-id determinism.
+`TestFirstTickPhaseFirstSpawnUnchanged` — positive controls: first
+spawns keep the full stagger; sub-cap intervals are not re-hashed.
+`TestFirstSpawnKeepsFullStagger`'s exact-cap assertion (which pinned the
+old clamp) was updated to the window contract.
+Sabotage-verified: the clamp body restored → the spread pin fails
+("collapsed to 6 distinct phases"); tree MD5-verified restored.

@@ -116,8 +116,11 @@ func TestFirstSpawnKeepsFullStagger(t *testing.T) {
 	if firstTickPhase(id, time.Hour, false) <= respawnFirstTickCap {
 		t.Fatal("discriminating id lost its stagger")
 	}
-	if got := firstTickPhase(id, time.Hour, true); got != respawnFirstTickCap {
-		t.Fatalf("resumed phase = %v, want the %v cap", got, respawnFirstTickCap)
+	// F18: the resumed phase is HASHED into the cap window
+	// ([250ms, cap+250ms)) — the old exact-cap assertion pinned the
+	// clamp, which was the thundering herd.
+	if got := firstTickPhase(id, time.Hour, true); got < 250*time.Millisecond || got >= respawnFirstTickCap+250*time.Millisecond {
+		t.Fatalf("resumed phase = %v, want within [250ms, %v)", got, respawnFirstTickCap+250*time.Millisecond)
 	}
 	// Sub-cap phases are untouched by the cap (cap is a ceiling, not a floor).
 	if got, want := firstTickPhase("m3-fast", time.Second, true), staggerPhase("m3-fast", time.Second); got != want {
