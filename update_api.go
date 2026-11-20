@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -154,12 +155,21 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		Version        string `json:"version"`
 		AllowDowngrade bool   `json:"allow_downgrade"`
 	}
-	if r.ContentLength > 0 {
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&body); err == nil && body.Version != "" {
-			version = body.Version
-		}
+	// Decode UNCONDITIONALLY: a chunked body reports ContentLength -1 and
+	// the old `> 0` gate silently dropped it — a chunked version pin was
+	// treated as "latest". Only a truly empty body (io.EOF) is a valid
+	// no-fields request; malformed JSON is a 400 BEFORE any field is
+	// consulted, so a truncated body can never partially apply
+	// allow_downgrade. The 4 KiB cap bounds the decode: the payload is a
+	// couple of hundred bytes at most.
+	dec := json.NewDecoder(io.LimitReader(r.Body, 4<<10))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		respondWithError(w, http.StatusBadRequest, `invalid JSON body: expected {"version":"...","allow_downgrade":bool} or an empty body`)
+		return
+	}
+	if body.Version != "" {
+		version = body.Version
 	}
 	// Pre-validate the pin the same way fetchRelease does, so a malformed
 	// token (path traversal, whitespace) is a 400 before any network call.
@@ -224,10 +234,17 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 
 	digest, err := verifyDownloadedAsset(client, sel, tmp)
 	if err != nil {
-		// Intentionally NOT redacted: this text is a SHA-256 mismatch /
-		// missing-sidecar verdict — actionable, operator-facing, and
+		if errors.Is(err, errReleaseFetch) {
+			// A .sig/.sha256 FETCH failed: the error text embeds upstream
+			// asset URLs / DNS / proxy detail — log-only, generic body.
+			log.Printf("update: verify fetch: %v", err)
+			respondWithError(w, http.StatusBadGateway, "could not fetch the release signature/checksum; try again later")
+			return
+		}
+		// Verification VERDICT (bad/missing signature, SHA mismatch,
+		// missing sidecar asset): actionable, operator-facing, and
 		// carries no upstream detail.
-		respondWithError(w, http.StatusBadGateway, "refusing to update: "+err.Error()) // redaction-ok: actionable SHA verdict
+		respondWithError(w, http.StatusBadGateway, "refusing to update: "+err.Error()) // redaction-ok: actionable verification verdict
 		return
 	}
 

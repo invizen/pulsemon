@@ -3025,3 +3025,48 @@ reverted to the `"setup|"` key → `TestBootstrapSuccessExemptsBareIP`
 fails on the missing bare-IP entry; (b) reverted to the all-or-nothing
 wipe → `TestLoginThrottleHardCapWipePreservesUserMaps` fails with
 "an IP-spray hard-cap wipe cleared userFails".
+
+## updater-buffering-redaction-decode (update.go, update_api.go, update_sig_test.go, update_manifest_test.go, update_edge_test.go, 2026-11-19)
+
+**Decision:** Three updater fixes: (a) `verifyDownloadedAsset` streams
+the digest ONCE via `fileSHA256` (32 KiB buffer) and passes it to
+`verifyReleaseSignature` — the up-to-512 MiB asset is no longer read
+into RAM, and the binary is no longer hashed twice in memory; (b)
+fetch failures of the `.sig`/`.sha256` assets are marked with the
+`errReleaseFetch` sentinel and redacted to a generic 502 at the API
+layer (the error text embeds upstream asset URLs / DNS / proxy detail),
+while verification VERDICTS (bad/missing signature, SHA mismatch,
+missing sidecar asset) stay surfaced verbatim — operator-actionable
+with no upstream detail; the CLI path shows the full error either way;
+(c) `handleUpdate` decodes the request body UNCONDITIONALLY (4 KiB
+cap; only `io.EOF` means "no fields"), so a chunked body
+(ContentLength -1) is no longer silently dropped and malformed JSON is
+a 400 BEFORE `allow_downgrade` is consulted — a truncated body can no
+longer partially apply the downgrade opt-in.
+
+**Why:** (a) a low-RAM SBC must not page the entire binary in just to
+hash it, and the two in-memory `sha256.Sum256` passes were pure waste;
+(b) the old 502 comment claimed "carries no upstream detail", but the
+fetch-failure paths embedded `HTTP %d for <url>` and raw `client.Do`
+transport errors in the body; (c) `if r.ContentLength > 0` skipped
+chunked bodies entirely (a pinned chunked request was treated as
+"latest"), and `json.Decoder` applies fields as it parses, so a
+truncated `{"allow_downgrade":true,...}` left the flag set even when
+the decode error was silently discarded.
+
+**Pinned by:** `TestVerifyDownloadedAsset_StreamsSinglePassDigest` —
+the streamed digest equals the in-memory reference on a multi-chunk
+payload. `TestUpdateAPIVerifyFetchFailureRedacted` — a `.sig` served
+by a dead upstream (error text carries 127.0.0.1:PORT) yields a
+generic 502 with no address in the body and nothing installed.
+`TestUpdateAPIVerifyVerdictStillSurfaced` — the SHA-mismatch verdict
+stays verbatim in the 502 body. `TestUpdateAPIChunkedBodyHonored` — a
+chunked (ContentLength -1) version pin reaches the tags fetch (502)
+instead of the "latest" shortcut (200).
+`TestUpdateAPIMalformedBodyRejectedBeforeFlags` — a truncated body
+carrying `allow_downgrade:true` is a 400 with no install/restart.
+Sabotage-verified: removing the `errors.Is(err, errReleaseFetch)`
+branch → `TestUpdateAPIVerifyFetchFailureRedacted` fails with the
+dead upstream's 127.0.0.1:PORT in the 502 body; restoring the
+`ContentLength > 0` gate → `TestUpdateAPIChunkedBodyHonored` fails
+with 200 up-to-date (the chunked pin was dropped).

@@ -25,12 +25,20 @@ func manifestSel(tag, asset, sigURL string) releaseSelection {
 	return releaseSelection{sigURL: sigURL, tag: tag, asset: asset}
 }
 
+// binSHA is the lowercase hex SHA-256 of binBytes — what
+// verifyReleaseSignature takes in place of raw bytes (the production caller
+// streams the digest from disk via fileSHA256).
+func binSHA(binBytes []byte) string {
+	sum := sha256.Sum256(binBytes)
+	return hex.EncodeToString(sum[:])
+}
+
 // TestVerifyReleaseSignature_ManifestValid pins the new happy path: a
 // manifest signature for exactly (tag, asset, sha) verifies.
 func TestVerifyReleaseSignature_ManifestValid(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err != nil {
 		t.Fatalf("valid manifest signature rejected: %v", err)
 	}
 }
@@ -42,7 +50,7 @@ func TestVerifyReleaseSignature_ManifestValid(t *testing.T) {
 func TestVerifyReleaseSignature_ManifestReplayWrongTag(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.3.11", "pulsemon-linux-amd64", binBytes))
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v9.9.9", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v9.9.9", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err == nil {
 		t.Fatal("a v0.3.11 manifest signature was accepted for a v9.9.9 release")
 	}
 }
@@ -53,7 +61,7 @@ func TestVerifyReleaseSignature_ManifestReplayWrongTag(t *testing.T) {
 func TestVerifyReleaseSignature_ManifestWrongAsset(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-arm64", srv.URL), binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-arm64", srv.URL), binSHA(binBytes)); err == nil {
 		t.Fatal("an amd64 manifest signature was accepted for the arm64 asset")
 	}
 }
@@ -65,7 +73,7 @@ func TestVerifyReleaseSignature_ManifestWrongSHA(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 	other := []byte("different binary bytes — same tag, same asset, different sha")
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), other); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(other)); err == nil {
 		t.Fatal("a manifest signature verified against bytes with a different sha256")
 	}
 }
@@ -84,7 +92,7 @@ func TestVerifyReleaseSignature_RawBytesReplayRejected(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	// A raw-bytes signature: valid for the bytes, bound to no tag/asset.
 	srv := serveSig(t, ed25519.Sign(priv, binBytes))
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v9.9.9", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v9.9.9", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err == nil {
 		t.Fatal("a raw-bytes (pre-manifest) signature was accepted for a tagged release — replay hole not closed")
 	}
 }
@@ -96,7 +104,7 @@ func TestVerifyReleaseSignature_RawBytesReplayRejected(t *testing.T) {
 func TestVerifyReleaseSignature_MissingBindingRefused(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
-	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binSHA(binBytes)); err == nil {
 		t.Fatal("a signature was accepted with no tag/asset to bind it to")
 	}
 }

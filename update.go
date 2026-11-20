@@ -902,11 +902,11 @@ func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("%w: %v", errReleaseFetch, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		return "", fmt.Errorf("%w: HTTP %d for %s", errReleaseFetch, resp.StatusCode, url)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
@@ -1217,6 +1217,15 @@ func downgradeGuard(db *store.Store, tag string, allow bool) error {
 	return nil
 }
 
+// errReleaseFetch marks a failure to FETCH a release artifact (the .sig or
+// .sha256 asset download) as distinct from a verification VERDICT (bad or
+// missing signature, SHA mismatch, missing sidecar asset). Fetch failures
+// embed upstream detail — asset URLs, DNS names, proxy config — which the
+// API layer must not echo into a response body (handleUpdate splits on
+// this sentinel); verdicts are operator-actionable and are surfaced
+// verbatim. The CLI path (runUpdate) shows the full error either way.
+var errReleaseFetch = errors.New("release asset fetch failed")
+
 // verifyDownloadedAsset enforces the mandatory authenticity + integrity
 // checks on a downloaded release asset. It runs TWO gates, in order:
 //
@@ -1240,13 +1249,16 @@ func downgradeGuard(db *store.Store, tag string, allow bool) error {
 // Shared by the CLI (runUpdate) and the dashboard endpoint (handleUpdate) so
 // the verification contract lives in one place. Returns the verified digest.
 func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string) (string, error) {
-	binBytes, err := os.ReadFile(tmp)
+	// Stream the digest ONCE: the asset is up to 512 MiB (maxAssetBytes)
+	// and a low-RAM SBC must not page the whole binary in just to hash it.
+	// Both gates below consume this one digest.
+	digest, err := fileSHA256(tmp)
 	if err != nil {
 		return "", fmt.Errorf("verify: %v", err)
 	}
 
 	// Gate 1: authenticity. Fail-closed — see verifyReleaseSignature.
-	if err := verifyReleaseSignature(client, sel, binBytes); err != nil {
+	if err := verifyReleaseSignature(client, sel, digest); err != nil {
 		return "", err
 	}
 
@@ -1262,12 +1274,10 @@ func verifyDownloadedAsset(client *http.Client, sel releaseSelection, tmp string
 		}
 		verifySHA = sidecar
 	}
-	sum := sha256.Sum256(binBytes)
-	got := hex.EncodeToString(sum[:])
-	if got != verifySHA {
-		return "", fmt.Errorf("SHA-256 MISMATCH — expected %s, got %s", verifySHA, got)
+	if digest != verifySHA {
+		return "", fmt.Errorf("SHA-256 MISMATCH — expected %s, got %s", verifySHA, digest)
 	}
-	return got, nil
+	return digest, nil
 }
 
 // parseReleasePubkeys decodes the embedded trusted release-signing pubkeys
@@ -1308,11 +1318,11 @@ func fetchReleaseSignature(client *http.Client, url string) ([]byte, error) {
 	req.Header.Set("Accept-Encoding", "identity")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %v", errReleaseFetch, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		return nil, fmt.Errorf("%w: HTTP %d for %s", errReleaseFetch, resp.StatusCode, url)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
 	if err != nil {
@@ -1350,15 +1360,11 @@ func releaseManifestMessage(tag, asset, sha256Hex string) []byte {
 // foreign-signed release must never install. This is the authenticity root
 // the SHA-256 check cannot provide.
 //
-// The signature is checked against the MANIFEST (tag + asset + sha256) —
-// the only form accepted. The legacy raw-binary-bytes form (pre-manifest
-// releases — see releaseManifestMessage) is no longer a fallback: it bound
-// the signature to the bytes only, so a compromised release account (no
-// signing key) could replay an old signed binary under a newer-looking tag.
-// The one transition release that needed it is long past, and no client on
-// this verifier can self-update to a pre-manifest release (downgrades are
-// floor-refused), so dropping it closes the replay hole with no stranding.
-func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes []byte) error {
+// The signature is checked against the MANIFEST (tag + asset + sha256). The
+// digest is passed in by the caller (verifyDownloadedAsset streams it once
+// via fileSHA256) so the multi-hundred-MiB binary is never held in memory
+// just to build the manifest message.
+func verifyReleaseSignature(client *http.Client, sel releaseSelection, sha256Hex string) error {
 	if sel.sigURL == "" {
 		return errors.New("release has no .sig signature asset — refusing to install an unsigned release")
 	}
@@ -1390,8 +1396,7 @@ func verifyReleaseSignature(client *http.Client, sel releaseSelection, binBytes 
 	if sel.tag == "" || sel.asset == "" {
 		return errors.New("release signature: missing tag or asset — the manifest-bound signature cannot be verified")
 	}
-	sum := sha256.Sum256(binBytes)
-	msg := releaseManifestMessage(sel.tag, sel.asset, hex.EncodeToString(sum[:]))
+	msg := releaseManifestMessage(sel.tag, sel.asset, sha256Hex)
 	for _, pub := range keys {
 		if ed25519.Verify(pub, msg, sig) {
 			return nil

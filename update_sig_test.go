@@ -46,7 +46,7 @@ func TestVerifyReleaseSignature_Valid(t *testing.T) {
 	_, priv, binBytes := sigTestSetup(t)
 	srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err != nil {
 		t.Fatalf("valid manifest signature rejected: %v", err)
 	}
 }
@@ -58,7 +58,7 @@ func TestVerifyReleaseSignature_WrongKey(t *testing.T) {
 	_, otherPriv, _ := ed25519.GenerateKey(rand.Reader)
 	srv := serveSig(t, signManifest(t, otherPriv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
 
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err == nil {
 		t.Fatal("signature from an untrusted key was accepted")
 	}
 }
@@ -66,7 +66,7 @@ func TestVerifyReleaseSignature_WrongKey(t *testing.T) {
 func TestVerifyReleaseSignature_MissingSig(t *testing.T) {
 	_, _, binBytes := sigTestSetup(t)
 	// No .sig asset in the release (sel.sigURL == "") -> fail-closed refusal.
-	if err := verifyReleaseSignature(&http.Client{}, releaseSelection{}, binBytes); err == nil {
+	if err := verifyReleaseSignature(&http.Client{}, releaseSelection{}, binSHA(binBytes)); err == nil {
 		t.Fatal("an unsigned release (no .sig) was accepted")
 	}
 }
@@ -78,7 +78,7 @@ func TestVerifyReleaseSignature_CorruptSig(t *testing.T) {
 	sig[0] ^= 0xff
 	srv := serveSig(t, sig)
 
-	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err == nil {
 		t.Fatal("a corrupted signature was accepted")
 	}
 }
@@ -87,7 +87,7 @@ func TestVerifyReleaseSignature_WrongLength(t *testing.T) {
 	_, _, binBytes := sigTestSetup(t)
 	// 50 bytes, not 64 -> refused before any key is tried.
 	srv := serveSig(t, make([]byte, 50))
-	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binBytes); err == nil {
+	if err := verifyReleaseSignature(srv.Client(), releaseSelection{sigURL: srv.URL}, binSHA(binBytes)); err == nil {
 		t.Fatal("a mis-sized signature was accepted")
 	}
 }
@@ -105,7 +105,7 @@ func TestVerifyReleaseSignature_Rotation(t *testing.T) {
 	binBytes := []byte("binary signed during a rotation window")
 	for name, priv := range map[string]ed25519.PrivateKey{"A": privA, "B": privB} {
 		srv := serveSig(t, signManifest(t, priv, "v0.4.5", "pulsemon-linux-amd64", binBytes))
-		if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binBytes); err != nil {
+		if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err != nil {
 			t.Fatalf("rotation: signature from key %s rejected: %v", name, err)
 		}
 	}
