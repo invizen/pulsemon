@@ -3418,5 +3418,6 @@ signing/verification behavior is already pinned by `update_sig_test.go` and
 two-key bridge — a sig from either embedded key verifies). Standing checks:
 the `pulsemon-release` skill's release checklist (a release is not
 Windows-complete until the offline `.sig` is uploaded and verifies with the
-5-arg manifest form) and the grep gate `! grep -rn RELEASE_SIGNING_KEY
-.github/` (the workflow must not reference the secret again).
+5-arg manifest form) and the grep gate `! grep -rn
+'secrets.RELEASE_SIGNING_KEY' .github/` (the workflow must not reference the
+secret again — a plain-text mention in a comment is fine).
