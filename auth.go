@@ -1121,7 +1121,7 @@ func (a *AuthState) ClientIP(r *http.Request) string {
 	// connection that happens to send the header is a false positive,
 	// hence the hedged wording.)
 	if r.Header.Get("X-Forwarded-For") != "" && xffMisconfigWarned.CompareAndSwap(false, true) {
-		log.Printf("auth: ignoring X-Forwarded-For from untrusted peer %s — if pulsemon sits behind a reverse proxy, set PULSEMON_TRUSTED_PROXIES to the proxy's address; until then every client behind it shares the proxy's login-throttle bucket, so %d failed guesses from anyone lock everyone out for %s (logged once)", peer, loginFailMax, loginLockout)
+		log.Printf("auth: ignoring X-Forwarded-For from untrusted peer %s — if pulsemon sits behind a reverse proxy, set PULSEMON_TRUSTED_PROXIES to the proxy's address; until then every client behind it shares the proxy's login-throttle bucket (so %d failed guesses from anyone lock everyone out for %s), and — behind a TLS-terminating proxy — the dashboard's API calls are blocked with 403 'cross-origin request blocked' (logged once)", peer, loginFailMax, loginLockout)
 	}
 	return peer
 }

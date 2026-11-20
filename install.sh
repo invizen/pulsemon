@@ -304,6 +304,8 @@ esac
 PORT="${PULSEMON_ADDR##*:}"
 if curl -sf "http://$HOST:$PORT/api/healthz" >/dev/null 2>&1; then
   echo "pulsemon: healthy — open http://$HOST:$PORT"
+  echo "pulsemon: fronting with a TLS-terminating reverse proxy (Caddy/nginx https->http)?"
+  echo "       add PULSEMON_TRUSTED_PROXIES=<proxy-ip> or the dashboard 403s — README 'Behind a reverse proxy'"
 else
   echo "pulsemon: warning: service started but http://$HOST:$PORT is not answering yet."
   echo "       Check: journalctl --user -u pulsemon"

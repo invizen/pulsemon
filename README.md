@@ -137,7 +137,7 @@ Which one you're on is reported by `GET /api/healthz` as `"icmp_mode"`
 | `.env` (or container env) | `GOOGLE_CHAT_WEBHOOK_URL` — Google Chat URL used when none is set in the dashboard |
 | env | `PULSEMON_ADDR` — HTTP listen address, full `host:port` (e.g. `:9299`, `127.0.0.1:9299`). Default `:9299` (all interfaces). 8080 was the pre-0.1.19 default; 9299 avoids the dashboards/proxies that usually claim it. |
 | env | `PULSEMON_CERT` + `PULSEMON_KEY` — optional TLS certificate and key file paths (PEM). Set **both** together to serve HTTPS; omit both for plain HTTP. **When a valid pair is in place, pulsemon serves HTTPS ONLY on `listener_https_port` (Dashboard → Settings, default `443`) and does NOT bind the `PULSEMON_ADDR` port at all** — there is no plaintext fallback while a pair is configured. ⚠️ **Non-root and Docker users MUST set `listener_https_port` to an unprivileged port (e.g. `8443`)**: the default 443 bind fails without root, and the server will not start. If the files are missing, pulsemon warns and serves plain HTTP on `PULSEMON_ADDR` (so a fresh clone with no `certs/` dir doesn't crash-loop; opt back into this with `PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1`); if they exist but are corrupt or mismatched, startup fails — TLS is never silently degraded when a pair is in place. A self-signed or wildcard cert works for LAN use; use a real cert if the dashboard is reachable from outside. |
-| env | `PULSEMON_TRUSTED_PROXIES` — optional comma-separated list of CIDRs (or bare IPs) of **immediate TCP peers** whose `X-Forwarded-For` header is trusted for login rate-limiting. By default `X-Forwarded-For` is **ignored** (the throttle keys on the direct TCP peer), so a spoofed/rotated header can't dodge the per-IP lockout. When pulsemon sits behind a reverse proxy (Caddy, nginx, …) and you want attempts attributed to the real client, set this to the proxy's IP(s), e.g. `127.0.0.1` or `192.168.1.0/24`. The header is only ever read when the connection's source address is in this list. |
+| env | `PULSEMON_TRUSTED_PROXIES` — comma-separated list of CIDRs (or bare IPs) of **immediate TCP peers** whose `X-Forwarded-For` / `X-Forwarded-Proto` headers are trusted. **Required when the proxy terminates TLS** (v1.1.16+): without it the dashboard's `/api/` calls 403 `cross-origin request blocked` behind a TLS-terminating reverse proxy — see "Behind a reverse proxy". Also drives login rate-limiting: by default `X-Forwarded-For` is **ignored** (the throttle keys on the direct TCP peer), so a spoofed/rotated header can't dodge the per-IP lockout; behind a proxy, set it to the proxy's IP(s) (e.g. `127.0.0.1` or `192.168.1.0/24`) so attempts are attributed to the real client. The headers are only ever read when the connection's source address is in this list. |
 | env | `PULSEMON_ALLOW_CGNAT` — optional. Set to `1` to allow the CGNAT range (`100.64.0.0/10`) as a webhook, SMTP, or sensor-redirect target. Tailscale and Headscale assign every tailnet node an address in `100.64.0.0/10`, so a self-hosted ntfy/Gotify relay over the tailnet — or an HTTP sensor whose target redirects to a tailnet host — is refused without it. The rest of the SSRF blocklist (loopback, `169.254/16` cloud metadata, …) is unaffected. |
 | env | `PULSEMON_DISABLE_UPDATE_CHECK` — set to `1` to silence the periodic update check entirely: `/api/update-check` answers "no update" with zero network calls, so pulsemon makes no outbound GitHub requests in normal operation. The explicit CLI `pulsemon update` / `pulsemon update-check` commands are operator-initiated and remain unaffected. |
 | env | `PULSEMON_CA_FILE` — PEM bundle of CA certificates trusted by **HTTPS sensor probes** (not pulsemon's dashboard listener). Point it at your private CA root (e.g. a step-ca/Smallstep CA, mounted into the container) and sensors behind that CA verify UP instead of reading lost. The bundle **replaces** the system trust paths for probes, so include every CA you monitor (concatenate public roots with private roots if you need both); a `FROM scratch` container image ships no system bundle at all, so this file is its entire probe trust store. An unreadable file or a bundle with no parseable certificate fails startup loudly. |
@@ -158,13 +158,24 @@ When pulsemon sits behind Caddy, Traefik, nginx, or similar:
 
 - **`PULSEMON_TRUSTED_PROXIES`** — comma-separated CIDRs (or bare IPs) of the
   **immediate proxy peer**, e.g. `127.0.0.1` or `172.18.0.0/16` for a proxy
-  container on a Docker network. **Required behind a proxy** so login
-  throttling keys on the real client: pulsemon then reads `X-Forwarded-For`
-  right to left and uses the rightmost address that is not itself a trusted
-  proxy (entries further left are client-supplied and ignored). If it is
-  **unset** behind a proxy, every client shares the proxy's IP — and its
-  throttle budget — so **7 bad logins from anyone lock everyone out for 5
-  minutes**. Throttling is per /24 (IPv4) or /64 (IPv6).
+  container on a Docker network.
+
+  **Required when the proxy terminates TLS** (Caddy, nginx, Traefik doing
+  `https → http`). Since v1.1.16 the dashboard's CSRF gate compares the
+  browser's Origin *scheme* against the scheme pulsemon sees on the wire.
+  Behind a TLS-terminating proxy that wire is plain HTTP, so without a
+  trusted peer pulsemon reports `http` while the browser sends an `https`
+  Origin — and **every `/api/` call returns `403 cross-origin request
+  blocked`**. (A plain-HTTP proxy has no such scheme mismatch and works
+  without it.) Caddy and nginx send `X-Forwarded-Proto: https` by default,
+  so just listing the peer is enough.
+
+  Also needed for correct login throttling: pulsemon then reads
+  `X-Forwarded-For` right to left and keys the per-IP lockout on the real
+  client (entries past the rightmost trusted proxy are client-supplied and
+  ignored). Unset behind a proxy, every client shares the proxy's throttle
+  budget — **7 bad logins from anyone lock everyone out for 5 minutes**
+  (per /24 IPv4, /64 IPv6).
 - **`PULSEMON_ALLOWED_HOSTS`** — optional setup-mode hardening. A
   comma-separated list of `host` or `host:port` names the dashboard is reached
   by (case-insensitive; an entry without a port matches any port). When set,
@@ -183,6 +194,19 @@ When pulsemon sits behind Caddy, Traefik, nginx, or similar:
   stay hard.
 - The proxy must preserve the original `Host` header (Caddy and Traefik do by
   default) — the cross-origin check compares it with the browser's `Origin`.
+
+**Example — Caddy in front of a systemd user service** (TLS-terminating,
+proxies to `127.0.0.1:9299`): declare the peer in a drop-in, then reload —
+
+```ini
+# ~/.config/systemd/user/pulsemon.service.d/override.conf
+[Service]
+Environment="PULSEMON_TRUSTED_PROXIES=127.0.0.1"
+```
+
+```bash
+systemctl --user daemon-reload && systemctl --user restart pulsemon
+```
 
 ### Alert behavior
 
