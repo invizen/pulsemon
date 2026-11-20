@@ -1,3 +1,5 @@
+//go:build linux
+
 package main
 
 // Finding 23 (runRestartCommand ordering): the `pulsemon restart` subcommand
