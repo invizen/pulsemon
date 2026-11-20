@@ -11,7 +11,14 @@ import (
 	"time"
 )
 
-//go:embed web/*
+// The embed is an EXPLICIT list, not `web/*`: the wildcard pulled
+// web/test/*.mjs (the frontend test harness) into the release binary,
+// where handleStatic served it at /test/... — the app's test files
+// shipped on every dashboard. web/vendor is intentional (fonts + icon
+// CSS; the .woff2 Content-Type case in handleStatic exists for it).
+// History: docs/DECISIONS.md → embed-explicit-list.
+//
+//go:embed web/index.html web/app.js web/styles.css web/theme.js web/favicon.svg web/favicon-16x16.png web/favicon-32x32.png web/favicon-48x48.png web/apple-touch-icon.png web/vendor
 var content embed.FS
 
 // maxRequestBytes bounds every incoming request body (authGate wraps

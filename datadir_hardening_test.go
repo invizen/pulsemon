@@ -159,6 +159,13 @@ func TestFix_M3b_HardensDirOfDBInUse(t *testing.T) {
 // F15/N1: a relative PULSEMON_DB is refused with a clean error and nothing
 // on disk is touched (in particular the CWD is not chmod'd).
 func TestFix_M3c_RelativeDBRefused(t *testing.T) {
+	// The chdir below moves the ENTIRE test process; restore the original
+	// CWD on cleanup or every later test that reads a package-relative
+	// path (install.sh, web/*) resolves against this deleted temp dir.
+	origCwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	cwd := t.TempDir()
 	if err := os.Chmod(cwd, 0o755); err != nil {
 		t.Fatal(err)
@@ -166,12 +173,13 @@ func TestFix_M3c_RelativeDBRefused(t *testing.T) {
 	if err := os.Chdir(cwd); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { os.Chdir(origCwd) })
 	t.Setenv("PULSEMON_DB", "pulsemon.db")
 
 	prevUmask := syscall.Umask(0o077)
 	t.Cleanup(func() { syscall.Umask(prevUmask) })
 
-	err := ensureDataDir()
+	err = ensureDataDir()
 	if err == nil {
 		t.Fatal("ensureDataDir with a relative PULSEMON_DB: want error, got nil")
 	}

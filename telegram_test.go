@@ -66,20 +66,29 @@ func TestTelegramCardIcons(t *testing.T) {
 	}
 }
 
-// TestTelegramCardEscapesAmpersandInTarget locks the finding-9 fix: a URL
-// query string with a raw & (validURL accepts it) must reach the card as
-// &amp; — an unescaped & in Telegram HTML parse mode can make the API
-// reject the message with 400 "can't parse entities", silently dropping
-// the alert. Both card variants are checked.
+// TestTelegramCardEscapesAmpersandInTarget locks the finding-9 fix and its
+// 2026-11-20 successor: a raw & in the URL used to reach the card, where
+// an unescaped one makes Telegram's HTML parse mode reject the message
+// with 400 "can't parse entities", silently dropping the alert. Since the
+// query/fragment redaction (docs/DECISIONS.md → target-query-redaction),
+// the query never reaches the card at all — the stronger guarantee: the
+// target comes back query-free, so no & from it (escaped or not) can
+// appear. The escape layer itself stays pinned by the markup test below
+// (path-level & and <b> are escaped, not dropped).
 func TestTelegramCardEscapesAmpersandInTarget(t *testing.T) {
 	target := "https://host.lan/health?service=a&check=1"
 	for _, c := range []string{
 		telegramCard("up", "error", "zenkub1", target, 0),
 		telegramCardRe("error", "zenkub1", target, 0),
 	} {
-		if !strings.Contains(c, "&amp;check=1") {
-			t.Fatalf("expected escaped &amp;check=1 in:\n%s", c)
+		// The query (credential carrier) is redacted from the card.
+		if !strings.Contains(c, "<b>Target:</b> https://host.lan/health") {
+			t.Fatalf("expected the query-free target in:\n%s", c)
 		}
+		if strings.Contains(c, "service=a") || strings.Contains(c, "check=1") {
+			t.Fatalf("query string reached the card:\n%s", c)
+		}
+		// And no unescaped & from it can break Telegram HTML parsing.
 		if strings.Contains(c, "a&check") {
 			t.Fatalf("unescaped & reached the card:\n%s", c)
 		}

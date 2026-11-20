@@ -3446,3 +3446,71 @@ stripped form, the tcp target is unchanged, the admin gets the raw target
 on both paths, and the DB row is byte-identical after the viewer reads.
 Sabotage-verified: removing the `viewerTarget` call from either GET path
 turns the viewer assertions red.
+
+## embed-explicit-list (api.go, embed_surface_test.go, 2026-11-20)
+
+**Decision:** the dashboard embed is an EXPLICIT file list, not
+`web/*`. The wildcard pulled `web/test/*.mjs` (the frontend test
+harness) into the release binary, where `handleStatic` served it at
+`/test/...` — the app's test files shipped on every dashboard. The list
+covers the shipped surface exactly: `index.html`, `app.js`, `styles.css`,
+`theme.js`, the five icon files, and `web/vendor` (fonts + icon CSS —
+intentional; the `.woff2` Content-Type case in `handleStatic` exists for
+it).
+**Why:** `//go:embed` has no exclude syntax, so the wildcard is the
+only way it can ship a directory nobody asked for; an explicit list
+fails the build if a listed file disappears and ships nothing else.
+**Pinned by:** `TestEmbedSurfaceExcludesTests` — the two test files are
+unreadable from the embed FS, every real asset (incl. `web/vendor/`)
+is readable, and no `test` entry sits at the `web/` root of the FS.
+Sabotage-verified: restoring `web/*` turns the pin red.
+
+## install-pubkeys-proto-pin (install.sh, 2026-11-20)
+
+**Decision:** the `release_pubkeys` fetch — the one `curl` in install.sh
+whose URL is overridable (`PULSEMON_PUBKEYS_URL` test hook) — now carries
+`--proto '=https' --tlsv1.2` for https URLs, matching every other
+download in the script. The pin is applied by a `case` on the URL
+scheme, because the test hook serves fixtures over `file://`, which a
+hardcoded `=https` restriction would break.
+**Why:** the default URL is https (raw.githubusercontent.com), so the
+production path gets the same proto+TLS floor as the asset/digest/sig
+downloads; an override to a non-https URL is a local test-harness act
+and is not held to the public-internet floor.
+**Pinned by:** the DECISIONS entry + `grep` — the `case` arm sets the
+pin for `https://*` and the `curl` consumes `$PUBKEYS_PROTO`; the
+`file://` hook stays un-restricted (breaking it breaks the install
+harness, which would be loud, not silent).
+
+## target-query-redaction (alerts.go, target_query_redaction_test.go, fuzz_validators_test.go, 2026-11-20)
+
+**Decision:** `alertTarget` now cuts the query AND fragment of a URL
+target, in addition to the userinfo. A `?token=…` in the target is a
+credential carrier exactly like `user:pass@` (the same shape
+`webhookMasked` treats as secret), and it used to go verbatim into every
+alert card (Discord/Telegram/Chat/SMTP) and to viewer sessions
+(`viewerTarget` reuses `alertTarget`). The cut is unconditional — a
+redaction that promises "safe for a third-party channel" cannot prove a
+query param non-secret, so the param-key heuristic is rejected as
+bypassable (`?t=…`).
+**Why:** only `user:pass@` was redacted; the query string was the
+companion leak channel. The authority boundary stays exactly net/url's
+(first `/?#` — a raw `?`/`#` cannot sit inside userinfo per RFC 3986,
+so `https://user?x:pass@host/` is host `user` + a query that gets
+cut, not a lenient userinfo). Non-URL targets are untouched; `@` in
+the PATH survives; the raw-string (no `neturl.Parse` dependency)
+discipline is unchanged, so parse-failure rows still get stripped, not
+shipped.
+The local-journald surface (`ping.go` dns re-resolution log) still
+carries the raw target — accepted: it is a local root-readable log on a
+trusted homelab box, the same channel `user:pass@` already occupies.
+**Pinned by:** `TestAlertTargetQueryRedaction` (11 table cases: token
+query, token-only, userinfo+query, fragment, query+fragment, no-query
+unchanged, path-`@` survives, lenient-userinfo `?`, bare IP/host:port)
+and the extended `FuzzAlertTarget` property (any clean-host URL comes
+back with no userinfo AND no query/fragment; host preserved; output
+still parses). Same pass also REPAIRED five table-test literals in
+`fuzz_validators_test.go` that a prior session's redaction layer had
+committed as `***`-passwords (raw-@, pct-escape, control-char, and
+bad-escape variants) — the last-`@` boundary pin now tests the shape it
+claims to test.

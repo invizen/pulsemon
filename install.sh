@@ -170,7 +170,15 @@ hex2bin() {
   fi
 }
 
-curl -sfL -o "$TMP/release_pubkeys" "$PUBKEYS_URL" || {
+# The production URL is https (raw.githubusercontent.com); the test hook
+# (PULSEMON_PUBKEYS_URL) serves fixtures over file://, so the proto pin
+# applies to https URLs only — it would break the file:// harness. Every
+# other download in this script is fixed-https and carries the pin inline.
+PUBKEYS_PROTO=""
+case "$PUBKEYS_URL" in
+	https://*) PUBKEYS_PROTO="--proto '=https' --tlsv1.2" ;;
+esac
+curl -sfL $PUBKEYS_PROTO -o "$TMP/release_pubkeys" "$PUBKEYS_URL" || {
   echo "pulsemon: could not fetch release_pubkeys from main — refusing to install an unverifiable binary" >&2
   exit 1; }
 curl -sfL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET.sig" "$BASE/$ASSET.sig" || {

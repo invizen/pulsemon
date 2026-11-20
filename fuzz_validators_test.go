@@ -185,7 +185,7 @@ func FuzzAlertTarget(f *testing.F) {
 	// in the password must not survive the strip (2026-11-11 review: the
 	// old first-'@' cut left "ss@nas.lan" — a password fragment — in the
 	// card).
-	if got := alertTarget("https://admin:***@ss@nas.lan/health"); got != "https://nas.lan/health" {
+	if got := alertTarget("https://admin:p@ss@nas.lan/health"); got != "https://nas.lan/health" {
 		f.Errorf("alertTarget with '@' in the password: %q, want the WHOLE userinfo stripped", got)
 	}
 	if got := alertTarget("//admin:secret@nas.lan/health"); got != "//nas.lan/health" {
@@ -198,16 +198,16 @@ func FuzzAlertTarget(f *testing.F) {
 	// in the host, bad percent-escape) fails neturl.Parse and must NOT
 	// fall back to verbatim — the userinfo is stripped from the raw
 	// string using the same authority boundary as the parseable path.
-	if got := alertTarget("https://admin:***@nas.lan\\health"); got != "https://nas.lan\\health" {
+	if got := alertTarget("https://admin:p%40ss@nas.lan\\health"); got != "https://nas.lan\\health" {
 		f.Errorf("alertTarget on a backslash-host (parse failure): %q, want the userinfo stripped", got)
 	}
-	if got := alertTarget("https://admin:***@nas.lan/\x00"); got != "https://nas.lan/\x00" {
+	if got := alertTarget("https://admin:pa\x00ss@nas.lan/\x00"); got != "https://nas.lan/\x00" {
 		f.Errorf("alertTarget on a control-char target (parse failure): %q, want the userinfo stripped", got)
 	}
-	if got := alertTarget("https://admin:***@nas.lan/%zz"); got != "https://nas.lan/%zz" {
+	if got := alertTarget("https://admin:p%zzss@nas.lan/%zz"); got != "https://nas.lan/%zz" {
 		f.Errorf("alertTarget on a bad-escape target (parse failure): %q, want the userinfo stripped", got)
 	}
-	if got := alertTarget("//admin:***@nas.lan\\health"); got != "//nas.lan\\health" {
+	if got := alertTarget("//admin:p%40ss@nas.lan\\health"); got != "//nas.lan\\health" {
 		f.Errorf("alertTarget on a scheme-relative parse failure: %q, want the userinfo stripped", got)
 	}
 	// '@' only in the PATH (no userinfo) must survive the strip.
@@ -222,6 +222,9 @@ func FuzzAlertTarget(f *testing.F) {
 		"https://a:b@A:80/x?q=1#f",
 		"192.168.1.10",
 		"https://user@host:8443/path?q=1#frag",
+		"https://host/health?token=abc123",
+		"https://host?token=abc",
+		"https://user?x:pass@host/",
 		"not a url",
 		"",
 	} {
@@ -230,17 +233,22 @@ func FuzzAlertTarget(f *testing.F) {
 	f.Fuzz(func(t *testing.T, s string) {
 		got := alertTarget(s) // must not panic
 		u, err := url.Parse(s)
-		if err != nil || u.User == nil {
+		if err != nil {
 			return
 		}
-		// The fuzz-sound form of "the output never contains
-		// u.User.String()": the card must carry NO userinfo under
-		// net/url's own parser, and the strip must not eat the host.
-		// (Raw containment is not sound: "https://ab:ab@ab:ab/x"
+		// A target whose host net/url reads as clean (no '?'/'#' inside
+		// — a host containing them is validator-refused garbage, where
+		// the lenient boundary diverges by design) must come back with NO
+		// userinfo AND no query/fragment: all three are credential
+		// carriers, and the card is a third-party channel. (Raw
+		// containment is not sound: "https://ab:ab@ab:ab/x"
 		// legitimately strips to host "ab:ab", which EQUALS the userinfo
 		// string — a containment hit on the host is not a leak. Parsing
 		// the output asks the same parser the probe uses, so any
 		// userinfo-shaped leak — "ss@nas.lan" included — trips it.)
+		if u.Host == "" || strings.ContainsAny(u.Host, "?#") {
+			return
+		}
 		g, gerr := url.Parse(got)
 		if gerr != nil {
 			t.Fatalf("alertTarget(%q) = %q, which does not parse: %v", s, got, gerr)
@@ -250,6 +258,9 @@ func FuzzAlertTarget(f *testing.F) {
 		}
 		if g.Host != u.Host {
 			t.Errorf("alertTarget(%q) = %q: host %q, want %q", s, got, g.Host, u.Host)
+		}
+		if g.RawQuery != "" || g.Fragment != "" {
+			t.Errorf("alertTarget(%q) = %q leaks query/fragment", s, got)
 		}
 	})
 }

@@ -1631,10 +1631,14 @@ func statusIcon(state string) string { return statusIcons[state] }
 var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}
 
 // alertTarget renders a sensor's target for third-party alert payloads,
-// stripping any userinfo: an HTTP target like
+// stripping any userinfo AND the query/fragment: an HTTP target like
 // https://admin:***@nas.lan/health used to go VERBATIM into the
 // Discord/Telegram/Chat/SMTP card — the password readable by everyone who
-// can see the channel.
+// can see the channel. A ?token=… in the target is a credential carrier
+// exactly like userinfo (the same shape webhookMasked treats as secret),
+// so it is cut too: a redaction that promises "safe for a third-party
+// channel" cannot ship the query string verbatim. The cut covers the
+// fragment as well (it never reaches the server, but tokens live there).
 //
 // The strip is RAW-STRING based and deliberately does NOT depend on
 // neturl.Parse succeeding: a malformed target (backslash or control
@@ -1644,19 +1648,23 @@ var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "
 // function exists to prevent. A string with no authority (a bare IP, a
 // hostname) has nothing to strip and is returned unchanged.
 //
-// Strip ONLY the userinfo, from the RAW string. Rebuilding via
-// u.String() would percent-encode the path/query — a target like
-// /<b>bold</b> would come back as /%3Cb%3Ebold%3C/b%3E, and the card's
-// HTML escaping would then show literal %3C… to the reader instead of
-// the escaped markup the target really is (telegram_test.go pins both
-// halves: & -> &amp; and <b> -> &lt;b&gt;, with the card's own tags
-// intact).
+// Strip ONLY the userinfo and the query/fragment, from the RAW string.
+// Rebuilding via u.String() would percent-encode the path — a target
+// like /<b>bold</b> would come back as /%3Cb%3Ebold%3C/b%3E, and the
+// card's HTML escaping would then show literal %3C… to the reader
+// instead of the escaped markup the target really is (telegram_test.go
+// pins both halves: & -> &amp; and <b> -> &lt;b&gt;, with the card's own
+// tags intact).
 //
 // The authority runs from after "scheme://" (or after a leading "//"
-// for a scheme-relative URL) to the first path/query/fragment
-// separator, and userinfo ENDS AT THE LAST '@' in it — net/url's
-// validUserinfo permits a raw '@', so the cut MUST mirror net/url's
-// boundary: cutting at the FIRST '@' of
+// for a scheme-relative URL) to the first '/', '?' or '#' — exactly
+// net/url's boundary. A raw '?'/'#' cannot sit inside userinfo (RFC
+// 3986's userinfo excludes both), so there is no lenient case: in
+// https://user?x:pass@host/ the '?' starts the QUERY (host "user"),
+// there is no userinfo to strip, and the query is cut. userinfo
+// ENDS AT THE LAST '@' in the authority — net/url's validUserinfo
+// permits a raw '@', so the cut MUST mirror net/url's boundary:
+// cutting at the FIRST '@' of
 // https://admin:***@ss@nas.lan/health left "ss@nas.lan" in the card —
 // a password fragment shipped to Discord/Telegram/SMTP, and the
 // scheme-relative form leaked the whole credential verbatim.
@@ -1670,10 +1678,20 @@ func alertTarget(target string) string {
 	if end < 0 {
 		end = len(rest)
 	}
+
+	// Cut the userinfo (to and including the LAST '@' in the authority)
+	// and the query/fragment (from the first '?'/'#' of the remainder —
+	// after the userinfo cut the remainder starts at host[:port], which
+	// cannot contain '?'/'#', so the first one is the true
+	// query/fragment start).
+	out := rest
 	if at := strings.LastIndexByte(rest[:end], '@'); at >= 0 {
-		return target[:prefix] + rest[at+1:]
+		out = rest[at+1:]
 	}
-	return target
+	if q := strings.IndexAny(out, "?#"); q >= 0 {
+		out = out[:q]
+	}
+	return target[:prefix] + out
 }
 
 // authorityStart returns the offset just past "scheme://" (or a leading
