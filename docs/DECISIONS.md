@@ -3195,3 +3195,67 @@ interleaved old shape writes before a later read, the split shape does not).
 Gated on the box (Node 22): poll_layout 3/3 and the F16 regression
 (frontend.test.mjs) 6/6 (no breakage). Sabotage-verified: each of the three
 fixes individually reverted → its pin fails; tree MD5-verified restored.
+
+## testing-benchmark-gaps
+
+Finding #25 (2026-11-19/20 local). Closed the testing/benchmark gaps the
+review flagged — the paths where every Major/Critical fix above slipped
+through. Each listed gap was verified against live code FIRST; three turned
+out to be already covered and were dropped as duplicates rather than re-added:
+- `SetUserPassword` common-password rejection → already `TestSetUserPasswordRejectsCommonPassword`
+  (auth_hourly_budget_test.go): tests "password" AND "password123", asserts
+  `errPasswordCommon`, verifies nothing changed.
+- concurrent `EnterMaintenanceWithFreshSnapshot` → already
+  `TestConcurrentEnterMaintenancePreservesSnapshot` (maintenance_test.go), a
+  stronger double-click race driven through the HTTP handler with a
+  parked-enter seam.
+- gzip 204/ResponseController/MaxBytesReader, storm summary limits, SMTP
+  TLS/STARTTLS mode matrix, SharedEngine concurrent init → already covered by
+  the existing suites (gzip_test.go, storm_summary_limits_test.go,
+  smtp_tls_mode_test.go, healthz_icmp_test.go).
+
+Genuinely missing, now added (all gated on the box, `-race`; no production
+code changed — test-only finding):
+- `BenchmarkPurgeOld` guarded `b.N = 1` (a fixed-shape 1.5M-row 30-day delete
+  can't loop on b.N without re-seeding; the guard makes it a clean single-shot
+  instead of meaningless at the default ~100 reps). ~1.41s/op on the box.
+- `BenchmarkWarmStats` — the heaviest DB read path (two-phase 24h load:
+  covering-index scan for all sensors + slow-sensor LIMIT 60 backfill). Seeded
+  100 sensors × 5000 probes (~500K rows, all in-window) via `NewProbeWorker`
+  (the series cache must be initialized — a bare `&ProbeWorker{}` nil-maps).
+  ~742ms/op on the box.
+- `TestEngineModeDeadBeforeSharedEngine` (engine_mode_dead_test.go):
+  EngineMode()/EngineDead() are safe to read BEFORE the shared engine inits
+  (a /api/healthz poll can land first) and flip to "dead" once the one-shot
+  open fails — both take only the read lock, never the init.
+- `TestInitSchemaMigration11RetryWithoutReset`
+  (internal/store/schema_migration11_retry_test.go): a retry of the migration
+  sequence at the 11 boundary restores the head WITHOUT resetting
+  user_version to 0 (the pre-versioning escape hatch is not the normal
+  recovery path).
+- `TestSendSMTPCredentialsPlaintextRefused` (smtp_auth_flow_test.go): a relay
+  advertising NO STARTTLS + NO AUTH — credentials over a plaintext wire are
+  refused. The guard fires AFTER the dial + EHLO, so a live in-process relay
+  + a plain `smtpDial` override are needed (the production dial blocks
+  loopback by design).
+- `TestUpdateCheckTTLExceedsFailTTLOutageBackoff`
+  (update_check_realistic_ttl_test.go): the REALISTIC production ordering
+  updateCheckTTL (30m) > updateCheckFailTTL (1m). The existing
+  TestUpdateCheckStaleOnFailure uses the INVERSE (1ms/1h) to stay fast, which
+  hides the interaction: an expired success must probe (not be suppressed by
+  its own age), and the resulting failure is backoff'd by the SHORTER FailTTL
+  measured from the ATTEMPT time, not the success time.
+- `TestGzipHeadResponse` (gzip_test.go): a HEAD request through the gzip
+  wrapper COMPLETES (a body-less response must not leave the gzip writer
+  blocked) — the other bodyless verb alongside the 204/304 already pinned.
+- `TestVerifyReleaseSignatureRejectsLegacyRawSig` (update_sig_test.go): a
+  LEGACY raw ed25519 signature over the binary bytes (pre-manifest format)
+  from a TRUSTED key is REJECTED — the verifier binds the signature to the
+  manifest (tag + asset + sha256), not the raw bytes, so accepting the raw
+  form re-opens a replay hole.
+
+Gated on the box (Go 1.27.4): gofmt + `go vet` clean; all 6 new tests + the
+store test pass under `-race`; both benchmarks run at -benchtime=1x.
+Sabotage-verified: keying the update-check failure suppression off
+`updateCheckAt` (success) instead of `updateCheckAttemptAt` (attempt) flips
+`TestUpdateCheckTTLExceedsFailTTLOutageBackoff` red (hits=2, want 1).

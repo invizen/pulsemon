@@ -417,3 +417,43 @@ func TestOversizedBody413ClosesConnection(t *testing.T) {
 		t.Fatalf("server accepted only %d connection(s) after the 413 — the MaxBytesReader requestTooLarge hook could not close the connection (wrapped the body AFTER gzip / no Unwrap)", cl.conns)
 	}
 }
+
+// TestGzipHeadResponse pins the HEAD path through the gzip wrapper: a HEAD
+// request must COMPLETE (a body-less response must not leave the gzip writer
+// blocked waiting to flush a body) and answer 200. 204/304 are covered by
+// TestGzipBodylessCarriesNoTrailer; HEAD is the other bodyless verb the
+// wrapper must not choke on.
+// History: docs/DECISIONS.md → testing-benchmark-gaps
+func TestGzipHeadResponse(t *testing.T) {
+	db := newTestDB(t)
+	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
+		t.Fatalf("SetSetting auth_bootstrapped: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES ('s1', 's1', '10.255.255.1', 60, 1000, 25, 1, 5, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
+		t.Fatalf("seed sensor: %v", err)
+	}
+	srv := NewServer(db, NewProbeWorker(db))
+	ts := httptest.NewServer(srv.authGate())
+	defer ts.Close()
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableCompression: true}}
+	req, _ := http.NewRequest(http.MethodHead, ts.URL+"/api/sensors", nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	done := make(chan error, 1)
+	go func() {
+		resp, err := client.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("HEAD /api/sensors through the gzip wrapper: %v (it must complete, not hang)", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("HEAD /api/sensors through the gzip wrapper hung (the gzip writer blocked on a body-less response)")
+	}
+}

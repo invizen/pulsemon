@@ -16,11 +16,14 @@ import (
 //
 //	go test -run=^$ -bench='BenchmarkPurgeOld|BenchmarkComputeSensorStats|BenchmarkProbeWrites' -benchtime=1x .
 //
-// -benchtime=1x is recommended for BenchmarkPurgeOld: the purge DELETES its
-// target rows, so it cannot be looped without re-seeding (which would dominate
-// the measurement) — one representative run of the full-scale purge is the
-// honest measure of the hourly retention job. BenchmarkComputeSensorStats is a
-// pure read and loops cleanly, so it can use the default -benchtime.
+// BenchmarkPurgeOld and BenchmarkWarmStats are fixed-shape workloads (the
+// purge DELETES its target rows; the warm-up reads a full 24h window) that
+// cannot be looped without re-seeding (which would dominate the measurement).
+// Both therefore GUARD b.N to 1: the harness reports the real single-run
+// duration, so they are honest even under the default -benchtime (no longer
+// "meaningless results unless run with -benchtime=1x"). BenchmarkComputeSensorStats
+// is a pure in-memory read and loops cleanly on b.N, so it uses the default
+// -benchtime.
 //
 // The file also hosts TestProbeWriteSoakFleetCadence — the bounded fleet-scale
 // write soak (external review #10) — because it shares this file's fleet
@@ -43,6 +46,7 @@ const benchPurgeRowsPerSensor = 10_000
 // correctness is locked by TestPurgeOldMultiBatchPerSensor).
 func BenchmarkPurgeOld(b *testing.B) {
 	b.ReportAllocs()
+	b.N = 1 // guard: fixed-shape purge (deletes its targets), not a per-iteration loop
 	db, err := store.NewStore(filepath.Join(b.TempDir(), "purgebench.db"))
 	if err != nil {
 		b.Fatalf("store.NewStore: %v", err)
@@ -173,4 +177,70 @@ func makeBenchSeries(n int, now int64) []probeEntry {
 		}
 	}
 	return e
+}
+
+// benchWarmSensors x benchWarmRowsPerSensor: the warm-up's real scale — 100
+// sensors, each with ~5000 probes spread across the 24h window (~500K rows).
+const benchWarmSensors = 100
+const benchWarmRowsPerSensor = 5_000
+
+// BenchmarkWarmStats measures the heaviest DB read path: the 24h warm-up load
+// (warmStats) that repopulates the in-memory series after a restart/deploy. It
+// seeds benchWarmSensors sensors with ~500K in-window probes and times the full
+// two-phase load (the 24h covering-index scan + the slow-sensor last-60
+// backfill). Like BenchmarkPurgeOld it is a fixed-shape read workload, so b.N
+// is guarded to 1 and the harness reports the real single-run duration.
+// History: docs/DECISIONS.md → testing-benchmark-gaps
+func BenchmarkWarmStats(b *testing.B) {
+	b.ReportAllocs()
+	b.N = 1 // guard: fixed-shape 24h load, not a per-iteration loop
+	db, err := store.NewStore(filepath.Join(b.TempDir(), "warmbench.db"))
+	if err != nil {
+		b.Fatalf("store.NewStore: %v", err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		b.Fatalf("InitSchema: %v", err)
+	}
+
+	createdAt := time.Now().UTC().Format(time.RFC3339Nano)
+	tx, err := db.Begin()
+	if err != nil {
+		b.Fatalf("begin: %v", err)
+	}
+	defer tx.Rollback()
+	sensSt, err := tx.Prepare(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at)
+		VALUES (?, ?, '127.0.0.1', 5, 1000, 25, 2, 3, 'active', 'up', ?)`)
+	if err != nil {
+		b.Fatalf("prepare sensor: %v", err)
+	}
+	defer sensSt.Close()
+	probeSt, err := tx.Prepare(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, 10.0)`)
+	if err != nil {
+		b.Fatalf("prepare probe: %v", err)
+	}
+	defer probeSt.Close()
+
+	now := time.Now().UTC()
+	for s := 0; s < benchWarmSensors; s++ {
+		id := fmt.Sprintf("w%03d", s)
+		if _, err := sensSt.Exec(id, id, createdAt); err != nil {
+			b.Fatalf("insert sensor %s: %v", id, err)
+		}
+		for i := 0; i < benchWarmRowsPerSensor; i++ {
+			// 17s spacing x 5000 = ~85000s ≈ 23.6h: every row inside the 24h window.
+			ts := now.Add(-time.Duration(i*17) * time.Second).Format(time.RFC3339Nano)
+			if _, err := probeSt.Exec(id, ts); err != nil {
+				b.Fatalf("insert probe %s/%d: %v", id, i, err)
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		b.Fatalf("commit: %v", err)
+	}
+
+	pw := NewProbeWorker(db)
+	b.ResetTimer()
+	pw.warmStats(context.Background())
+	b.StopTimer()
 }

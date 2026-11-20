@@ -186,3 +186,23 @@ func TestVerifyDownloadedAsset_ForeignSig(t *testing.T) {
 		t.Fatal("a foreign-signed release (matching SHA) was installed")
 	}
 }
+
+// TestVerifyReleaseSignatureRejectsLegacyRawSig pins the manifest-only
+// contract: a LEGACY raw ed25519 signature over the binary bytes (the
+// pre-manifest format, signed by a TRUSTED key) must be REJECTED. The
+// verifier binds the signature to the manifest (tag + asset + sha256), not the
+// raw bytes — so a correctly-keyed legacy sig verifies against nothing and is
+// refused. This is the "rejection of legacy sigs" the review called out: the
+// trust decision is the FORMAT (manifest-bound), not just the key. Accepting
+// the raw form re-opened a replay hole (a compromised account re-uploading an
+// old signed binary under a newer tag).
+// History: docs/DECISIONS.md → testing-benchmark-gaps
+func TestVerifyReleaseSignatureRejectsLegacyRawSig(t *testing.T) {
+	_, priv, binBytes := sigTestSetup(t)
+	// A raw signature over the binary (NOT a manifest) from the TRUSTED key.
+	legacySig := ed25519.Sign(priv, binBytes)
+	srv := serveSig(t, legacySig)
+	if err := verifyReleaseSignature(srv.Client(), manifestSel("v0.4.5", "pulsemon-linux-amd64", srv.URL), binSHA(binBytes)); err == nil {
+		t.Fatal("a legacy raw (non-manifest) signature from a trusted key was accepted; the manifest-only contract is broken (replay hole)")
+	}
+}
