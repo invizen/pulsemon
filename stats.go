@@ -369,8 +369,38 @@ func (pw *ProbeWorker) statsFor(id string, nowUnix int64) *SensorStats {
 	// computeSensorStats reads only the raw tier: the 60-probe inspector
 	// window, the status window, the 1h loss/avg, and the sparkline all fit
 	// inside max(1h, last 60). The 24h uptime comes from the incremental
-	// counters, so the per-poll read never scans the minute buckets.
-	return computeSensorStats(s.raw[s.rawStart:], nowUnix, s.total24, s.lost24)
+	// counters, decayed to this read's nowUnix below.
+	//
+	// The counters are maintained in append() anchored at the NEWEST probe's
+	// ts, so a sensor whose last probe is old (paused for hours, slow
+	// cadence, long gap since the last tick) carries a count of
+	// [newest-24h, newest] — not the [nowUnix-24h, nowUnix] window
+	// computeSensorStats documents. Re-anchor at read time, read-only over
+	// local copies: subtract the leading live buckets and raw entries older
+	// than the now-anchored cutoff. Both tiers are ts-sorted and every live
+	// bucket is older than every live raw entry (folds only leave the raw
+	// front), so two independent walks are exact. Steady state (nowUnix
+	// ≈ newest) leaves an empty band — zero iterations per poll; the next
+	// append re-anchors for real. Manual rows are already excluded from the
+	// counters, so the raw walk skips them. The series fields stay
+	// untouched: this runs under RLock, and only append (write lock)
+	// mutates them.
+	cutoff := nowUnix - retentionSeconds
+	d24, l24 := s.total24, s.lost24
+	for i := s.bucketStart; i < len(s.buckets) && s.buckets[i].minute < cutoff; i++ {
+		d24 -= int(s.buckets[i].total)
+		l24 -= int(s.buckets[i].lost)
+	}
+	for i := s.raw24Start; i < len(s.raw) && s.raw[i].ts < cutoff; i++ {
+		if s.raw[i].manual {
+			continue
+		}
+		d24--
+		if isLost(s.raw[i].rtt) {
+			l24--
+		}
+	}
+	return computeSensorStats(s.raw[s.rawStart:], nowUnix, d24, l24)
 }
 
 // GetStats computes a sensor's SensorStats from the in-memory series,

@@ -2916,3 +2916,37 @@ spawns keep the full stagger; sub-cap intervals are not re-hashed.
 old clamp) was updated to the window contract.
 Sabotage-verified: the clamp body restored → the spread pin fails
 ("collapsed to 6 distinct phases"); tree MD5-verified restored.
+
+## stats-24h-counters-decay-to-now (stats.go, stats_decay_test.go, 2026-11-19)
+
+**Decision:** `statsFor` decays the incremental 24h counters to the read's
+`nowUnix` before calling `computeSensorStats`: local copies of
+total24/lost24, subtracting the leading live minute buckets
+(`minute < nowUnix-retentionSeconds`) and the leading live raw entries
+(`ts < nowUnix-retentionSeconds`, manual rows skipped) from
+`raw24Start`. The series fields are untouched — the decay is read-only
+under RLock; the next `append` re-anchors the real counters.
+
+**Why:** The counters are maintained in `append()` anchored at the
+NEWEST probe's ts, so a sensor whose last probe is old (paused >24h,
+hourly cadence between ticks, just warmed from the DB) carried a count of
+[newest-24h, newest] into a read anchored at now — violating
+`computeSensorStats`' documented "ts >= nowUnix-86400" contract and
+disagreeing with `graphPoints("24h")`, which is anchored at
+`time.Now()`. A sensor paused 30h reported the 24h uptime from 30h ago.
+Steady state (nowUnix ≈ newest) leaves an empty decay band — zero
+iterations per poll — so the cost is bounded by the sensor's age gap.
+
+**Pinned by:** `TestStatsForDecays24hUptimeToNow` — a full 24h 5s sensor
+(17,280 entries, oldest 6h all losses, 75.0% at the newest anchor) must
+read 75.0% steady, 100.0% when now is 20h later (oldest 4h left the
+window), and 0 when now is 30h later (every probe is >24h old — matching
+an empty 24h graph); pre-fix all three reads returned 75.0%. Its final
+check pins the read-only contract (a decayed future read must not mutate
+the series — an in-place variant would also race appends under RLock).
+`TestStatsForDecaysSlowSensorDrift` — an hourly sensor read 30m after its
+newest probe drops the age-24h loss entry: 96.0% → 100.0%.
+`TestStatsForDecaySkipsManualRows` — 54 manual rows in the decay band
+must be skipped (they were never counted): 90.0%, not 88.24%.
+Sabotage-verified: the pre-fix passthrough restored → all three pins
+fail.
