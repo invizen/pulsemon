@@ -195,7 +195,11 @@ func TestPatchCrossFieldSentinelsNotSubstrings(t *testing.T) {
 	id, _ := out["id"].(string)
 	cases := []struct{ label, body, want string }{
 		{"http target not a URL", `{"type":"http","target":"notaurl"}`, "target must be an http://"},
-		{"tcp target without port", `{"type":"tcp","target":"noport"}`, "target must be an IPv4 address or hostname"},
+		// #29 (2026-11-20): the errPatchTargetInvalid 400 now renders the
+		// probe-type-specific message (patchErr.Error()), so a TCP target
+		// without a port gets the TCP text, not the ICMP "IPv4 address or
+		// hostname". The sentinel routing this test pins is unchanged.
+		{"tcp target without port", `{"type":"tcp","target":"noport"}`, "target must be host:port with an explicit port"},
 		{"icmp target invalid", `{"target":"!!!"}`, "target must be an IPv4 address or hostname"},
 		{"timeout over interval", `{"interval_s":5,"timeout_ms":30000}`, "timeout_ms must not exceed interval_s*1000"},
 		{"down_after over retention", `{"interval_s":3600,"down_after":100}`, "down_after × interval_s must not exceed 24h"},

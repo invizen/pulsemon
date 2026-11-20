@@ -3304,3 +3304,64 @@ Gated on the box (Go 1.27.4): gofmt + `go vet` clean; the new nits tests +
 the store tag suite + the bootstrap suite pass; `node --test` 9/9.
 Sabotage-verified: reverting the transport clone, the PATCH message, or the
 `closeAlerts()` call each flips its pin red.
+
+## api-split-settings-put-breakdown (api.go, api_middleware.go, api_sensors.go, api_settings.go, validation_bounds_test.go, 2026-11-20)
+
+Review nit (2026-11-20): `api.go` had grown to ~3,086 LOC / 70 top-level
+declarations, and `handleSettingsPut` was a ~400-line function. Both hurt
+readability. Keeping `package main` (see the package-layout decision), the
+file is now split by domain and the settings-PUT handler is broken into
+focused helpers. Pure readability refactor — NO behavioral change; the pin
+is the full test suite (gated on the box).
+
+Split (mechanical declaration move, lossless — 2,958/2,958 non-blank lines
+preserved, verified):
+- `api.go` (~296 LOC): the `Server` struct, `NewServer`, shared types, the
+  `respondWith*` / `requestBodyErr` response helpers, `Mux()` + route table,
+  `normalizeProbeType`, `handleStatic`.
+- `api_middleware.go` (~434 LOC): `authGate`, `hostAllowed` +
+  `parseAllowedHosts` / `splitHostPortLenient`, `unauthMutateAllowed`, the
+  CORS + rate-limit middleware.
+- `api_sensors.go` (~1,532 LOC): sensor CRUD, `handleSensorByID` (PATCH),
+  clone, ping, history, graph, events, tags, `validSensorName` / `cleanTags`,
+  `setSensorTagsInConn`, `deleteRowsBatched`, the PATCH sentinels.
+- `api_settings.go` (~982 LOC): `settingsPayload`, `handleSettingsGet` /
+  `Put` / `Test`, provider validation (`validateProviderUpdate*` /
+  `applyProviderUpdate*`), `guardSMTPNoCredsOverTLSInTx`, `extraFields`,
+  maintenance enter/leave.
+
+Each file carries its own import block, trimmed to what it uses (the compiler
+is authoritative — a regex pre-pass over-matched on identifiers in
+comments/strings, and the 5 residual unused imports were removed by hand).
+The `//go:embed web/*` directive stays with `var content embed.FS` in
+`api.go`.
+
+`handleSettingsPut` breakdown (401 → ~90 lines, a short orchestration):
+- `settingsPutReq` / `settingsPutProvider`: the request body is now a named
+  type (was an inline anonymous struct), so the "nil = keep the stored value"
+  contract is documented in one place.
+- `validateSettingsPut`: the validate-everything-before-any-write phase
+  (allow_unauth pre-guard, alert_scope / realert_min / alert_filter cleaning,
+  the pre-flight `getAllSettings` snapshot, the dead-alert guard, per-provider
+  stored-state + `validateProviderUpdate`). Returns the snapshot + stored
+  extras the apply pass reuses, so validation and apply evaluate the same
+  state.
+- `applySettingsTx`: the ONE-transaction apply (write-lock pin, provider
+  writes, routing fields, the in-tx allow_unauth user-count re-check, commit).
+- `applyMaintenanceTransition`: the post-commit maintenance enter/leave
+  (snapshot + pause / resume ordering).
+The maintenance-entry 400 pre-check stays inline in the handler (it's the
+derived "no active sensors to pause" gate and seeds `maintIDs`).
+
+Also fixed a latent regression from the #29 PATCH-message change:
+`TestPatchCrossFieldSentinelsNotSubstrings` (review 2026-11-11 #7) still
+expected the old ICMP "IPv4 address or hostname" text for a TCP target
+without a port. #29 made `errPatchTargetInvalid` render the
+probe-type-specific message, so that case now expects "target must be
+host:port with an explicit port". The test's core (400 routed to the target
+sentinel, not a 500) is unchanged. This was missed because the #29 gate was
+targeted, not the full suite.
+
+Gate (Go 1.27.4, the box): gofmt + `go vet` clean; the FULL `go test -race`
+suite passes (`ok pulsemon`); `node --test` 9/9. No new pin (behavior is
+unchanged — the existing settings/PATCH suites are the pin).
