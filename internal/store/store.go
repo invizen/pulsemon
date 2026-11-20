@@ -687,8 +687,11 @@ func (db *Store) SensorTagsFor(ctx context.Context, ids []string) (map[string][]
 			q[j] = "?"
 			args[j] = id
 		}
+		// ORDER BY sensor_id, tag uses the (sensor_id, tag) PK B-tree directly
+		// (no temp sort); the per-sensor output is identical to ORDER BY tag
+		// because tags within a sensor are still alphabetical.
 		rows, err := db.QueryContext(ctx, "SELECT sensor_id, tag FROM sensor_tags WHERE sensor_id IN ("+
-			strings.Join(q, ",")+") ORDER BY tag", args...)
+			strings.Join(q, ",")+") ORDER BY sensor_id, tag", args...)
 		if err != nil {
 			return err
 		}
@@ -915,7 +918,10 @@ func applyMaintenanceTx(ctx context.Context, tx *sql.Tx, on bool, ids []string, 
 // surface as a 500 — the old swallow-to-empty map rendered a failure as
 // "the fleet has no tags".
 func (db *Store) AllTags(ctx context.Context) (map[string]int, error) {
-	rows, err := db.QueryContext(ctx, `SELECT tag, COUNT(DISTINCT sensor_id) FROM sensor_tags GROUP BY tag ORDER BY tag`)
+	// (sensor_id, tag) is the PK, so each sensor_id appears exactly once per
+	// tag group — COUNT(*) equals COUNT(DISTINCT sensor_id) without the
+	// DISTINCT's extra dedup pass.
+	rows, err := db.QueryContext(ctx, `SELECT tag, COUNT(*) FROM sensor_tags GROUP BY tag ORDER BY tag`)
 	if err != nil {
 		return nil, err
 	}

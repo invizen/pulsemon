@@ -1238,7 +1238,11 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(patchErr, errPatchTargetNotURL):
 			respondWithError(w, http.StatusBadRequest, "target must be an http:// or https:// URL (e.g. https://example.com/health)")
 		case errors.Is(patchErr, errPatchTargetInvalid):
-			respondWithError(w, http.StatusBadRequest, "target must be an IPv4 address or hostname")
+			// patchErr is a *crossFieldError whose Error() carries the
+			// probe-type-specific message (ICMP: "IPv4 address or hostname";
+			// TCP: "host:port with an explicit port 1-65535"). Hardcoding the
+			// ICMP text here mis-told TCP targets what to fix.
+			respondWithError(w, http.StatusBadRequest, patchErr.Error())
 		case errors.Is(patchErr, errPatchTimeoutExceedsInterval):
 			respondWithError(w, http.StatusBadRequest, "timeout_ms must not exceed interval_s*1000")
 		case errors.Is(patchErr, errPatchDownAfterExceedsRetention):

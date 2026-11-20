@@ -77,7 +77,7 @@ let authState = null;
 let meIsAdmin = true;
 function applyAdminVisibility() {
   const hide = !meIsAdmin;
-  for (const id of ['alerts-btn', 'settings-btn', 'update-pill', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn', 'unauth-update-row']) {
+  for (const id of ['alerts-btn', 'settings-btn', 'update-pill', 'tls-panel', 'maint-row', 'new-sensor-btn', 'empty-add-btn', 'clear-hist-btn', 'clear-activity-btn', 'unauth-update-row']) {
     const el = $(id);
     if (el) el.classList.toggle('hidden', hide);
   }
@@ -1690,6 +1690,7 @@ document.addEventListener('keydown', e => {
     closeModal();
     closeInspector();
     closeSettings();
+    closeAlerts();
     const acc = $('acc-modal');
     if (acc) acc.classList.add('hidden');
   }

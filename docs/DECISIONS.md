@@ -3259,3 +3259,48 @@ store test pass under `-race`; both benchmarks run at -benchtime=1x.
 Sabotage-verified: keying the update-check failure suppression off
 `updateCheckAt` (success) instead of `updateCheckAttemptAt` (attempt) flips
 `TestUpdateCheckTTLExceedsFailTTLOutageBackoff` red (hits=2, want 1).
+
+## nits-20261120-query-webhook-ui (store.go, main.go, webhook.go, api.go, web/index.html, web/app.js, nits_20261120_test.go, web/test/frontend.test.mjs, 2026-11-20)
+
+Six small nits from the review (the 7th — the api.go file split — is its own
+entry). Each verified against live code first. The query rewrites are
+behavior-identical (same rows, same order), so their pins are the EXISTING
+store/bootstrap suites; the two behavioral fixes (webhook transport, PATCH
+error text) and the three UI items get new pins.
+
+- `SensorTagsFor` (store.go): `ORDER BY tag` → `ORDER BY sensor_id, tag`.
+  The `(sensor_id, tag)` PK B-tree serves the sort directly (no temp B-tree
+  sort); per-sensor output is identical because tags within a sensor were
+  already alphabetical.
+- `AllTags` (store.go): `COUNT(DISTINCT sensor_id)` → `COUNT(*)`. The PK makes
+  each `(sensor_id, tag)` unique, so within a `GROUP BY tag` group each
+  sensor_id appears exactly once — the DISTINCT was a no-op dedup pass.
+- `migrateAuthBootstrapped` (main.go): `SELECT COUNT(*) FROM probes` →
+  `SELECT EXISTS(SELECT 1 FROM probes)`. Existence, not a count — short-
+  circuits on the first row instead of scanning the whole table.
+- `webhookTransport` (webhook.go): now a Clone of `http.DefaultTransport`
+  (inherits IdleConnTimeout 90s, MaxIdleConns 100, MaxIdleConnsPerHost 2,
+  TLSHandshakeTimeout 10s) with two overrides — `Proxy: nil` (DefaultTransport
+  uses ProxyFromEnvironment; webhook egress must never route through an
+  ambient proxy) and `DialContext: dialChecked`. A bare `&http.Transport{}`
+  left the idle limits at 0 (unbounded idle conns).
+- PATCH target error (api.go): `errPatchTargetInvalid` now returns
+  `patchErr.Error()` — the `*crossFieldError` carries the probe-type-specific
+  message (TCP: "host:port with an explicit port"; ICMP: "IPv4 address or
+  hostname"). The old hardcoded ICMP text mis-told TCP targets what to fix.
+- UI polish: `#f-interval` `min="1"` → `min="5"` (matches backend
+  `minIntervalS=5`); the Escape key handler now calls `closeAlerts()` (the
+  Alerts modal was the one overlay it didn't close); `clear-activity-btn`
+  added to `applyAdminVisibility()`'s hide list (a viewer can't clear the
+  activity log).
+
+New pins (gated on the box): `TestWebhookTransportHasBoundedIdleLifetime` +
+`TestPatchTCPInvalidTargetGetsTCPMessage` (nits_20261120_test.go) and three
+Node pins in web/test/frontend.test.mjs (f-interval min, Escape→closeAlerts,
+viewer hides clear-activity-btn). The Node harness gained a `fire()` helper so
+the document keydown listener is now exercisable.
+
+Gated on the box (Go 1.27.4): gofmt + `go vet` clean; the new nits tests +
+the store tag suite + the bootstrap suite pass; `node --test` 9/9.
+Sabotage-verified: reverting the transport clone, the PATCH message, or the
+`closeAlerts()` call each flips its pin red.

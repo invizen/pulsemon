@@ -668,8 +668,10 @@ func migrateAuthBootstrapped(db *store.Store) {
 	if db.GetSetting("auth_bootstrapped") == "1" {
 		return
 	}
-	var probes int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes").Scan(&probes); err != nil || probes == 0 {
+	// EXISTS short-circuits on the first row; COUNT(*) would scan the whole
+	// probes table just to decide "any history?".
+	var hasProbes bool
+	if err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM probes)").Scan(&hasProbes); err != nil || !hasProbes {
 		return
 	}
 	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {

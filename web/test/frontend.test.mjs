@@ -64,12 +64,13 @@ function makeEl(id) {
 
 async function makeApp() {
   const els = new Map();
+  const listeners = {};
   const doc = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); },
     querySelector() { return null; },
     querySelectorAll() { return []; },
     createElement(tag) { return makeEl('dyn-' + tag); },
-    addEventListener() {},
+    addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
     visibilityState: 'visible',
     documentElement: makeEl('html'),
     body: makeEl('body'),
@@ -115,6 +116,7 @@ async function makeApp() {
     get(expr) { return vm.runInContext(expr, ctx); },
     set(name, val) { vm.runInContext(`${name} = ${JSON.stringify(val)}`, ctx); },
     call(fn, ...args) { return vm.runInContext(`(${fn}).apply(null, ${JSON.stringify(args)})`, ctx); },
+    fire(type, ev) { (listeners[type] || []).forEach(fn => fn(ev)); },
   };
 }
 
@@ -150,12 +152,13 @@ function makeAppSync() {
   // Synchronous load: boot() is an IIFE that will run against the base
   // fetch; its async tail settles harmlessly (no test depends on it).
   const els = new Map();
+  const listeners = {};
   const doc = {
     getElementById(id) { if (!els.has(id)) els.set(id, makeEl(id)); return els.get(id); },
     querySelector() { return null; },
     querySelectorAll() { return []; },
     createElement(tag) { return makeEl('dyn-' + tag); },
-    addEventListener() {},
+    addEventListener(type, fn) { (listeners[type] ||= []).push(fn); },
     visibilityState: 'visible',
     documentElement: makeEl('html'),
     body: makeEl('body'),
@@ -197,6 +200,7 @@ function makeAppSync() {
     get(expr) { return vm.runInContext(expr, ctx); },
     set(name, val) { vm.runInContext(`${name} = ${JSON.stringify(val)}`, ctx); },
     call(fn, ...args) { return vm.runInContext(`(${fn}).apply(null, ${JSON.stringify(args)})`, ctx); },
+    fire(type, ev) { (listeners[type] || []).forEach(fn => fn(ev)); },
   };
 }
 
@@ -306,4 +310,35 @@ test('renderUpdateUI: the update pill is gated on meIsAdmin', () => {
   app.call('renderUpdateUI', { running: '1.1.0', latest: '1.1.0', available: false,
     url: 'https://github.com/invizen/pulsemon/releases' });
   assert.ok(pill().classList.contains('hidden'), 'no update → pill hidden');
+});
+
+// ---------- Nits (2026-11-20): UI polish ----------
+
+test('sensor form: #f-interval min matches the backend floor (5s)', () => {
+  const m = INDEX_HTML.match(/<input id="f-interval"[^>]*>/);
+  assert.ok(m, 'f-interval input missing from index.html');
+  assert.ok(/min="5"/.test(m[0]),
+    'f-interval min must be 5 (backend minIntervalS=5), got: ' + m[0]);
+});
+
+test('Escape closes the Alerts modal', () => {
+  const app = makeAppSync();
+  const bd = app.doc.getElementById('alerts-backdrop');
+  bd.classList.remove('hidden'); // simulate the modal open
+  app.fire('keydown', { key: 'Escape' });
+  assert.ok(bd.classList.contains('hidden'),
+    'Escape must close the Alerts modal (closeAlerts was missing from the handler)');
+});
+
+test('applyAdminVisibility: a viewer does not see the clear-activity button', () => {
+  const app = makeAppSync();
+  const btn = () => app.doc.getElementById('clear-activity-btn');
+  app.set('meIsAdmin', false);
+  app.call('applyAdminVisibility');
+  assert.ok(btn().classList.contains('hidden'),
+    'a viewer must not see the clear-activity button');
+  app.set('meIsAdmin', true);
+  app.call('applyAdminVisibility');
+  assert.ok(!btn().classList.contains('hidden'),
+    'an admin must see the clear-activity button');
 });

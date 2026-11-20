@@ -130,17 +130,26 @@ func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 	return nil, lastErr
 }
 
-var webhookTransport = &http.Transport{
-	// Only DialContext is set: the transport uses it for the TCP connect
-	// on BOTH http and https, then performs the TLS handshake itself
-	// (default TLSClientConfig, ServerName = the URL host) — so SNI and
-	// certificate verification behave normally while the connected IP is
-	// still the one dialChecked verified against the blocklist.
-	// (Setting DialTLSContext instead would make the transport assume the
-	// returned conn is already past the handshake and skip
-	// TLSClientConfig entirely — wrong for our purposes.)
-	DialContext: dialChecked,
-}
+// webhookTransport is a Clone of http.DefaultTransport so it inherits sane
+// idle-lifecycle limits (IdleConnTimeout 90s, MaxIdleConns 100,
+// MaxIdleConnsPerHost 2, TLSHandshakeTimeout 10s) — a bare &http.Transport{}
+// leaves those at 0 (unbounded idle conns, no handshake timeout). Two
+// overrides preserve the security contract:
+//   - Proxy: nil — DefaultTransport uses ProxyFromEnvironment; webhook egress
+//     must never route through an ambient proxy (SSRF pivot).
+//   - DialContext: dialChecked — used for the TCP connect on BOTH http and
+//     https, then the transport performs the TLS handshake itself (default
+//     TLSClientConfig, ServerName = the URL host) — so SNI and certificate
+//     verification behave normally while the connected IP is still the one
+//     dialChecked verified against the blocklist. (Setting DialTLSContext
+//     instead would make the transport assume the returned conn is already
+//     past the handshake and skip TLSClientConfig entirely — wrong.)
+var webhookTransport = func() *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.Proxy = nil
+	t.DialContext = dialChecked
+	return t
+}()
 
 // webhookClient is the ONLY client used for alert delivery. Three deliberate
 // hardening choices:
