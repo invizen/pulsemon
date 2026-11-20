@@ -220,8 +220,15 @@ function pollRender() {
   if (inspectId) loadInspector();
 }
 
+// In-flight guard: the 5s poll can fire while a slow refresh is still awaiting
+// its 3 api() calls. Without this, a second concurrent refresh doubles the
+// request burst (6 in flight) and lets the later one's sensors/events land
+// over the earlier (interleaved). Drop the duplicate until the first settles.
+let refreshInFlight = false;
 async function refresh() {
   if (authBlocking()) return;
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const [s, e, hz] = await Promise.all([
       api('/api/sensors'),
@@ -243,6 +250,7 @@ async function refresh() {
     }
     pollRender();
   } catch (err) { console.error('refresh failed', err); }
+  finally { refreshInFlight = false; }
 }
 
 function fmtRtt(v) {
@@ -405,21 +413,26 @@ function render() {
 }
 
 function layoutSparklines() {
-  // CSP-safe: bar heights live in data-h (no inline style attribute, which the
-  // strict Content-Security-Policy blocks). Apply them via the style property.
-  document.querySelectorAll('[data-h]').forEach(b => { b.style.height = b.dataset.h; });
   // Round each bar to a whole number of PHYSICAL (device) pixels so the browser
   // rasterizes every bar identically. A fractional CSS width (e.g. 4.14px) is
   // invisible on a 1x screen but, on fractionally-scaled high-DPI displays
   // (1.25x / 1.5x), beats against the pixel grid and produces a periodic
   // "wide bar every Nth" pattern. Snapping to device pixels kills it.
+  //
+  // READ-PASS / WRITE-PASS split: the old code read getComputedStyle(c) +
+  // c.clientWidth and then wrote 60 bar widths INSIDE the per-card loop, so
+  // each card's read forced a synchronous reflow of the previous card's writes
+  // — N full layouts per render with 100+ sensors (visible jank). Gathering
+  // every container's width up front collapses that to a single reflow; the
+  // write pass below then runs with no interleaved reads.
   const dpr = window.devicePixelRatio || 1;
+  const gap = 2;
+  const plans = [];
   document.querySelectorAll('.h-9.flex').forEach(c => {
     const bars = c.querySelectorAll('.spark-bar');
     if (bars.length !== 60) return;
     const cs = getComputedStyle(c);
     const inner = c.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
-    const gap = 2;
     const innerD = inner * dpr;
     const gapD = gap * dpr;
     // FLOOR, not round: with 60 bars, Math.round can inflate the total bar
@@ -427,9 +440,13 @@ function layoutSparklines() {
     // out of the box at certain window widths. Floor guarantees the snapped
     // total <= inner while keeping the device-pixel snap from v0.2.7.
     const barD = Math.max(1, Math.floor((innerD - (bars.length - 1) * gapD) / bars.length));
-    const w = barD / dpr;
-    bars.forEach(b => { b.style.flex = 'none'; b.style.width = w + 'px'; });
+    plans.push({ bars, w: barD / dpr });
   });
+  // CSP-safe: bar heights live in data-h (no inline style attribute, which the
+  // strict Content-Security-Policy blocks). Apply them via the style property.
+  // Every write happens here, strictly after every read above.
+  document.querySelectorAll('[data-h]').forEach(b => { b.style.height = b.dataset.h; });
+  plans.forEach(p => { p.bars.forEach(b => { b.style.flex = 'none'; b.style.width = p.w + 'px'; }); });
 }
 
 function cardHtml(s) {
@@ -1700,12 +1717,10 @@ function startPolling() {
   // simply skipped while hidden; on return, visibilitychange fires an
   // immediate refresh so the data is fresh the moment the tab is shown again.
   setInterval(() => { if (document.visibilityState === 'visible') refresh(); }, 5000);
+  // The 5s refresh above already drives loadInspector() through pollRender()
+  // while an inspector is open. A second 5s interval that called loadInspector()
+  // directly doubled every inspector request (2x / 5s) for no reason — removed.
   let _sparkRt; window.addEventListener('resize', () => { clearTimeout(_sparkRt); _sparkRt = setTimeout(layoutSparklines, 120); });
-  setInterval(() => {
-    if (document.visibilityState !== 'visible' || !inspectId) return;
-    if (mouseButtonsDown > 0) { renderDeferred = true; return; }
-    loadInspector();
-  }, 5000);
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') {
       refresh();

@@ -3159,3 +3159,39 @@ Sabotage-verified: reverting the hostAllowed reqHost capture →
 TestHostAllowedBracketedIPv6 fails; reverting the auto+465 guard →
 TestWantsStartTLSMatrix fails. GOOS windows cross-build clean
 (`GOOS=windows go build .`).
+
+## frontend-poll-layout-thrash
+
+Finding #24 (2026-11-19/20 local). Three frontend (web/app.js) fixes:
+- Double-poll of the inspector: two 5s `setInterval` callbacks both drove
+  `loadInspector()` — the refresh interval (`refresh()` → `pollRender()` →
+  `loadInspector()`) AND a separate interval that called `loadInspector()`
+  directly. With an inspector open that was 2x the inspector requests every
+  5s. The redundant direct interval is removed; the 5s refresh is the single
+  source (pollRender already loads the inspector when one is open).
+- `refresh()` had no in-flight guard: a slow first refresh (its 3 api() calls
+  still pending) let the next 5s tick start a second concurrent refresh — 6
+  requests in flight, and the later one's sensors/events could land over the
+  earlier (interleaved data). `refresh()` now sets `refreshInFlight` at entry
+  and clears it in `finally`; a call while in flight returns immediately.
+- `layoutSparklines()` interleaved layout reads (`getComputedStyle(c)` +
+  `c.clientWidth`) with style writes (`b.style.width`) INSIDE the per-card
+  loop, so each card's read forced a synchronous reflow of the previous
+  card's writes — N full layouts per render with 100+ sensors (visible jank).
+  It is now a read pass (gather every container's snapped bar width up front)
+  followed by a write pass (apply all heights + widths), collapsing the N
+  per-card reflows to one. The device-pixel FLOOR math and the CSP-safe
+  `data-h` height mechanism are unchanged.
+
+Pins: `web/test/poll_layout.test.mjs` (Node vm harness loading the REAL
+app.js): `polling: one 5s tick drives exactly one loadInspector call` (fires
+every armed 5s callback and counts loadInspector invocations — 2 with the
+duplicate interval, 1 after), `refresh: a second call while the first is in
+flight is dropped` (a gated fetch counts api() calls — 6 without the guard, 3
+with, plus a positive control that the guard clears after settle), and
+`layoutSparklines: every layout read precedes every style write`
+(instrumented getComputedStyle/clientWidth/style track read/write order — the
+interleaved old shape writes before a later read, the split shape does not).
+Gated on the box (Node 22): poll_layout 3/3 and the F16 regression
+(frontend.test.mjs) 6/6 (no breakage). Sabotage-verified: each of the three
+fixes individually reverted → its pin fails; tree MD5-verified restored.
