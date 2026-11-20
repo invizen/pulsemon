@@ -1127,10 +1127,24 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			var txType, txTarget string
 			var txIntervalS, txTimeoutMS, txDownAfter int
-			if err := c.QueryRowContext(ctx,
+			scanErr := c.QueryRowContext(ctx,
 				"SELECT type, target, interval_s, timeout_ms, down_after FROM sensors WHERE id = ?", id).
-				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS, &txDownAfter); err != nil {
-				return errPatchSensorGone
+				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS, &txDownAfter)
+			if patchScanHook != nil {
+				scanErr = patchScanHook(scanErr)
+			}
+			if scanErr != nil {
+				// Only a missing row is a 404. A transient SQLITE_BUSY, a
+				// canceled context, or an I/O failure must surface as a
+				// logged 500 (respondInternal) — collapsing it into
+				// errPatchSensorGone told the client "sensor not found"
+				// and dropped the error from the service log.
+				// (2026-11-19 external review F17)
+				// History: docs/DECISIONS.md -> patch-scan-error-404-vs-500
+				if errors.Is(scanErr, sql.ErrNoRows) {
+					return errPatchSensorGone
+				}
+				return scanErr
 			}
 			freshType := txType
 			if req.Type != nil {
@@ -1649,6 +1663,12 @@ var (
 	errPatchDownAfterExceedsRetention = errors.New("down_after × interval_s exceeds probe retention")
 	errPatchNameConflict              = errors.New("sensor name already exists")
 )
+
+// patchScanHook is a TEST SEAM: when non-nil, it transforms the
+// PATCH-sensor in-tx sensor-read scan error before the handler classifies
+// it, so a non-ErrNoRows failure (SQLITE_BUSY, canceled context, I/O) is
+// exercisable without a real DB fault. Production always leaves it nil.
+var patchScanHook func(err error) error
 
 // handleSensorClone creates a copy of a sensor with a new unique name
 // (name-copy, name-copy2, ...). The clone starts PAUSED, like a new sensor.

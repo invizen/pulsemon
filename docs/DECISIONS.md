@@ -2857,3 +2857,34 @@ REAL app.js into a vm sandbox with a DOM shim; no Go involved):
 Sabotage-verified: each of the four fix vectors individually reverted →
 its pin fails (port vector fails 3 pins, the others 1 each); tree
 MD5-verified restored.
+
+## patch-scan-error-404-vs-500 (api.go, patch_sensor_scan_error_test.go, 2026-11-19)
+
+**Decision:** The in-tx sensor read in `PATCH /api/sensors/{id}` now
+classifies scan errors explicitly: `errors.Is(err, sql.ErrNoRows)` →
+`errPatchSensorGone` (404); every other error (SQLITE_BUSY, canceled
+context, I/O) is returned raw and reaches `respondInternal` — the only
+logged-500 path. The read itself gained a `patchScanHook` test seam (nil
+in production) that transforms the scan error before classification, so a
+non-NoRows failure is exercisable without a real DB fault. The separate
+`RowsAffected()==0 → errPatchSensorGone` check on the UPDATE is unchanged
+(it is a genuine gone-detection, not an error collapse).
+
+**Why:** Before the fix, ANY scan error returned `errPatchSensorGone`, so
+a transient SQLITE_BUSY, a canceled request context, or a disk I/O failure
+was reported to the client as 404 "sensor not found" and never reached the
+service log — the operator saw a phantom missing sensor and no error to
+diagnose.
+
+**Pinned by:** `TestPatchSensorScanErrorIs500Not404` (4 subtests):
+- `missing row is still 404 (positive control)` — the genuine gone path.
+- `clean patch is still 200 (positive control)` — the healthy path.
+- `injected non-NoRows scan failure is 500, not 404` — `patchScanHook`
+  substitutes a SQLITE_BUSY-style error on an EXISTING sensor; asserts 500
+  (not 404) and the generic "internal error" body (raw DB text must not
+  leak to the client). The run's service log shows the injected error
+  landed in `respondInternal`'s log line.
+- `injected ErrNoRows stays 404` — the classification branch itself.
+Sabotage-verified: the classification reverted to the old
+`return errPatchSensorGone` shape (seam kept) → the 500 pin fails; tree
+MD5-verified restored.
