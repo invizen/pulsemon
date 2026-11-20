@@ -270,12 +270,20 @@ func rawHTTP10Post(t *testing.T, url string, headers map[string]string) int {
 }
 
 // TestOriginGateProxyPreservedHost pins the reverse-proxy path: Caddy
-// (pulsemon.invizen.com → pulsemon:9299) forwards the ORIGINAL Host header,
-// so the browser's Origin host and r.Host agree and legitimate saves keep
-// working through TLS termination.
+// (pulsemon.invizen.com → pulsemon:9299) forwards the ORIGINAL Host header
+// and terminates TLS, so the browser's Origin host and r.Host agree AND the
+// external scheme is https — legitimate saves keep working through TLS
+// termination. The test server is plain HTTP, so it marks the loopback peer
+// as a trusted proxy and sets X-Forwarded-Proto: https (what Caddy does) to
+// exercise requestScheme's https path — the same trusted-peer rule
+// cookieSecure uses.
 func TestOriginGateProxyPreservedHost(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
+	// The immediate TCP peer (the test server's loopback listener) is the
+	// "reverse proxy" in this scenario: trust it so X-Forwarded-Proto is
+	// honored by requestScheme.
+	srv.auth.trustedProxies = parseTrustedProxies("127.0.0.0/8")
 	httpSrv := httptest.NewServer(srv.authGate())
 	defer httpSrv.Close()
 
@@ -284,6 +292,7 @@ func TestOriginGateProxyPreservedHost(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/logout", strings.NewReader(""))
 	req.Host = "pulsemon.example.com" // what a Host-preserving proxy forwards
 	req.Header.Set("Origin", "https://pulsemon.example.com")
+	req.Header.Set("X-Forwarded-Proto", "https") // what Caddy sets
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -291,5 +300,48 @@ func TestOriginGateProxyPreservedHost(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("proxy-preserved Host: got %d, want 200", resp.StatusCode)
+	}
+}
+
+// TestOriginGateSchemeMismatchRefused pins the finding-23 scheme arm: the
+// Origin's scheme must equal the request's EXTERNAL scheme. Pre-fix the gate
+// compared only the host, so an http:// page on the SAME host passed against
+// the (https) dashboard — a same-host, scheme-mismatch CSRF vector that
+// SameSite=Strict does not stop (a same-site http page can still fire a
+// credentials-including POST at the https origin on some deployments). The
+// test server is plain HTTP (requestScheme = "http"), so an https Origin with
+// a matching host is refused, and the matching http Origin passes.
+func TestOriginGateSchemeMismatchRefused(t *testing.T) {
+	db := newTestDB(t)
+	srv := NewServer(db, NewProbeWorker(db))
+	httpSrv := httptest.NewServer(srv.authGate())
+	defer httpSrv.Close()
+	host := strings.TrimPrefix(httpSrv.URL, "http://")
+
+	bootstrapAdmin(t, &http.Client{}, httpSrv.URL)
+
+	// https Origin, same host, but the request is plain HTTP (no trusted
+	// proxy reporting https) → scheme mismatch → 403.
+	req, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/logout", strings.NewReader(""))
+	req.Header.Set("Origin", "https://"+host)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("scheme-mismatch Origin (https vs http request): got %d, want 403", resp.StatusCode)
+	}
+
+	// Control: the matching http Origin on the same host passes.
+	req2, _ := http.NewRequest(http.MethodPost, httpSrv.URL+"/api/auth/logout", strings.NewReader(""))
+	req2.Header.Set("Origin", "http://"+host)
+	resp2, err := http.DefaultClient.Do(req2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("matching-scheme Origin (http vs http): got %d, want 200", resp2.StatusCode)
 	}
 }

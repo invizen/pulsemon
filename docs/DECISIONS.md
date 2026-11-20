@@ -3098,3 +3098,64 @@ refusal, probe-failure error path) and `settings_snapshot_test.go`
 (payload values from the single row-set). (d)'s `db.Close()` has no
 observable state on `*sql.DB`, so it is verified by inspection; the
 probe-failure test pins the error path itself.
+
+## platform-transport-script-edge-cases
+
+Finding #23 (2026-11-19/20 local). Seven fixes across platform, transport,
+and install-script edge cases:
+- `ping_windows.go` closed its Winsock socket with `windows.Close(fd)` (a
+  handle/pipe-end close) instead of `windows.Closesocket(fd)`. Both the
+  Bind-error path and `winDgram.close()` now call `Closesocket`.
+- `readerRestartDelay` (ping.go, ping_linux.go, ping_windows.go) and
+  `recoveryRetryDelay` (alerts.go) were read INSIDE the spawned goroutine
+  (`time.After(<var>)` in the `go func()` body), violating the repo's -race
+  capture rule: tests swap the package var and restore it, but the goroutine
+  outlives the restore, so the read raced the write. Each site now captures
+  `delay := <var>` before `go func()`.
+- `smtp.go` ran the STARTTLS probe in `case "auto"` even when the conn was
+  already implicit-TLS (auto+465), and had no fail-closed default for an
+  unknown `tls_mode` (it fell through to plaintext). `wantsStartTLS()` is
+  now the switch's predicate (auto+465 → false, so no nested STARTTLS on the
+  already-encrypted wire), and an unknown mode returns
+  `smtp: unknown tls_mode` before any plaintext send.
+- `hostAllowed` used `net.SplitHostPort` on the allowlist entry, which
+  rejects a bracketed no-port value — so `PULSEMON_ALLOWED_HOSTS=[::1]`
+  never matched `Host: [::1]:9299` (only the bare `::1` form worked).
+  `splitHostPortLenient()` now strips brackets, so both forms match.
+- `authGate`'s Origin check compared only the host, so an `http://` page on
+  the same host passed against the (https) dashboard. It now also compares
+  the Origin scheme against `requestScheme(r)` (https over direct TLS or a
+  trusted proxy reporting `X-Forwarded-Proto: https` — the same rule as
+  cookieSecure), so a same-host scheme mismatch is refused.
+- `runRestartCommand` ran the BLOCKING `restartSystemdService()` before
+  checking `isSystemdManaged()`, so a systemd-managed process called
+  systemctl on itself (a self-restart that hangs on its stop phase). It now
+  checks `isSystemdManaged()` first and takes the detached-helper branch
+  (helper spawn failure is reported, not fallen through). The TLS settings
+  response reported `"restarting": true` even on Windows (where
+  `requestRestart()` never restarts); it now reports `autoRestarts()`
+  (win=false, linux=true). The Windows SCM `WaitHint` was 10000ms — shorter
+  than the 30s shutdown drain — and is now 40000ms.
+- `install.sh` created `API_JSON` (mktemp) BEFORE the EXIT trap existed (a
+  grep/sed failure under set -e leaked the temp file), did not validate
+  `$VERSION` before interpolating it into download URLs, and omitted
+  `--proto '=https' --tlsv1.2` on the GitHub curls. TMP+trap now come first
+  with API_JSON under TMP, `$VERSION` is validated as `vX.Y.Z[-pre]` before
+  URL use, and the four hardcoded GitHub curls pin https/TLS1.2+. The
+  `Dockerfile` copied the CA bundle from EOL `alpine:3.20`; it now copies it
+  from the builder stage (golang:1.27.4-alpine).
+
+Pins: `smtp_tls_mode_test.go` (wantsStartTLS matrix incl. auto+465→false,
+unknown-mode fail-closed e2e, auto-plaintext positive control),
+`host_allowed_test.go` (bracketed-IPv6 match + splitHostPortLenient
+contract), `restart_command_test.go` (systemd-managed takes the helper
+branch, external caller blocks, helper failure reports; autoRestarts
+linux=true), and `csrf_test.go` (TestOriginGateSchemeMismatchRefused + the
+proxy-preserved-host test now exercises a trusted proxy + X-Forwarded-Proto).
+install.sh / Dockerfile are pinned by `bash -n`, the release-sig-harness
+extraction (confirmed unaffected), and the VERSION regex (valid tags
+accepted; path-traversal / spaces / no-v refused) on the gate box.
+Sabotage-verified: reverting the hostAllowed reqHost capture →
+TestHostAllowedBracketedIPv6 fails; reverting the auto+465 guard →
+TestWantsStartTLSMatrix fails. GOOS windows cross-build clean
+(`GOOS=windows go build .`).

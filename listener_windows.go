@@ -15,6 +15,12 @@ func isContainer() bool { return false }
 // isSystemdManaged is always false on Windows: there is no systemd.
 func isSystemdManaged() bool { return false }
 
+// autoRestarts reports whether requestRestart on this platform actually
+// performs a restart. On Windows it never does (the service can't re-exec
+// itself; it returns a hint), so the TLS settings response reports
+// "restarting": false rather than falsely claiming a restart is underway.
+func autoRestarts() bool { return false }
+
 // requestRestart makes a listener config change take effect. On Windows the
 // process is a service managed by the SCM, so it cannot re-exec itself the
 // way the Linux bare-process path does. The first-cut behavior is to tell

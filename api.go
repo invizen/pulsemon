@@ -245,25 +245,47 @@ func parseAllowedHosts(v string) []string {
 	return out
 }
 
-// hostAllowed reports whether r.Host matches the allowlist. An entry with a port must equal r.Host exactly; an entry without a
-// port matches r.Host or r.Host's host portion (port stripped). Matching is
-// case-insensitive. r.Host is client-controlled, so this is the only Host
-// check that a DNS-rebinding page can't satisfy — the Origin==Host CSRF gate
-// compares two values the attacker's page both controls.
-func (s *Server) hostAllowed(host string) bool {
-	host = strings.ToLower(host)
-	bare := host
-	if h, _, err := net.SplitHostPort(host); err == nil {
-		bare = h
+// splitHostPortLenient splits a host[:port] value into its bare host (no
+// port, no brackets) and port. Unlike net.SplitHostPort it also accepts a
+// bracketed IPv6 with NO port ("[::1]"), which SplitHostPort rejects — the
+// allowlist commonly stores IPv6 that way. It returns the bare host, the
+// port ("" if none), and whether a port was present.
+func splitHostPortLenient(v string) (host, port string, hasPort bool) {
+	v = strings.ToLower(strings.TrimSpace(v))
+	if strings.HasPrefix(v, "[") {
+		if end := strings.IndexByte(v, ']'); end >= 0 {
+			host = v[1:end]
+			rest := v[end+1:]
+			if strings.HasPrefix(rest, ":") {
+				return host, rest[1:], true
+			}
+			return host, "", false
+		}
 	}
+	if h, p, err := net.SplitHostPort(v); err == nil {
+		return h, p, true
+	}
+	return v, "", false
+}
+
+// hostAllowed reports whether r.Host matches the allowlist. An entry with a port must equal r.Host exactly; an entry without a
+// port matches r.Host's host portion (any port). Matching is case-insensitive
+// and bracket-agnostic, so a bracketed IPv6 entry ([::1]) matches a request
+// to [::1]:9299 the same way a bare entry (::1) does. r.Host is
+// client-controlled, so this is the only Host check that a DNS-rebinding
+// page can't satisfy — the Origin==Host CSRF gate compares two values the
+// attacker's page both controls.
+func (s *Server) hostAllowed(host string) bool {
+	reqHost, _, _ := splitHostPortLenient(host)
 	for _, a := range s.allowedHosts {
-		if _, _, err := net.SplitHostPort(a); err == nil {
-			if a == host {
+		entHost, _, entHasPort := splitHostPortLenient(a)
+		if entHasPort {
+			if strings.EqualFold(a, host) {
 				return true
 			}
 			continue
 		}
-		if a == host || a == bare || "["+a+"]" == bare {
+		if entHost == reqHost {
 			return true
 		}
 	}
@@ -404,7 +426,17 @@ func (s *Server) authGate() http.Handler {
 				// pass (the arm is skipped when Origin is absent), so
 				// rejecting it breaks nothing — the gate must never treat
 				// "no origin host" as equal to "no request host".
-				if err != nil || u.Host == "" || r.Host == "" || !strings.EqualFold(u.Host, r.Host) {
+				// Reject a scheme mismatch too: the browser's Origin scheme
+				// must equal the EXTERNAL scheme of the request (https over
+				// direct TLS or a trusted proxy reporting https). Without
+				// this, an http:// page on the same host passes the host
+				// check and CSRFs the https dashboard (scheme is not part of
+				// the host comparison). requestScheme uses the same
+				// trusted-peer rule as cookieSecure, so a direct attacker
+				// can't spoof it.
+				if err != nil || u.Host == "" || r.Host == "" ||
+					!strings.EqualFold(u.Host, r.Host) ||
+					!strings.EqualFold(u.Scheme, s.requestScheme(r)) {
 					respondWithError(w, http.StatusForbidden, "cross-origin request blocked")
 					return
 				}

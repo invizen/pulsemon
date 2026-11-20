@@ -32,7 +32,12 @@ FROM scratch
 # no dynamic loader or libc is needed, and the web UI is compiled in via
 # go:embed, so there is nothing else to ship.
 COPY --from=builder /app/pulsemon /pulsemon
-COPY --from=alpine:3.20 /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+# CA bundle comes from the BUILDER stage (golang:1.27.4-alpine), not from a
+# separate alpine:3.20 pull: the pinned 3.20 tag is EOL (no more security
+# updates to its ca-certificates), and a second image pull is an extra
+# supply-chain surface that can drift / be tampered with. The builder is
+# Alpine-based and already carries /etc/ssl/certs/ca-certificates.crt.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 WORKDIR /
 ENV PULSEMON_DB=/data/pulsemon.db
 EXPOSE 9299

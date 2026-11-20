@@ -2384,3 +2384,21 @@ func (s *Server) cookieSecure(r *http.Request) bool {
 	return s.auth.trustedPeer(peerIP(r)) &&
 		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 }
+
+// requestScheme reports the EXTERNAL scheme of the request: "https" over
+// direct TLS, and — for a TLS-terminating reverse proxy — when the immediate
+// TCP peer is in PULSEMON_TRUSTED_PROXIES and reports X-Forwarded-Proto:
+// https; "http" otherwise. The Origin CSRF gate compares the browser's
+// Origin scheme against this, so an http:// page can never masquerade as the
+// https dashboard's own origin (and vice versa). Same trusted-peer rule as
+// cookieSecure, so a direct attacker cannot spoof it.
+func (s *Server) requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	if s.auth.trustedPeer(peerIP(r)) &&
+		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
+		return "https"
+	}
+	return "http"
+}

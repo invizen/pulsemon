@@ -386,6 +386,11 @@ func (e *Engine) run() {
 		return
 	}
 	e.wg.Add(1)
+	// Capture the restart delay BEFORE spawning: the repo's -race rule
+	// forbids reading a package var (tests swap it) inside a spawned
+	// goroutine — the reader outlives the test's restore, and the
+	// unsynchronized read/write is a data race the detector flags.
+	delay := readerRestartDelay
 	go func() {
 		defer e.wg.Done()
 		for {
@@ -393,7 +398,7 @@ func (e *Engine) run() {
 			select { // readRaw returns on done (clean) or an unexpected error: supervise it
 			case <-e.done:
 				return
-			case <-time.After(readerRestartDelay):
+			case <-time.After(delay):
 				log.Printf("pulsemon: icmp reader (raw) restarted after an unexpected stop")
 			}
 		}

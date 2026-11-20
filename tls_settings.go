@@ -471,7 +471,7 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 	// net/http time to write the response to the wire.
 	respondWithJSON(w, http.StatusOK, map[string]any{
 		"status":     "applied",
-		"restarting": true,
+		"restarting": autoRestarts(),
 		"tls":        s.tlsPayload(),
 	})
 	if f, ok := w.(http.Flusher); ok {
@@ -517,7 +517,7 @@ func (s *Server) handleTLSSettingsDelete(w http.ResponseWriter, r *http.Request)
 	log.Printf("TLS: certificate removed — reverting to plain HTTP on %s", listenAddr())
 	respondWithJSON(w, http.StatusOK, map[string]any{
 		"status":     "removed",
-		"restarting": true,
+		"restarting": autoRestarts(),
 	})
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()

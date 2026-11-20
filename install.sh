@@ -88,27 +88,41 @@ echo "pulsemon: installing ${VERSION} for user '$USER'"
 mkdir -p "$PREFIX" "$PREFIX/data"
 
 # --- 1. download + verify -----------------------------------------------------
+# TMP and the EXIT trap are set up FIRST, and API_JSON lives UNDER TMP, so
+# the trap removes it on every exit path. The old order created API_JSON
+# with mktemp() before the trap existed and cleaned it up only inline — a
+# grep/sed failure under set -e (no tag_name in a corrupt API response)
+# leaked the temp file.
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
 if [ "$VERSION" = "latest" ]; then
   # Fetch the JSON to a file BEFORE parsing: piping curl into `grep -m1`
   # is flaky under `set -o pipefail` — grep exits after the first match,
   # curl's next write gets SIGPIPE (exit 23), and the pipeline aborts.
   # How often it trips depends on whether the whole API response fits in
   # a single write before the pipe closes.
-  API_JSON="$(mktemp)"
-  curl -sf "https://api.github.com/repos/$REPO/releases/latest" -o "$API_JSON" || {
+  API_JSON="$TMP/api.json"
+  curl -sf --proto '=https' --tlsv1.2 "https://api.github.com/repos/$REPO/releases/latest" -o "$API_JSON" || {
     echo "pulsemon: could not reach the GitHub API (latest release lookup failed)" >&2
-    rm -f "$API_JSON"; exit 1; }
+    exit 1; }
   VERSION="$(grep -m1 '"tag_name"' "$API_JSON" | sed 's/.*"tag_name": *"//;s/".*//')"
-  rm -f "$API_JSON"
 fi
 [ -n "$VERSION" ] || { echo "pulsemon: could not resolve version" >&2; exit 1; }
 
-BASE="https://github.com/$REPO/releases/download/$VERSION"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# Validate the resolved version BEFORE it is interpolated into download
+# URLs: a malformed or malicious tag (path traversal, spaces, a leading
+# slash) would otherwise be planted into $BASE. Tags are vX.Y.Z with an
+# optional -prerelease suffix.
+if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+  echo "pulsemon: invalid version '$VERSION' (expected vX.Y.Z) — refusing to install" >&2
+  exit 1
+fi
 
-curl -sfL -o "$TMP/$ASSET" "$BASE/$ASSET"
-curl -sfL -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256" || {
+BASE="https://github.com/$REPO/releases/download/$VERSION"
+
+curl -sfL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET" "$BASE/$ASSET"
+curl -sfL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET.sha256" "$BASE/$ASSET.sha256" || {
   echo "pulsemon: release $VERSION has no published $ASSET.sha256 digest — refusing to install" >&2
   echo "        (an unverified binary is worse than no update; check github.com/$REPO/releases/$VERSION)" >&2
   exit 1; }
@@ -159,7 +173,7 @@ hex2bin() {
 curl -sfL -o "$TMP/release_pubkeys" "$PUBKEYS_URL" || {
   echo "pulsemon: could not fetch release_pubkeys from main — refusing to install an unverifiable binary" >&2
   exit 1; }
-curl -sfL -o "$TMP/$ASSET.sig" "$BASE/$ASSET.sig" || {
+curl -sfL --proto '=https' --tlsv1.2 -o "$TMP/$ASSET.sig" "$BASE/$ASSET.sig" || {
   echo "pulsemon: release $VERSION has no published $ASSET.sig signature — refusing to install" >&2
   echo "        (the in-app updater requires it; a first install must not be weaker)" >&2
   exit 1; }

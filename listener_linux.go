@@ -31,6 +31,13 @@ func isSystemdManaged() bool {
 	return os.Getenv("SYSTEMD_EXEC_PID") != ""
 }
 
+// autoRestarts reports whether requestRestart on this platform actually
+// performs a restart. On Linux it does in every runtime: the systemd path
+// spawns a detached helper, the container path SIGTERMs the entrypoint, and
+// the bare-process path re-execs. So the TLS settings response can report
+// "restarting": true.
+func autoRestarts() bool { return true }
+
 // requestRestart makes a listener config change take effect. The listener
 // binds at startup, so a config change needs a fresh process. Each runtime
 // has its own respawn mechanism:
@@ -140,33 +147,58 @@ func reexec() error {
 	return cmd.Start()
 }
 
+// startRestartHelper spawns the detached `pulsemon restart` helper that
+// performs the actual systemctl restart. The helper must NOT inherit
+// SYSTEMD_EXEC_PID (it acts as an external caller, not the service). It is
+// invoked through startRestartHelperFn so the systemd-managed path of
+// runRestartCommand is testable WITHOUT spawning a real process.
+func startRestartHelper() error {
+	exe, _ := os.Executable()
+	cmd := exec.Command(exe, "restart")
+	cmd.Env = filterEnv("SYSTEMD_EXEC_PID=")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd.Start()
+}
+
+// startRestartHelperFn and restartSystemdServiceFn are the two external side
+// effects of runRestartCommand, exposed as vars so tests can verify the
+// systemd-managed path takes the helper branch (and NEVER the blocking
+// self-restart) without spawning a real helper or calling systemctl. Access
+// is single-goroutine (the subcommand dispatch), so no lock is needed.
+var (
+	startRestartHelperFn    = startRestartHelper
+	restartSystemdServiceFn = restartSystemdService
+)
+
 // runRestartCommand is the manual `pulsemon restart` subcommand: restart
-// the pulsemon installation on this box (an external caller, so blocking
-// on systemctl is fine):
-//   - systemd service (user, then system) → systemctl restart
+// the pulsemon installation on this box:
+//   - we ARE the systemd service → a detached `pulsemon restart` helper
+//     runs `systemctl restart` (we cannot block on our own restart:
+//     systemctl would target this very process and hang on its stop
+//     phase). Checked FIRST so the blocking path is never reached.
+//   - external caller (console, the detached helper) → systemctl restart
+//     (blocking is fine: a separate process)
 //   - inside a container → SIGTERM to PID 1 (the entrypoint); the
 //     container's restart policy respawns it
 //   - otherwise → hint (a bare process has no manager to ask)
 func runRestartCommand() dispatchKind {
-	if err := restartSystemdService(); err == nil {
+	if isSystemdManaged() {
+		// We ARE the service process: cannot block on our own restart.
+		// Ask a detached helper; on failure report it rather than fall
+		// through to the blocking self-restart (which would hang).
+		if err := startRestartHelperFn(); err != nil {
+			fmt.Fprintf(os.Stderr, "pulsemon: failed to start the restart helper: %v\n", err)
+			return dExit1
+		}
+		return dExit0
+	}
+	if err := restartSystemdServiceFn(); err == nil {
 		fmt.Println("pulsemon: service restarted")
 		return dExit0
 	}
 	if isContainer() {
 		if err := syscall.Kill(1, syscall.SIGTERM); err == nil {
 			log.Println("pulsemon: signalled the entrypoint; the container's restart policy respawns it")
-			return dExit0
-		}
-	}
-	if isSystemdManaged() {
-		// We ARE the service process: cannot block on our own restart.
-		// Ask a detached helper and let the stop phase's SIGTERM drive
-		// the clean shutdown (server context) / exit (subcommand).
-		exe, _ := os.Executable()
-		cmd := exec.Command(exe, "restart")
-		cmd.Env = filterEnv("SYSTEMD_EXEC_PID=")
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-		if err := cmd.Start(); err == nil {
 			return dExit0
 		}
 	}

@@ -33,7 +33,7 @@ func newWinDgram() (*winDgram, error) {
 		return nil, err
 	}
 	if err := windows.Bind(fd, &windows.SockaddrInet4{}); err != nil {
-		_ = windows.Close(fd)
+		_ = windows.Closesocket(fd)
 		return nil, err
 	}
 	return &winDgram{fd: fd}, nil
@@ -55,12 +55,17 @@ func (t *winDgram) send(dst net.IP, seq uint16) error {
 	return windows.Sendto(t.fd, msg, 0, addr)
 }
 
-func (t *winDgram) close() error { return windows.Close(t.fd) }
+func (t *winDgram) close() error { return windows.Closesocket(t.fd) }
 
 // run starts the reader goroutine, tracked by the Engine's wg so Close() can
 // block until it has stopped.
 func (t *winDgram) run(e *Engine) {
 	e.wg.Add(1)
+	// Capture the restart delay BEFORE spawning: the repo's -race rule
+	// forbids reading a package var (tests swap it) inside a spawned
+	// goroutine — the reader outlives the test's restore, and the
+	// unsynchronized read/write is a data race the detector flags.
+	delay := readerRestartDelay
 	go func() {
 		defer e.wg.Done()
 		// Supervisor loop, mirroring the Linux dgram
@@ -77,7 +82,7 @@ func (t *winDgram) run(e *Engine) {
 			select {
 			case <-e.done:
 				return
-			case <-time.After(readerRestartDelay):
+			case <-time.After(delay):
 				log.Printf("pulsemon: icmp reader (win dgram) restarted after an unexpected stop")
 			}
 		}

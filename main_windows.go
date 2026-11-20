@@ -118,7 +118,7 @@ func (h *pulsemonHandler) Execute(args []string, r <-chan svc.ChangeRequest, s c
 				// without it the SCM still believes the service is
 				// Running and its stop timer can kill the process mid
 				// drain on box shutdown.
-				s <- svc.Status{State: svc.StopPending, WaitHint: 10000}
+				s <- svc.Status{State: svc.StopPending, WaitHint: 40000}
 				close(stop)
 				<-done
 				s <- svc.Status{State: svc.Stopped}
@@ -131,7 +131,7 @@ func (h *pulsemonHandler) Execute(args []string, r <-chan svc.ChangeRequest, s c
 				// finishes its graceful drain; the hint tells the SCM
 				// we are alive and working, so a slow-but-progressing
 				// shutdown is not killed.
-				s <- svc.Status{State: svc.StopPending, WaitHint: 10000}
+				s <- svc.Status{State: svc.StopPending, WaitHint: 40000}
 				close(stop)
 				<-done // wait for the clean shutdown before reporting Stopped
 				s <- svc.Status{State: svc.Stopped}

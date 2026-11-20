@@ -605,9 +605,15 @@ var recoveryRetryDelay = time.Minute
 //     rows are correct, only the notification is lost, and an endless
 //     retry loop against a dead provider is worse.
 func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newStatus string, rttMs float64) {
+	// Capture the delay BEFORE spawning: the repo's -race rule forbids
+	// reading a package var (tests swap it) inside the goroutine — the
+	// retry outlives the test's restore, and the unsynchronized read/write
+	// is a data race the detector flags (same discipline as enqueueAlert,
+	// which passes alertGateIdle as a parameter).
+	delay := recoveryRetryDelay
 	pw.launchAlert(func() {
 		select {
-		case <-time.After(recoveryRetryDelay):
+		case <-time.After(delay):
 		case <-pw.stopCtx.Done():
 			return
 		}

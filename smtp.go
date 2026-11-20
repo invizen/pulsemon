@@ -205,6 +205,25 @@ func (pw *ProbeWorker) sendSMTP(ctx context.Context, subject, body string) error
 	return pw.sendSMTPWith(ctx, cfg, subject, body)
 }
 
+// wantsStartTLS reports whether sendSMTPWith should attempt a STARTTLS
+// upgrade after the (optional) implicit handshake: always for "starttls"
+// (required), for "auto" on a non-465 port (opportunistic — auto+465 is
+// implicit TLS, where a nested STARTTLS on the already-encrypted wire would
+// fail), never for "none"/"tls". Unknown modes return false here; the
+// caller's fail-closed default turns them into a hard error before any wire
+// is used. Pure, so the 465 guard is testable without a live SMTP+TLS
+// conversation.
+func wantsStartTLS(cfg smtpConfig) bool {
+	switch cfg.TLS {
+	case "starttls":
+		return true
+	case "auto":
+		return cfg.Port != 465
+	default:
+		return false
+	}
+}
+
 // sendSMTPWith delivers with an already-resolved config (zero settings
 // reads on the delivery hot path).
 func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject, body string) error {
@@ -268,14 +287,26 @@ func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject
 		tlsOn = true
 	case "auto":
 		// Opportunistic: only if the server advertises STARTTLS in EHLO.
-		if ok, _ := c.Extension("STARTTLS"); ok {
-			if err := c.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
-				return fmt.Errorf("smtp starttls: %w", err)
+		// Skipped when the conn is already implicit-TLS (auto+465): a
+		// nested STARTTLS on the already-encrypted wire would fail.
+		if wantsStartTLS(cfg) {
+			if ok, _ := c.Extension("STARTTLS"); ok {
+				if err := c.StartTLS(&tls.Config{ServerName: cfg.Host}); err != nil {
+					return fmt.Errorf("smtp starttls: %w", err)
+				}
+				tlsOn = true
 			}
-			tlsOn = true
 		}
 	case "none":
 		// no TLS
+	case "tls":
+		// implicit TLS was applied above (handshake on the raw conn); no
+		// STARTTLS.
+	default:
+		// Fail closed: an unknown tls_mode (a legacy/corrupt stored value
+		// that slipped past save-time validation) must never silently fall
+		// through to plaintext.
+		return fmt.Errorf("smtp: unknown tls_mode %q", cfg.TLS)
 	}
 
 	// Q1: what TLS state did we ACTUALLY end up in?
