@@ -1887,39 +1887,15 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "tag query parameter is required")
 			return
 		}
-		// Collect the tagged sensors BEFORE the delete: each probe loop
-		// holds a spawn-time copy of its tag set (alert routing reads
-		// c.tags from that copy), so every affected loop must be respawned
-		// to pick up the new set. Without this, a sensor that just left the
-		// alert_filter's tag scope keeps the stale routing (alerts it
-		// shouldn't send, or silence it should have) until the next process
-		// restart.
-		var tagged []string
-		rows, err := s.db.QueryContext(r.Context(), "SELECT sensor_id FROM sensor_tags WHERE tag = ?", tag)
-		if err != nil {
-			respondInternal(w, "delete tag "+tag, err)
-			return
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
-				// A skipped id is safe (the rows.Err() check below 500s a
-				// mid-stream failure), but log it like the other per-row
-				// scans.
-				log.Printf("API: skipping corrupt sensor_tags row for tag %s: %v", logSafe(tag), err)
-			} else {
-				tagged = append(tagged, id)
-			}
-		}
-		if err := rows.Err(); err != nil {
-			// Fail before DeleteTag: a truncated tagged list would delete
-			// the tag while leaving some loops un-respawned with stale
-			// alert routing.
-			respondInternal(w, "delete tag "+tag, err)
-			return
-		}
-		n, err := s.db.DeleteTag(r.Context(), tag)
+		// Collect the tagged sensors atomically WITH the delete: each
+		// probe loop holds a spawn-time copy of its tag set (alert
+		// routing reads c.tags from that copy), so every affected loop
+		// must be respawned to pick up the new set. DELETE ... RETURNING
+		// hands back exactly the rows removed — no SELECT→DELETE window
+		// in which a sensor gaining/losing the tag could stale the list
+		// (a loop keeping alert routing for a tag it no longer has).
+		// History: docs/DECISIONS.md → db-ctx-torn-reads-resources
+		tagged, err := s.db.DeleteTagReturning(r.Context(), tag)
 		if err != nil {
 			respondInternal(w, "delete tag "+tag, err)
 			return
@@ -1937,7 +1913,7 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 		for _, id := range tagged {
 			s.probeWorker.Restart(id)
 		}
-		respondWithJSON(w, http.StatusOK, map[string]any{"status": "deleted", "sensors_updated": n})
+		respondWithJSON(w, http.StatusOK, map[string]any{"status": "deleted", "sensors_updated": len(tagged)})
 	default:
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -2118,30 +2094,30 @@ func webhookMasked(raw string) string {
 // A read failure is now an error: the handlers 500 and the UI shows
 // "Failed to load settings" instead of an editable form of fabrications.
 func (s *Server) settingsPayload() (map[string]any, error) {
-	scope, err := s.db.GetSettingErr("alert_scope")
+	// ONE settings snapshot, not six: each GetSettingErr was its own
+	// query on its own pool connection, so a concurrent PUT
+	// /api/settings could land between reads and mix pre- and
+	// post-update values in one payload (e.g. alert_scope "tagged"
+	// beside a stale empty alert_filter). GetAllSettings is a single
+	// statement — one consistent row-set, one round trip. History:
+	// docs/DECISIONS.md → db-ctx-torn-reads-resources
+	settings, err := s.db.GetAllSettings()
 	if err != nil {
-		return nil, fmt.Errorf("read alert_scope: %w", err)
+		return nil, fmt.Errorf("read settings: %w", err)
 	}
+	scope := settings["alert_scope"]
 	if scope == "" {
 		scope = "all"
 	}
 	filter := []string{}
-	f, err := s.db.GetSettingErr("alert_filter")
-	if err != nil {
-		return nil, fmt.Errorf("read alert_filter: %w", err)
-	}
-	if f != "" {
+	if f := settings["alert_filter"]; f != "" {
 		_ = json.Unmarshal([]byte(f), &filter)
 	}
 	if filter == nil {
 		filter = []string{}
 	}
 	realert := 30
-	rv, err := s.db.GetSettingErr("realert_min")
-	if err != nil {
-		return nil, fmt.Errorf("read realert_min: %w", err)
-	}
-	if rv != "" {
+	if rv := settings["realert_min"]; rv != "" {
 		if n, err := strconv.Atoi(rv); err == nil && n >= 0 && n <= 1440 {
 			realert = n
 		}
@@ -2149,10 +2125,7 @@ func (s *Server) settingsPayload() (map[string]any, error) {
 	// Legacy single-webhook fields stay for backward compat with older
 	// dashboards (and the env-configured Google Chat URL, which has no
 	// settings row). The multi-provider "providers" array is the real data.
-	chatURL, err := s.db.GetSettingErr("google_chat_url")
-	if err != nil {
-		return nil, fmt.Errorf("read google_chat_url: %w", err)
-	}
+	chatURL := settings["google_chat_url"]
 	chatSource := "none"
 	if chatURL != "" {
 		chatSource = "dashboard"
@@ -2160,14 +2133,8 @@ func (s *Server) settingsPayload() (map[string]any, error) {
 		chatURL = os.Getenv("GOOGLE_CHAT_WEBHOOK_URL")
 		chatSource = "env"
 	}
-	maint, err := s.db.GetSettingErr("maintenance_mode")
-	if err != nil {
-		return nil, fmt.Errorf("read maintenance_mode: %w", err)
-	}
-	unauth, err := s.db.GetSettingErr("allow_unauth_update")
-	if err != nil {
-		return nil, fmt.Errorf("read allow_unauth_update: %w", err)
-	}
+	maint := settings["maintenance_mode"]
+	unauth := settings["allow_unauth_update"]
 	// The providers array is built fail-loud too: it
 	// embeds every provider's enabled/has_url/url/extra reads, and a
 	// swallowed DB error there answered 200 with silent "false" provider

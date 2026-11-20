@@ -3070,3 +3070,31 @@ branch → `TestUpdateAPIVerifyFetchFailureRedacted` fails with the
 dead upstream's 127.0.0.1:PORT in the 502 body; restoring the
 `ContentLength > 0` gate → `TestUpdateAPIChunkedBodyHonored` fails
 with 200 up-to-date (the chunked pin was dropped).
+
+## db-ctx-torn-reads-resources
+
+Finding #22 (2026-11-19/20 local). Five fixes:
+- `applyMaintenanceTx` now takes ctx and runs every step via
+  `ExecContext` — a dead request context aborts a maintenance
+  transition instead of parking it on the write lock.
+- `settingsPayload` reads ONE `GetAllSettings` row-set instead of six
+  separate `GetSettingErr` queries (each on its own pool connection):
+  a concurrent PUT /api/settings can no longer interleave the reads
+  and mix pre-/post-update values in one payload; one round trip.
+- DELETE /api/tags: the pre-SELECT sensor_id → DeleteTag pair was a
+  TOCTOU window (a sensor gaining/losing the tag in between staled the
+  probe-loop respawn list). It is now one `DELETE ... RETURNING
+  sensor_id` via `DeleteTagReturning` — the respawn list is exactly the
+  rows removed, by construction.
+- `NewStore` closes `db` when the `SELECT 1` probe fails (the pool was
+  real; the failure path leaked the handle).
+- `InitSchema` fails loudly when `user_version > schemaVersionHead` —
+  a DB stamped by a NEWER binary is no longer silently accepted by an
+  older build whose migration list cannot read its schema.
+
+Pins: `internal/store/ctx_resources_test.go` (ctx-aware maintenance
+transition, DeleteTagReturning exact-row contract, newer-version
+refusal, probe-failure error path) and `settings_snapshot_test.go`
+(payload values from the single row-set). (d)'s `db.Close()` has no
+observable state on `*sql.DB`, so it is verified by inspection; the
+probe-failure test pins the error path itself.

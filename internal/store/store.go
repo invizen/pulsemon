@@ -126,6 +126,9 @@ func NewStore(dsn string) (*Store, error) {
 	db.SetConnMaxIdleTime(0)
 	// Verify the store is reachable and the pragmas applied.
 	if _, err := db.Exec("SELECT 1"); err != nil {
+		// The pool above is real: a failed probe must not leave the
+		// handle (and its idle pool) behind.
+		db.Close()
 		return nil, err
 	}
 	// Probe-write handle: the same file, busy_timeout = ProbeWriteTimeout.
@@ -288,6 +291,14 @@ func (db *Store) InitSchema() error {
 	ver, err := db.schemaVersion()
 	if err != nil {
 		return err
+	}
+	if ver > schemaVersionHead {
+		// A DB stamped by a NEWER binary: this build's migration list
+		// has no entry for the extra step(s), so the loop below would
+		// be a pure skip that accepts a schema this binary cannot fully
+		// read. Refuse to start — restore a backup or run the newer
+		// binary. History: docs/DECISIONS.md → db-ctx-torn-reads-resources
+		return fmt.Errorf("database schema version %d is newer than this binary's %d: refusing to start with a schema it cannot fully read", ver, schemaVersionHead)
 	}
 	for v := ver; v < len(schemaMigrations); v++ {
 		if err := db.applyMigration(v+1, schemaMigrations[v]); err != nil {
@@ -802,7 +813,7 @@ func (db *Store) EnterMaintenanceWithFreshSnapshot(ctx context.Context) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	if err := applyMaintenanceTx(tx, true, ids, string(snap)); err != nil {
+	if err := applyMaintenanceTx(ctx, tx, true, ids, string(snap)); err != nil {
 		return nil, err
 	}
 	return ids, nil
@@ -839,15 +850,18 @@ func (db *Store) LeaveMaintenanceFromSnapshot(ctx context.Context) ([]string, er
 			return nil, fmt.Errorf("maintenance snapshot is not valid JSON (%q): %w", snap, err)
 		}
 	}
-	if err := applyMaintenanceTx(tx, false, ids, ""); err != nil {
+	if err := applyMaintenanceTx(ctx, tx, false, ids, ""); err != nil {
 		return nil, err
 	}
 	return ids, nil
 }
 
 // applyMaintenanceTx is the body of both maintenance transitions, running
-// on the caller's tx and committing it on success.
-func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) error {
+// on the caller's tx and committing it on success. ctx is threaded into
+// every Exec so a dead request context aborts the transition mid-statement
+// instead of parking on the write lock (History: docs/DECISIONS.md →
+// db-ctx-torn-reads-resources).
+func applyMaintenanceTx(ctx context.Context, tx *sql.Tx, on bool, ids []string, snapJSON string) error {
 
 	state := "paused"
 	modeVal := "1"
@@ -872,21 +886,21 @@ func applyMaintenanceTx(tx *sql.Tx, on bool, ids []string, snapJSON string) erro
 				q[j] = "?"
 				args = append(args, id)
 			}
-			if _, err := tx.Exec("UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...); err != nil {
+			if _, err := tx.ExecContext(ctx, "UPDATE sensors SET state = ? WHERE id IN ("+strings.Join(q, ",")+")", args...); err != nil {
 				return err
 			}
 		}
 	}
 
 	// 2. Save/clear the snapshot.
-	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		"maintenance_active_ids", snapJSON, Now()); err != nil {
 		return err
 	}
 
 	// 3. Set the mode flag.
-	if _, err := tx.Exec(`INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
+	if _, err := tx.ExecContext(ctx, `INSERT INTO settings (setting_key, value, updated_at) VALUES (?, ?, ?)
 		ON CONFLICT(setting_key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
 		"maintenance_mode", modeVal, Now()); err != nil {
 		return err
@@ -1063,6 +1077,31 @@ func (db *Store) DeleteTag(ctx context.Context, tag string) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// DeleteTagReturning removes one tag from every sensor and returns the
+// sensor ids it came off of, atomically: the old pre-SELECT + DeleteTag
+// pair left a TOCTOU window in which a sensor gaining/losing the tag
+// between the two statements made the respawn list stale (a probe loop
+// keeping alert routing for a tag it no longer has, until process
+// restart). DELETE ... RETURNING hands back exactly the rows removed,
+// so the list is correct by construction and no window exists.
+// History: docs/DECISIONS.md → db-ctx-torn-reads-resources
+func (db *Store) DeleteTagReturning(ctx context.Context, tag string) ([]string, error) {
+	rows, err := db.QueryContext(ctx, "DELETE FROM sensor_tags WHERE tag = ? RETURNING sensor_id", tag)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 // GetSetting reads a key from the settings table ("" when absent).
