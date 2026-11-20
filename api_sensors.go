@@ -190,6 +190,27 @@ func (s *Server) fillHTTPView(v *SensorView) {
 	v.HTTPStatus, v.CertExpiry = s.probeWorker.LastHTTPStatus(v.ID)
 }
 
+// viewerTarget returns the target for the CALLER: the raw stored target for
+// admins (and auth-off installs — the trusted-LAN single-operator mode,
+// where requireAdmin stands down), and the userinfo-stripped form for
+// non-admin sessions. The redaction reuses alertTarget (the alert cards'
+// raw-string last-'@' cut, parse-failure safe), so a viewer account can
+// never read the credentials an operator stored in an http target
+// (https://user:pass@host/). Non-URL targets (bare IP, host:port) have no
+// authority and come back unchanged.
+//
+// View-only: the DB row is untouched, and the edit modal is admin-only, so
+// a masked value can never be saved back — the reason target masking was
+// previously declined for the shared UI does not apply to this read path.
+// History: docs/DECISIONS.md → viewer-target-redaction.
+
+func (s *Server) viewerTarget(r *http.Request, target string) string {
+	if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
+		return alertTarget(target)
+	}
+	return target
+}
+
 func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -201,6 +222,11 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		views := make([]SensorView, 0, len(sensors))
 		for _, sn := range sensors {
 			v := SensorView{Sensor: sn}
+			// Viewers (non-admin sessions) get the target with any
+			// userinfo stripped — the stored target can carry operator
+			// credentials (https://user:pass@host/), which the
+			// admin-only settings gate exists to keep from them.
+			v.Target = s.viewerTarget(r, v.Target)
 			if sn.State == "active" {
 				// In-memory stats (v0.1.18): one map lookup, no per-sensor
 				// SQLite queries. This was 4 queries per sensor per poll —
@@ -397,6 +423,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "get sensor tags "+id, err)
 			return
 		}
+		// Same viewer redaction as the list path: a non-admin session
+		// must not read credentials stored in the target.
+		sn.Target = s.viewerTarget(r, sn.Target)
 		v := SensorView{Sensor: sn}
 		if sn.State == "active" {
 			v.Stats = s.probeWorker.GetStats(id)

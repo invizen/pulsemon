@@ -3421,3 +3421,28 @@ Windows-complete until the offline `.sig` is uploaded and verifies with the
 5-arg manifest form) and the grep gate `! grep -rn
 'secrets.RELEASE_SIGNING_KEY' .github/` (the workflow must not reference the
 secret again — a plain-text mention in a comment is fine).
+
+## viewer-target-redaction (api_sensors.go, target_redaction_test.go, 2026-11-20)
+
+**Decision:** `GET /api/sensors` and `GET /api/sensors/{id}` now run the
+stored target through `alertTarget` (the alert cards' raw-string last-'@'
+userinfo cut) when the caller is a NON-ADMIN session — a viewer sees
+`https://user:pass@host/` as `https://host/`. Admins and auth-off installs
+(the trusted-LAN single-operator mode, where `requireAdmin` stands down)
+get the raw target. The redaction is VIEW-ONLY: the DB row is untouched,
+and the edit modal is admin-only, so a masked value can never be saved
+back — the reason target masking was previously declined for the shared UI
+does not apply to this read path.
+**Why:** the settings reads are admin-only, but the sensor reads are open
+to every session and returned the stored target verbatim — a viewer
+account could read the credentials an operator stored in an http target,
+which is exactly the data the admin-only settings gate exists to keep from
+lower-trust accounts. Reusing `alertTarget` keeps ONE redaction rule for
+both consumers (parse-failure safe, last-'@' boundary, path `'@'`
+preserved); non-URL targets (bare IP, `host:port`) have no authority and
+come back unchanged.
+**Pinned by:** `TestViewerTargetRedaction` — viewer list + by-id get the
+stripped form, the tcp target is unchanged, the admin gets the raw target
+on both paths, and the DB row is byte-identical after the viewer reads.
+Sabotage-verified: removing the `viewerTarget` call from either GET path
+turns the viewer assertions red.
