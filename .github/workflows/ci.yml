@@ -39,7 +39,13 @@ jobs:
         run: go vet ./...
 
       - name: go test -race
-        run: go test -race -count=1 ./...
+        # Explicit -timeout: the default 10m panic bomb fires MID-SUITE on a
+        # slow 2-core runner (full -race takes 8-12m here) and blames a
+        # random in-flight test — 2026-11-20, run 44645698167 died at
+        # 600.187s with TestFix_M9_ProvidersAreIndependentAndParallel 1s
+        # into a run the gate box completes in 346s. 25m keeps real hangs
+        # fatal with headroom for runner variance.
+        run: go test -race -count=1 -timeout 25m ./...
 
       # Frontend regression pins (web/test/frontend.test.mjs): the Go gate
       # above never sees web/, so a JS-only push (no Go build needed) would
