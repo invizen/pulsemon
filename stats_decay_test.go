@@ -50,7 +50,7 @@ func decayWorker(t *testing.T, id string, s probeSeries) *ProbeWorker {
 // series (an in-place "optimization" would corrupt the steady-state read
 // that follows — and race with appends under RLock).
 func TestStatsForDecays24hUptimeToNow(t *testing.T) {
-	const n = 17280 // 24h at 5s
+	const n = 17280              // 24h at 5s
 	const lossCutoff = 18 * 3600 // entries older than 18h are losses
 	var s probeSeries
 	for i := 0; i < n; i++ {

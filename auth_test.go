@@ -1208,11 +1208,14 @@ func TestLoginThrottlePerUsername(t *testing.T) {
 	}
 }
 
-// TestLoginThrottleHardCapWipesUserMaps verifies the all-or-nothing hard-cap
-// wipe (finding #11): when the per-IP map exceeds throttleHardCap, the
-// per-username maps (userFails, userLock) are reset alongside the per-IP
-// maps — the fail-open bound applies to both layers, not just the per-IP one.
-func TestLoginThrottleHardCapWipesUserMaps(t *testing.T) {
+// TestLoginThrottleHardCapWipePreservesUserMaps pins the per-map hard-cap
+// wipe (finding #20b): when the PER-IP map exceeds throttleHardCap, only
+// the per-IP layer (fails + lockout) is reset. The per-username maps are
+// strictly bounded by the existing DB accounts (recordUserFail counts
+// existing users only) and can hold an ACTIVE account lockout — the old
+// all-or-nothing wipe let a per-IP spray clear a 30/hr account lock and
+// its hourly budget mid-attack.
+func TestLoginThrottleHardCapWipePreservesUserMaps(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
 
@@ -1231,9 +1234,11 @@ func TestLoginThrottleHardCapWipesUserMaps(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		a.loginThrottle.fails[fmt.Sprintf("ip%d", i)] = []time.Time{now.Add(-time.Second)}
 	}
-	// Seed the per-username maps with active state.
+	// Seed the per-username maps with ACTIVE state (an in-flight attack).
 	a.loginThrottle.userFails["admin"] = []time.Time{now.Add(-time.Second)}
 	a.loginThrottle.userLock["admin"] = now.Add(loginLockout)
+	a.loginThrottle.userHour["admin"] = &userHourBudget{start: now, count: 29}
+	a.loginThrottle.knownGood[knownGoodKey("admin", "10.1.1.5")] = now
 
 	// Force the sweep to run on the next beginAttempt.
 	a.loginThrottle.nextSweep = time.Time{}
@@ -1244,18 +1249,29 @@ func TestLoginThrottleHardCapWipesUserMaps(t *testing.T) {
 		t.Fatal("beginAttempt rejected a fresh IP after the hard-cap wipe")
 	}
 
-	// All maps must be reset; only the new IP's entry survives.
+	// The per-IP layer is reset; only the new IP's entry survives.
 	if len(a.loginThrottle.fails) != 1 {
 		t.Fatalf("per-IP map size = %d, want 1 (only newip)", len(a.loginThrottle.fails))
 	}
 	if _, ok := a.loginThrottle.fails["newip"]; !ok {
 		t.Fatal("newip missing from per-IP map after wipe")
 	}
-	if len(a.loginThrottle.userFails) != 0 {
-		t.Fatalf("userFails size = %d, want 0 (hard-cap wipe must reset per-username fails)", len(a.loginThrottle.userFails))
+	if len(a.loginThrottle.lockout) != 0 {
+		t.Fatalf("per-IP lockout size = %d, want 0", len(a.loginThrottle.lockout))
 	}
-	if len(a.loginThrottle.userLock) != 0 {
-		t.Fatalf("userLock size = %d, want 0 (hard-cap wipe must reset per-username lockouts)", len(a.loginThrottle.userLock))
+	// The per-username layer must SURVIVE: the account lockout and hourly
+	// budget are the defense an IP spray is trying to clear.
+	if _, ok := a.loginThrottle.userFails["admin"]; !ok {
+		t.Fatal("an IP-spray hard-cap wipe cleared userFails — it must not")
+	}
+	if _, ok := a.loginThrottle.userLock["admin"]; !ok {
+		t.Fatal("an IP-spray hard-cap wipe cleared the ACTIVE account lockout — it must not")
+	}
+	if _, ok := a.loginThrottle.userHour["admin"]; !ok {
+		t.Fatal("an IP-spray hard-cap wipe cleared the hourly budget — it must not")
+	}
+	if _, ok := a.loginThrottle.knownGood[knownGoodKey("admin", "10.1.1.5")]; !ok {
+		t.Fatal("an IP-spray hard-cap wipe cleared a known-good exemption — it must not")
 	}
 }
 
@@ -1537,12 +1553,15 @@ func TestLoginThrottleSweepTriggerWatchesUserFails(t *testing.T) {
 	}
 }
 
-// TestLoginThrottleUserFailsHardCapWipe (review 2026-11-10) pins the
-// hard-cap half: the emergency all-or-nothing wipe used to fire only when
-// the PER-IP map exceeded throttleHardCap. With a 1-entry per-IP map and a
-// userFails map past the cap (every entry fresh, so the sweep prunes
-// nothing), beginAttempt must wipe ALL four maps — bounding userFails at
-// the cap even under a pure random-username spray.
+// TestLoginThrottleUserFailsHardCapWipe (review 2026-11-10, rewritten for
+// the per-map wipe, finding #20b) pins the hard-cap half: with a 1-entry
+// per-IP map and a userFails map past the cap (every entry fresh, so the
+// sweep prunes nothing), beginAttempt must wipe the per-username maps —
+// bounding userFails at the cap even under a pure random-username spray —
+// while leaving the per-IP layer (fails + lockout) INTACT: the per-username
+// overflow is an account-bound condition, not an IP condition, and wiping
+// the per-IP spray defense here would be the same over-broad reset the old
+// all-or-nothing wipe was.
 func TestLoginThrottleUserFailsHardCapWipe(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
@@ -1568,16 +1587,20 @@ func TestLoginThrottleUserFailsHardCapWipe(t *testing.T) {
 	if ok, _ := a.beginAttempt("ip2"); !ok {
 		t.Fatal("beginAttempt rejected a fresh IP after the hard-cap wipe")
 	}
+	// The per-username layer is reset (the overflow it tripped on).
 	if len(a.loginThrottle.userFails) != 0 {
 		t.Fatalf("userFails size = %d, want 0 (hard cap on len(userFails) must wipe the per-username maps)", len(a.loginThrottle.userFails))
 	}
 	if len(a.loginThrottle.userLock) != 0 {
-		t.Fatalf("userLock size = %d, want 0 (all-or-nothing wipe)", len(a.loginThrottle.userLock))
+		t.Fatalf("userLock size = %d, want 0 (per-username layer wipe)", len(a.loginThrottle.userLock))
 	}
-	// The wipe is all-or-nothing: the per-IP map is reset too, and only the
-	// new attempt's entry survives.
-	if len(a.loginThrottle.fails) != 1 {
-		t.Fatalf("per-IP map size = %d, want 1 (only ip2)", len(a.loginThrottle.fails))
+	// The per-IP layer SURVIVES: a userFails overflow says nothing about
+	// the IP layer's entries, which the per-IP hard cap bounds itself.
+	if len(a.loginThrottle.fails) != 2 {
+		t.Fatalf("per-IP map size = %d, want 2 (ip1 + ip2 — the per-IP layer is untouched by a per-username overflow)", len(a.loginThrottle.fails))
+	}
+	if _, ok := a.loginThrottle.fails["ip1"]; !ok {
+		t.Fatal("ip1 missing from the per-IP map — a per-username overflow must not clear the per-IP layer")
 	}
 	if _, ok := a.loginThrottle.fails["ip2"]; !ok {
 		t.Fatal("ip2 missing from the per-IP map after the wipe")
@@ -2852,11 +2875,14 @@ func TestLoginThrottleSweepTriggerWatchesKnownGood(t *testing.T) {
 	}
 }
 
-// TestLoginThrottleKnownGoodHardCapWipe (review 2026-11-11) is the
-// hard-cap half of the same class: with a 1-entry per-IP map and a
-// knownGood map past throttleHardCap — every entry FRESH, so the sweep
-// prunes nothing — beginAttempt must wipe ALL throttle maps, bounding
-// knownGood at the cap under a pure successful-login spray.
+// TestLoginThrottleKnownGoodHardCapWipe (review 2026-11-11, rewritten for
+// the per-map wipe, finding #20b) is the hard-cap half of the same class:
+// with a 1-entry per-IP map and a knownGood map past throttleHardCap —
+// every entry FRESH, so the sweep prunes nothing — beginAttempt must wipe
+// the knownGood map, bounding it at the cap under a pure
+// successful-login spray — while leaving the per-IP layer (fails +
+// lockout) INTACT: an exemption-map overflow says nothing about the
+// spray-defense entries, which the per-IP hard cap bounds itself.
 func TestLoginThrottleKnownGoodHardCapWipe(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
@@ -2885,10 +2911,13 @@ func TestLoginThrottleKnownGoodHardCapWipe(t *testing.T) {
 	if len(a.loginThrottle.knownGood) != 0 {
 		t.Fatalf("knownGood size = %d, want 0 (hard cap on len(knownGood) must wipe it)", len(a.loginThrottle.knownGood))
 	}
-	// The wipe stays all-or-nothing: the per-IP maps reset too, and only
-	// the new attempt's entry survives.
-	if len(a.loginThrottle.fails) != 1 {
-		t.Fatalf("per-IP map size = %d, want 1 (only ip2)", len(a.loginThrottle.fails))
+	// The per-IP layer SURVIVES: a knownGood overflow says nothing about
+	// the IP layer's entries, which the per-IP hard cap bounds itself.
+	if len(a.loginThrottle.fails) != 2 {
+		t.Fatalf("per-IP map size = %d, want 2 (ip1 + ip2 — the per-IP layer is untouched by a knownGood overflow)", len(a.loginThrottle.fails))
+	}
+	if _, ok := a.loginThrottle.fails["ip1"]; !ok {
+		t.Fatal("ip1 missing from the per-IP map — a knownGood overflow must not clear the per-IP layer")
 	}
 	if _, ok := a.loginThrottle.fails["ip2"]; !ok {
 		t.Fatal("ip2 missing from the per-IP map after the wipe")

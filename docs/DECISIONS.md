@@ -2950,3 +2950,78 @@ newest probe drops the age-24h loss entry: 96.0% → 100.0%.
 must be skipped (they were never counted): 90.0%, not 88.24%.
 Sabotage-verified: the pre-fix passthrough restored → all three pins
 fail.
+
+## throttle-edge-cases (auth.go, auth_test.go, auth_throttle_edge_test.go, stats_decay_test.go, 2026-11-19)
+
+**Decision:** Four auth throttle / bootstrap edge cases fixed (review
+finding #20):
+
+- **(a) Bootstrap known-good keying.** A successful bootstrap now records
+  the operator's known-good exemption under the BARE `throttleKey(ip)`
+  bucket — the same key `checkUserLock` looks up — instead of the
+  `"setup|"+ip` admission bucket, whose suffixed knownGood entry could
+  never match. The dedicated `"setup|ip"` bucket is closed out by an
+  explicit `clearIPThrottle` on bootstrap success (loginSuccess's own
+  fails/lockout clear lands on the bare key it was passed).
+- **(b) Per-map hard-cap wipe.** The `beginAttempt` emergency wipe no
+  longer resets all six maps when any one exceeds `throttleHardCap`.
+  Each layer now fails open on its own cap: `len(fails) > cap` wipes
+  fails+lockout; `len(userFails) > cap` wipes userFails+userLock;
+  `len(knownGood) > cap` wipes knownGood. `userHour` is never wiped
+  (account-bounded like the rest of the per-username layer). The old
+  all-or-nothing wipe let a per-IP spray (the most common wide attack)
+  clear an ACTIVE 30/hr account lockout and its hourly budget
+  mid-attack.
+- **(c) Sentinel-precise setup refund.** The setup path refunds the
+  `"setup|ip"` admission only for rejections that paid NO bcrypt KDF
+  cost (`setupNoKDF`: the validation sentinels, the early bootstrap
+  pre-check, and a client that left while queued on the bcrypt
+  semaphore — `context.Canceled`/`DeadlineExceeded`). An in-tx
+  bootstrap race loss (`errBootstrapped`) DID pay the KDF (bcrypt runs
+  to completion and ignores ctx) and is deliberately NOT refunded, even
+  when the request's ctx is already canceled: refunding the paid case
+  would hand a scripted attacker an unbounded per-IP guessing channel
+  (abort mid-KDF → budget refunded → re-spray).
+- **(d) Per-user throttle purge on account removal.** `RemoveUser` now
+  calls `purgeUserThrottle` (drops userFails/userLock/userHour entries
+  and the `username\x00`-prefixed knownGood exemptions), and `Disable`
+  calls `purgeAllUserThrottle` (all four per-username maps reset).
+  Without the purge a RE-CREATED username inherits the old account's IP
+  exemptions and failure debt.
+
+`stats_decay_test.go` carries a one-line gofmt 1.27.4 comment-alignment
+fix (pre-existing from the stats commit).
+
+**Why:** (a) the operator's only per-username exemption was dead on
+arrival — a spray landing in the gap between bootstrap and first login
+would lock them out of their own new account; (b) the hard cap exists to
+bound memory under a wide spray, and an IP spray is the common wide
+spray, so its cap reset must not also disarm the account layer it has no
+claim over; (c) the refund contract is "throttling is for KDF cost", and
+the old `r.Context().Err() != nil` check refunded a disconnect that had
+already paid the cost; (d) throttle state is in-memory and keyed by
+name — it does not die with the account row.
+
+**Pinned by:** `TestBootstrapSuccessExemptsBareIP` — a fresh install
+whose account is spray-locked mid-bootstrap must record the exemption
+under the bare-IP key (and not the `"setup|"` key), and a login from
+that IP during the account lockout must succeed via the exemption.
+`TestLoginThrottleHardCapWipePreservesUserMaps` (rewritten from the
+all-or-nothing pin) — a per-IP overflow wipes the per-IP layer only; an
+active account lockout, its hourly budget, and a known-good exemption
+must survive. `TestLoginThrottleUserFailsHardCapWipe` and
+`TestLoginThrottleKnownGoodHardCapWipe` (rewritten) — a per-username or
+knownGood overflow wipes its own layer only; the per-IP layer survives
+with both entries intact. `TestSetupNoKDFRefundPredicate` — the
+refund set is exactly {ctx cancel/deadline, pre-check, validation
+sentinels}; `errBootstrapped`, `errUserExists`, and db errors are
+excluded. `TestSetupCtxCancelBeforeKDFRefunds` — a client that leaves
+while queued on the semaphore (KDF never ran) still refunds the setup
+bucket. `TestRemoveUserPurgesThrottle` — a removed user's userFails /
+userLock / userHour / knownGood entries are all gone and another
+user's knownGood survives. `TestDisablePurgesAllUserThrottle` —
+Disable leaves zero per-username entries. Sabotage-verified: (a)
+reverted to the `"setup|"` key → `TestBootstrapSuccessExemptsBareIP`
+fails on the missing bare-IP entry; (b) reverted to the all-or-nothing
+wipe → `TestLoginThrottleHardCapWipePreservesUserMaps` fails with
+"an IP-spray hard-cap wipe cleared userFails".

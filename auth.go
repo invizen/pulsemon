@@ -574,6 +574,28 @@ var (
 	errBootstrappedEarly = fmt.Errorf("%w (pre-check)", errBootstrapped)
 )
 
+// setupNoKDF reports whether a setup-mode rejection paid NO bcrypt KDF cost.
+// The refund contract ("throttling is for KDF cost", refundAttempt) applies
+// to exactly these: the cheap validation sentinels, the early bootstrap
+// pre-check (errBootstrappedEarly), and a client that left while QUEUED on
+// the bcrypt semaphore (AddUserMode returns ctx.Err() before the KDF
+// starts — context.Canceled or context.DeadlineExceeded, the only values
+// ctx.Err() can take). An in-tx bootstrap race loss (errBootstrapped) DID
+// pay the KDF — bcrypt runs to completion and ignores ctx — and a db
+// failure ran it too, so neither is refunded, even when the request's ctx
+// is already canceled: a disconnect mid-KDF must not buy a free retry (it
+// would hand a scripted attacker an unbounded per-IP guessing channel).
+// This is the sentinel-precise version of the login path's kdfCostFloor
+// timing split: CreateSession returns only a bool, so that path has to
+// measure; AddUserMode returns the error, so this one can inspect it.
+// History: docs/DECISIONS.md → throttle-edge-cases
+func setupNoKDF(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, errBootstrappedEarly) || errors.Is(err, errUsernameInvalid) ||
+		errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
+		errors.Is(err, errPasswordCommon)
+}
+
 func validUsername(u string) bool {
 	return u != "" && len(u) <= maxUsernameLen && usernameRe.MatchString(u)
 }
@@ -795,9 +817,48 @@ func (a *AuthState) RemoveUser(ctx context.Context, username string) error {
 		return err
 	}
 	a.dropUserSessions(username)
-	a.refreshEnabledNow() // may be the last user — don't wait for the TTL
+	a.purgeUserThrottle(username) // a re-created name starts with a clean budget
+	a.refreshEnabledNow()         // may be the last user — don't wait for the TTL
 	log.Println("Dashboard user removed: " + username)
 	return nil
+}
+
+// purgeUserThrottle drops every per-username throttle entry for username —
+// userFails, userLock, userHour, and the (username, ip) knownGood
+// exemptions (keyed username\x00ip; the \x00 makes the prefix collision-
+// free, since usernames match usernameRe). RemoveUser calls it after the
+// account row is gone: without the purge a RE-CREATED username inherits
+// the old account's IP exemptions (the new admin is exempt from the
+// per-username lockout at the old operator's IPs) and failure history (a
+// recreated account starts already-locked by the old account's 30/hr
+// debt).
+// History: docs/DECISIONS.md → throttle-edge-cases
+func (a *AuthState) purgeUserThrottle(username string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	delete(a.loginThrottle.userFails, username)
+	delete(a.loginThrottle.userLock, username)
+	delete(a.loginThrottle.userHour, username)
+	prefix := username + "\x00"
+	for k := range a.loginThrottle.knownGood {
+		if strings.HasPrefix(k, prefix) {
+			delete(a.loginThrottle.knownGood, k)
+		}
+	}
+}
+
+// purgeAllUserThrottle drops ALL per-username throttle state (userFails,
+// userLock, userHour, knownGood). Disable removes every user, so every
+// per-user entry is stale: without the purge a re-created account inherits
+// a removed account's exemptions and failure debt.
+// History: docs/DECISIONS.md → throttle-edge-cases
+func (a *AuthState) purgeAllUserThrottle() {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	a.loginThrottle.userFails = map[string][]time.Time{}
+	a.loginThrottle.userLock = map[string]time.Time{}
+	a.loginThrottle.userHour = map[string]*userHourBudget{}
+	a.loginThrottle.knownGood = map[string]time.Time{}
 }
 
 // SetUserPassword replaces a user's password and drops that user's other
@@ -1213,28 +1274,29 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		a.sweepThrottle(now)
 		a.loginThrottle.nextSweep = now.Add(throttleSweepInterval)
 		// Spray-proof memory bound: if a sweep still leaves a map huge
-		// (every entry fresh — a wide one-shot spray), drop ALL throttle
-		// state. This fail-OPENS the lockout only for an attacker already
-		// spread across >100k distinct sources (per-IP) or rotating >100k
-		// distinct usernames (per-username), where lockout buys nothing
-		// anyway and unbounded map growth (plus the O(n) walks) would
-		// degrade monitoring and logins for everyone. Chosen bound:
-		// 131072 entries ≈ tens of MB worst case.
-		if len(a.loginThrottle.fails) > throttleHardCap || len(a.loginThrottle.userFails) > throttleHardCap ||
-			len(a.loginThrottle.knownGood) > throttleHardCap {
+		// (every entry fresh — a wide one-shot spray), drop ONLY that
+		// layer's throttle state. Each layer fails open on its own cap:
+		// a per-IP spray (>100k distinct sources) resets the per-IP maps,
+		// a username-rotation spray (>100k distinct names) resets the
+		// per-username maps, a successful-login spray resets knownGood.
+		// The layers must NOT wipe each other: the per-username maps are
+		// strictly bounded by the existing DB accounts (recordUserFail
+		// counts existing users only) and can hold an ACTIVE 30/hr
+		// account lockout — an all-or-nothing wipe let a per-IP spray
+		// clear the account lock and its hourly budget mid-attack.
+		// userHour is the same account-bounded class: it never trips the
+		// cap and is never wiped here. Chosen bound: 131072 entries ≈
+		// tens of MB worst case per map.
+		// History: docs/DECISIONS.md → throttle-edge-cases
+		if len(a.loginThrottle.fails) > throttleHardCap {
 			a.loginThrottle.fails = map[string][]time.Time{}
 			a.loginThrottle.lockout = map[string]time.Time{}
-			// The per-username maps share the same fail-open bound: a wide
-			// spray that grows EITHER map past the cap resets all budgets,
-			// so the wipe is all-or-nothing.
+		}
+		if len(a.loginThrottle.userFails) > throttleHardCap {
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
-			// userHour shares the same fail-open bound (bounded by account
-			// count in practice, but the wipe is all-or-nothing).
-			a.loginThrottle.userHour = map[string]*userHourBudget{}
-			// knownGood shares the same fail-open bound:
-			// a wide spray that grows the maps past the
-			// cap resets ALL throttle state, so the wipe is all-or-nothing.
+		}
+		if len(a.loginThrottle.knownGood) > throttleHardCap {
 			a.loginThrottle.knownGood = map[string]time.Time{}
 		}
 	}
@@ -1328,6 +1390,20 @@ func (a *AuthState) checkUserLock(username, ipBucket string) (bool, time.Duratio
 		delete(a.loginThrottle.userFails, username)
 	}
 	return true, 0
+}
+
+// clearIPThrottle drops one bucket's per-IP failure accounting (fails +
+// lockout) without touching the per-username maps. The setup-success path
+// uses it to close out the dedicated "setup|ip" bucket: loginSuccess
+// records the (username, ip) known-good exemption under the BARE bucket
+// key (what checkUserLock looks up), so its own fails/lockout clear lands
+// on the login bucket and the setup bucket needs its own explicit clear.
+// History: docs/DECISIONS.md → throttle-edge-cases
+func (a *AuthState) clearIPThrottle(ip string) {
+	a.loginThrottle.Lock()
+	defer a.loginThrottle.Unlock()
+	delete(a.loginThrottle.fails, ip)
+	delete(a.loginThrottle.lockout, ip)
 }
 
 // recordUserFail counts ONE failed credential check against username (across
@@ -1599,7 +1675,8 @@ func (a *AuthState) Disable() error {
 	a.mu.Lock()
 	a.sessions = map[string]authSession{}
 	a.mu.Unlock()
-	a.refreshEnabledNow() // all users gone — open the dashboard immediately
+	a.purgeAllUserThrottle() // every account is gone, so every per-user entry is stale
+	a.refreshEnabledNow()    // all users gone — open the dashboard immediately
 	log.Println("Dashboard authentication disabled (all users removed)")
 	return nil
 }
@@ -1966,34 +2043,36 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// "setup|ip" key so it neither locks the operator's LOGIN bucket
 		// nor is diluted by it. Attempts that never reached the KDF are
 		// refunded below; a successful bootstrap clears the bucket.
-		var setupKey string
+		var setupKey, ipKey string
 		if setup {
-			setupKey = "setup|" + throttleKey(s.auth.ClientIP(r))
+			ipKey = throttleKey(s.auth.ClientIP(r))
+			setupKey = "setup|" + ipKey
 			if ok, wait := s.auth.beginAttempt(setupKey); !ok {
 				respondThrottled(w, wait, "too many setup attempts — try again in a few minutes")
 				return
 			}
 		}
 		if err := s.auth.AddUserMode(r.Context(), req.Username, req.Password, setup); err != nil {
-			// Client gone while queued on bcryptSem: the KDF never ran, so
-			// refund the setup attempt and
-			// drop the response (the write would be a no-op anyway).
-			if r.Context().Err() != nil {
-				if setup {
-					s.auth.refundAttempt(setupKey)
-				}
-				return
+			// Refund the setup admission for exactly the no-KDF-cost
+			// rejections (setupNoKDF): cheap validation, the early
+			// bootstrap pre-check, and a client that left while QUEUED on
+			// the bcrypt semaphore (AddUserMode returns ctx.Err() before
+			// the KDF starts). "Throttling is for KDF cost" — none of
+			// these paid it. An in-tx bootstrap race loss DID pay the KDF
+			// (bcrypt runs to completion and ignores ctx) — it is
+			// deliberately NOT refunded, even when the client disconnected
+			// mid-KDF: refunding the paid case would hand a scripted
+			// attacker an unbounded per-IP guessing channel (abort
+			// mid-KDF → budget refunded → re-spray, capped only by the
+			// global semaphore).
+			if setup && setupNoKDF(err) {
+				s.auth.refundAttempt(setupKey)
 			}
-			if setup {
-				// Refund exactly the no-KDF-cost rejections: cheap
-				// validation and the early bootstrap pre-check both run
-				// BEFORE bcrypt. (The in-tx bootstrap race loss DID pay
-				// the KDF — it is deliberately not refunded.)
-				if errors.Is(err, errBootstrappedEarly) || errors.Is(err, errUsernameInvalid) ||
-					errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
-					errors.Is(err, errPasswordCommon) {
-					s.auth.refundAttempt(setupKey)
-				}
+			// Client gone: drop the response (the write would be a no-op
+			// anyway) — the refund decision above already ran, and a
+			// disconnected client owes no delay.
+			if r.Context().Err() != nil {
+				return
 			}
 			// Only the duplicate-account and validation cases are client
 			// errors; any other failure (db, KDF) is a 500 with the detail
@@ -2015,7 +2094,18 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if setup {
-			s.auth.loginSuccess(strings.ToLower(req.Username), setupKey) // bootstrap done; clear the bucket
+			// Record the known-good exemption under the BARE IP bucket —
+			// the same key checkUserLock looks up. (The "setup|" key is
+			// the admission bucket only; a knownGood entry suffixed with
+			// it never matches, so the operator's first post-bootstrap
+			// login from that IP would get no per-username exemption —
+			// a spray landing during bootstrap would lock them out of
+			// their own new account.)
+			s.auth.loginSuccess(strings.ToLower(req.Username), ipKey)
+			// loginSuccess's own fails/lockout clear targets the key it
+			// was passed (the login bucket); close out the dedicated
+			// setup bucket itself.
+			s.auth.clearIPThrottle(setupKey)
 		}
 		respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
 	default:
