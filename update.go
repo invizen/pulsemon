@@ -551,6 +551,11 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 	ok, detail := waitHealthyWithTimeout(db, timeout)
 	if ok {
 		uInfo("watchdog: service is healthy after restart (" + detail + ")")
+		// Healthy is not the same as intact: the v1.1.19->v1.1.20
+		// incident left a HEALTHY service with its sensors wiped. This
+		// is the belt-and-suspenders check (DB restore + binary rollback
+		// if the live sensor count dropped below the pre-update one).
+		verifySensorsIntactWatchdog(db, prev, dst)
 		return 0
 	}
 	uErr("watchdog: service not healthy after restart (" + detail + "); restoring " + prev)
@@ -567,6 +572,209 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 		uInfo("watchdog: service restarted with the previous binary")
 	}
 	return 0
+}
+
+// stopForRestoreFn stops the running service before the watchdog restores
+// the pre-update DB and rolls the binary back: a live process must not have
+// the DB open (the restore removes -wal/-shm and rewrites the file) nor be
+// holding the binary image. Platform default (Linux): systemctl stop on the
+// detected bus. Windows overrides this in update_windows.go (SCM stop —
+// best-effort for the VSA). Tests stub it.
+var stopForRestoreFn = func() error {
+	bus := detectRestartSystemd()
+	if bus == "" {
+		return fmt.Errorf("no active pulsemon systemd service detected")
+	}
+	args := []string{"stop", "pulsemon"}
+	if bus == "user" {
+		args = append([]string{"--user"}, args...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, systemctlPath(), args...)
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("stop pulsemon (%s bus): %v: %s", bus, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// serviceStateFn reports the live service state: "running", "stopped",
+// "pending", or "" with an error. The watchdog's data-restore path must
+// know whether a live process is holding the DB open BEFORE it rewrites
+// the file (a restore under a live writer corrupts the data). Platform
+// default (Linux): systemctl is-active. Windows overrides in
+// update_windows.go (SCM QueryServiceStatus with the VSA's proven query
+// right — its START/STOP are integrity-denied, so the state is the only
+// reliable signal of who holds the DB). Tests stub it.
+var serviceStateFn = func() (string, error) {
+	bus := detectRestartSystemd()
+	if bus == "" {
+		return "stopped", nil // not active on either bus
+	}
+	args := []string{"is-active", "pulsemon"}
+	if bus == "user" {
+		args = append([]string{"--user"}, args...)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), activeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, systemctlPath(), args...)
+	cmd.WaitDelay = 2 * time.Second
+	out, err := cmd.CombinedOutput()
+	state := strings.TrimSpace(string(out))
+	if err != nil {
+		// is-active exits non-zero for every non-active state but still
+		// prints it: trust the printed state over the exit code.
+		switch state {
+		case "inactive", "failed", "deactivating", "activating", "":
+			return "stopped", nil
+		default:
+			return "", fmt.Errorf("systemctl is-active: %v: %s", err, state)
+		}
+	}
+	if state == "active" {
+		return "running", nil
+	}
+	return state, nil
+}
+
+// restartSensorWaitTimeout bounds the post-restart healthz sensor-count
+// poll in the watchdog verifier. The watchdog ALREADY waited for the
+// service to become healthy (waitHealthyWithTimeout passed) — the count
+// poll is the same endpoint one probe later, so 30s is generous headroom
+// (the 90s the retired helper used covered the service START, which the
+// watchdog does not re-wait for). A var so a test can shrink it.
+var restartSensorWaitTimeout = 30 * time.Second
+
+// restartSensorWait is a seam over waitSensorCount so the verifier's test
+// can stub it (a unit test must not poll a real port).
+var restartSensorWait = func(db *store.Store, timeout time.Duration) (int, bool, string) {
+	return waitSensorCount(db, timeout)
+}
+
+// restoreDatabaseFile replaces the live DB with a copy of backup (a
+// consistent VACUUM INTO snapshot). The service is STOPPED when this runs,
+// so nobody has the DB open. The live -wal/-shm files belong to the live
+// DB's last session and must NOT replay over the restored file: remove
+// them first (SQLite would replay them on the next open, mixing stale WAL
+// pages into the snapshot).
+func restoreDatabaseFile(backup, live string) error {
+	_ = os.Remove(live + "-wal")
+	_ = os.Remove(live + "-shm")
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(live, data, 0o644)
+}
+
+// verifySensorsIntactWatchdog is the post-restart data-integrity check the
+// watchdog runs on the HEALTHY path (the belt-and-suspenders half of the
+// self-update): the update wrote pulsemon.db.preupdate (a VACUUM INTO
+// snapshot) BEFORE swapping the binary, so now that the service is back
+// up, compare the live sensor count against the pre-update one. A
+// shortfall means the update lost sensor data (the v1.1.19->v1.1.20
+// "sensors wiped" incident: the binary swap raced a schema migration and
+// the new schema lost rows). The only self-heal is restoring the pre-
+// update DB and rolling the binary back to the known-good pair, then
+// bringing the service up on it.
+//
+// It runs while the watchdog HOLDS the update lock (runWatchdog acquired
+// it), so it cannot race the unhealthy-path rollback.
+//
+// SAFETY: the service is RUNNING when this runs (it answered healthz). A
+// DB restore under a live writer corrupts the data, so the restore only
+// proceeds when the service is stopped: a stopped service (the crash-loop
+// case) is restored directly; a running service is stopped first, and a
+// stop that is DENIED (the Windows VSA lacks SERVICE_STOP —
+// integrity-enforced, see update_windows.go) means nothing is touched and
+// the log carries exact manual-restore instructions. The data is safe in
+// the backup either way.
+//
+// The watchdog is detached (no console, no inherited pipes), so uInfo/uErr
+// would vanish: every finding also goes to pulsemon-watchdog.log next to
+// the DB — the operator's only post-mortem record.
+//
+// History: docs/DECISIONS.md -> windows-upgrade-safety,
+//
+//	windows-recovery-restart
+func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin string) {
+	dbPath := healthzDBPath()
+	backup := filepath.Join(filepath.Dir(dbPath), "pulsemon.db.preupdate")
+	logLine := func(format string, a ...any) {
+		// Go forbids extra fixed args alongside a `s...` expansion (the
+		// expansion must supply the ENTIRE variadic tail), so the
+		// timestamp rides in the slice.
+		args := append([]any{time.Now().Format(time.RFC3339)}, a...)
+		line := fmt.Sprintf("%s watchdog: "+format+"\n", args...)
+		f, err := os.OpenFile(filepath.Join(filepath.Dir(dbPath), "pulsemon-watchdog.log"),
+			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		_, _ = f.WriteString(line)
+	}
+
+	if _, err := os.Stat(backup); err != nil {
+		logLine("no pre-update backup at %s — sensor verification skipped", backup)
+		return
+	}
+	bst, err := store.NewStore(backup)
+	if err != nil {
+		logLine("cannot open pre-update backup (%v) — sensor verification skipped", err)
+		return
+	}
+	want, err := bst.SensorCount()
+	bst.Close()
+	if err != nil {
+		logLine("cannot count sensors in pre-update backup (%v) — sensor verification skipped", err)
+		return
+	}
+	if want == 0 {
+		logLine("no sensors in the pre-update backup — nothing to verify")
+		return
+	}
+
+	live, ok, detail := restartSensorWait(db, restartSensorWaitTimeout)
+	if !ok {
+		logLine("live sensor count unavailable (%s) — the watchdog's unhealthy path owns a service that will not answer; leaving data as-is", detail)
+		return
+	}
+	rest, reason := sensorRestoreDecision(live, want, true)
+	if !rest {
+		logLine("sensors intact: %s", reason)
+		return
+	}
+	logLine("DATA LOSS after update: %s — restoring the pre-update DB and the previous binary", reason)
+
+	state, sErr := serviceStateFn()
+	if (state == "running" || state == "pending") && sErr == nil {
+		if err := stopForRestoreFn(); err != nil {
+			logLine("cannot stop the running service to restore the database (%v) — MANUAL ACTION REQUIRED: stop the pulsemon service, replace the data DB with the backup at %s, replace the service binary with %s, then start the service", err, backup, prevBin)
+			return
+		}
+	} else if sErr != nil && state != "stopped" {
+		logLine("cannot determine the service state (%v) — a running service would hold the DB open, so nothing was restored; check the pulsemon service, then restore the DB from %s and the binary from %s if needed", sErr, backup, prevBin)
+		return
+	}
+	// state == "stopped": no live writer; safe to restore.
+	if err := restoreDatabaseFile(backup, dbPath); err != nil {
+		logLine("DATABASE RESTORE FAILED: %v — restore %s over the data DB manually", err, backup)
+		return
+	}
+	logLine("pre-update database restored from %s", backup)
+	if err := rollbackBinaryFile(prevBin, dstBin); err != nil {
+		logLine("BINARY ROLLBACK FAILED: %v — replace the service binary with %s manually", err, prevBin)
+		return
+	}
+	logLine("previous binary restored to %s", dstBin)
+	if err := performRestart(detectRestart()); err != nil {
+		logLine("restart after restore: %v — if the service's SCM recovery action is configured it will start the service on the restored pair by itself; otherwise start the pulsemon service manually", err)
+		return
+	}
+	logLine("service restarted on the restored database and previous binary")
 }
 
 // wdOldProcTimeout bounds the watchdog's wait for the SPAWNING server
@@ -1643,7 +1851,7 @@ func journalHint(bus string) string {
 		return "journalctl --user -u pulsemon"
 	}
 	if bus == "windows-service" {
-		return "the Windows Event Log (Application) + %ProgramData%\\Pulsemon\\pulsemon-restart.log"
+		return "the Windows Event Log (Application) + %ProgramData%\\Pulsemon\\pulsemon-watchdog.log"
 	}
 	return "journalctl -u pulsemon"
 }
@@ -1964,6 +2172,7 @@ func waitSensorCount(db *store.Store, timeout time.Duration) (count int, ok bool
 // A var so tests can inject a fake: a unit test must NEVER run the host's real
 // systemctl (it would restart a real pulsemon service on a dev/test box).
 var systemctlPath = resolveSystemctl
+
 // resolveSystemctl picks the systemctl binary. The fixed system locations win
 // over $PATH so a writable directory early in PATH cannot substitute its own
 // "systemctl"; PATH is only the fallback for unusual layouts (NixOS, containers).

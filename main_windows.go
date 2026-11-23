@@ -96,6 +96,17 @@ func runMain() {
 	}
 }
 
+// serviceStopCh / serviceDoneCh are the running service's drain channels,
+// set when the service handler starts the server. The in-service
+// self-update path (selfRestartViaRecoveryFn in update_windows.go) closes
+// serviceStopCh to run the SAME clean drain a Stop control triggers, then
+// exits for the SCM's recovery restart. Nil in a console (non-service)
+// run — the update path checks before closing.
+var (
+	serviceStopCh chan struct{}
+	serviceDoneCh chan struct{}
+)
+
 // pulsemonHandler is the Windows service control handler (x/sys/windows/svc
 // v0.48.0 API: Execute reads ChangeRequest from r, writes Status to s, and
 // returns a service-specific-exit-code flag + exit code). It reports
@@ -111,6 +122,8 @@ func (h *pulsemonHandler) Execute(args []string, r <-chan svc.ChangeRequest, s c
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
+	serviceStopCh = stop
+	serviceDoneCh = done
 	s <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
 	go func() {

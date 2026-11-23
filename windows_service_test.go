@@ -136,8 +136,10 @@ func TestInstallerIsASCII(t *testing.T) {
 }
 
 // TestWindowsRestartUsesNativeSCM pins the restart path (H3/M7): no
-// PowerShell child process; the SCM is driven natively via
-// golang.org/x/sys/windows/svc/mgr.
+// PowerShell child process; the SCM is driven natively with minimal
+// rights (windows.OpenSCManager / windows.OpenService per-call masks —
+// never the ALL_ACCESS that x/sys's mgr.Connect() requests, which the
+// VSA's DACL denies).
 func TestWindowsRestartUsesNativeSCM(t *testing.T) {
 	listener := stripGoComments(readSource(t, "listener_windows.go"))
 	if strings.Contains(listener, "powershell") {
@@ -147,11 +149,17 @@ func TestWindowsRestartUsesNativeSCM(t *testing.T) {
 		t.Error("listener_windows.go must not reference Restart-Service in code (native SCM only)")
 	}
 	upd := stripGoComments(readSource(t, "update_windows.go"))
-	if !strings.Contains(upd, "golang.org/x/sys/windows/svc/mgr") {
-		t.Error("update_windows.go must import golang.org/x/sys/windows/svc/mgr")
+	if strings.Contains(upd, "powershell") {
+		t.Error("update_windows.go must not shell out to powershell (native SCM only)")
 	}
-	if !strings.Contains(upd, "mgr.Connect()") {
-		t.Error("update_windows.go must drive the SCM via mgr.Connect()")
+	if strings.Contains(upd, "svc/mgr") {
+		t.Error("update_windows.go must not import svc/mgr (mgr.Connect() requests SC_MANAGER_ALL_ACCESS, which the VSA's DACL denies)")
+	}
+	if !strings.Contains(upd, "windows.OpenSCManager(") {
+		t.Error("update_windows.go must drive the SCM via windows.OpenSCManager with a minimal mask")
+	}
+	if !strings.Contains(upd, "windows.OpenService(") {
+		t.Error("update_windows.go must open the service via windows.OpenService with a per-call mask")
 	}
 }
 
@@ -183,27 +191,53 @@ func TestDgramBootRetryHardened(t *testing.T) {
 	}
 }
 
-// TestWindowsSelfRestartHelper pins the self-restart wiring: the update
-// flow detaches a helper from the new binary BEFORE stopping the service
-// (the helper is the only thing that can start it back), the helper waits
-// for the stopped state before Start, and the dispatch table knows the
-// subcommand.
-func TestWindowsSelfRestartHelper(t *testing.T) {
+// TestWindowsRecoveryRestart pins the in-service self-update design (the
+// VSA CANNOT stop/start its own service — its START/STOP are
+// integrity-denied despite the DACL grant, probed live from the service's
+// own token on zendev). So the SCM does the restarting: the installer
+// configures the service's RECOVERY ACTION, the service runs the clean
+// drain and then exits WITHOUT reporting Stopped (a deliberate failure —
+// the SCM records 7031 and runs the recovery action: restart, now on the
+// NEW binary), and the update is refused when the recovery action is
+// missing (an update would strand the monitor stopped). The old
+// __restart-helper child process (s.Start() from the VSA — always denied)
+// is retired.
+func TestWindowsRecoveryRestart(t *testing.T) {
 	wd := stripGoComments(readSource(t, "update_windows.go"))
-	if !strings.Contains(wd, `"__restart-helper"`) {
-		t.Error("update_windows.go must spawn the __restart-helper subcommand")
-	}
 	if !strings.Contains(wd, "isWindowsService()") {
 		t.Error("performRestartWindows must branch on isWindowsService()")
 	}
-	h := stripGoComments(readSource(t, "restart_helper_windows.go"))
-	stopped := strings.Index(h, "svc.Stopped")
-	start := strings.Index(h, "s.Start()")
-	if stopped < 0 || start < 0 || stopped > start {
-		t.Errorf("restart helper must observe svc.Stopped (idx %d) BEFORE s.Start() (idx %d)", stopped, start)
+	if !strings.Contains(wd, "selfRestartViaRecoveryFn") {
+		t.Error("the in-service path must use selfRestartViaRecoveryFn (clean drain + failure-exit for the SCM recovery action)")
 	}
-	if !strings.Contains(stripGoComments(readSource(t, "main.go")), `"__restart-helper"`) {
-		t.Error("main.go dispatch must handle the __restart-helper subcommand")
+	if !strings.Contains(wd, "recoveryActionConfiguredFn") {
+		t.Error("the in-service path must verify the recovery action is configured before exiting (an update with no recovery action strands the monitor stopped)")
+	}
+	if !strings.Contains(wd, "os.Exit(updateExitCode)") {
+		t.Error("the in-service path must exit with updateExitCode (non-zero, unreported — the SCM's recovery action restarts the service)")
+	}
+	if strings.Contains(wd, "s.Start()") {
+		t.Error("update_windows.go must not call s.Start() from the VSA token (SERVICE_START is integrity-denied — the SCM recovery action does the starting)")
+	}
+	if strings.Contains(wd, "__restart-helper") {
+		t.Error("the __restart-helper child is retired (its s.Start() can never succeed under the VSA)")
+	}
+	// The installer must configure the recovery action.
+	iss := readSource(t, "installer/pulsemon.iss")
+	if !strings.Contains(iss, "failure") {
+		t.Error("installer/pulsemon.iss must configure the service recovery action (sc failure ... actions= restart/...)")
+	}
+	if !strings.Contains(iss, "restart/") {
+		t.Error("the installer's recovery action must be 'restart the service' (actions= restart/...)")
+	}
+	// The dispatch table must NOT know the retired subcommand.
+	if strings.Contains(stripGoComments(readSource(t, "main.go")), `"__restart-helper"`) {
+		t.Error("main.go dispatch must not handle the retired __restart-helper subcommand")
+	}
+	// The watchdog's healthy path must run the data-integrity check.
+	upd := stripGoComments(readSource(t, "update.go"))
+	if !strings.Contains(upd, "verifySensorsIntactWatchdog(db, prev, dst)") {
+		t.Error("runWatchdog's healthy path must call verifySensorsIntactWatchdog (the 'sensors wiped' guard)")
 	}
 }
 

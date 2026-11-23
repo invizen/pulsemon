@@ -102,14 +102,6 @@ func dispatch(args []string) dispatchKind {
 	case "restart":
 		// Apply a config that needs a fresh process (listener/TLS).
 		return runRestartCommand()
-	case "__restart-helper":
-		// Detached self-restart helper (Windows): waits for the service to
-		// stop, then starts it. Spawned by the update flow, not an operator
-		// command.
-		if runRestartHelper() == 0 {
-			return dExit0
-		}
-		return dExit1
 	case "auth-user":
 		// Dashboard accounts: pulsemon auth-user add|remove|list [NAME]
 		return runAuthUser(args[2:])

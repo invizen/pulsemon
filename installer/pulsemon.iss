@@ -120,6 +120,51 @@ begin
   RunHidden('icacls.exe', '"' + DataDir + '" /T /remove "NT AUTHORITY\SYSTEM"');
 end;
 
+procedure GrantServiceSelfAccess;
+var
+  rc: Integer;
+begin
+  // Grant the service's VSA a query-plus ACE on its OWN service object.
+  // The SDDL mask CCLCSWLOCRRC decodes to CHANGE_CONFIG|QUERY_STATUS|STOP|
+  // START|USER_DEFINED_CONTROL|QUERY_RECOVERY|READ_CONTROL (0x220136) - a
+  // full grant, EXCEPT that the VSA's START/STOP are DENIED AT RUN TIME by
+  // mandatory integrity enforcement: the service object carries a higher
+  // integrity label than the VSA's Medium-integrity token, and the UI
+  // policy blocks write-type rights across that gap REGARDLESS of the
+  // DACL (probed live from the service's own token on zendev, 2026-11-23:
+  // DACL grants START|STOP, OpenService with them is access-denied). So
+  // the VSA CANNOT stop/start its own service - the in-dashboard
+  // self-update does NOT try; it relies on the SCM RECOVERY ACTION
+  // configured below (sc failure ... actions= restart/...) and exits for
+  // it. What this ACE still buys: the QUERY rights (QUERY_CONFIG,
+  // QUERY_STATUS, QUERY_RECOVERY, READ_CONTROL) the update flow's state
+  // checks need from the VSA token - the default service SD gives the VSA
+  // those only via the Authenticated Users ACE, and this makes the
+  // guarantee explicit and VSA-specific. One ACE for the VSA's own SID.
+  // Mask notes: NOT ALL_ACCESS (no WRITE_DAC / WRITE_OWNER - a compromised
+  // service cannot repoint its binPath or re-grant itself). And NOT the
+  // "obvious" minimal CLWRRC: sc.exe's SDDL converter rejects that exact
+  // mask combined with the 8-part VSA SID and the default audit SACL
+  // (ConvertString... FAILED 1336, reproduced with a synthetic 8-part SID
+  // - a parser quirk), while CCLCSWLOCRRC converts cleanly. Runs on EVERY
+  // install (CreateService runs on upgrades too), repairing an SD an
+  // earlier installer left default. The VSA SID is resolved at runtime -
+  // it only exists once `sc create` has materialized it (same
+  // precondition as GrantDataDirAcls).
+  // PowerShell exits 1 on sdset failure, 2 if sdshow cannot confirm the
+  // SID landed. Best-effort: a failure warns but never blocks the
+  // install - the monitor works; the recovery action (set separately) is
+  // what the self-update depends on.
+  // History: docs/DECISIONS.md -> windows-vsa-scm-rights,
+  //          windows-recovery-restart
+  if not Exec('powershell.exe',
+    '-NoProfile -Command "$a = New-Object System.Security.Principal.NTAccount ''NT SERVICE\Pulsemon''; $sid = $a.Translate([System.Security.Principal.SecurityIdentifier]).Value; $sddl = ''D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;'' + $sid + '')S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)''; sc.exe sdset ' + ServiceName + ' $sddl; if ($LASTEXITCODE -ne 0) { exit 1 }; if ((sc.exe sdshow ' + ServiceName + ') -notmatch [regex]::Escape($sid)) { exit 2 }; exit 0"',
+    '', SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
+    MsgBox('The Pulsemon service was installed, but its virtual account could not be granted self-restart rights.' #13#10 +
+           'The dashboard self-update will ask for a manual service restart instead; the next installer run repairs this.',
+           mbWarning, MB_OK);
+end;
+
 procedure CreateService;
 var
   exePath: string;
@@ -164,6 +209,9 @@ begin
   // M1 (F30, 2026-10-19 review): strip ProgramData inheritance (BUILTIN\Users
   // RX on the DB), grant the VSA modify + Administrators full, drop SYSTEM.
   GrantDataDirAcls;
+  // Service-SD self-restart grant: also AFTER sc create (the VSA SID must
+  // exist). See GrantServiceSelfAccess.
+  GrantServiceSelfAccess;
   // Self-update grant: the service swaps its own .exe (rename the running
   // binary aside, rename the new one in), so the VSA needs modify on the
   // app dir. /T: the .exe is copied BEFORE this grant runs, so the file
@@ -174,6 +222,10 @@ begin
   RunHidden('icacls.exe', '"' + ExpandConstant('{app}') + '" /T /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"');
   RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
+  // LOAD-BEARING for the self-update: the VSA cannot start its own service
+  // (integrity-enforced), so the in-dashboard update exits for THIS
+  // recovery action (a deliberate 7031) - the update is refused at runtime
+  // when this action is missing (recoveryActionConfiguredFn).
   RunHidden('sc.exe', 'failure ' + ServiceName +
     ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
 end;

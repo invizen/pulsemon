@@ -41,74 +41,71 @@ func TestRunRestartCommandFailure(t *testing.T) {
 // "windows-service", anything else (stopped, query failure) reports "" —
 // the "no live service, install-and-hint" answer.
 func TestDetectRestartWindows(t *testing.T) {
-	old := serviceStateFn
-	defer func() { serviceStateFn = old }()
+	old := scmStateFn
+	defer func() { scmStateFn = old }()
 
-	serviceStateFn = func() (svc.State, error) { return svc.Running, nil }
+	scmStateFn = func() (svc.State, error) { return svc.Running, nil }
 	if d := detectRestartWindows(); d != "windows-service" {
 		t.Errorf("running service: detectRestartWindows() = %q, want \"windows-service\"", d)
 	}
-	serviceStateFn = func() (svc.State, error) { return svc.Stopped, nil }
+	scmStateFn = func() (svc.State, error) { return svc.Stopped, nil }
 	if d := detectRestartWindows(); d != "" {
 		t.Errorf("stopped service: detectRestartWindows() = %q, want \"\"", d)
 	}
-	serviceStateFn = func() (svc.State, error) { return 0, errForTest }
+	scmStateFn = func() (svc.State, error) { return 0, errForTest }
 	if d := detectRestartWindows(); d != "" {
 		t.Errorf("query failure: detectRestartWindows() = %q, want \"\"", d)
 	}
 }
 
-// TestPerformRestartWindowsServiceBranch pins the self-restart branch: when
-// the caller IS the service, the helper is spawned from the new binary
-// BEFORE the self-stop is issued (the helper is the only thing that can
-// start the service back).
+// TestPerformRestartWindowsServiceBranch pins the in-service branch: when
+// the caller IS the service, the restart is delegated to the SCM recovery
+// action (the VSA cannot start its own service — integrity-enforced), so
+// the branch runs selfRestartViaRecoveryFn (clean drain + failure-exit).
+// The real selfRestartViaRecoveryFn os.Exits; the stub records the call.
 func TestPerformRestartWindowsServiceBranch(t *testing.T) {
-	oldSvc, oldSpawn, oldStop, oldBin := isWindowsService, spawnRestartHelper, selfStopFn, serviceBinPathFn
+	oldSvc, oldRecovery, oldSelf := isWindowsService, recoveryActionConfiguredFn, selfRestartViaRecoveryFn
 	isWindowsService = func() bool { return true }
-	serviceBinPathFn = func() (string, error) { return `C:\Program Files\Pulsemon\pulsemon.exe`, nil }
-	var seq []string
-	var spawnedExe string
-	spawnRestartHelper = func(exePath string) error { spawnedExe = exePath; seq = append(seq, "spawn"); return nil }
-	selfStopFn = func() error { seq = append(seq, "stop"); return nil }
 	defer func() {
-		isWindowsService, spawnRestartHelper, selfStopFn, serviceBinPathFn = oldSvc, oldSpawn, oldStop, oldBin
+		isWindowsService, recoveryActionConfiguredFn, selfRestartViaRecoveryFn = oldSvc, oldRecovery, oldSelf
 	}()
 
+	var selfCalled bool
+	selfRestartViaRecoveryFn = func() error { selfCalled = true; return nil }
 	if err := performRestartWindows("windows-service"); err != nil {
 		t.Fatalf("performRestartWindows: %v", err)
 	}
-	if len(seq) != 2 || seq[0] != "spawn" || seq[1] != "stop" {
-		t.Errorf("call order = %v, want [spawn stop] (the helper must be running before the service stops)", seq)
+	if !selfCalled {
+		t.Error("the in-service branch must delegate to selfRestartViaRecoveryFn (the SCM recovery action does the starting)")
 	}
-	if spawnedExe != `C:\Program Files\Pulsemon\pulsemon.exe` {
-		t.Errorf("helper spawned from %q, want the SCM binPath (the new in-place binary)", spawnedExe)
-	}
-}
 
-// TestPerformRestartWindowsExternalBranch pins the external branch: a
-// process that is NOT the service (console `update --restart`, rollback
-// watchdog) gets the synchronous stop→start — no helper, no self-stop.
-func TestPerformRestartWindowsExternalBranch(t *testing.T) {
-	oldSvc, oldRestart, oldSpawn, oldStop := isWindowsService, restartWindowsServiceFn, spawnRestartHelper, selfStopFn
+	// External branch sanity in the same harness: not the service → the
+	// synchronous stop→start, never the recovery self-restart.
 	isWindowsService = func() bool { return false }
-	var restarted, spawned, stopped bool
+	oldRestart := restartWindowsServiceFn
+	var restarted bool
 	restartWindowsServiceFn = func() error { restarted = true; return nil }
-	spawnRestartHelper = func(string) error { spawned = true; return nil }
-	selfStopFn = func() error { stopped = true; return nil }
-	defer func() {
-		isWindowsService, restartWindowsServiceFn, spawnRestartHelper, selfStopFn = oldSvc, oldRestart, oldSpawn, oldStop
-	}()
-
+	defer func() { restartWindowsServiceFn = oldRestart }()
 	if err := performRestartWindows("windows-service"); err != nil {
-		t.Fatalf("performRestartWindows: %v", err)
+		t.Fatalf("performRestartWindows (external): %v", err)
 	}
 	if !restarted {
 		t.Error("external branch must perform the synchronous stop→start")
 	}
-	if spawned {
-		t.Error("external branch must NOT spawn the restart helper (the caller survives)")
-	}
-	if stopped {
-		t.Error("external branch must NOT issue the self-stop")
+}
+
+// TestSelfRestartRefusesWithoutRecovery pins the pre-flight: the in-service
+// self-restart REFUSES when the service's recovery action is not configured
+// — an update on such a machine would exit with no one to bring the
+// service back (the monitor stays stopped).
+func TestSelfRestartRefusesWithoutRecovery(t *testing.T) {
+	oldRecovery, oldStop := recoveryActionConfiguredFn, serviceStopCh
+	recoveryActionConfiguredFn = func() bool { return false }
+	serviceStopCh = make(chan struct{})
+	defer func() {
+		recoveryActionConfiguredFn, serviceStopCh = oldRecovery, oldStop
+	}()
+	if err := selfRestartViaRecoveryFn(); err == nil {
+		t.Error("selfRestartViaRecoveryFn must refuse (with an error, NOT an exit) when the recovery action is not configured")
 	}
 }
