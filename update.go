@@ -549,7 +549,7 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 		return 0
 	}
 	uErr("watchdog: service not healthy after restart (" + detail + "); restoring " + prev)
-	if err := os.Rename(prev, dst); err != nil {
+	if err := rollbackBinaryFile(prev, dst); err != nil {
 		uErr("watchdog: rollback failed: " + err.Error())
 		return 1
 	}
@@ -1636,6 +1636,9 @@ func runRestart(bus string) error {
 func journalHint(bus string) string {
 	if bus == "user" {
 		return "journalctl --user -u pulsemon"
+	}
+	if bus == "windows-service" {
+		return "the Windows Event Log (Application) + %ProgramData%\\Pulsemon\\pulsemon-restart.log"
 	}
 	return "journalctl -u pulsemon"
 }

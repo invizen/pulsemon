@@ -3,7 +3,7 @@
 ; Installs the pulsemon dashboard as a native Windows service:
 ;   - pulsemon.exe  ->  {autopf}\Pulsemon
 ;   - data dir      ->  C:\ProgramData\Pulsemon  (survives upgrade/uninstall)
-;   - service       ->  "pulsemon" (LocalSystem, auto-start, restart-on-failure)
+;   - service       ->  "pulsemon" (NT SERVICE\Pulsemon VSA, auto-start, restart-on-failure)
 ;   - shortcuts     ->  Start Menu + optional Desktop
 ;
 ; Build (Inno Setup 6 is preinstalled on GitHub Actions Windows runners):
@@ -100,12 +100,18 @@ begin
   end;
   // M1 (F30, 2026-10-19 review): C:\ProgramData\Pulsemon inherits
   // ProgramData's ACL, which grants BUILTIN\Users (RX) read on EVERYTHING
-  // inside it — including the SQLite DB (SMTP passwords, webhook tokens).
-  // Strip inheritance and grant full control to SYSTEM (the service runs
-  // as LocalSystem) and Administrators only. Runs on EVERY install, so an
-  // upgrade also repairs a directory an earlier installer created with the
-  // inherited ACL.
-  RunHidden('icacls.exe', '"' + DataDir + '" /inheritance:r /grant "NT AUTHORITY\SYSTEM:(OI)(CI)(F)" /grant "BUILTIN\Administrators:(OI)(CI)(F)"');
+  // inside it, including the SQLite DB (SMTP passwords, webhook tokens).
+  // Strip inheritance and grant the service's virtual account
+  // (NT SERVICE\Pulsemon - the service no longer runs under the
+  // full-privilege built-in account, see the obj= in CreateService below)
+  // modify, and Administrators full
+  // control, and nothing else. Runs on EVERY install, so an upgrade also
+  // repairs a directory an earlier installer created with the inherited
+  // ACL.
+  RunHidden('icacls.exe', '"' + DataDir + '" /inheritance:r /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)" /grant "BUILTIN\Administrators:(OI)(CI)(F)"');
+  // Drop the explicit SYSTEM grant a pre-VSA installer left behind (fresh
+  // installs have none; the /remove on a missing entry is best-effort).
+  RunHidden('icacls.exe', '"' + DataDir + '" /remove "NT AUTHORITY\SYSTEM"');
 end;
 
 procedure CreateService;
@@ -121,7 +127,9 @@ begin
   // and recreating it as "Pulsemon" is the only reliable way to present it that
   // way. Service names are case-insensitive, so `sc delete Pulsemon` works
   // against a legacy "pulsemon" too. PrepareToInstall already stopped a running
-  // service before the file copy; the stop below is a safety net.
+  // service before the file copy; the stop below is a safety net. The same
+  // delete+recreate is the VSA UPGRADE PATH: a pre-VSA (built-in-account)
+  // registration is replaced by the obj= "NT SERVICE\Pulsemon" create below.
   if ServiceExists() then
   begin
     RunHidden('sc.exe', 'stop ' + ServiceName);
@@ -129,17 +137,29 @@ begin
     Sleep(2000);
     RunHidden('sc.exe', 'delete ' + ServiceName);
   end;
+  // obj= "NT SERVICE\Pulsemon": the service runs as its own VIRTUAL service
+  // account - least privilege, no local account, no password to manage,
+  // auditable by name. The SCM materializes the VSA at create time. ICMP
+  // needs no elevation (unprivileged SOCK_DGRAM), so no probe path depends
+  // on the full-privilege rights the old registration carried.
   if not RunHidden('sc.exe',
       'create ' + ServiceName +
       ' binPath= "' + exePath + '"' +
       ' start= auto' +
+      ' obj= "NT SERVICE\Pulsemon"' +
       ' DisplayName= "Pulsemon"') then
   begin
     MsgBox('Failed to create the Pulsemon service. You can create it manually:' #13#10 +
-           'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto DisplayName= "Pulsemon"',
+           'sc create ' + ServiceName + ' binPath= "' + exePath + '" start= auto obj= "NT SERVICE\Pulsemon" DisplayName= "Pulsemon"',
            mbError, MB_OK);
     Exit;
   end;
+  // Self-update grant: the service swaps its own .exe (rename the running
+  // binary aside, rename the new one in), so the VSA needs modify on the
+  // app dir. Deliberate: a compromised service can replace its own binary -
+  // inherent to self-update; the update flow verifies sha256 + ed25519
+  // signature BEFORE the swap, so this adds no network-facing surface.
+  RunHidden('icacls.exe', '"' + ExpandConstant('{app}') + '" /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"');
   RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
   RunHidden('sc.exe', 'failure ' + ServiceName +
@@ -154,7 +174,7 @@ end;
 // Open the dashboard port (9299) in Windows Firewall so the dashboard is
 // reachable from the LAN. Idempotent: any existing "pulsemon" rule is
 // replaced. Runs elevated (the installer requires admin).
-// M2 (F31, 2026-10-19 review): profile=private,domain — WITHOUT it, netsh
+// M2 (F31, 2026-10-19 review): profile=private,domain - WITHOUT it, netsh
 // defaults to ALL profiles, so a laptop on a Public network (cafe, airport)
 // would expose the dashboard to that network. The homelab LAN is private.
 procedure OpenFirewallPort;

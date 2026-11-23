@@ -138,14 +138,21 @@ func (t *winDgram) readDgram(e *Engine) {
 // reader wait), so the post-wait close in Engine.Close must not run again.
 //
 // At boot a Windows service can start before the network stack is ready, and
-// the first ICMP datagram socket open then fails transiently. Retry a few
-// times before giving up (the caller falls back to raw), so a boot-timing
-// race doesn't pin the engine to the raw transport for the process lifetime.
+// the first ICMP datagram socket open then fails transiently. Retry with a
+// GROWING delay before giving up: the service runs as a virtual account that
+// CANNOT open the raw fallback (SOCK_RAW needs elevation), so this retry is
+// the effective last line for ICMP — a socket that never opens means no
+// probes at all, not a degraded transport.
+const (
+	dgramBootAttempts  = 10
+	dgramBootRetryBase = 500 * time.Millisecond
+)
+
 func openDgram() (dgramState, sendFunc, closeFunc, error) {
 	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
+	for attempt := 0; attempt < dgramBootAttempts; attempt++ {
 		if attempt > 0 {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(dgramBootRetryBase * time.Duration(attempt))
 		}
 		t, err := newWinDgram()
 		if err == nil {

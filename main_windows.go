@@ -13,9 +13,16 @@ import (
 	"golang.org/x/sys/windows/svc"
 )
 
+// serviceName is the SCM service name. The installer registers it as
+// "Pulsemon" (capital P); service names are case-insensitive for lookup, so
+// one const keeps the spelling out of the call sites (svc.Run, the SCM
+// restart paths, the installer).
+const serviceName = "Pulsemon"
+
 // defaultDBPath is the Windows data location: %ProgramData%\Pulsemon, the
-// machine-wide (not per-user) store a service should use. ProgramData is
-// writable by the service's LocalSystem account and survives user logoffs.
+// machine-wide (not per-user) store a service should use. The data dir's
+// ACL is the installer's (NT SERVICE\Pulsemon + Administrators — see M1 in
+// installer/pulsemon.iss) and survives user logoffs.
 func defaultDBPath() string {
 	return filepath.Join(os.Getenv("ProgramData"), "Pulsemon", "pulsemon.db")
 }
@@ -50,15 +57,17 @@ func hardenDataPath(dbPath string) {}
 
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.
 func icmpHint() string {
-	return "ICMP socket unavailable: the unprivileged datagram socket failed and the raw fallback needs elevation. Run the pulsemon service under an account that can send ICMP (Local System by default), or check that a firewall / antivirus isn't blocking ICMP echo."
+	return "ICMP socket unavailable: the unprivileged datagram socket failed to open. Check that a firewall / antivirus isn't blocking ICMP echo, and restart the service (a boot-timing race is the usual cause). Note: the raw-socket fallback needs elevation and is unavailable to the service's virtual account (NT SERVICE\\Pulsemon), so the datagram socket is the only ICMP path."
 }
 
 // isWindowsService reports whether this process is running under the Service
 // Control Manager. Services run in the non-interactive session 0, while
 // interactive user processes run in session 1+; ProcessIdToSessionId is the
 // standard, reliable discriminator. (x/sys/windows/svc in v0.48.0 has no
-// IsServiceRunning helper, so we check the session directly.)
-func isWindowsService() bool {
+// IsServiceRunning helper, so we check the session directly.) Var so the
+// windows test can stub it: a test process must not be reclassified as the
+// service.
+var isWindowsService = func() bool {
 	var sessionID uint32
 	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &sessionID); err != nil {
 		return false
@@ -82,7 +91,7 @@ func runMain() {
 		runServer(stop)
 		return
 	}
-	if err := svc.Run("pulsemon", &pulsemonHandler{}); err != nil {
+	if err := svc.Run(serviceName, &pulsemonHandler{}); err != nil {
 		log.Fatalf("pulsemon service: %v", err)
 	}
 }

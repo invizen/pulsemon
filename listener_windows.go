@@ -5,7 +5,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"os/exec"
 )
 
 // isContainer is always false on Windows: pulsemon runs as a native service
@@ -16,37 +15,40 @@ func isContainer() bool { return false }
 func isSystemdManaged() bool { return false }
 
 // autoRestarts reports whether requestRestart on this platform actually
-// performs a restart. On Windows it never does (the service can't re-exec
-// itself; it returns a hint), so the TLS settings response reports
+// performs a restart. On Windows it never does (listener/TLS config changes
+// keep the safe-hint behavior — a config change must not take the monitor
+// down on its own), so the TLS settings response reports
 // "restarting": false rather than falsely claiming a restart is underway.
 func autoRestarts() bool { return false }
 
 // requestRestart makes a listener config change take effect. On Windows the
 // process is a service managed by the SCM, so it cannot re-exec itself the
-// way the Linux bare-process path does. The first-cut behavior is to tell
-// the operator to restart the service — the config change is already saved,
-// it just needs a fresh process to bind the new listener. (A detached
-// `Restart-Service` helper is a possible follow-up, but a self-triggered
-// service restart that can't be tested headlessly is a worse failure mode
-// than a clear, safe hint.)
+// way the Linux bare-process path does. The config change is already saved;
+// it needs a fresh process to bind the new listener. The operator restarts
+// with `pulsemon restart` (native SCM stop/start — see runRestartCommand).
 func requestRestart() restartOutcome {
 	return restartOutcome{
 		restarted: false,
-		hint:      "the change is saved — restart the pulsemon service to apply it (services.msc → pulsemon → Restart, or: Restart-Service pulsemon)",
+		hint:      "the change is saved — restart the pulsemon service to apply it (services.msc → Pulsemon → Restart, or: pulsemon restart)",
 	}
 }
 
+// restartServiceFn performs a full stop→start of the pulsemon service. Var
+// so the windows test can stub it: a unit test must NEVER restart the
+// host's real service. The real implementation (restartWindowsServiceFn in
+// update_windows.go) drives the native SCM — no PowerShell child process.
+var restartServiceFn = restartWindowsServiceFn
+
 // runRestartCommand is the manual `pulsemon restart` subcommand. On Windows
 // this is an EXTERNAL caller (a console, not the service process), so it can
-// block on restarting the service via the SCM. `Restart-Service` stops and
-// starts the service; it is the PowerShell equivalent of `systemctl restart`.
+// block on a synchronous stop→start through the SCM. The caller needs admin
+// (the service account's own rights also work) — the same elevation the old
+// `powershell -Command "Restart-Service"` path required.
 func runRestartCommand() dispatchKind {
-	cmd := exec.Command("powershell", "-NoProfile", "-Command", "Restart-Service -Name pulsemon -ErrorAction Stop")
-	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
-	if err := cmd.Run(); err == nil {
-		fmt.Println("pulsemon: service restarted")
-		return dExit0
+	if err := restartServiceFn(); err != nil {
+		fmt.Fprintf(os.Stderr, "pulsemon: could not restart the %s service: %v (requires admin; is the service installed?)\n", serviceName, err)
+		return dExit1
 	}
-	fmt.Fprintln(os.Stderr, "pulsemon: could not restart the pulsemon service (is it installed and running? try: Restart-Service pulsemon)")
-	return dExit1
+	fmt.Println("pulsemon: service restarted")
+	return dExit0
 }
