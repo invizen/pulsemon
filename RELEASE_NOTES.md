@@ -1,60 +1,44 @@
-# pulsemon v1.1.15
+# pulsemon v1.1.19
 
 ## What's new
 
-Eleven external-review findings plus four nits from the 2026-11-17 → 11-18
-review batches. A mix of auth hardening, probe correctness, API strictness,
-and performance — every fix regression-pinned with tests and a full `-race`
-gate. No DB schema changes.
+Windows service hardening and account-op re-authentication. Five commits
+since v1.1.18 — no DB schema changes.
 
-### Auth hardening
-- **Hourly login budget + common-password blocklist** (findings #1–2): a
-  rolling hourly budget caps brute-force beyond the per-IP lockout, and a
-  blocklist of common passwords rejects weak first-install / user passwords at
-  the door.
-- **Auth-off rebinding gate** (findings #1–2): with auth disabled, the first
-  `auth-user add` is gated so the port can't be silently re-bound to a new
-  account.
-- **Bootstrapped() latch** (finding #6): the auth gate no longer queries the
-  DB for bootstrap state on every request — a one-way ratchet caches the true
-  value and never re-reads a false one.
+### Windows: Virtual Service Account (VSA)
+- The Windows service now runs as `NT SERVICE\Pulsemon` (a per-service VSA
+  with its own SID) instead of LocalSystem — least privilege, its own
+  profile and data-dir ACLs.
+- Native SCM restart replaces the PowerShell child process: the service
+  restarts itself in-process, and `pulsemon.exe restart` works from a
+  non-service console too.
+- Live-verified on a Windows 21H2 box: service RUNNING as the VSA, ICMP
+  probes working (24/24 up, 0% loss), ACLs correct, restart verified.
 
-### Probes
-- **Fleet-wide Pulse Now cap** (finding #7): a shared in-flight semaphore
-  (cap 8) bounds aggregate concurrent Pulse Now probes; when full it's a 429,
-  not an unbounded fan-out of outbound connections.
-- **ICMP timeout now bounds DNS** (nit): `pingHost` wraps its context in the
-  probe timeout, so the DNS lookup and the reply-wait are bounded TOGETHER — a
-  30s ICMP Pulse Now can no longer run ~5s long and outlast the server's
-  WriteTimeout, leaving the client nothing.
-- **probeTCP nil-IP guard** (nit): an IPv6 literal in a hand-edited row is a
-  clean loss, not a dial of `":port"` (localhost).
+### Windows installer
+- VSA ACL grants now run in the right order: data-dir ACLs apply AFTER
+  `sc create` (the VSA SID does not exist until the service is
+  registered), using a two-phase icacls (dir-only inheritable + explicit
+  `/T`) so pre-existing file ACEs are not wiped.
+- Fixes an upgrade-path crash loop: a single `icacls /T /inheritance:r`
+  was stripping the ACL off an existing database file.
+- The setup installer now ships an offline ed25519 `.sig` alongside its
+  `.sha256` — the fresh-install authenticity anchor matches the
+  self-update chain (the release asset set grows from 12 to 13).
 
-### API
-- **Strict JSON decode** (nit): all nine request decoders now reject unknown
-  fields, so a misspelled PATCH field is a 400 instead of a silent no-op.
-  Frontend payloads verified field-exact, so nothing breaks.
-- **Gzip responses** (finding #8): `/api/` responses are gzipped for clients
-  that accept it.
-- **Uniqueness by result code** (finding #10): duplicate-name / duplicate-user
-  violations are detected by SQLite result code, not message text.
-- **Batched delete cascade** (finding #5): sensor delete batches the large
-  `probes` / `events` sweeps so the WAL write lock isn't held across the whole
-  cascade.
-- **Store dedup + context** (finding #11): the 3× copy-pasted sensor column
-  list is deduped; `RemoveUser` threads the request context through the
-  delete + last-admin promotion.
-
-### Stats
-- **Warm paused sensors at startup** (finding #3): paused sensors' history is
-  warmed on boot too, so a paused-then-resumed sensor doesn't show a gap.
-
-### Hygiene
-- **Comment corrections** (finding #4): stale / garbled comments fixed
-  (comment-only).
-- **Graph/uptime pin + package-split re-adjudication** (finding #9): the
-  restart → 24h graph + uptime path is pinned; the package-split proposal is
-  re-rejected on the record.
+### Auth: current-password re-auth for destructive account ops
+- Adding a user (admin path), deleting a user, and disabling
+  authentication now require the acting session's CURRENT password. A
+  stolen session cookie can no longer win account-level decisions — mint
+  a backdoor account, erase accounts, or strip the credential gate.
+- The check shares the login gate's exact semantics: per-IP throttle,
+  per-username failure budget (7 fails / 60s → 5-minute lockout),
+  constant rejection delay, success clears the budget.
+- The fresh-install bootstrap path is unchanged (no session exists by
+  definition).
+- UI: the add-user form gains a "Your password" field; remove and
+  disable route through a current-password confirmation dialog.
 
 ---
-Full `-race` suite green. No DB schema changes.
+Every fix is regression-pinned (new Go + frontend test pins) and gated on
+the full `-race` suite (Go 1.27.4).
