@@ -1,9 +1,10 @@
 name: Windows release
 
 # Builds the Windows amd64 binary + Inno Setup installer and attaches them to
-# the GitHub release UNSIGNED. The .exe's detached .sig is made OFFLINE on the
-# trusted release host (same key + flow as the Linux cut) and uploaded there
-# after this workflow finishes — the signing key never lives in GitHub
+# the GitHub release UNSIGNED. The detached .sigs for BOTH Windows assets
+# (the .exe and the setup installer) are made OFFLINE on the trusted release
+# host (same key + flow as the Linux cut) and uploaded there after this
+# workflow finishes — the signing key never lives in GitHub
 # (2026-11-20: the CI-held RELEASE_SIGNING_KEY secret let any workflow
 # triggerer sign arbitrary code; docs/DECISIONS.md → windows-signing-offline).
 # Composes with the existing Linux release flow (cut from zenai via `gh
@@ -118,10 +119,12 @@ jobs:
         run: |
           $ver = $env:VER -replace '^v',''
           $tag = "v$ver"   # GitHub releases are always tagged with the v prefix
-          # No .sig here: it is signed OFFLINE on the release host (the key
-          # never touches CI) and uploaded after this workflow — see the
-          # header. The exe ships unsigned by design; clients are fail-closed
-          # until the .sig lands.
+          # No .sig here: the exe's and the installer's .sigs are signed
+          # OFFLINE on the release host (the key never touches CI) and
+          # uploaded after this workflow — see the header. Both ship unsigned
+          # by design; self-update clients are fail-closed until the exe's
+          # .sig lands, and a fresh install verifies the installer's .sig
+          # before running it (docs/DECISIONS.md -> windows-setup-sig).
           $assets = @(
             "dist\pulsemon-windows-amd64.exe",
             "dist\pulsemon-windows-amd64.exe.sha256",

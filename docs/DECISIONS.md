@@ -3422,6 +3422,42 @@ Windows-complete until the offline `.sig` is uploaded and verifies with the
 'secrets.RELEASE_SIGNING_KEY' .github/` (the workflow must not reference the
 secret again — a plain-text mention in a comment is fine).
 
+## windows-setup-sig (windows-release.yml, docs, 2026-11-23)
+
+**Decision:** (external review H7) the Inno Setup installer
+`pulsemon-setup-<ver>.exe` is now part of the OFFLINE ed25519 `.sig` flow,
+alongside `pulsemon-windows-amd64.exe`. After `windows-release.yml` goes
+green, the cut flow signs BOTH Windows assets offline on the release host
+(manifest form — the manifest message is asset-name-agnostic, so NO Go
+change is needed; the installer's asset name is `pulsemon-setup-<ver>.exe`),
+verifies both with the 5-arg `sign verify`, and uploads both `.sig` files.
+A release is not Windows-complete until BOTH `.sig` files are uploaded.
+**Authenticode is deliberately NOT adopted:** it is a paid code-signing
+certificate that buys a SmartScreen trust signal for end users; pulsemon is
+a single-operator homelab tool whose only installer user is the operator
+running their own GitHub release, and the `.sig` already covers the actual
+threat (a GitHub/repo compromise republishing a trojaned installer + its
+`.sha256`). Revisit only if pulsemon ships outside the LAN.
+
+**Why:** the installer was the ONLY release asset with no authenticity
+anchor — its `.sha256` sidecar is worthless against the exact threat the
+`.sig` exists for (a compromised GitHub republishes the file AND its
+checksum) — and it is the highest-trust artifact in the set: running it
+plants an auto-start service. The self-update path (bare exe) was already
+fail-closed signed; the fresh-install path (installer) was the gap. Cost is
+~zero per release: two extra `sign` invocations on the release host, and
+`sign verify <file> <tag> <asset>` works on any file (embedded
+`release_pubkeys`, no private key needed) — which doubles as the documented
+verify-before-run step for a fresh box (download the installer + its `.sig`
++ any release binary, verify, then run the installer).
+
+**Pinned by:** the `pulsemon-release` skill's checklist (13 assets; the
+installer carries `.sha256` + `.sig`; step 4b signs BOTH Windows assets) and
+the `windows-release.yml` header comment. No Go change: the manifest
+verifier in `update.go` is asset-name-agnostic, and the updater only
+consumes the bare exe, so the installer's `.sig` is a manual pre-run check,
+not client-enforced.
+
 ## viewer-target-redaction (api_sensors.go, target_redaction_test.go, 2026-11-20)
 
 **Decision:** `GET /api/sensors` and `GET /api/sensors/{id}` now run the
