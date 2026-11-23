@@ -112,6 +112,19 @@
   </div>
 </div>
 
+<!-- Shown while the page cannot reach the pulsemon server (upgrade
+     restart window, service down). Without it the grid silently renders
+     its "no sensors" empty state during the ~5s service-down window of an
+     in-dashboard self-update, which reads as "the sensors were wiped".
+     refresh() shows/hides it from the fetch outcome; the 5s poller is the
+     retry. History: docs/DECISIONS.md → windows-upgrade-safety -->
+<div id="conn-banner" class="hidden max-w-[1700px] mx-auto px-4 sm:px-6 pt-4">
+  <div class="text-[13px] font-mono px-3 py-2.5 rounded-lg border border-warn/50 bg-warn/10 text-warn flex items-center gap-2">
+    <i class="ph-bold ph-plugs-connected"></i>
+    <span id="conn-banner-text">Waiting for the pulsemon server…</span>
+  </div>
+</div>
+
 <main class="max-w-[1700px] mx-auto px-4 sm:px-6 py-5 flex flex-col gap-4">
   <!-- ============ TOOLBAR ============ -->
   <section class="bg-surface-900 border border-surface-800 rounded-xl p-2.5 flex flex-col lg:flex-row lg:items-center gap-2.5 shadow-sm">

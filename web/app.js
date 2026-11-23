@@ -225,6 +225,25 @@ function pollRender() {
 // request burst (6 in flight) and lets the later one's sensors/events land
 // over the earlier (interleaved). Drop the duplicate until the first settles.
 let refreshInFlight = false;
+// connFails counts consecutive failed refresh() rounds. The 5s poller is
+// the retry loop; the banner is the VISIBLE part of it. Without a banner,
+// a page loaded during the service-down window of an upgrade (the
+// installer pops the browser open ~4s before the service answers) renders
+// the "no sensors" empty state and reads as "the sensors were wiped".
+// History: docs/DECISIONS.md → windows-upgrade-safety
+let connFails = 0;
+function updateConnBanner() {
+  const banner = $('conn-banner');
+  if (!banner) return;
+  if (connFails === 0) { banner.classList.add('hidden'); return; }
+  const text = $('conn-banner-text');
+  if (text) {
+    text.textContent = connFails < 3
+      ? 'Waiting for the pulsemon server… (it is starting up?)'
+      : 'Cannot reach the pulsemon server — sensors appear as soon as it answers. If this persists, check the pulsemon service.';
+  }
+  banner.classList.remove('hidden');
+}
 async function refresh() {
   if (authBlocking()) return;
   if (refreshInFlight) return;
@@ -237,6 +256,8 @@ async function refresh() {
     ]);
     SENSORS = s || [];
     EVENTS = e || [];
+    connFails = 0;
+    updateConnBanner();
     if (hz && hz.version) { const v = $('app-ver'); if (v) v.textContent = hz.version; }
     const banner = $('probe-banner');
     if (hz && hz.icmp_hint) {
@@ -249,7 +270,11 @@ async function refresh() {
       banner.classList.add('hidden');
     }
     pollRender();
-  } catch (err) { console.error('refresh failed', err); }
+  } catch (err) {
+    console.error('refresh failed', err);
+    connFails++;
+    updateConnBanner();
+  }
   finally { refreshInFlight = false; }
 }
 
