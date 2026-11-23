@@ -484,6 +484,11 @@ func runUpdate(args []string) int {
 	}
 	uInfo("sha256:  " + digest + " ✓")
 
+	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
+	// while serving): the post-restart verifier compares the sensor count
+	// against this backup. Best effort - it never blocks the update.
+	backupDatabasePreUpdate()
+
 	if err := installBinary(tmp, exe, digest); err != nil {
 		uErr("install: " + err.Error())
 		return 1
@@ -1864,11 +1869,101 @@ func waitHealthyWithTimeout(db *store.Store, timeout time.Duration) (bool, strin
 	}
 }
 
+// backupDatabasePreUpdate makes the pre-swap safety copy of the data DB
+// (pulsemon.db.preupdate, next to the DB) so the post-restart verifier
+// (the Windows restart-helper) can compare the live sensor count against
+// the pre-update one and restore the backup if the update lost data.
+// It uses `VACUUM INTO` (store.BackupTo), so the snapshot is consistent
+// even while the monitor keeps serving - no service pause needed.
+// Best effort: a failed backup must NEVER block an update; it degrades to
+// "no verification", which is exactly today's behavior.
+// History: docs/DECISIONS.md -> windows-upgrade-safety
+func backupDatabasePreUpdate() {
+	dbPath := healthzDBPath()
+	backup := filepath.Join(filepath.Dir(dbPath), "pulsemon.db.preupdate")
+	st, err := store.NewStore(dbPath)
+	if err != nil {
+		uWarn("pre-update DB backup skipped: " + err.Error())
+		return
+	}
+	defer st.Close()
+	if err := st.BackupTo(backup); err != nil {
+		uWarn("pre-update DB backup failed: " + err.Error())
+	}
+}
+
+// sensorRestoreDecision is the pure decision core of the post-restart
+// verifier: given the live sensor count (from the restarted service's
+// healthz) and the pre-update backup's count, should the backup be
+// restored? The restore fires when the live count DROPPED below the
+// pre-update count (data loss) - a higher count is fine (sensors added
+// during the window). With no usable backup there is nothing to compare
+// against: no restore (today's behavior).
+// History: docs/DECISIONS.md -> windows-upgrade-safety
+func sensorRestoreDecision(liveCount, backupCount int, haveBackup bool) (restore bool, reason string) {
+	if !haveBackup {
+		return false, "no pre-update backup; nothing to verify against"
+	}
+	if liveCount < 0 {
+		// The service answered no usable healthz (or its payload had no
+		// count): we cannot distinguish "data loss" from "not up". The
+		// watchdog already owns the not-up case (binary rollback); the
+		// verifier does not double-act on an unverifiable state.
+		return false, "live sensor count unavailable; leaving the binary/watchdog path in charge"
+	}
+	if liveCount < backupCount {
+		return true, fmt.Sprintf("sensor count dropped %d -> %d", backupCount, liveCount)
+	}
+	return false, fmt.Sprintf("sensor count intact (%d >= pre-update %d)", liveCount, backupCount)
+}
+
+// waitSensorCount polls the pulsemon healthz endpoint (same candidate
+// targets and payload check as waitHealthyWithTimeout) until it answers
+// with a pulsemon payload, then returns the reported sensor count (the
+// "sensors" field). ok=false with count=-1 means the deadline elapsed
+// without a usable answer.
+func waitSensorCount(db *store.Store, timeout time.Duration) (count int, ok bool, detail string) {
+	targets := healthzTargets(db)
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	var lastErr error
+	for {
+		for _, target := range targets {
+			resp, err := client.Get(target + "/api/healthz")
+			if err == nil {
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				resp.Body.Close()
+				if resp.StatusCode < 400 && healthzPayloadOK(string(body)) {
+					var hz struct {
+						Sensors int `json:"sensors"`
+					}
+					if jerr := json.Unmarshal(body, &hz); jerr == nil {
+						return hz.Sensors, true, target
+					}
+					lastErr = fmt.Errorf("pulsemon healthz payload without a sensors field: %s", body)
+				} else {
+					lastErr = fmt.Errorf("HTTP %d without pulsemon healthz payload", resp.StatusCode)
+				}
+			} else {
+				lastErr = err
+			}
+		}
+		if time.Now().After(deadline) {
+			return -1, false, strings.Join(targets, ", ") + " - " + lastErr.Error()
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 // systemctlPath is the systemctl binary the updater/restart helpers execute.
 // A var so tests can inject a fake: a unit test must NEVER run the host's real
 // systemctl (it would restart a real pulsemon service on a dev/test box).
 var systemctlPath = resolveSystemctl
-
 // resolveSystemctl picks the systemctl binary. The fixed system locations win
 // over $PATH so a writable directory early in PATH cannot substitute its own
 // "systemctl"; PATH is only the fallback for unusual layouts (NixOS, containers).

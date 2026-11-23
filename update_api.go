@@ -253,6 +253,11 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		respondInternal(w, "cannot locate running binary", err)
 		return
 	}
+	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
+	// while serving): the Windows restart-helper compares the post-restart
+	// sensor count against this backup and restores it if the update lost
+	// data. Best effort - it never blocks the update.
+	backupDatabasePreUpdate()
 	if err := installBinary(tmp, exe, digest); err != nil {
 		respondInternal(w, "install", err)
 		return

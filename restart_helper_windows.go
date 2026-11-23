@@ -11,6 +11,8 @@ import (
 
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
+
+	"pulsemon/internal/store"
 )
 
 // runRestartHelper is the detached self-restart helper for the Windows
@@ -79,5 +81,117 @@ func runRestartHelper() int {
 		return 5
 	}
 	logLine("service started")
+	return verifySensorsIntact(logLine)
+}
+
+// restartSensorWaitTimeout bounds the post-restart healthz poll in the
+// verifier. The helper already waited up to 90s for the STOP; the start is
+// fast, but a crashing new binary may need a few seconds of SCM
+// restart-on-failure cycles before it answers, so 90s total. A var so a
+// test can shrink it.
+var restartSensorWaitTimeout = 90 * time.Second
+
+// restartSensorWait is a seam over waitSensorCount so the verifier's test
+// can stub it (a unit test must not poll a real port).
+var restartSensorWait = func(db *store.Store, timeout time.Duration) (int, bool, string) {
+	return waitSensorCount(db, timeout)
+}
+
+// restoreDatabaseFile replaces the live DB with a copy of backup (a
+// consistent VACUUM INTO snapshot). The service is STOPPED when this runs,
+// so nobody has the DB open. The live -wal/-shm files belong to the live
+// DB's last session and must NOT replay over the restored file: remove
+// them first (SQLite would replay them on the next open, mixing stale WAL
+// pages into the snapshot).
+func restoreDatabaseFile(backup, live string) error {
+	_ = os.Remove(live + "-wal")
+	_ = os.Remove(live + "-shm")
+	data, err := os.ReadFile(backup)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(live, data, 0o644)
+}
+
+// verifySensorsIntact is the post-restart data-loss check (the
+// belt-and-suspenders half of the self-update): the update wrote
+// pulsemon.db.preupdate (a VACUUM INTO snapshot) BEFORE swapping the
+// binary, so now that the service is back up, compare the live sensor
+// count against the pre-update one. If the count DROPPED, restore the
+// backup DB and roll the binary back to .prev, then restart the service
+// on the known-good pair.
+//
+// It deliberately does NOT act when it cannot verify (no backup, no usable
+// healthz): the update watchdog already owns the "service did not come up"
+// case (binary rollback), and double-acting on an unverifiable state risks
+// clobbering a healthy install.
+//
+// logLine is the helper's file logger (this process is detached, no
+// console). Exit codes continue the helper's scheme: 0 = verified, or
+// nothing to verify; 6..9 = the specific failure that left the service
+// as-is for a human (see the log).
+func verifySensorsIntact(logLine func(string, ...any)) int {
+	dbPath := dbPathFromEnv()
+	backup := filepath.Join(filepath.Dir(dbPath), "pulsemon.db.preupdate")
+	if _, err := os.Stat(backup); err != nil {
+		logLine("no pre-update backup; skipping sensor verification")
+		return 0
+	}
+	bst, err := store.NewStore(backup)
+	if err != nil {
+		logLine("cannot open pre-update backup (%v); skipping verification", err)
+		return 0
+	}
+	want, err := bst.SensorCount()
+	bst.Close()
+	if err != nil {
+		logLine("cannot count sensors in pre-update backup (%v); skipping verification", err)
+		return 0
+	}
+	live, ok, detail := restartSensorWait(openHealthzDB(), restartSensorWaitTimeout)
+	if !ok {
+		logLine("service not healthy within %s (%s); leaving it to the watchdog/human", restartSensorWaitTimeout, detail)
+		return 6
+	}
+	rest, reason := sensorRestoreDecision(live, want, true)
+	if !rest {
+		logLine("verified: %s", reason)
+		return 0
+	}
+	logLine("data loss after update: %s; restoring pre-update DB and previous binary", reason)
+
+	// The update lock keeps this restore from racing the update watchdog
+	// (which holds the same lock for its own rollback). The watchdog has
+	// already exited by the time the service is healthy, so the lock is
+	// normally free; a held lock means it is still working.
+	lockFile, err := acquireUpdateLock()
+	if err != nil {
+		logLine("update lock not available (%v); skipping restore - the watchdog may be handling it", err)
+		return 0
+	}
+	defer lockFile.Close()
+
+	if err := stopWindowsServiceFn(); err != nil {
+		logLine("stop service for restore failed: %v", err)
+		return 7
+	}
+	if err := restoreDatabaseFile(backup, dbPath); err != nil {
+		logLine("DB restore failed: %v; starting the service on the current DB", err)
+	} else {
+		logLine("pre-update DB restored")
+	}
+	exe, err := serviceBinPathFn()
+	if err != nil {
+		logLine("cannot locate binary for rollback: %v", err)
+	} else if rerr := rollbackBinaryFile(exe+".prev", exe); rerr != nil {
+		logLine("binary rollback failed: %v", rerr)
+	} else {
+		logLine("previous binary restored")
+	}
+	if err := startWindowsServiceFn(); err != nil {
+		logLine("start service after restore failed: %v", err)
+		return 9
+	}
+	logLine("service restarted on the pre-update DB and previous binary")
 	return 0
 }

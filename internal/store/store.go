@@ -1400,3 +1400,24 @@ func (db *Store) SeedSensors() error {
 	}
 	return nil
 }
+
+// BackupTo writes a consistent, self-contained snapshot of the database
+// to dst via `VACUUM INTO` (SQLite 3.27+; the bundled modernc sqlite is
+// 3.4x). Unlike a plain file copy, the snapshot is valid while this store
+// is actively serving WAL traffic - no stopped service needed. The
+// pre-update safety copy (pulsemon.db.preupdate, see
+// backupDatabasePreUpdate in update.go) uses this so the in-dashboard
+// self-update can make its copy without pausing the monitor.
+func (s *Store) BackupTo(dst string) error {
+	_, err := s.Exec("VACUUM INTO ?", dst)
+	return err
+}
+
+// SensorCount returns the number of configured sensors. The post-restart
+// verifier (Windows restart-helper) compares it against the pre-update
+// backup's count to detect a data-losing update.
+func (s *Store) SensorCount() (int, error) {
+	var n int
+	err := s.QueryRow("SELECT COUNT(*) FROM sensors").Scan(&n)
+	return n, err
+}
