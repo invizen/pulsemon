@@ -7,6 +7,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 // TestAuthUserPasswordDeleteErrorStatuses pins the 2026-10-20 external-review
@@ -66,16 +68,16 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 
 	// 2. Normal delete of a NON-last user still works (200) — the fix
 	// must not have broken the happy path.
-	if code, body := do(http.MethodPost, "/api/auth/users", `{"username":"temp","password":"secretpw123"}`); code != 200 {
+	if code, body := do(http.MethodPost, "/api/auth/users", `{"username":"temp","password":"secretpw123","current_password": "secretpw123"}`); code != 200 {
 		t.Fatalf("add temp user: got %d (%s), want 200", code, body)
 	}
-	if code, body := do(http.MethodDelete, "/api/auth/users/temp", ""); code != 200 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/temp", `{"current_password": "secretpw123"}`); code != 200 {
 		t.Fatalf("delete temp user: got %d (%s), want 200", code, body)
 	}
 
 	// 3. Last-user guard: business rule → 400 with the friendly message
 	// (now the store.ErrLastUser sentinel, message byte-identical).
-	if code, body := do(http.MethodDelete, "/api/auth/users/admin", ""); code != 400 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/admin", `{"current_password": "secretpw123"}`); code != 400 {
 		t.Fatalf("delete last user: got %d (%s), want 400", code, body)
 	} else if !strings.Contains(body, "cannot remove the last user") {
 		t.Fatalf("delete last user: body %q does not carry the guard message", body)
@@ -104,13 +106,20 @@ func TestAuthUserPasswordDeleteErrorStatuses(t *testing.T) {
 	// column) makes the last-admin promotion UPDATE inside db.RemoveUser
 	// hit a raw driver error. Deleting 'admin' (the last admin, with a
 	// second user present) is the only path that reaches that UPDATE.
-	if _, err := db.Exec("CREATE TABLE users (username TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0)"); err != nil {
+	// The table DOES carry a valid bcrypt hash (L1, 2026-11-23): the
+	// current-password reauth must PASS for the handler to reach the
+	// broken UPDATE — only created_at is missing.
+	reauthHash, err := bcrypt.GenerateFromPassword([]byte("secretpw123"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatalf("bcrypt: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE users (username TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0, password_hash TEXT)"); err != nil {
 		t.Fatalf("recreate minimal users table: %v", err)
 	}
-	if _, err := db.Exec("INSERT INTO users (username, is_admin) VALUES ('admin', 1), ('other', 0)"); err != nil {
+	if _, err := db.Exec("INSERT INTO users (username, is_admin, password_hash) VALUES ('admin', 1, ?), ('other', 0, '')", string(reauthHash)); err != nil {
 		t.Fatalf("seed minimal users table: %v", err)
 	}
-	if code, body := do(http.MethodDelete, "/api/auth/users/admin", ""); code != 500 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/admin", `{"current_password": "secretpw123"}`); code != 500 {
 		t.Fatalf("delete user with broken db: got %d (%s), want 500", code, body)
 	} else if strings.Contains(body, "no such column") || strings.Contains(body, "no such table") {
 		t.Fatalf("delete user with broken db: body %q leaks the raw driver text", body)

@@ -640,13 +640,13 @@ func TestAuthGateEndToEnd(t *testing.T) {
 			t.Fatalf("user list = %v, want [admin]", users)
 		}
 		// Add a second account.
-		resp = post("/api/auth/users", `{"username":"bob","password":"bobpass1"}`)
+		resp = post("/api/auth/users", `{"username":"bob","password":"bobpass1","current_password": "secretpw"}`)
 		resp.Body.Close()
 		if resp.StatusCode != 200 {
 			t.Fatalf("add bob: got %d", resp.StatusCode)
 		}
 		// Duplicate (case variant) is rejected.
-		resp = post("/api/auth/users", `{"username":"BOB","password":"bobpass1"}`)
+		resp = post("/api/auth/users", `{"username":"BOB","password":"bobpass1","current_password": "secretpw"}`)
 		resp.Body.Close()
 		if resp.StatusCode != 400 {
 			t.Fatalf("duplicate user: got %d, want 400", resp.StatusCode)
@@ -689,7 +689,7 @@ func TestAuthGateEndToEnd(t *testing.T) {
 			t.Fatalf("new password: got %d, want 200", r3.StatusCode)
 		}
 		// Remove bob (a non-last user).
-		req, _ = http.NewRequest("DELETE", httpSrv.URL+"/api/auth/users/bob", nil)
+		req, _ = http.NewRequest("DELETE", httpSrv.URL+"/api/auth/users/bob", strings.NewReader(`{"current_password": "newpass9"}`))
 		r4, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -699,7 +699,7 @@ func TestAuthGateEndToEnd(t *testing.T) {
 			t.Fatalf("remove bob: got %d", r4.StatusCode)
 		}
 		// Remove the last user is refused (400).
-		req, _ = http.NewRequest("DELETE", httpSrv.URL+"/api/auth/users/admin", nil)
+		req, _ = http.NewRequest("DELETE", httpSrv.URL+"/api/auth/users/admin", strings.NewReader(`{"current_password": "newpass9"}`))
 		r5, err := client.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -778,7 +778,7 @@ func TestAuthDisableViaAPI(t *testing.T) {
 	if resp.StatusCode != 200 {
 		t.Fatalf("login: %d", resp.StatusCode)
 	}
-	resp, err = client.Post(httpSrv.URL+"/api/auth/disable", "application/json", strings.NewReader("{}"))
+	resp, err = client.Post(httpSrv.URL+"/api/auth/disable", "application/json", strings.NewReader(`{"current_password": "secretpw"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2230,7 +2230,7 @@ func TestSetupBootstrapUserIsAdmin(t *testing.T) {
 		t.Fatalf("login: %d", code)
 	}
 	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/users",
-		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		`{"username":"helper","password":"helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin add helper: %d", code)
 	}
 
@@ -2259,7 +2259,7 @@ func TestNonAdminCannotManageUsers(t *testing.T) {
 		t.Fatalf("admin login: %d", code)
 	}
 	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
-		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		`{"username":"helper","password":"helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin add helper: %d", code)
 	}
 
@@ -2326,12 +2326,12 @@ func TestAdminRemovalAndPromotion(t *testing.T) {
 		t.Fatalf("admin login: %d", code)
 	}
 	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
-		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		`{"username":"helper","password":"helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin add helper: %d", code)
 	}
 
 	// Admin removes the regular user: allowed, no promotion needed.
-	if code := deleteStatus(t, admin, httpSrv.URL+"/api/auth/users/helper"); code != http.StatusOK {
+	if code := deleteStatusJSON(t, admin, httpSrv.URL+"/api/auth/users/helper", `{"current_password": "secretpw"}`); code != http.StatusOK {
 		t.Fatalf("admin remove helper: got %d, want 200", code)
 	}
 	if _, ok := userByName(t, db, "helper"); ok {
@@ -2344,10 +2344,10 @@ func TestAdminRemovalAndPromotion(t *testing.T) {
 	// Admin re-adds helper, then removes SELF — the last admin. Allowed:
 	// the oldest remaining user (helper) is promoted atomically.
 	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
-		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		`{"username":"helper","password":"helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin re-add helper: %d", code)
 	}
-	if code := deleteStatus(t, admin, httpSrv.URL+"/api/auth/users/admin"); code != http.StatusOK {
+	if code := deleteStatusJSON(t, admin, httpSrv.URL+"/api/auth/users/admin", `{"current_password": "secretpw"}`); code != http.StatusOK {
 		t.Fatalf("admin self-remove (last admin): got %d, want 200", code)
 	}
 	if _, ok := userByName(t, db, "admin"); ok {
@@ -2368,7 +2368,7 @@ func TestAdminRemovalAndPromotion(t *testing.T) {
 		`{"username":"helper","password":"helperpw1"}`); code != 200 {
 		t.Fatalf("helper login: %d", code)
 	}
-	req, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/api/auth/users/helper", nil)
+	req, _ := http.NewRequest(http.MethodDelete, httpSrv.URL+"/api/auth/users/helper", strings.NewReader(`{"current_password": "helperpw1"}`))
 	resp, err := hclient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -2481,6 +2481,26 @@ func deleteStatus(t *testing.T, client *http.Client, url string) int {
 	return resp.StatusCode
 }
 
+// deleteStatusJSON is deleteStatus with a JSON body — the L1
+// current_password reauth (2026-11-23) made the delete endpoint body-
+// carrying, so admin-path deletes in tests send the caller's current
+// password. The non-admin 403 pins keep using deleteStatus (the
+// requireAdmin gate refuses before any body is read).
+func deleteStatusJSON(t *testing.T, client *http.Client, url, body string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodDelete, url, strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 // TestSetupBootstrapGate pins the 2026-10-20 external review fix:
 // setup mode (unauthenticated first-account creation) is keyed off a
 // VALID session, not raw cookie presence, and is a FRESH-INSTALL
@@ -2527,7 +2547,7 @@ func TestSetupBootstrapGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	resp, err = client.Post(httpSrv.URL+"/api/auth/disable", "application/json", strings.NewReader("{}"))
+	resp, err = client.Post(httpSrv.URL+"/api/auth/disable", "application/json", strings.NewReader(`{"current_password": "secretpw"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

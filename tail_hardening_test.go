@@ -289,7 +289,7 @@ func TestUsersRosterSelfRowForNonAdmin(t *testing.T) {
 	}
 	resp.Body.Close()
 	resp, err = admin.Post(httpSrv.URL+"/api/auth/users", "application/json",
-		strings.NewReader(`{"username":"helper","password":"secretpw2"}`))
+		strings.NewReader(`{"username":"helper","password":"secretpw2","current_password": "secretpw"}`))
 	if err != nil {
 		t.Fatal(err)
 	}

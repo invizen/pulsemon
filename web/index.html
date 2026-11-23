@@ -368,6 +368,7 @@
           <div id="auth-add-user-box" class="border border-surface-800 rounded-lg p-2.5 bg-surface-900/60 space-y-2">
             <div class="text-[11px] font-mono text-slate-400 font-semibold">Add User Account</div>
             <div class="flex flex-col sm:flex-row gap-2">
+              <input id="auth-new-current" type="password" placeholder="Your password" autocomplete="current-password" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
               <input id="auth-new-username" type="text" placeholder="Username" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
               <input id="auth-new-password" type="password" placeholder="Password (8+ chars)" class="flex-1 bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1 text-[12px] font-mono text-slate-200 focus:outline-none">
             </div>
@@ -472,11 +473,11 @@
       <label class="text-[11px] font-mono text-slate-400">Current Password</label>
       <input id="acc-p0" type="password" autocomplete="current-password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
     </div>
-    <div>
+    <div id="acc-modal-new-wrap">
       <label class="text-[11px] font-mono text-slate-400">Password (8+ chars)</label>
       <input id="acc-p" type="password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
     </div>
-    <div>
+    <div id="acc-modal-confirm-wrap">
       <label class="text-[11px] font-mono text-slate-400">Confirm Password</label>
       <input id="acc-p2" type="password" class="w-full bg-surface-950 border border-surface-800 rounded-lg px-2.5 py-1.5 text-[13px] font-mono text-slate-200 mt-0.5">
     </div>

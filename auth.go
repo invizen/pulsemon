@@ -1997,6 +1997,11 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			Username string `json:"username"`
 			Password string `json:"password"`
+			// Required on the ADMIN-ADD path only (external review L1,
+			// 2026-11-23): the session minting a new account must prove
+			// it is its owner. Ignored in setup mode (there is no
+			// session by definition) — the field is optional there.
+			Current string `json:"current_password"`
 		}
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
@@ -2034,6 +2039,18 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 		// persistence (admin-flag fix).
 		if !setup && !s.auth.IsAdmin(caller) {
 			respondWithError(w, http.StatusForbidden, "admin only")
+			return
+		}
+		// External review L1 (2026-11-23): account creation is the
+		// sharpest stolen-cookie primitive — a backdoor account mints
+		// persistence that survives password rotation and every recovery
+		// short of a reinstall — so an authenticated add requires the
+		// session's own current password (same helper, same throttle
+		// semantics as the password endpoint). The non-admin 403 above
+		// runs FIRST, so a helper session never reaches the KDF; the
+		// setup-mode bootstrap stays open (no session exists by
+		// definition).
+		if !setup && !s.reauthCurrentPassword(w, r, caller, req.Current) {
 			return
 		}
 		// Throttle the setup path: an unauthenticated
@@ -2113,6 +2130,104 @@ func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// reauthCurrentPassword verifies that the session caller still knows their
+// own password before a destructive account operation proceeds (external
+// review L1, 2026-11-23: a stolen session cookie must not win
+// account-level decisions — the same threat model handleAuthUserPassword
+// already applies to password changes). It mirrors that handler's
+// credential-check semantics exactly, so every reauth surface gets the
+// same guarantees at once:
+//
+//   - empty or >72-byte input is a 400 NOT counted against the throttle
+//     (no KDF ran — same uncharged category as the login gate's
+//     empty-credential reject);
+//   - the check runs through the per-IP login throttle (beginAttempt)
+//     AND the shared per-username failure budget (checkUserLock), so a
+//     session holder spraying current_password from many /64 IPs locks
+//     the account exactly like a login spray, and a locked account 429s
+//     on every reauth surface;
+//   - a wrong password pays the same constant rejection delay as a
+//     rejected login and counts against the account's budget;
+//   - a correct one clears the caller's failure streak, so a legitimate
+//     reauth never consumes the operator's lockout budget.
+//
+// `caller` must be the SESSION user (s.sessionFrom(r)) — reauth is
+// always "prove you are who this session says you are", never the
+// password of the target account (the deleted/disabled one). Returns
+// true when the operation may proceed; false when a response was
+// already written.
+func (s *Server) reauthCurrentPassword(w http.ResponseWriter, r *http.Request, caller, current string) bool {
+	if current == "" {
+		respondWithError(w, http.StatusBadRequest, "current password required")
+		return false
+	}
+	if len(current) > 72 {
+		// bcrypt rejects inputs over 72 bytes: a longer current
+		// password can never verify (same category and text as the
+		// login gate).
+		respondWithError(w, http.StatusBadRequest, errPasswordTooLong.Error())
+		return false
+	}
+	// Per-IP failure throttle, identical bucketing to login: this
+	// endpoint verifies a real password, so it must carry the same
+	// 7-failures/60s → 5-minute lockout. beginAttempt counts the
+	// attempt in the same locked section that admits it (a failure is
+	// not recorded again below).
+	ip := s.auth.ClientIP(r)
+	key := throttleKey(ip)
+	if ok, wait := s.auth.beginAttempt(key); !ok {
+		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
+		return false
+	}
+	// Per-username lockout (mirror of /api/auth/login): the per-IP gate
+	// above can't see a multi-IP holder of a valid session (stolen
+	// cookie, unlocked browser — the session is a bearer token, usable
+	// from any number of sources) spraying current_password, so the
+	// account's shared failure budget applies here too. Runs AFTER the
+	// per-IP gate so a single locked IP gets its 429 first; the KDF is
+	// skipped on the 429, so the account counter is not incremented by
+	// the rejection.
+	if ok, wait := s.auth.checkUserLock(caller, key); !ok {
+		// Refund the per-IP admission: no KDF ran (mirror of the login
+		// path) — 429-only requests must not burn the caller's per-IP
+		// budget and self-lock a fresh IP holding a valid session.
+		s.auth.refundAttempt(key)
+		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
+		return false
+	}
+	t0 := time.Now()
+	if _, ok := s.auth.VerifyUser(r.Context(), caller, current); !ok {
+		// Client gone while queued on bcryptSem: a disconnect is not a
+		// failed current_password attempt — skip the failure budget and
+		// the rejection delay. Refund the per-IP admission ONLY for the
+		// zero-KDF-cost case (queued-then-canceled returns in
+		// microseconds; a disconnect DURING the ctx-ignoring KDF paid
+		// it and stays counted) — same split as the login path.
+		if r.Context().Err() != nil {
+			if time.Since(t0) < kdfCostFloor {
+				s.auth.refundAttempt(key)
+			}
+			return false
+		}
+		// Count the failure against the account (across all IPs) — the
+		// same shared budget login uses. The caller holds a live
+		// session, so the account exists by construction — no
+		// userExists gate needed (unlike the login path, where the
+		// username is attacker-chosen).
+		s.auth.recordUserFail(caller)
+		// Constant-time-ish delay on rejection, same as a rejected
+		// login: caps an online attacker at ~5 guesses/second per IP.
+		// The attempt was already counted by beginAttempt before the
+		// KDF.
+		time.Sleep(loginSlowDown)
+		respondWithError(w, http.StatusForbidden, "current password incorrect")
+		return false
+	}
+	s.auth.loginSuccess(caller, key)
+	s.auth.clearUserFail(caller) // success resets the account's budget
+	return true
+}
+
 // handleAuthUserPassword changes the password of the CALLER's own account
 // only (the {username} in the path must match the session's user — anyone
 // else gets 404, not 403, so the endpoint doesn't even confirm other
@@ -2179,73 +2294,22 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		respondWithError(w, http.StatusBadRequest, errPasswordCommon.Error())
 		return
 	}
-	if len(req.Password) > 72 || len(req.Current) > 72 {
+	if len(req.Password) > 72 {
 		// bcrypt rejects inputs over 72 bytes: a longer new password can
-		// never be stored, and a longer current password can never verify
-		// (the old order ran the KDF and answered 401 CHARGED for it).
-		// Same category, same text as the login gate.
+		// never be stored. Same category, same text as the login gate.
+		// (The current-password half of this check lives in
+		// reauthCurrentPassword below.)
 		respondWithError(w, http.StatusBadRequest, errPasswordTooLong.Error())
 		return
 	}
 
-	// Per-IP failure throttle, identical bucketing to login: this endpoint
-	// verifies a real password, so it must carry the same 7-failures/60s →
-	// 5-minute lockout. beginAttempt counts the attempt in the same locked
-	// section that admits it (a failure is not recorded again below).
-	ip := s.auth.ClientIP(r)
-	key := throttleKey(ip)
-	if ok, wait := s.auth.beginAttempt(key); !ok {
-		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
+	// Credential check (reauth): per-IP throttle, per-username lockout,
+	// constant rejection delay, failure budget, success clear — all in
+	// one shared helper so this endpoint and the destructive-account
+	// endpoints (L1) can never drift apart in throttle semantics.
+	if !s.reauthCurrentPassword(w, r, user, req.Current) {
 		return
 	}
-
-	// Per-username lockout (mirror of /api/auth/login): the
-	// per-IP gate above can't see a multi-IP holder of a valid session
-	// (stolen cookie, unlocked browser — the session is a bearer token,
-	// usable from any number of sources) spraying current_password, so
-	// the account's shared failure budget applies here too. Runs AFTER
-	// the per-IP gate so a single locked IP gets its 429 first; the KDF
-	// is skipped on the 429, so the account counter is not incremented
-	// by the rejection.
-	if ok, wait := s.auth.checkUserLock(user, key); !ok {
-		// Refund the per-IP admission: no KDF ran (mirror
-		// of the login path) — 429-only requests must not burn the
-		// caller's per-IP budget and self-lock a fresh IP holding a valid
-		// session.
-		s.auth.refundAttempt(key)
-		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
-		return
-	}
-
-	t0 := time.Now()
-	if _, ok := s.auth.VerifyUser(r.Context(), user, req.Current); !ok {
-		// Client gone while queued on bcryptSem:
-		// a disconnect is not a failed current_password attempt — skip
-		// the failure budget and the rejection delay. Refund the per-IP
-		// admission ONLY for the zero-KDF-cost case (queued-then-canceled
-		// returns in microseconds; a disconnect DURING the ctx-ignoring
-		// KDF paid it and stays counted) — same split as the login path.
-		if r.Context().Err() != nil {
-			if time.Since(t0) < kdfCostFloor {
-				s.auth.refundAttempt(key)
-			}
-			return
-		}
-		// Count the failure against the account (across all IPs) — the
-		// same shared budget login uses. The caller
-		// holds a live session, so the account exists by construction —
-		// no userExists gate needed (unlike the login path, where the
-		// username is attacker-chosen).
-		s.auth.recordUserFail(user)
-		// Constant-time-ish delay on rejection, same as a rejected login:
-		// caps an online attacker at ~5 guesses/second per IP. The attempt
-		// was already counted by beginAttempt before the KDF.
-		time.Sleep(loginSlowDown)
-		respondWithError(w, http.StatusForbidden, "current password incorrect")
-		return
-	}
-	s.auth.loginSuccess(user, key)
-	s.auth.clearUserFail(user) // success resets the account's budget
 
 	keep := ""
 	if c, err := r.Cookie(authSessionName); err == nil {
@@ -2281,6 +2345,24 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 	// admins only). Self-removal is allowed — the last-user guard in
 	// db.RemoveUser stops it from ever locking the install out, and
 	// removing the last admin promotes the oldest remaining user.
+	//
+	// External review L1 (2026-11-23): like every destructive account
+	// operation, a delete requires the session's own current password —
+	// a stolen cookie must not be able to erase accounts (including the
+	// real owner's, the clearest takeover tell).
+	var req struct {
+		Current string `json:"current_password"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
+		return
+	}
+	if !s.reauthCurrentPassword(w, r, s.sessionFrom(r), req.Current) {
+		return
+	}
 	user := strings.ToLower(r.PathValue("username"))
 	if err := s.auth.RemoveUser(r.Context(), user); err != nil {
 		// A name that doesn't exist is a 404 — the same policy as the
@@ -2310,9 +2392,28 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 // operator's own session dies with the last user, so the UI re-shows the
 // login gate — which, with zero users, immediately becomes the open
 // dashboard. The route is registered with requireAdmin.
+//
+// External review L1 (2026-11-23): disabling auth is a silent posture
+// downgrade (the dashboard goes open to the network, and if the operator
+// has allow_unauth_update set, self-update follows), so it requires the
+// session's own current password — a stolen cookie must not be able to
+// strip the credential gate from under the operator's feet.
 func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	var req struct {
+		Current string `json:"current_password"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&req); err != nil {
+		code, msg := requestBodyErr(err)
+		respondWithError(w, code, msg)
+		return
+	}
+	if !s.reauthCurrentPassword(w, r, s.sessionFrom(r), req.Current) {
 		return
 	}
 	if err := s.auth.Disable(); err != nil {

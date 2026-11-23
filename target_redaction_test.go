@@ -30,7 +30,7 @@ func TestViewerTargetRedaction(t *testing.T) {
 	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/login", adminLogin); code != 200 {
 		t.Fatalf("admin login: %d", code)
 	}
-	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users", helperCred); code != 200 {
+	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users", `{"username":"helper","password": "helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin add helper: %d", code)
 	}
 

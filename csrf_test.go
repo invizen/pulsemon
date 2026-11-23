@@ -147,7 +147,7 @@ func TestOriginGateBlocksCSRFWithSession(t *testing.T) {
 
 	// Control: the same request from the dashboard's own origin passes.
 	if code := postJSONStatus(t, client, httpSrv.URL+"/api/auth/disable",
-		`{}`); code != 200 {
+		`{"current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("same-origin disable: got %d, want 200", code)
 	}
 }

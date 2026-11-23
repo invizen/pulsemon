@@ -90,16 +90,16 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 		t.Fatalf("login: got %d (%s), want 200", code, body)
 	}
 	// Single-user install: 404, NOT the last-user 400, NOT a 200.
-	if code, body := do(http.MethodDelete, "/api/auth/users/ghost", ""); code != 404 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/ghost", `{"current_password": "secretpw123"}`); code != 404 {
 		t.Fatalf("DELETE ghost (1 user): got %d (%s), want 404", code, body)
 	} else if !strings.Contains(body, "no such user") {
 		t.Fatalf("DELETE ghost (1 user): body %q, want the not-found message", body)
 	}
 	// Two-user install: the db.RemoveUser path — also 404.
-	if code, body := do(http.MethodPost, "/api/auth/users", `{"username":"temp","password":"secretpw123"}`); code != 200 {
+	if code, body := do(http.MethodPost, "/api/auth/users", `{"username":"temp","password":"secretpw123","current_password": "secretpw123"}`); code != 200 {
 		t.Fatalf("add temp: got %d (%s), want 200", code, body)
 	}
-	if code, body := do(http.MethodDelete, "/api/auth/users/ghost", ""); code != 404 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/ghost", `{"current_password": "secretpw123"}`); code != 404 {
 		t.Fatalf("DELETE ghost (2 users): got %d (%s), want 404", code, body)
 	}
 	// The real users are intact.
@@ -107,7 +107,7 @@ func TestRemoveUserNonexistentReportsNotFound(t *testing.T) {
 		t.Fatalf("status after failed deletes: %d (%s), want admin still present", code, body)
 	}
 	// A real removal still succeeds (happy path intact).
-	if code, body := do(http.MethodDelete, "/api/auth/users/temp", ""); code != 200 {
+	if code, body := do(http.MethodDelete, "/api/auth/users/temp", `{"current_password": "secretpw123"}`); code != 200 {
 		t.Fatalf("DELETE temp (real user): got %d (%s), want 200", code, body)
 	}
 }

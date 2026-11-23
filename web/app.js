@@ -731,11 +731,37 @@ function confirmRemoveTLSCert(btn) {
   }, 3000);
 }
 
-function confirmDisableAuth(btn) {
+// openConfirmModal re-uses the account modal as a CURRENT-PASSWORD gate
+// for destructive account operations (external review L1, 2026-11-23):
+// a stolen session cookie must not win account-level decisions. Only the
+// current-password field is shown; `action` is executed by
+// submitAccountModal() once the password verifies.
+let accConfirmAction = null;
+function openConfirmModal(title, action) {
+  accountModalMode = 'confirm';
+  accConfirmAction = action;
+  $('acc-modal-title').textContent = title;
+  $('acc-modal-user-wrap').classList.add('hidden');
+  $('acc-modal-current-wrap').classList.remove('hidden');
+  $('acc-modal-new-wrap').classList.add('hidden');
+  $('acc-modal-confirm-wrap').classList.add('hidden');
+  $('acc-u').value = ''; $('acc-p0').value = ''; $('acc-p').value = '';
+  $('acc-p2').value = ''; $('acc-err').classList.add('hidden');
+  $('acc-modal').classList.remove('hidden');
+  $('acc-p0').focus();
+}
+
+function removeAuthUser(username) {
+  openConfirmModal('Remove account "' + username + '"?', { type: 'removeUser', username: username });
+}
+
+async function confirmDisableAuth(btn) {
   if (btn.dataset.confirming === "true") {
-    disableAuth();
+    // Second click: the two-click arm is spent — collect the current
+    // password before the destructive call.
     btn.textContent = "Disable Auth";
     btn.dataset.confirming = "false";
+    openConfirmModal('Disable authentication?', { type: 'disableAuth' });
     return;
   }
   btn.dataset.confirming = "true";
@@ -1204,20 +1230,30 @@ async function renderAuthPanel() {
 
 function openFirstAccountDialog() {
   accountModalMode = 'create';
-  $('acc-modal-title').textContent = 'Create Admin Account';$('acc-modal-user-wrap').classList.remove('hidden');
+  accConfirmAction = null;
+  $('acc-modal-title').textContent = 'Create Admin Account';
+  $('acc-modal-user-wrap').classList.remove('hidden');
   $('acc-modal-current-wrap').classList.add('hidden');
-  $('acc-u').value = '';$('acc-p0').value = '';$('acc-p').value = '';
-  $('acc-p2').value = '';$('acc-err').classList.add('hidden');
-  $('acc-modal').classList.remove('hidden');$('acc-u').focus();
+  // Show explicitly: a preceding confirm-mode dialog hides these.
+  $('acc-modal-new-wrap').classList.remove('hidden');
+  $('acc-modal-confirm-wrap').classList.remove('hidden');
+  $('acc-u').value = ''; $('acc-p0').value = ''; $('acc-p').value = '';
+  $('acc-p2').value = ''; $('acc-err').classList.add('hidden');
+  $('acc-modal').classList.remove('hidden'); $('acc-u').focus();
 }
 
 function openChangePasswordDialog() {
   accountModalMode = 'password';
+  accConfirmAction = null;
   $('acc-modal-title').textContent = 'Change Password (' + ($('auth-me').textContent || 'User') + ')';
-  $('acc-modal-user-wrap').classList.add('hidden');$('acc-modal-current-wrap').classList.remove('hidden');
-  $('acc-p0').value = '';$('acc-p').value = '';
-  $('acc-p2').value = '';$('acc-err').classList.add('hidden');
-  $('acc-modal').classList.remove('hidden');$('acc-p0').focus();
+  $('acc-modal-user-wrap').classList.add('hidden');
+  $('acc-modal-current-wrap').classList.remove('hidden');
+  // Show explicitly: a preceding confirm-mode dialog hides these.
+  $('acc-modal-new-wrap').classList.remove('hidden');
+  $('acc-modal-confirm-wrap').classList.remove('hidden');
+  $('acc-p0').value = ''; $('acc-p').value = '';
+  $('acc-p2').value = ''; $('acc-err').classList.add('hidden');
+  $('acc-modal').classList.remove('hidden'); $('acc-p0').focus();
 }
 
 async function submitAccountModal() {
@@ -1225,6 +1261,32 @@ async function submitAccountModal() {
   const p = $('acc-p').value;
   const p2 = $('acc-p2').value;
   const err = $('acc-err');
+  // Confirm mode (external review L1): a destructive account operation
+  // armed by removeAuthUser()/confirmDisableAuth() — the current
+  // password is the whole payload, and the server verifies it before
+  // the delete/disable runs.
+  if (accountModalMode === 'confirm') {
+    if (p0 === '') { err.textContent = 'Current password is required'; err.classList.remove('hidden'); return; }
+    try {
+      if (accConfirmAction.type === 'removeUser') {
+        await api('/api/auth/users/' + encodeURIComponent(accConfirmAction.username),
+          { method: 'DELETE', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: p0 }) });
+        setMsg('account removed: ' + accConfirmAction.username, 'ok');
+      } else if (accConfirmAction.type === 'disableAuth') {
+        await api('/api/auth/disable',
+          { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ current_password: p0 }) });
+        authState = { enabled: false, authed: false };
+        setMsg('authentication disabled', 'ok');
+      }
+      accConfirmAction = null;
+      $('acc-modal').classList.add('hidden');
+      renderAuthPanel();
+    } catch (e) {
+      err.textContent = e.message;
+      err.classList.remove('hidden');
+    }
+    return;
+  }
   if (accountModalMode === 'password' && p0 === '') { err.textContent = 'Current password is required'; err.classList.remove('hidden'); return; }
   if (p.length < 8) { err.textContent = 'Password must be 8+ characters'; err.classList.remove('hidden'); return; }
   if (p !== p2) { err.textContent = 'Passwords do not match'; err.classList.remove('hidden'); return; }
@@ -1250,32 +1312,19 @@ async function submitAccountModal() {
 }
 
 async function addAuthUser() {
+  const cur = $('auth-new-current').value;
   const u = $('auth-new-username').value.trim();
   const p = $('auth-new-password').value;
   if (!u || p.length < 8) { setMsg('username and 8+ char password required', 'bad'); return; }
   try {
-    await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p }) });
-    $('auth-new-username').value = '';$('auth-new-password').value = '';
+    // current_password (external review L1): the session minting the new
+    // account must prove it is its owner — the server 400s a missing
+    // field, 403s a wrong one.
+    await api('/api/auth/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: u, password: p, current_password: cur }) });
+    $('auth-new-current').value = ''; $('auth-new-username').value = ''; $('auth-new-password').value = '';
     setMsg('account added: ' + u.toLowerCase(), 'ok');
     renderAuthPanel();
   } catch (e) { setMsg('add failed: ' + e.message, 'bad'); }
-}
-
-async function removeAuthUser(username) {
-  try {
-    await api('/api/auth/users/' + encodeURIComponent(username), { method: 'DELETE' });
-    setMsg('account removed: ' + username, 'ok');
-    renderAuthPanel();
-  } catch (e) { setMsg('remove failed: ' + e.message, 'bad'); }
-}
-
-async function disableAuth() {
-  try {
-    await api('/api/auth/disable', { method: 'POST' });
-    authState = { enabled: false, authed: false };
-    setMsg('authentication disabled', 'ok');
-    renderAuthPanel();
-  } catch (e) { setMsg('disable failed: ' + e.message, 'bad'); }
 }
 
 async function logoutAuth() {

@@ -20,7 +20,7 @@ func TestNonAdminCannotDeleteTags(t *testing.T) {
 		t.Fatalf("admin login: %d", code)
 	}
 	if code := postJSONStatus(t, admin, httpSrv.URL+"/api/auth/users",
-		`{"username":"helper","password":"helperpw1"}`); code != 200 {
+		`{"username":"helper","password":"helperpw1","current_password": "secretpw"}`); code != 200 {
 		t.Fatalf("admin add helper: %d", code)
 	}
 	hjar, _ := cookiejar.New(nil)
