@@ -162,7 +162,7 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
     MsgBox('The Pulsemon service was installed, but its virtual account could not be granted self-restart rights.' #13#10 +
            'The dashboard self-update will ask for a manual service restart instead; the next installer run repairs this.',
-           mbWarning, MB_OK);
+           mbError, MB_OK);
 end;
 
 procedure CreateService;
