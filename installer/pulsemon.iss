@@ -98,20 +98,26 @@ begin
     if not CreateDir(DataDir) then
       MsgBox('Could not create the data directory:' #13#10 + DataDir, mbError, MB_OK);
   end;
-  // M1 (F30, 2026-10-19 review): C:\ProgramData\Pulsemon inherits
-  // ProgramData's ACL, which grants BUILTIN\Users (RX) read on EVERYTHING
-  // inside it, including the SQLite DB (SMTP passwords, webhook tokens).
-  // Strip inheritance and grant the service's virtual account
-  // (NT SERVICE\Pulsemon - the service no longer runs under the
-  // full-privilege built-in account, see the obj= in CreateService below)
-  // modify, and Administrators full
-  // control, and nothing else. Runs on EVERY install, so an upgrade also
-  // repairs a directory an earlier installer created with the inherited
-  // ACL.
-  RunHidden('icacls.exe', '"' + DataDir + '" /inheritance:r /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)" /grant "BUILTIN\Administrators:(OI)(CI)(F)"');
+  // NOTE: the ACL hardening (M1/F30, 2026-10-19 review: ProgramData
+  // inheritance grants BUILTIN\Users read on the SQLite DB - SMTP
+  // passwords, webhook tokens) happens in GrantDataDirAcls, which runs
+  // AFTER sc create in CreateService: the NT SERVICE\Pulsemon SID only
+  // exists once the service is registered, so icacls cannot resolve it
+  // before that.
+end;
+
+procedure GrantDataDirAcls;
+begin
+  // Runs on EVERY install (after sc create), so an upgrade also repairs a
+  // directory an earlier installer created with the inherited ACL.
+  // /T: apply to the directory AND every existing file/subdir. Required on
+  // the upgrade path: a pre-VSA DB was created by the built-in-account
+  // service and carries no VSA grant - without /T the VSA can create new
+  // files in the dir but cannot OPEN the existing DB (crash loop).
+  RunHidden('icacls.exe', '"' + DataDir + '" /T /inheritance:r /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)" /grant "BUILTIN\Administrators:(OI)(CI)(F)"');
   // Drop the explicit SYSTEM grant a pre-VSA installer left behind (fresh
   // installs have none; the /remove on a missing entry is best-effort).
-  RunHidden('icacls.exe', '"' + DataDir + '" /remove "NT AUTHORITY\SYSTEM"');
+  RunHidden('icacls.exe', '"' + DataDir + '" /T /remove "NT AUTHORITY\SYSTEM"');
 end;
 
 procedure CreateService;
@@ -154,12 +160,18 @@ begin
            mbError, MB_OK);
     Exit;
   end;
+  // Data-dir ACLs: AFTER sc create (the VSA SID must exist first).
+  // M1 (F30, 2026-10-19 review): strip ProgramData inheritance (BUILTIN\Users
+  // RX on the DB), grant the VSA modify + Administrators full, drop SYSTEM.
+  GrantDataDirAcls;
   // Self-update grant: the service swaps its own .exe (rename the running
   // binary aside, rename the new one in), so the VSA needs modify on the
-  // app dir. Deliberate: a compromised service can replace its own binary -
+  // app dir. /T: the .exe is copied BEFORE this grant runs, so the file
+  // itself must receive it directly (a dir-only grant covers new files).
+  // Deliberate: a compromised service can replace its own binary -
   // inherent to self-update; the update flow verifies sha256 + ed25519
   // signature BEFORE the swap, so this adds no network-facing surface.
-  RunHidden('icacls.exe', '"' + ExpandConstant('{app}') + '" /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"');
+  RunHidden('icacls.exe', '"' + ExpandConstant('{app}') + '" /T /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"');
   RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
   // Restart the service automatically if it crashes (10s, 30s, 60s delays).
   RunHidden('sc.exe', 'failure ' + ServiceName +

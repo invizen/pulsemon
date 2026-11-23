@@ -93,6 +93,25 @@ func TestInstallerRegistersVSA(t *testing.T) {
 	if n := strings.Count(iss, `NT SERVICE\Pulsemon:(OI)(CI)(M)`); n < 2 {
 		t.Errorf("icacls must grant NT SERVICE\\Pulsemon (OI)(CI)(M) on the data dir AND the app dir (found %d grants, want >= 2)", n)
 	}
+	// /T is required on BOTH grants: without it, pre-existing files get no
+	// VSA entry — the upgrade path (a LocalSystem-era DB) crash-loops, and
+	// the copied .exe (copied before the app-dir grant runs) can't be
+	// renamed by self-update.
+	if !strings.Contains(iss, ` /T /inheritance:r /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"`) {
+		t.Error("data-dir icacls must carry /T (apply the VSA grant to existing files, not just the dir)")
+	}
+	if !strings.Contains(iss, ` /T /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"`) {
+		t.Error("app-dir icacls must carry /T (the .exe is copied before the grant runs)")
+	}
+	// Ordering: the data-dir ACLs run AFTER sc create — the VSA SID only
+	// exists once the service is registered, so icacls cannot resolve
+	// "NT SERVICE\Pulsemon" before that (fresh installs would ship an
+	// unhardened data dir).
+	createIdx := strings.Index(iss, `' obj= "NT SERVICE\Pulsemon"' +`)
+	aclIdx := strings.Index(iss, "\n  GrantDataDirAcls;\n")
+	if createIdx < 0 || aclIdx < 0 || aclIdx < createIdx {
+		t.Error("GrantDataDirAcls must be called AFTER the sc create invocation (the VSA SID must exist first)")
+	}
 	if strings.Contains(iss, "LocalSystem") {
 		t.Error("installer must not reference LocalSystem (the service no longer runs as it)")
 	}
