@@ -205,11 +205,39 @@ begin
   RunHidden('netsh.exe', 'advfirewall firewall delete rule name=pulsemon');
 end;
 
-// Open the dashboard in the default browser after install.
-procedure OpenDashboard;
+// Ask the service whether it is answering on its HTTP port. PowerShell
+// ships with every supported Windows; explicit exit codes on every path
+// (success = 0, refused/non-200 = 1) so Inno can read the result.
+function HealthzAlive(): Boolean;
 var
   rc: Integer;
 begin
+  Result := Exec('powershell.exe',
+    '-NoProfile -Command "try { $r = Invoke-WebRequest -UseBasicParsing -Uri ''http://localhost:9299/api/healthz'' -TimeoutSec 2; if ($r.StatusCode -eq 200) { exit 0 } else { exit 1 } } catch { exit 1 }"',
+    '', SW_HIDE, ewWaitUntilTerminated, rc) and (rc = 0);
+end;
+
+// Open the dashboard in the default browser after install - but only once
+// the service is actually answering. The service needs a few seconds to
+// bind its port after `sc start`; opening the browser immediately (the old
+// behavior) loads a dead port and the dashboard renders its empty "no
+// sensors" state, which on an upgrade reads as "the sensors were wiped"
+// (nothing was lost). Poll healthz up to ~15s; open as soon as it
+// answers. If it never answers (e.g. a TLS install, where the plain-HTTP
+// port is not bound), fall back to opening the default URL after the
+// timeout - the old behavior.
+// History: docs/DECISIONS.md -> windows-upgrade-safety
+procedure OpenDashboard;
+var
+  rc: Integer;
+  i: Integer;
+begin
+  for i := 1 to 5 do
+  begin
+    if HealthzAlive() then
+      Break;
+    Sleep(3000);
+  end;
   ShellExec('open', 'http://localhost:9299', '', '', SW_SHOWNORMAL, ewNoWait, rc);
 end;
 
@@ -222,6 +250,21 @@ begin
   // alert drain, HTTP drain) before deleting the registration.
   Sleep(2000);
   RunHidden('sc.exe', 'delete ' + ServiceName);
+end;
+
+// Copy the SQLite DB to pulsemon.db.preupdate as a pre-upgrade safety
+// copy. Called only while the service is STOPPED (PrepareToInstall before
+// the file overwrite, and the uninstall path), so a plain file copy is a
+// consistent snapshot - no open WAL to replay over it later. The
+// in-dashboard self-update path makes the same copy from INSIDE the
+// running service via `VACUUM INTO` (see update.go) before the binary
+// swap. Best-effort: a failed copy must never block the upgrade - it only
+// degrades to "no extra safety net".
+// History: docs/DECISIONS.md -> windows-upgrade-safety
+procedure BackupDatabasePreUpdate;
+begin
+  if FileExists(DataDir + '\pulsemon.db') then
+    FileCopy(DataDir + '\pulsemon.db', DataDir + '\pulsemon.db.preupdate', True);
 end;
 
 // Stop a running pulsemon service BEFORE the [Files] section overwrites
@@ -240,6 +283,9 @@ begin
     // Let the service finish its clean shutdown (probe/alert/HTTP drain) so the
     // .exe handle is released before we overwrite it - same delay as uninstall.
     Sleep(2000);
+    // Service is stopped and its DB is consistent: make the pre-upgrade
+    // safety copy now (see BackupDatabasePreUpdate).
+    BackupDatabasePreUpdate;
   end;
 end;
 
@@ -259,6 +305,9 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     StopAndDeleteService;
+    // Service is stopped: leave a final consistent safety copy of the DB
+    // (the data dir itself is kept on uninstall by design).
+    BackupDatabasePreUpdate;
     RemoveFirewallPort;
     // The data dir (C:\ProgramData\Pulsemon) is intentionally KEPT on
     // uninstall - it holds the operator's sensors and probe history. Delete
