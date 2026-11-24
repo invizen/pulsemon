@@ -228,6 +228,41 @@ func TestUpdateInstalledNoService(t *testing.T) {
 	}
 }
 
+// TestUpdateStagedWhenAutoRestartDisabled pins the Windows contract at the
+// seam Windows init() sets (update_windows.go: apiAutoRestart = false):
+// when the platform refuses the in-process auto-restart, a live-service
+// update must land in 200 {status:"installed", hint} — the binary IS
+// swapped, but NO restart is issued and no 202 is sent. The operator
+// restarts the service (the VSA cannot, see windows-update-staged).
+func TestUpdateStagedWhenAutoRestartDisabled(t *testing.T) {
+	srv := updateServer(t)
+	h := setupUpdateHarness(t, false)
+	h.detectBus = "windows-service" // a live service IS detected
+	oldAuto := apiAutoRestart
+	apiAutoRestart = false // the Windows override
+	t.Cleanup(func() { apiAutoRestart = oldAuto })
+	base, _ := serveReleaseVerified(t, "v9.9.9")
+	oldBase, oldVer := releaseBase, Version
+	releaseBase, Version = base, "v0.0.1"
+	t.Cleanup(func() { releaseBase, Version = oldBase, oldVer })
+
+	rec := postUpdate(t, srv, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200 (staged, no auto-restart): %s", rec.Code, rec.Body.String())
+	}
+	res := decodeUpdate(t, rec)
+	if res.Status != "installed" || res.Hint == "" {
+		t.Fatalf("res = %+v, want installed + hint", res)
+	}
+	if len(h.restarted) != 0 {
+		t.Fatalf("restarted = %v, want none (the operator restarts the service)", h.restarted)
+	}
+	got, _ := os.ReadFile(h.exePath)
+	if !bytes.Contains(got, []byte("fake pulsemon binary payload")) {
+		t.Fatalf("binary not swapped: %q", got)
+	}
+}
+
 // TestUpdateSHARefused is the endpoint twin of TestRunUpdateSHARefusedNoLeak:
 // a download that verifies against the wrong SHA-256 is refused (502) and
 // nothing is installed or restarted.

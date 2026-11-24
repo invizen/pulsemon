@@ -191,41 +191,47 @@ func TestDgramBootRetryHardened(t *testing.T) {
 	}
 }
 
-// TestWindowsRecoveryRestart pins the in-service self-update design (the
-// VSA CANNOT stop/start its own service — its START/STOP are
-// integrity-denied despite the DACL grant, probed live from the service's
-// own token on zendev). So the SCM does the restarting: the installer
-// configures the service's RECOVERY ACTION, the service runs the clean
-// drain and then exits WITHOUT reporting Stopped (a deliberate failure —
-// the SCM records 7031 and runs the recovery action: restart, now on the
-// NEW binary), and the update is refused when the recovery action is
-// missing (an update would strand the monitor stopped). The old
-// __restart-helper child process (s.Start() from the VSA — always denied)
-// is retired.
-func TestWindowsRecoveryRestart(t *testing.T) {
+// TestWindowsUpdateStaged pins the staged in-dashboard self-update design
+// (2026-11-24, supersedes the in-service restart half of the old
+// windows-recovery-restart design): the VSA CANNOT stop/start its own
+// service — its START/STOP are integrity-denied despite the DACL grant
+// (probed live from the service's own token on zendev) — and the dashboard
+// update runs INSIDE the service process, so it STAGES the verified binary
+// and hands the operator the restart. The in-service restart machinery
+// (recovery-exit, pre-flight, exit code) is gone from the code; the
+// installer's recovery action stays as a crash safety net; the external
+// (elevated console) path keeps the synchronous stop→start.
+func TestWindowsUpdateStaged(t *testing.T) {
 	wd := stripGoComments(readSource(t, "update_windows.go"))
-	if !strings.Contains(wd, "isWindowsService()") {
-		t.Error("performRestartWindows must branch on isWindowsService()")
-	}
-	if !strings.Contains(wd, "selfRestartViaRecoveryFn") {
-		t.Error("the in-service path must use selfRestartViaRecoveryFn (clean drain + failure-exit for the SCM recovery action)")
-	}
-	if !strings.Contains(wd, "recoveryActionConfiguredFn") {
-		t.Error("the in-service path must verify the recovery action is configured before exiting (an update with no recovery action strands the monitor stopped)")
-	}
-	if !strings.Contains(wd, "os.Exit(updateExitCode)") {
-		t.Error("the in-service path must exit with updateExitCode (non-zero, unreported — the SCM's recovery action restarts the service)")
+	// The in-service restart machinery must be GONE from the code.
+	for _, gone := range []string{
+		"selfRestartViaRecoveryFn",
+		"recoveryActionConfiguredFn",
+		"updateExitCode",
+		"__restart-helper",
+	} {
+		if strings.Contains(wd, gone) {
+			t.Errorf("update_windows.go code must not contain %s (the in-service restart is retired — the VSA cannot restart its own service)", gone)
+		}
 	}
 	if strings.Contains(wd, "s.Start()") {
-		t.Error("update_windows.go must not call s.Start() from the VSA token (SERVICE_START is integrity-denied — the SCM recovery action does the starting)")
+		t.Error("update_windows.go must not call s.Start() from the service token (SERVICE_START is integrity-denied)")
 	}
-	if strings.Contains(wd, "__restart-helper") {
-		t.Error("the __restart-helper child is retired (its s.Start() can never succeed under the VSA)")
+	// The in-dashboard update must be staged: apiAutoRestart = false is set
+	// in the Windows init, and performRestartWindows is the external path
+	// only (synchronous stop→start via the seam).
+	if !strings.Contains(wd, "apiAutoRestart = false") {
+		t.Error("update_windows.go must set apiAutoRestart = false (the in-dashboard update stages the binary; the operator restarts the service)")
 	}
-	// The installer must configure the recovery action.
+	if !strings.Contains(wd, "restartWindowsServiceFn()") {
+		t.Error("performRestartWindows must perform the synchronous stop→start via restartWindowsServiceFn (the external path)")
+	}
+	// The installer must STILL configure the recovery action — now a crash
+	// safety net (a crashed service comes back automatically), not part of
+	// the update flow.
 	iss := readSource(t, "installer/pulsemon.iss")
 	if !strings.Contains(iss, "failure") {
-		t.Error("installer/pulsemon.iss must configure the service recovery action (sc failure ... actions= restart/...)")
+		t.Error("installer/pulsemon.iss must configure the service recovery action (sc failure ... actions= restart/...) — the crash safety net")
 	}
 	if !strings.Contains(iss, "restart/") {
 		t.Error("the installer's recovery action must be 'restart the service' (actions= restart/...)")

@@ -1816,6 +1816,26 @@ var (
 	performRestart = func(bus string) error { return runRestart(bus) }
 )
 
+// apiAutoRestart reports whether the in-dashboard update (POST /api/update,
+// which runs INSIDE the server process) may restart the service itself
+// after the binary swap. systemd (the default): yes. Windows: NO — the
+// service runs as its own virtual service account (NT SERVICE\Pulsemon),
+// and that VSA cannot start/stop its own service (mandatory-integrity
+// enforcement denies it even though the DACL grants START|STOP — probed
+// live from the service's own token), so an in-process restart is
+// impossible. The Windows in-dashboard update stages the verified binary
+// and hands the operator the restart (restartServiceHint); an elevated
+// console `pulsemon update --restart` keeps the full auto-restart path
+// (a High-integrity token passes the SCM check). Windows overrides in
+// update_windows.go.
+var apiAutoRestart = true
+
+// restartServiceHint is the operator-facing restart instruction carried in
+// the "installed" (staged) update response. The systemd default is generic;
+// Windows overrides in update_windows.go with the service name and its two
+// restart paths (services.msc / Restart-Service).
+var restartServiceHint = "the new binary is installed; restart the pulsemon service to pick it up"
+
 // detectRestartSystemd reports which systemd bus the live pulsemon service runs
 // on: "user" if a user-bus service is active, "system" if a system-bus service
 // is active (root), else "" when no live service is confidently detectable.

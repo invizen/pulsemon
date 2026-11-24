@@ -27,7 +27,9 @@ const containerUpdateCommand = "docker compose up -d --build"
 //	container   — Docker install; the app cannot self-update, run `command`
 //	up-to-date  — the running version is >= the release (nothing installed)
 //	installed   — new binary on disk, no auto-restart possible (manual hint)
-//	restarting  — new binary on disk, service restart issued (HTTP 202)
+//	restarting  — new binary on disk, service restart issued (HTTP 202;
+//	              systemd installs only — the Windows in-dashboard update
+//	              always lands in "installed", see apiAutoRestart)
 type updateResponse struct {
 	Status  string `json:"status"`
 	Running string `json:"running"`
@@ -73,10 +75,14 @@ var isContainerInstall = func() bool {
 //	download/verify failed   -> 502 (nothing installed)
 //	install failed           -> 500 (nothing swapped)
 //	installed, no service    -> 200 {status:"installed", hint}
-//	installed + live service -> 202 {status:"restarting"} — sent BEFORE the
-//	restart is issued: systemd's restart SIGTERMs this process, so the
-//	client must have its answer first. The UI then polls /api/healthz for
-//	the new version and reloads.
+//	installed + live service -> 202 {status:"restarting"} on systemd —
+//	sent BEFORE the restart is issued: systemd's restart SIGTERMs this
+//	process, so the client must have its answer first. The UI then polls
+//	/api/healthz for the new version and reloads.
+//	installed + live service, Windows -> 200 {status:"installed", hint} —
+//	the service's VSA cannot restart its own service (mandatory-integrity,
+//	see apiAutoRestart), so the in-dashboard update always stages the
+//	binary and hands the operator the restart.
 func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// The self-update can run ~60s (download + verify + install), longer than
 	// the server-level WriteTimeout (30s): extend THIS connection's write
@@ -254,7 +260,7 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
-	// while serving): the Windows restart-helper compares the post-restart
+	// while serving): the update watchdog compares the post-restart
 	// sensor count against this backup and restores it if the update lost
 	// data. Best effort - it never blocks the update.
 	backupDatabasePreUpdate()
@@ -263,17 +269,24 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Restart decision mirrors the CLI contract: auto-restart ONLY when a
-	// live systemd pulsemon service is confidently detected. Anything else
-	// gets the install-and-hint answer (a bad new version must not take the
-	// monitor down on its own).
+	// Restart decision: auto-restart ONLY when a live service is
+	// confidently detected AND the platform's in-process update is allowed
+	// to restart it (apiAutoRestart). Windows is the exception: the
+	// service's VSA cannot start/stop its own service (mandatory-integrity
+	// enforcement — the DACL grants START|STOP, the open is denied; probed
+	// live from the service's own token), and this handler runs INSIDE the
+	// service process, so there is no in-process restart: stage the binary
+	// and hand the operator the restart. (An elevated console
+	// `pulsemon update --restart` keeps the full auto-restart path.)
+	// Anything else gets the install-and-hint answer (a bad new version
+	// must not take the monitor down on its own).
 	d := detectRestart()
-	if d == "" {
+	if d == "" || !apiAutoRestart {
 		respondWithJSON(w, http.StatusOK, updateResponse{
 			Status:  "installed",
 			Running: Version,
 			Target:  rel.TagName,
-			Hint:    "the new binary is installed; restart the pulsemon service to pick it up",
+			Hint:    restartServiceHint,
 		})
 		return
 	}

@@ -97,11 +97,10 @@ func runMain() {
 }
 
 // serviceStopCh / serviceDoneCh are the running service's drain channels,
-// set when the service handler starts the server. The in-service
-// self-update path (selfRestartViaRecoveryFn in update_windows.go) closes
-// serviceStopCh to run the SAME clean drain a Stop control triggers, then
-// exits for the SCM's recovery restart. Nil in a console (non-service)
-// run — the update path checks before closing.
+// set when the service handler starts the server. The Stop/Shutdown control
+// path closes serviceStopCh and waits on serviceDoneCh for the clean
+// shutdown to finish before reporting Stopped (see pulsemonHandler). Nil
+// in a console (non-service) run.
 var (
 	serviceStopCh chan struct{}
 	serviceDoneCh chan struct{}

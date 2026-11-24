@@ -68,47 +68,59 @@ func cleanupStaleBinary() {
 //
 // The service runs as a virtual account (NT SERVICE\Pulsemon), and that
 // VSA CANNOT restart its own service — probed live from the service's own
-// token on zendev (2026-11-23): the service object's DACL grants the VSA
-// START|STOP (the installer's GrantServiceSelfAccess ACE,
+// token on zendev (2026-11-23, 2026-11-24): the service object's DACL
+// grants the VSA START|STOP (the installer's GrantServiceSelfAccess ACE,
 // CCLCSWLOCRRC = CHANGE_CONFIG|QUERY_STATUS|STOP|START|USER_DEFINED_
 // CONTROL|QUERY_RECOVERY|READ_CONTROL), yet OpenService with START or
 // STOP is access-denied. The denial is mandatory-integrity enforcement:
 // the service object carries a higher integrity label than the VSA's
 // Medium-integrity token, and the UI policy blocks write-type rights
 // (START/STOP) across that gap regardless of the DACL. No ACE the
-// installer can write changes that — so the VSA's in-service restart is
-// delegated to the SCM itself:
+// installer can write changes that.
 //
-//   - the installer configures the service's RECOVERY ACTION
-//     (sc failure ... actions= restart/...);
-//   - the in-service update flow runs the clean drain, then exits with
-//     a non-zero code WITHOUT reporting Stopped to the SCM;
-//   - the SCM records an unexpected termination (7031) and runs the
-//     recovery action: restart the service — now with the NEW binary.
+// Consequence (2026-11-24, decision windows-update-staged): the
+// in-dashboard self-update is STAGED, not self-restarting. The dashboard
+// update runs INSIDE the service process, and the VSA cannot restart that
+// service, so there is no in-process restart path at all:
+// apiAutoRestart = false (below), and POST /api/update keeps the verified
+// swap half (download → ed25519 + SHA-256 verify → atomic rename with the
+// .prev rollback copy) and then answers {status:"installed"} with an
+// operator hint. The operator restarts the service (services.msc /
+// Restart-Service) to activate the new binary.
 //
-// The restart is executed by services.exe (SYSTEM), so the VSA needs no
-// SCM rights for it. The VSA keeps its QUERY rights (the installer's
-// ACE) for the state checks below, which DO work from the VSA token.
+// The service's SCM recovery action (sc failure ... actions= restart/...,
+// configured by the installer) stays as a CRASH safety net — a crashed
+// service comes back automatically. It is NOT part of the update flow.
 //
 // An EXTERNAL process (elevated console `pulsemon update --restart`,
-// `pulsemon restart`) still does a synchronous stop→start through the
-// native SCM: an elevated admin token is High integrity and passes the
-// check.
+// `pulsemon restart`, the rollback watchdog) still does a synchronous
+// stop→start through the native SCM: an elevated admin token is High
+// integrity and passes the check.
 //
 // No systemctl, no PowerShell.
 //
-// History: docs/DECISIONS.md -> windows-vsa-scm-rights, windows-recovery-restart
+// History: docs/DECISIONS.md -> windows-vsa-scm-rights,
+// windows-recovery-restart (superseded for the update flow by
+// windows-update-staged)
 func init() {
 	detectRestart = detectRestartWindows
 	performRestart = performRestartWindows
-	// The VSA's SCM stop is best-effort here (integrity-denied on the
-	// in-service path): the shared restore code treats a denial as
+	// The VSA's SCM stop is best-effort here (integrity-denied on any
+	// in-service call): the shared restore code treats a denial as
 	// "leave the data alone, tell the human" — see update.go.
 	stopForRestoreFn = stopWindowsServiceFn
 	serviceStateFn = windowsServiceState
+	// The in-dashboard update NEVER restarts the service: the VSA cannot
+	// restart its own service (mandatory-integrity — probed live from the
+	// service's own token), so it stages the binary and hands the operator
+	// the restart. The external (elevated console) path keeps the full
+	// auto-restart + watchdog.
+	apiAutoRestart = false
+	restartServiceHint = "the new binary is installed; restart the Pulsemon service to pick it up (services.msc → Pulsemon → Restart service, or `Restart-Service Pulsemon`)"
 	// The Windows clean drain is bounded at ~30s (probe + alert + HTTP
 	// backstops) plus SCM stop grace; the shared 20s old-pid budget would
-	// make the rollback watchdog give up on a slow-but-clean stop.
+	// make the rollback watchdog (and the external update's watchdog)
+	// give up on a slow-but-clean stop.
 	wdOldProcTimeout = 45 * time.Second
 }
 
@@ -158,11 +170,13 @@ var scmStateFn = func() (svc.State, error) {
 }
 
 // detectRestartWindows reports a live pulsemon service: the registration
-// exists AND the SCM says it is running. (The in-dashboard update, the
-// console `update --restart`, and the rollback watchdog all restart the
-// SAME service; performRestartWindows branches on whether the CALLER is
-// that service.) A stopped/absent service gets the install-and-hint answer,
-// the Windows twin of the systemd "no live service" path.
+// exists AND the SCM says it is running. With apiAutoRestart = false the
+// value no longer gates a restart — it only feeds the response's bus
+// field and logs; the in-dashboard update stages the binary either way.
+// (The console `update --restart` and the rollback watchdog restart the
+// same service from OUTSIDE it, where the SCM check passes.) A
+// stopped/absent service gets the install-and-hint answer, the Windows
+// twin of the systemd "no live service" path.
 func detectRestartWindows() string {
 	st, err := scmStateFn()
 	if err != nil || st != svc.Running {
@@ -171,30 +185,17 @@ func detectRestartWindows() string {
 	return "windows-service"
 }
 
-// updateExitCode is the exit code the service uses when it has completed
-// a self-update and is exiting for the SCM's recovery restart. The exit
-// happens WITHOUT a Stopped report to the SCM, so the SCM records an
-// unexpected termination (event 7031) and runs the configured recovery
-// action (restart) — the new binary then starts. The code itself is not
-// SCM-significant (any unreported non-zero exit triggers recovery); 3
-// distinguishes an update exit from a crash in post-mortem log triage.
-const updateExitCode = 3
-
 // performRestartWindows is the shared performRestart on Windows. The new
 // binary is ALREADY in place when this runs (installBinary did the
-// rename-aside + rename-in), so:
+// rename-aside + rename-in), so the only step left is the restart.
 //
-//   - the service process (the in-dashboard update) is about to die: run
-//     the clean drain, then exit for the SCM's recovery restart (the VSA
-//     cannot stop/start its own service — integrity-enforced; see the
-//     file header). The recovery action is set by the installer.
-//   - an external process (console `pulsemon update --restart`, the
-//     rollback path) survives the restart: a synchronous stop→start (an
-//     elevated console token has the rights).
+// EXTERNAL callers only: the in-dashboard update never reaches here
+// (apiAutoRestart = false — the VSA cannot restart its own service, see
+// the file header; it stages the binary and hands the operator the
+// restart). An elevated console process (`pulsemon update --restart`,
+// `pulsemon restart`, the rollback watchdog) survives the restart, so it
+// performs the synchronous stop→start (an elevated token has the rights).
 func performRestartWindows(string) error {
-	if isWindowsService() {
-		return selfRestartViaRecoveryFn()
-	}
 	return restartWindowsServiceFn()
 }
 
@@ -233,71 +234,6 @@ func windowsServiceState() (string, error) {
 		// stopping) before touching the DB.
 		return "pending", nil
 	}
-}
-
-// recoveryActionConfiguredFn reports whether the service's recovery
-// configuration contains a RESTART action. The in-service update relies
-// on the SCM restarting the service after its deliberate failure-exit,
-// so an update on a machine where the recovery action was cleared after
-// install would leave the monitor stopped with no one to bring it back.
-// It reads HKLM\SYSTEM\CurrentControlSet\Services\Pulsemon\Recovery
-// (REG_BINARY SERVICE_RECOVERY_STRUCTURE: DWORD reset, DWORD actions[N])
-// with plain KEY_READ — no SCM rights. The installer sets the action
-// (installer/pulsemon.iss); a missing/mangled value means it was reset
-// by hand. Var so the windows test can stub it.
-var recoveryActionConfiguredFn = func() bool {
-	var k windows.Handle
-	if err := windows.RegOpenKeyEx(windows.HKEY_LOCAL_MACHINE,
-		windows.StringToUTF16Ptr(`SYSTEM\CurrentControlSet\Services\`+serviceName),
-		0, windows.KEY_READ, &k); err != nil {
-		return false
-	}
-	defer windows.RegCloseKey(k)
-	var (
-		valType uint32
-		bufLen  uint32
-	)
-	if err := windows.RegQueryValueEx(k, windows.StringToUTF16Ptr(`Recovery`), nil, &valType, nil, &bufLen); err != nil {
-		return false
-	}
-	v := make([]byte, bufLen)
-	if err := windows.RegQueryValueEx(k, windows.StringToUTF16Ptr(`Recovery`), nil, &valType, &v[0], &bufLen); err != nil || len(v) < 8 {
-		return false
-	}
-	// First recovery action at offset 4; 0x2 =
-	// SERVICE_RECOVERY_ACTION_RESTART_SERVICE.
-	firstAction := uint32(v[4]) | uint32(v[5])<<8 | uint32(v[6])<<16 | uint32(v[7])<<24
-	return firstAction == 0x2
-}
-
-// selfRestartViaRecoveryFn is the in-service restart: verify the recovery
-// action is configured (refuse an update that would strand the monitor
-// stopped), run the SAME clean drain a Stop control triggers (close the
-// handler's stop channel and wait for the server's done channel), then
-// exit(updateExitCode) WITHOUT reporting Stopped. The SCM's recovery
-// action restarts the service with the new binary — services.exe does
-// the starting, so the VSA needs no SCM rights for any of it.
-//
-// Bounded drain: the clean shutdown is ~30s worst case (probe + alert +
-// HTTP backstops); 45s matches wdOldProcTimeout so the rollback watchdog
-// (which waits for this process to die) is never left guessing.
-// Var so the windows test can stub it.
-var selfRestartViaRecoveryFn = func() error {
-	if !recoveryActionConfiguredFn() {
-		return fmt.Errorf("the %s service has no restart recovery action configured — the installer sets it (sc failure %s actions= restart/...); re-run the installer, then update again", serviceName, serviceName)
-	}
-	if serviceStopCh == nil {
-		return fmt.Errorf("no running service drain channel (isWindowsService mismatch)")
-	}
-	fmt.Fprintf(os.Stderr, "pulsemon: self-update complete; clean drain, then exiting for the SCM recovery restart\n")
-	close(serviceStopCh)
-	select {
-	case <-serviceDoneCh:
-	case <-time.After(45 * time.Second):
-		fmt.Fprintln(os.Stderr, "pulsemon: clean drain did not finish within 45s; exiting for the recovery restart anyway")
-	}
-	os.Exit(updateExitCode)
-	return nil // unreachable
 }
 
 // serviceBinPathFn reads the service's binPath from the registry

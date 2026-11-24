@@ -3,6 +3,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"golang.org/x/sys/windows/svc"
@@ -58,54 +59,36 @@ func TestDetectRestartWindows(t *testing.T) {
 	}
 }
 
-// TestPerformRestartWindowsServiceBranch pins the in-service branch: when
-// the caller IS the service, the restart is delegated to the SCM recovery
-// action (the VSA cannot start its own service — integrity-enforced), so
-// the branch runs selfRestartViaRecoveryFn (clean drain + failure-exit).
-// The real selfRestartViaRecoveryFn os.Exits; the stub records the call.
-func TestPerformRestartWindowsServiceBranch(t *testing.T) {
-	oldSvc, oldRecovery, oldSelf := isWindowsService, recoveryActionConfiguredFn, selfRestartViaRecoveryFn
-	isWindowsService = func() bool { return true }
-	defer func() {
-		isWindowsService, recoveryActionConfiguredFn, selfRestartViaRecoveryFn = oldSvc, oldRecovery, oldSelf
-	}()
-
-	var selfCalled bool
-	selfRestartViaRecoveryFn = func() error { selfCalled = true; return nil }
-	if err := performRestartWindows("windows-service"); err != nil {
-		t.Fatalf("performRestartWindows: %v", err)
-	}
-	if !selfCalled {
-		t.Error("the in-service branch must delegate to selfRestartViaRecoveryFn (the SCM recovery action does the starting)")
-	}
-
-	// External branch sanity in the same harness: not the service → the
-	// synchronous stop→start, never the recovery self-restart.
-	isWindowsService = func() bool { return false }
+// TestPerformRestartWindowsExternalOnly pins the post-2026-11-24 contract
+// (windows-update-staged): performRestartWindows is the EXTERNAL path only
+// (an elevated console process — High-integrity tokens pass the SCM check)
+// and always performs the synchronous stop→start. The in-service branch
+// (self-restart via the SCM recovery action) is gone: the VSA cannot
+// restart its own service (mandatory-integrity), and the in-dashboard
+// update stages the binary instead of restarting (apiAutoRestart = false).
+func TestPerformRestartWindowsExternalOnly(t *testing.T) {
 	oldRestart := restartWindowsServiceFn
 	var restarted bool
 	restartWindowsServiceFn = func() error { restarted = true; return nil }
 	defer func() { restartWindowsServiceFn = oldRestart }()
 	if err := performRestartWindows("windows-service"); err != nil {
-		t.Fatalf("performRestartWindows (external): %v", err)
+		t.Fatalf("performRestartWindows: %v", err)
 	}
 	if !restarted {
-		t.Error("external branch must perform the synchronous stop→start")
+		t.Error("performRestartWindows must perform the synchronous stop→start (the only remaining Windows restart path)")
 	}
 }
 
-// TestSelfRestartRefusesWithoutRecovery pins the pre-flight: the in-service
-// self-restart REFUSES when the service's recovery action is not configured
-// — an update on such a machine would exit with no one to bring the
-// service back (the monitor stays stopped).
-func TestSelfRestartRefusesWithoutRecovery(t *testing.T) {
-	oldRecovery, oldStop := recoveryActionConfiguredFn, serviceStopCh
-	recoveryActionConfiguredFn = func() bool { return false }
-	serviceStopCh = make(chan struct{})
-	defer func() {
-		recoveryActionConfiguredFn, serviceStopCh = oldRecovery, oldStop
-	}()
-	if err := selfRestartViaRecoveryFn(); err == nil {
-		t.Error("selfRestartViaRecoveryFn must refuse (with an error, NOT an exit) when the recovery action is not configured")
+// TestWindowsUpdateStagedSeams pins the in-dashboard contract at the
+// runtime seams: the Windows service cannot auto-restart from inside
+// itself (the VSA's integrity wall), so the API must stage the binary and
+// hand the operator the restart — apiAutoRestart is false and the hint
+// names the Pulsemon service with its restart paths.
+func TestWindowsUpdateStagedSeams(t *testing.T) {
+	if apiAutoRestart {
+		t.Error("apiAutoRestart must be false on Windows: the service's VSA cannot restart its own service (mandatory-integrity), so the in-dashboard update stages the binary")
+	}
+	if !strings.Contains(restartServiceHint, "Pulsemon") {
+		t.Errorf("restartServiceHint must name the Pulsemon service: %q", restartServiceHint)
 	}
 }

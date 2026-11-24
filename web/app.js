@@ -1084,7 +1084,7 @@ async function startUpdate() {
   if (!target) { setMsg('no update target known — re-check for updates first', 'bad'); return; }
   const btn = $('update-btn');
   if (btn) { btn.disabled = true; btn.classList.add('opacity-50'); }
-  if (!confirm('Update pulsemon to ' + target + ' now?\nThe dashboard will be briefly unavailable while the service restarts.')) {
+  if (!confirm('Update pulsemon to ' + target + ' now?\nThe new binary is downloaded and verified before it is installed. On some installs the service restarts automatically (the dashboard goes briefly unavailable); on others you are told how to restart it.')) {
     if (btn) { btn.disabled = false; btn.classList.remove('opacity-50'); }
     return;
   }

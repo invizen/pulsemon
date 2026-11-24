@@ -131,12 +131,13 @@ begin
   // mandatory integrity enforcement: the service object carries a higher
   // integrity label than the VSA's Medium-integrity token, and the UI
   // policy blocks write-type rights across that gap REGARDLESS of the
-  // DACL (probed live from the service's own token on zendev, 2026-11-23:
-  // DACL grants START|STOP, OpenService with them is access-denied). So
-  // the VSA CANNOT stop/start its own service - the in-dashboard
-  // self-update does NOT try; it relies on the SCM RECOVERY ACTION
-  // configured below (sc failure ... actions= restart/...) and exits for
-  // it. What this ACE still buys: the QUERY rights (QUERY_CONFIG,
+  // DACL (probed live from the service's own token on zendev, 2026-11-23
+  // and 2026-11-24: DACL grants START|STOP, OpenService with them is
+  // access-denied). So the VSA CANNOT stop/start its own service - and
+  // the in-dashboard self-update does NOT try (2026-11-24, decision
+  // windows-update-staged): it stages the verified binary and tells the
+  // operator to restart the service (services.msc / Restart-Service).
+  // What this ACE still buys: the QUERY rights (QUERY_CONFIG,
   // QUERY_STATUS, QUERY_RECOVERY, READ_CONTROL) the update flow's state
   // checks need from the VSA token - the default service SD gives the VSA
   // those only via the Authenticated Users ACE, and this makes the
@@ -160,8 +161,8 @@ begin
   if not Exec('powershell.exe',
     '-NoProfile -Command "$a = New-Object System.Security.Principal.NTAccount ''NT SERVICE\Pulsemon''; $sid = $a.Translate([System.Security.Principal.SecurityIdentifier]).Value; $sddl = ''D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;CCLCSWLOCRRC;;;'' + $sid + '')S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)''; sc.exe sdset ' + ServiceName + ' $sddl; if ($LASTEXITCODE -ne 0) { exit 1 }; if ((sc.exe sdshow ' + ServiceName + ') -notmatch [regex]::Escape($sid)) { exit 2 }; exit 0"',
     '', SW_HIDE, ewWaitUntilTerminated, rc) or (rc <> 0) then
-    MsgBox('The Pulsemon service was installed, but its virtual account could not be granted self-restart rights.' #13#10 +
-           'The dashboard self-update will ask for a manual service restart instead; the next installer run repairs this.',
+    MsgBox('The Pulsemon service was installed, but its virtual account could not be granted its service-query rights (it falls back to the standard grant; the monitor works).' #13#10 +
+           'The next installer run repairs this.',
            mbError, MB_OK);
 end;
 
@@ -221,11 +222,12 @@ begin
   // signature BEFORE the swap, so this adds no network-facing surface.
   RunHidden('icacls.exe', '"' + ExpandConstant('{app}') + '" /T /grant "NT SERVICE\Pulsemon:(OI)(CI)(M)"');
   RunHidden('sc.exe', 'description ' + ServiceName + ' ' + #34 + 'Pulsemon network monitor (ICMP sensor dashboard)' + #34);
-  // Restart the service automatically if it crashes (10s, 30s, 60s delays).
-  // LOAD-BEARING for the self-update: the VSA cannot start its own service
-  // (integrity-enforced), so the in-dashboard update exits for THIS
-  // recovery action (a deliberate 7031) - the update is refused at runtime
-  // when this action is missing (recoveryActionConfiguredFn).
+  // Restart the service automatically if it crashes (10s, 30s, 60s
+  // delays). CRASH SAFETY NET (2026-11-24, windows-update-staged): a
+  // crashed service comes back automatically. The in-dashboard
+  // self-update does NOT depend on it - it stages the binary and hands
+  // the operator the restart (the VSA cannot start its own service,
+  // integrity-enforced).
   RunHidden('sc.exe', 'failure ' + ServiceName +
     ' reset= 86400 actions= restart/10000/restart/30000/restart/60000');
 end;
