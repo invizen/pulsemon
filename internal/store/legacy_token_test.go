@@ -112,7 +112,7 @@ func TestDeferredLegacyTokenMigrationRetriesNextBoot(t *testing.T) {
 		VALUES ('s1', 'legacy', '10.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', '2026-01-01T00:00:00Z')`); err != nil {
 		t.Fatalf("seed sensor: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('s1', '2026-10-13T00:00:00Z', 1.5)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 's1'), 1791867600000, 1.5)`); err != nil {
 		t.Fatalf("seed probe: %v", err)
 	}
 	if _, err := db.Exec("DROP TABLE users"); err != nil {

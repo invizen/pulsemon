@@ -35,19 +35,19 @@ func TestWarmStatsCarriesManualFlag(t *testing.T) {
 	}
 	// 4 scheduled probes (3 up, 1 lost).
 	for i := 0; i < 4; i++ {
-		ts := now.Add(-time.Duration(90-i*30) * time.Second).Format(time.RFC3339)
+		ts := now.Add(-time.Duration(90-i*30) * time.Second).UnixMilli()
 		var val any = 10.0
 		if i == 2 {
 			val = nil
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", id, ts, val); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", id, ts, val); err != nil {
 			t.Fatalf("insert scheduled probe %d: %v", i, err)
 		}
 	}
 	// One MANUAL lost probe, the newest row overall.
 	manTs := now.Add(-5 * time.Second)
-	if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, manual) VALUES (?, ?, NULL, '127.0.0.1', 1)",
-		id, manTs.Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, '127.0.0.1', 1)",
+		id, manTs.UnixMilli()); err != nil {
 		t.Fatalf("insert manual probe: %v", err)
 	}
 

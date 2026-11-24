@@ -29,8 +29,8 @@ func seedFailingHTTPSensor(t *testing.T, id, name string) (*store.Store, *ProbeW
 		VALUES (?, ?, 'http://127.0.0.1:1/', 15, 8000, 25, 1, 3, 'active', 'error', '2026-01-01T00:00:00Z')`, id, name); err != nil {
 		t.Fatalf("insert sensor: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status)
-		VALUES (?, ?, NULL, '127.0.0.1', 503)`, id, time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, http_status)
+		VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, '127.0.0.1', 503)`, id, time.Now().Add(-time.Minute).UTC().UnixMilli()); err != nil {
 		t.Fatalf("seed probe: %v", err)
 	}
 	pw := NewProbeWorker(db)
@@ -155,16 +155,16 @@ func TestClearHistoryAtomicOnFailure(t *testing.T) {
 	if _, err := db.Exec(`CREATE TABLE users (username TEXT PRIMARY KEY, is_admin INTEGER NOT NULL DEFAULT 0)`); err != nil {
 		t.Fatalf("create users: %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE sensors (id TEXT PRIMARY KEY, name TEXT, status TEXT)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE sensors (id TEXT PRIMARY KEY, name TEXT, status TEXT, sk INTEGER)`); err != nil {
 		t.Fatalf("create sensors: %v", err)
 	}
-	if _, err := db.Exec(`CREATE TABLE probes (id INTEGER PRIMARY KEY, sensor_id TEXT, ts TEXT, rtt_ms REAL)`); err != nil {
+	if _, err := db.Exec(`CREATE TABLE probes (id INTEGER PRIMARY KEY, sk INTEGER, ts_ms INTEGER, rtt_ms REAL)`); err != nil {
 		t.Fatalf("create probes: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO sensors (id, name, status) VALUES ('clr3', 'clr3', 'error')`); err != nil {
+	if _, err := db.Exec(`INSERT INTO sensors (id, name, status, sk) VALUES ('clr3', 'clr3', 'error', 1)`); err != nil {
 		t.Fatalf("insert sensor: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('clr3', '2026-01-01T00:00:00Z', NULL)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'clr3'), 1767247200000, NULL)`); err != nil {
 		t.Fatalf("seed probe: %v", err)
 	}
 	srv := NewServer(db, NewProbeWorker(db))
@@ -180,7 +180,7 @@ func TestClearHistoryAtomicOnFailure(t *testing.T) {
 	// (bounded write lock); a retry of the DELETE endpoint converges the
 	// rest. What must NOT have happened: the small atomic tail.
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "clr3").Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "clr3").Scan(&n); err != nil {
 		t.Fatalf("count probes: %v", err)
 	}
 	if n != 0 {

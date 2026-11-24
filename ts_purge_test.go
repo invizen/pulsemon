@@ -10,6 +10,13 @@ import (
 )
 
 // ---------------------------------------------------------------- timestamps
+//
+// TestFix_TS_FixedWidthLexicographicEqualsChronological pins the TSLayout
+// string format that the EVENTS table (and every API ts string) still uses:
+// fixed width, so lexicographic order == chronological order. The probes
+// table moved to INTEGER epoch-ms in migration 14, but the events table
+// stays TEXT by decision (docs/DECISIONS.md, probe-rows-int-schema), so
+// this format pin remains live for the events write path.
 
 func TestFix_TS_FixedWidthLexicographicEqualsChronological(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
@@ -49,7 +56,12 @@ func TestFix_TS_FixedWidthLexicographicEqualsChronological(t *testing.T) {
 	}
 }
 
-func TestFix_TS_PurgeDeletesOnlyOldRowsIncludingLegacyFormat(t *testing.T) {
+// TestPurgeOldDeletesOnlyRowsPast24hCutoff pins purgeOld's cutoff and
+// tail-exemption arithmetic on the INTEGER layout (migration 14). The
+// pre-migration version of this test seeded variable-width legacy STRING
+// rows to prove the purge survived string comparison; with ts_ms that
+// hazard class is gone, so the seed is plain epoch-ms rows.
+func TestPurgeOldDeletesOnlyRowsPast24hCutoff(t *testing.T) {
 	db := fcDB(t)
 	fcSensor(t, db, "a", "a", "active")
 	pw := NewProbeWorker(db)
@@ -57,42 +69,28 @@ func TestFix_TS_PurgeDeletesOnlyOldRowsIncludingLegacyFormat(t *testing.T) {
 	young := time.Now().Add(-23 * time.Hour)
 	// Seed BEYOND the per-sensor 60-row tail exemption (finding #6): 65 old
 	// + 2 young = 67 rows, so the sweep deletes exactly the 7 oldest. Hour
-	// spacing keeps every old row unambiguously past the 24h cutoff. The
-	// two legacy variable-width OLD rows are seeded as the oldest, so the
-	// deleted set provably includes them (the point of this test: legacy
-	// rows are purged by string comparison despite the variable width).
+	// spacing keeps every old row unambiguously past the 24h cutoff.
 	for i := 0; i < 63; i++ {
 		fcProbe(t, db, "a", old.Add(-time.Duration(i)*time.Hour), 1.0)
 	}
-	legacyOld1 := old.Add(-64 * time.Hour).UTC().Format(time.RFC3339)
-	legacyOld2 := old.Add(-65 * time.Hour).UTC().Format(time.RFC3339Nano)
-	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyOld1)
-	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyOld2)
+	fcProbe(t, db, "a", old.Add(-64*time.Hour), 1.0)
+	fcProbe(t, db, "a", old.Add(-65*time.Hour), 1.0)
 	fcProbe(t, db, "a", young, 1.0)
-	// legacy variable-width young row (integer-second form, like pre-
-	// FormatTS writers: trailing zeros trimmed, so it cannot collide with
-	// the nanosecond-precision fcProbe rows in the ts IN/= lookups)
-	legacyYoung := young.Truncate(time.Second).UTC().Format(time.RFC3339Nano)
-	db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('a', ?, 1)`, legacyYoung)
+	// 30m inside the window: a row seeded at EXACTLY 24h is ambiguous — by
+	// the time purgeOld computes its cutoff (ms later) it is past it, and
+	// purging it is correct behavior, not a regression.
+	fcProbe(t, db, "a", young.Add(-30*time.Minute), 1.0)
 
 	pw.purgeOld(context.Background())
 
-	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
-	var n, oldLeft, legacyOldLeft, legacyYoungLeft int
+	cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
+	var n, oldLeft int
 	db.QueryRow(`SELECT COUNT(*) FROM probes`).Scan(&n)
-	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts < ?`, cutoff).Scan(&oldLeft)
-	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts IN (?, ?)`, legacyOld1, legacyOld2).Scan(&legacyOldLeft)
-	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts = ?`, legacyYoung).Scan(&legacyYoungLeft)
+	db.QueryRow(`SELECT COUNT(*) FROM probes WHERE ts_ms < ?`, cutoff).Scan(&oldLeft)
 	if n != 60 {
 		t.Fatalf("%d rows left, want 60 (24h window + 60-row tail exemption)", n)
 	}
 	if oldLeft != 58 {
 		t.Errorf("%d old rows left, want 58 (the 58 newest old rows are inside the tail)", oldLeft)
-	}
-	if legacyOldLeft != 0 {
-		t.Errorf("%d legacy-format OLD rows left, want 0 (purge must delete variable-width legacy rows)", legacyOldLeft)
-	}
-	if legacyYoungLeft != 1 {
-		t.Errorf("legacy-format young row missing (want 1, got %d)", legacyYoungLeft)
 	}
 }

@@ -32,7 +32,7 @@ func TestInQueryChunking(t *testing.T) {
 
 	// A fleet that spans multiple chunks, including a partial final one.
 	n := 2*store.InQueryChunk + 70 // 1070 -> chunks of 500, 500, 70
-	now := time.Now().UTC().Format(time.RFC3339Nano)
+	now := time.Now().UTC().UnixMilli()
 	probeRTT := func(i int) float64 { return float64(10 + i%7) } // 10..16 ms
 
 	// Seed sensors, one probe each (ts within 24h so warmStats loads it), and
@@ -53,7 +53,7 @@ func TestInQueryChunking(t *testing.T) {
 			id := "s" + itoa(i)
 			sVals = append(sVals, "(?, ?, '127.0.0.1', 15, 1000, 25, 4, 'active', 'up', '2026-01-01T00:00:00Z')")
 			sArgs = append(sArgs, id, id)
-			pVals = append(pVals, "(?, ?, ?)")
+			pVals = append(pVals, "((SELECT sk FROM sensors WHERE id = ?), ?, ?)")
 			pArgs = append(pArgs, id, now, probeRTT(i))
 			tVals = append(tVals, "(?, ?)")
 			tArgs = append(tArgs, id, "tag"+itoa(i%13))
@@ -62,7 +62,7 @@ func TestInQueryChunking(t *testing.T) {
 			VALUES `+joinComma(sVals), sArgs...); err != nil {
 			t.Fatalf("seed sensors chunk %d: %v", start, err)
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES "+joinComma(pVals), pArgs...); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES "+joinComma(pVals), pArgs...); err != nil {
 			t.Fatalf("seed probes chunk %d: %v", start, err)
 		}
 		if _, err := db.Exec("INSERT INTO sensor_tags (sensor_id, tag) VALUES "+joinComma(tVals), tArgs...); err != nil {

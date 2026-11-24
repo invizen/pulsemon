@@ -36,8 +36,8 @@ func TestWarmStatsDropsStaleLiveEntries(t *testing.T) {
 	// DB rows: three scheduled probes at 180s / 120s / 60s ago (newest 60s).
 	for i, age := range []int{180, 120, 60} {
 		ts := now.Add(-time.Duration(age) * time.Second)
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, 1.0, '127.0.0.1')`,
-			id, ts.Format(time.RFC3339Nano)); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, 1.0, '127.0.0.1')`,
+			id, ts.UnixMilli()); err != nil {
 			t.Fatalf("insert probe %d: %v", i, err)
 		}
 	}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -92,9 +91,9 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 
 	now := time.Now().UTC()
 	anchor := now.Add(-24 * time.Hour) // the ~24h boundary
-	seed := func(off time.Duration) string {
-		ts := anchor.Add(off).Format(time.RFC3339Nano)
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES ('p', ?, 10.0, '127.0.0.1')", ts); err != nil {
+	seed := func(off time.Duration) int64 {
+		ts := anchor.Add(off).UnixMilli()
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = 'p'), ?, 10.0, '127.0.0.1')", ts); err != nil {
 			t.Fatalf("insert probe %v: %v", off, err)
 		}
 		return ts
@@ -113,13 +112,13 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 	pw := &ProbeWorker{db: db}
 	pw.purgeOld(context.Background())
 
-	present := map[string]bool{}
-	rows, err := db.Query("SELECT ts FROM probes")
+	present := map[int64]bool{}
+	rows, err := db.Query("SELECT ts_ms FROM probes")
 	if err != nil {
 		t.Fatalf("query probes: %v", err)
 	}
 	for rows.Next() {
-		var ts string
+		var ts int64
 		if err := rows.Scan(&ts); err != nil {
 			t.Fatalf("scan: %v", err)
 		}
@@ -129,16 +128,16 @@ func TestPurgeOldNoEarlyDeletion(t *testing.T) {
 
 	// No early-deletion: the in-window row survives.
 	if !present[young] {
-		t.Fatalf("row %q (1h inside the window) was EARLY-DELETED — the finding's feared bug (purgeOld must never delete a young row)", young)
+		t.Fatalf("row %d (1h inside the window) was EARLY-DELETED — the finding's feared bug (purgeOld must never delete a young row)", young)
 	}
 	// Retention works: both past-boundary rows are gone.
 	if present[far] {
-		t.Fatalf("row %q (6h past the boundary) was NOT purged — retention is broken", far)
+		t.Fatalf("row %d (6h past the boundary) was NOT purged — retention is broken", far)
 	}
 	if present[justOld] {
-		t.Fatalf("row %q (10s past the boundary) was NOT purged — retention is broken", justOld)
+		t.Fatalf("row %d (10s past the boundary) was NOT purged — retention is broken", justOld)
 	}
-	t.Logf("purgeOld: kept in-window %q, deleted %q and %q — no early-deletion, retention works", young, far, justOld)
+	t.Logf("purgeOld: kept in-window %d, deleted %d and %d — no early-deletion, retention works", young, far, justOld)
 }
 
 // TestPurgeOldMultiBatchPerSensor drives the per-sensor, batched purge
@@ -169,28 +168,35 @@ func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	st, err := tx.Prepare("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, 10.0)")
+	st, err := tx.Prepare("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES (?, ?, 10.0)")
 	if err != nil {
 		t.Fatalf("prepare: %v", err)
+	}
+	var skA, skB int64
+	if err := db.QueryRow("SELECT sk FROM sensors WHERE id = 'a'").Scan(&skA); err != nil {
+		t.Fatalf("sk a: %v", err)
+	}
+	if err := db.QueryRow("SELECT sk FROM sensors WHERE id = 'b'").Scan(&skB); err != nil {
+		t.Fatalf("sk b: %v", err)
 	}
 	now := time.Now().UTC()
 	// 'a': 12,000 rows 30h..~26.7h old (all past the 24h boundary) + 50
 	// rows 1h old (inside the window).
 	oldBase := now.Add(-30 * time.Hour)
 	for i := 0; i < 12000; i++ {
-		if _, err := st.Exec("a", oldBase.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano)); err != nil {
+		if _, err := st.Exec(skA, oldBase.Add(time.Duration(i)*time.Second).UnixMilli()); err != nil {
 			t.Fatalf("insert old probe %d: %v", i, err)
 		}
 	}
 	youngBase := now.Add(-time.Hour)
 	for i := 0; i < 50; i++ {
-		if _, err := st.Exec("a", youngBase.Add(time.Duration(i)*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		if _, err := st.Exec(skA, youngBase.Add(time.Duration(i)*time.Minute).UnixMilli()); err != nil {
 			t.Fatalf("insert young probe %d: %v", i, err)
 		}
 	}
 	// 'b': 100 rows, all inside the window (empty purge round trip).
 	for i := 0; i < 100; i++ {
-		if _, err := st.Exec("b", youngBase.Add(time.Duration(i)*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		if _, err := st.Exec(skB, youngBase.Add(time.Duration(i)*time.Minute).UnixMilli()); err != nil {
 			t.Fatalf("insert b probe %d: %v", i, err)
 		}
 	}
@@ -203,10 +209,10 @@ func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
 	pw.purgeOld(context.Background())
 
 	var nA, nB int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = 'a'").Scan(&nA); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'a')").Scan(&nA); err != nil {
 		t.Fatalf("count a: %v", err)
 	}
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = 'b'").Scan(&nB); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'b')").Scan(&nB); err != nil {
 		t.Fatalf("count b: %v", err)
 	}
 	// Tail exemption (finding #6): 'a' keeps the 50 in-window rows PLUS its
@@ -220,13 +226,13 @@ func TestPurgeOldMultiBatchPerSensor(t *testing.T) {
 	}
 	// The 10 survivors beyond the window are the NEWEST old rows — no
 	// early-deletion at scale: survivors = 50 young + old rows i=11990..11999,
-	// so MIN(ts) is the 10th-newest old row, i=11990.
-	var oldest string
-	if err := db.QueryRow("SELECT MIN(ts) FROM probes WHERE sensor_id = 'a'").Scan(&oldest); err != nil {
-		t.Fatalf("min ts: %v", err)
+	// so MIN(ts_ms) is the 10th-newest old row, i=11990.
+	var oldest int64
+	if err := db.QueryRow("SELECT MIN(ts_ms) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'a')").Scan(&oldest); err != nil {
+		t.Fatalf("min ts_ms: %v", err)
 	}
-	if !strings.HasPrefix(oldest, oldBase.Add(11990*time.Second).Format("2006-01-02T15:04")) {
-		t.Fatalf("sensor 'a' oldest survivor %q is not the 10th-newest old row (the exempted tail must be the newest rows)", oldest)
+	if oldest != oldBase.Add(11990*time.Second).UnixMilli() {
+		t.Fatalf("sensor 'a' oldest survivor %d is not the 10th-newest old row %d (the exempted tail must be the newest rows)", oldest, oldBase.Add(11990*time.Second).UnixMilli())
 	}
 	t.Logf("purgeOld multi-batch: 'a' 12,050 -> 60 (50 in-window + 10 tail), 'b' 100 -> 100")
 }

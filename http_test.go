@@ -1016,7 +1016,7 @@ func TestPingNowHTTPSensor(t *testing.T) {
 	}
 
 	var rtt sql.NullFloat64
-	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sensor_id = ?", "pnow").Scan(&rtt); err != nil {
+	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "pnow").Scan(&rtt); err != nil {
 		t.Fatalf("read rtt_ms: %v", err)
 	}
 	if rtt.Valid {

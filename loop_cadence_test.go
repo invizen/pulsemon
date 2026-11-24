@@ -190,8 +190,8 @@ func TestSensorLoopFastRetryMatchesInterval(t *testing.T) {
 	// loop's first lost probe then makes the whole window loss.
 	for i := 1; i <= 8; i++ {
 		ts := time.Now().UTC().Add(-time.Duration(i) * 5 * time.Second)
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, NULL, ?, NULL, 0)`,
-			id, store.FormatTS(ts), "127.0.0.1"); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, http_status, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, ?, NULL, 0)`,
+			id, ts.UnixMilli(), "127.0.0.1"); err != nil {
 			t.Fatalf("seed loss %d: %v", i, err)
 		}
 	}
@@ -291,8 +291,8 @@ func TestSensorLoopFirstFastRetryNotDelayed(t *testing.T) {
 	// Seed 8 prior losses so the first live probe makes the window all-loss.
 	for i := 1; i <= 8; i++ {
 		ts := time.Now().UTC().Add(-time.Duration(i) * 10 * time.Second)
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, manual) VALUES (?, ?, NULL, ?, NULL, 0)`,
-			id, store.FormatTS(ts), "127.0.0.1"); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, http_status, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, ?, NULL, 0)`,
+			id, ts.UnixMilli(), "127.0.0.1"); err != nil {
 			t.Fatalf("seed loss %d: %v", i, err)
 		}
 	}

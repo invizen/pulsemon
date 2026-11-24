@@ -726,7 +726,8 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// compensating restore below.
 		var one int
 		var curState string
-		if err := s.db.QueryRowContext(r.Context(), "SELECT 1, state FROM sensors WHERE id = ?", id).Scan(&one, &curState); err != nil {
+		var curSk int64
+		if err := s.db.QueryRowContext(r.Context(), "SELECT 1, state, sk FROM sensors WHERE id = ?", id).Scan(&one, &curState, &curSk); err != nil {
 			if errors.Is(err, sql.ErrNoRows) {
 				respondWithError(w, http.StatusNotFound, "sensor not found")
 				return
@@ -780,7 +781,9 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// milliseconds per chunk instead of one long lock over the whole
 		// cascade. The small cascade tables (sensor_tags, alert_state — a
 		// few rows each) ride the final sensor-row DELETE's ON DELETE CASCADE.
-		if _, err := deleteRowsBatched(ctx, s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+		// probes cascade on the INTEGER sk (migration 14); events keep
+		// the TEXT sensor_id.
+		if _, err := deleteRowsBatched(ctx, s.db, "probes", "sk = ?", []any{curSk}); err != nil {
 			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
@@ -914,8 +917,15 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusNotFound, "sensor not found")
 		return
 	}
+	// probes are keyed by the INTEGER sk (migration 14); the row is
+	// known to exist from the check above.
+	var sk int64
+	if err := s.db.QueryRowContext(r.Context(), "SELECT sk FROM sensors WHERE id = ?", id).Scan(&sk); err != nil {
+		respondInternal(w, "sensor history sk "+id, err)
+		return
+	}
 
-	rows, err := s.db.QueryContext(r.Context(), "SELECT ts, rtt_ms FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?", id, n)
+	rows, err := s.db.QueryContext(r.Context(), "SELECT ts_ms, rtt_ms FROM probes WHERE sk = ? ORDER BY ts_ms DESC LIMIT ?", sk, n)
 	if err != nil {
 		respondInternal(w, "sensor history "+id, err)
 		return
@@ -924,18 +934,21 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 
 	out := []ProbeRow{}
 	for rows.Next() {
-		var ts time.Time
+		var tsMS int64
 		var rtt *float64
-		if err := rows.Scan(&ts, &rtt); err != nil {
-			// A corrupt row (e.g. a non-RFC3339 ts after a bad
-			// migration) must be visible in the service log, not a
-			// silently truncated history with a 200 — same contract
-			// as fetchSensors' per-row scan log.
+		if err := rows.Scan(&tsMS, &rtt); err != nil {
+			// A corrupt row (a non-numeric ts_ms stored as TEXT after a
+			// bad edit/migration) must be visible in the service log,
+			// not a silently truncated history with a 200 — same
+			// contract as fetchSensors' per-row scan log.
 			log.Printf("API: skipping corrupt probe row for %s: %v", id, err)
 			continue
 		}
+		// ts_ms is epoch ms: the API's ts resolution is now millisecond
+		// (the INTEGER layout's design granularity), displayed via the
+		// same RFC3339Nano format as before.
 		out = append(out, ProbeRow{
-			TS:   ts.UTC().Format(time.RFC3339Nano),
+			TS:   time.UnixMilli(tsMS).UTC().Format(time.RFC3339Nano),
 			RTT:  rtt,
 			Lost: rtt == nil,
 		})
@@ -964,7 +977,8 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	id := r.PathValue("id")
 
 	var name string
-	if err := s.db.QueryRowContext(r.Context(), "SELECT name FROM sensors WHERE id = ?", id).Scan(&name); err != nil {
+	var sk int64
+	if err := s.db.QueryRowContext(r.Context(), "SELECT name, sk FROM sensors WHERE id = ?", id).Scan(&name, &sk); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			respondWithError(w, http.StatusNotFound, "sensor not found")
 		} else {
@@ -986,7 +1000,7 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 	// The small state-consistency steps below stay atomic: alert_state
 	// removal and the status reset commit all-or-none (the old autocommit
 	// code ignored their errors — the half-cleared bug the tx fixes).
-	if probes, err = deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+	if probes, err = deleteRowsBatched(r.Context(), s.db, "probes", "sk = ?", []any{sk}); err != nil {
 		respondInternal(w, "clear probes "+id, err)
 		return
 	}

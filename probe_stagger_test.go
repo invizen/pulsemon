@@ -32,9 +32,23 @@ func fcSensor(t *testing.T, db *store.Store, id, name, state string) {
 
 func fcProbe(t *testing.T, db *store.Store, id string, ts time.Time, rtt any) {
 	t.Helper()
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?,?,?)`, id, store.FormatTS(ts), rtt); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)`, id, ts.UnixMilli(), rtt); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// sensorSK reads a sensor's migration-14 surrogate key. Tests that
+// hand-build a sensorConfig for a DB-seeded sensor must carry the sk —
+// doProbe's probe INSERT and the DB-fallback reads are keyed on sk, not
+// the TEXT id (a zero sk writes an orphan row the FK rejects, and reads
+// nothing).
+func sensorSK(t *testing.T, db *store.Store, id string) int64 {
+	t.Helper()
+	var sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = ?`, id).Scan(&sk); err != nil {
+		t.Fatalf("sensorSK(%s): %v", id, err)
+	}
+	return sk
 }
 
 // ---------------------------------------------------------------- M1

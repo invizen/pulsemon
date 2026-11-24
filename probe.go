@@ -324,7 +324,13 @@ func (ps *probeSeries) graphPoints(bucketSecs, rangeSecs int, nowUnix int64) []G
 }
 
 type sensorConfig struct {
-	id     string
+	id string
+	// sk is the sensor's INTEGER surrogate (sensors.sk): the probes
+	// table's FK key since the INTEGER row-layout migration. Carried on
+	// the spawn-time config so doProbe and PingNow write probe rows
+	// without a per-probe re-read. History: docs/DECISIONS.md ->
+	// probe-rows-int-schema
+	sk     int64
 	name   string
 	target string
 	// probeType is the probe transport: "icmp" (default), "http", or
@@ -641,7 +647,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	// drops their loop + state explicitly (what the vanished pass did
 	// implicitly when they were filtered out) and records wasPaused, so the
 	// first spawn after a resume is capped like any other respawn.
-	rows, err := pw.db.Query(`SELECT id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
+	rows, err := pw.db.Query(`SELECT id, sk, name, target, type, interval_s, timeout_ms, loss_warn, down_after, state
 		FROM sensors WHERE state IN ('active', 'paused')`)
 	if err != nil {
 		log.Printf("ProbeWorker: failed to query sensors: %v", err)
@@ -661,7 +667,7 @@ func (pw *ProbeWorker) syncSensors(ctx context.Context) {
 	partial := false
 	for rows.Next() {
 		var c activeCfg
-		if err := rows.Scan(&c.id, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
+		if err := rows.Scan(&c.id, &c.sk, &c.name, &c.target, &c.probeType, &c.intervalS, &c.timeoutMS, &c.lossWarn, &c.downAfter, &c.state); err != nil {
 			log.Printf("ProbeWorker: skipping unreadable sensor row: %v", err)
 			partial = true
 			continue
@@ -1127,7 +1133,8 @@ const pulseMaxInFlight = 8
 func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, error) {
 	var target, probeType, state string
 	var timeoutMS int
-	if err := pw.db.QueryRow("SELECT target, type, timeout_ms, state FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS, &state); err != nil {
+	var sk int64
+	if err := pw.db.QueryRow("SELECT target, type, timeout_ms, state, sk FROM sensors WHERE id = ?", id).Scan(&target, &probeType, &timeoutMS, &state, &sk); err != nil {
 		return probeOutcome{}, err // sql.ErrNoRows for an unknown sensor
 	}
 	if state == "deleting" {
@@ -1199,8 +1206,9 @@ func (pw *ProbeWorker) PingNow(ctx context.Context, id string) (probeOutcome, er
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}
-	if _, err := pw.db.ProbeExecContext(writeCtx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error, manual) VALUES (?, ?, ?, ?, ?, ?, 1)",
-		id, store.FormatTS(ts), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
+	// Same INTEGER layout as doProbe (migration 14): sk + epoch-ms.
+	if _, err := pw.db.ProbeExecContext(writeCtx, "INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, http_status, dns_error, manual) VALUES (?, ?, ?, ?, ?, ?, 1)",
+		sk, ts.UnixMilli(), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		return o, fmt.Errorf("record echo probe: %w", err)
 	}
 	// Keep the in-memory stats cache in lockstep with the DB row (the same
@@ -1339,7 +1347,11 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	if o.dnsErr != "" {
 		dnsErrVal = o.dnsErr
 	}
-	if _, err := pw.db.ProbeExecContext(ctx, "INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, http_status, dns_error) VALUES (?, ?, ?, ?, ?, ?)", c.id, store.FormatTS(now), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
+	// probes' INTEGER layout (migration 14): sk is the FK key, ts_ms is
+	// epoch milliseconds — exact ordering, no string compare. The
+	// in-memory entry below keeps epoch SECONDS (the series layer's
+	// unchanged unit). History: docs/DECISIONS.md -> probe-rows-int-schema
+	if _, err := pw.db.ProbeExecContext(ctx, "INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, http_status, dns_error) VALUES (?, ?, ?, ?, ?, ?)", c.sk, now.UnixMilli(), rttVal, o.ip, o.httpCode, dnsErrVal); err != nil {
 		log.Printf("ProbeWorker: failed to insert probe for %s: %v", c.id, err)
 		return
 	}
@@ -1494,12 +1506,13 @@ const purgeBatchSize = 5000
 // always contains everything warmStats can load and a restart never shrinks
 // the 60-probe inspector window.
 //
-// ts is compared as a string. That is exact because every writer uses the
-// fixed-width store.FormatTS layout (lexicographic order == chronological order). Rows
-// written by older versions used a variable-width layout; for those the
-// comparison can be off by under one second right at the cutoff, which only
-// ever over- or under-retains a single boundary row once and ages out within a
-// day - harmless for a 24h window.
+// probes' ts_ms is compared as an INTEGER (epoch ms): exact, no layout
+// assumptions. events' ts is still compared as a fixed-width TEXT string
+// (the store.FormatTS layout: lexicographic order == chronological
+// order; legacy variable-width rows can be off by under a second right
+// at the cutoff, which only ever over- or under-retains a single
+// boundary row once and ages out within a day - harmless for a 24h
+// window).
 //
 // PLAN: the old body was one
 // `DELETE FROM <table> WHERE ts < ?` per table. ts is the SECOND column of
@@ -1519,15 +1532,19 @@ const purgeBatchSize = 5000
 // context-free loop could run minutes of DELETEs uninterruptibly on a
 // large retention backlog, past the shutdown drain budget.
 func (pw *ProbeWorker) purgeOld(ctx context.Context) {
-	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
-	ids, err := pw.db.SensorIDs()
+	// One instant, two cutoffs: probes compare epoch-ms integers,
+	// events compare fixed-width TEXT (store.FormatTS).
+	cutoffTime := time.Now().Add(-24 * time.Hour)
+	cutoffMS := cutoffTime.UnixMilli()
+	cutoffTS := store.FormatTS(cutoffTime)
+	keys, err := pw.db.SensorKeys()
 	if err != nil {
 		log.Printf("retention: failed to list sensors: %v", err)
 		return
 	}
 	for _, table := range []string{"probes", "events"} {
 		total := int64(0)
-		for _, id := range ids {
+		for _, k := range keys {
 			for {
 				select {
 				case <-ctx.Done():
@@ -1543,8 +1560,8 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 				// purge deletes the tail warmStats phase 2 promises to
 				// rebuild, so a slow sensor's inspector window would
 				// shrink across every restart. The subquery reads the
-				// tail off idx_probes_sensor_ts_cov (sensor_id, ts prefix) —
-				// ~60 index probes per batch. events need no exemption
+				// tail off idx_probes_cov (sk, ts_ms prefix) — ~60
+				// index probes per batch. events need no exemption
 				// (transitions are sparse; nothing mirrors a tail).
 				var res sql.Result
 				var err error
@@ -1555,15 +1572,15 @@ func (pw *ProbeWorker) purgeOld(ctx context.Context) {
 				switch table {
 				case "probes":
 					res, err = pw.db.ExecContext(ctx, `DELETE FROM probes WHERE id IN (
-					SELECT id FROM probes WHERE sensor_id = ? AND ts < ?
-					AND id NOT IN (SELECT id FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?)
-					LIMIT ?)`, id, cutoff, id, seriesTailProbes, purgeBatchSize)
+					SELECT id FROM probes WHERE sk = ? AND ts_ms < ?
+					AND id NOT IN (SELECT id FROM probes WHERE sk = ? ORDER BY ts_ms DESC LIMIT ?)
+					LIMIT ?)`, k.Sk, cutoffMS, k.Sk, seriesTailProbes, purgeBatchSize)
 				case "events":
 					res, err = pw.db.ExecContext(ctx, `DELETE FROM events WHERE id IN (
-					SELECT id FROM events WHERE sensor_id = ? AND ts < ? LIMIT ?)`, id, cutoff, purgeBatchSize)
+					SELECT id FROM events WHERE sensor_id = ? AND ts < ? LIMIT ?)`, k.ID, cutoffTS, purgeBatchSize)
 				}
 				if err != nil {
-					log.Printf("retention: failed to purge %s for sensor %s: %v", table, id, err)
+					log.Printf("retention: failed to purge %s for sensor %s: %v", table, k.ID, err)
 					break
 				}
 				n, _ := res.RowsAffected()

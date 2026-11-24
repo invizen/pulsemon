@@ -74,7 +74,7 @@ func TestGraph24hFromMemoryMatchesSQL(t *testing.T) {
 		} else {
 			val = 10 + float64(i%40)
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, ?)", "g", store.FormatTS(ts), val); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'g'), ?, ?)", ts.UnixMilli(), val); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -95,10 +95,10 @@ func TestGraph24hFromMemoryMatchesSQL(t *testing.T) {
 	}
 
 	// SQL reference: the 15-min aggregate the old path returned.
-	rows, err := db.Query(`SELECT (strftime('%s', ts) / 900) * 900 AS bucket, COUNT(*),
+	rows, err := db.Query(`SELECT (ts_ms / 900000) * 900 AS bucket, COUNT(*),
 		COALESCE(SUM(rtt_ms IS NULL), 0), AVG(rtt_ms), MAX(rtt_ms)
-		FROM probes WHERE sensor_id = 'g' AND manual = 0
-			AND CAST(strftime('%s', ts) AS INTEGER) >= CAST(strftime('%s', datetime('now', '-24 hours')) AS INTEGER)
+		FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'g') AND manual = 0
+			AND ts_ms >= (strftime('%s', 'now') - 86400) * 1000
 		GROUP BY bucket ORDER BY bucket`)
 	if err != nil {
 		t.Fatal(err)

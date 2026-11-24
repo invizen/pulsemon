@@ -63,7 +63,7 @@ func TestFix_C3_OtherSensorsErrorsDoNotChangeStatus(t *testing.T) {
 	pw := NewProbeWorker(db)
 	probeErrCount.Store(7) // another sensor/engine bumped the global counter
 	defer probeErrCount.Store(0)
-	c := sensorConfig{id: "a", downAfter: 2, lossWarn: 25}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), downAfter: 2, lossWarn: 25}
 	if got := pw.deriveStatus(c, "up"); got != "error" {
 		t.Fatalf("derived %q with an unrelated global counter bump, want error", got)
 	}

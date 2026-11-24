@@ -4,8 +4,6 @@ import (
 	"context"
 	"testing"
 	"time"
-
-	"pulsemon/internal/store"
 )
 
 // TestRunPurgesAtStartup pins finding #9: the 24h retention sweep runs ONCE at
@@ -46,15 +44,15 @@ func TestRunPurgesAtStartup(t *testing.T) {
 	cancel()
 	<-done
 
-	cutoff := store.FormatTS(time.Now().Add(-24 * time.Hour))
+	cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
 	var oldCount, recentCount, total int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1' AND ts < ?`, cutoff).Scan(&oldCount); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'purge1') AND ts_ms < ?`, cutoff).Scan(&oldCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1' AND ts >= ?`, cutoff).Scan(&recentCount); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'purge1') AND ts_ms >= ?`, cutoff).Scan(&recentCount); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='purge1'`).Scan(&total); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'purge1')`).Scan(&total); err != nil {
 		t.Fatal(err)
 	}
 	// 71 rows seeded; the startup sweep must have removed exactly the 11

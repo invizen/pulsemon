@@ -50,16 +50,16 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 		t.Fatalf("PingNow = (lost=%v, err=%v), want a lost pulse", o.lost, err)
 	}
 	var manual int
-	if err := db.QueryRow(`SELECT manual FROM probes WHERE sensor_id = ?`, id).Scan(&manual); err != nil || manual != 1 {
+	if err := db.QueryRow(`SELECT manual FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)`, id).Scan(&manual); err != nil || manual != 1 {
 		t.Fatalf("pulse row manual = %d (err=%v), want 1 — the row must be tagged so derivation can exclude it", manual, err)
 	}
 	base := time.Now().UTC().Add(2 * time.Second)
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, manual) VALUES (?, ?, NULL, 0)`,
-		id, store.FormatTS(base)); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, 0)`,
+		id, base.UnixMilli()); err != nil {
 		t.Fatalf("insert scheduled loss: %v", err)
 	}
 
-	cfg := sensorConfig{id: id, name: id, target: "127.0.0.1", probeType: "icmp",
+	cfg := sensorConfig{id: id, sk: sensorSK(t, db, id), name: id, target: "127.0.0.1", probeType: "icmp",
 		intervalS: 60, timeoutMS: 2000, lossWarn: 25, downAfter: 2}
 
 	// (2) The manual loss must NOT join the consecutive-loss test: one
@@ -72,8 +72,8 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 
 	// (3) Control: two SCHEDULED losses still trip it — the consecutive-
 	// loss logic itself is intact.
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, manual) VALUES (?, ?, NULL, 0)`,
-		id, store.FormatTS(base.Add(time.Second))); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, 0)`,
+		id, base.Add(time.Second).UnixMilli()); err != nil {
 		t.Fatalf("insert second scheduled loss: %v", err)
 	}
 	if st := pw.deriveStatus(cfg, "up"); st != "error" {
@@ -83,12 +83,16 @@ func TestPulseNowNeverAffectsStatus(t *testing.T) {
 	// (4) History honesty: the manual row is STILL in the table (sparkline
 	// / graph / inspector read it unfiltered) — 3 rows total.
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id = ?`, id).Scan(&n); err != nil || n != 3 {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)`, id).Scan(&n); err != nil || n != 3 {
 		t.Fatalf("probe history rows = %d (err=%v), want 3 — manual rows stay in history", n, err)
 	}
 
 	// (5) recentFromDB returns only scheduled rows.
-	recent, err := pw.recentFromDB(id, 8)
+	var sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = ?`, id).Scan(&sk); err != nil {
+		t.Fatalf("read sk: %v", err)
+	}
+	recent, err := pw.recentFromDB(sk, 8)
 	if err != nil {
 		t.Fatalf("recentFromDB: %v", err)
 	}

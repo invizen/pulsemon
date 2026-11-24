@@ -43,8 +43,8 @@ func clearBatchFixture(t *testing.T, sensorID string, rows int) *store.Store {
 		base := time.Now().UTC().Add(-24 * time.Hour)
 		for i := 0; i < rows; i++ {
 			if _, err := tx.Exec(
-				"INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, 5.0, '127.0.0.1')",
-				sensorID, base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano)); err != nil {
+				"INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, 5.0, '127.0.0.1')",
+				sensorID, base.Add(time.Duration(i)*time.Second).UnixMilli()); err != nil {
 				t.Fatalf("seed %d: %v", i, err)
 			}
 		}
@@ -58,7 +58,7 @@ func clearBatchFixture(t *testing.T, sensorID string, rows int) *store.Store {
 func countProbes(t *testing.T, db *store.Store, id string) int {
 	t.Helper()
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", id).Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", id).Scan(&n); err != nil {
 		t.Fatalf("count %s: %v", id, err)
 	}
 	return n
@@ -76,13 +76,13 @@ func TestDeleteRowsBatchedFilters(t *testing.T) {
 	}
 	base := time.Now().UTC().Add(-2 * time.Hour)
 	for i := 0; i < 7; i++ {
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('keep', ?, 5.0)",
-			base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano)); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'keep'), ?, 5.0)",
+			base.Add(time.Duration(i)*time.Second).UnixMilli()); err != nil {
 			t.Fatalf("keep probe: %v", err)
 		}
 	}
 
-	total, err := deleteRowsBatched(context.Background(), db, "probes", "sensor_id = ?", []any{"bulk"})
+	total, err := deleteRowsBatched(context.Background(), db, "probes", "sk IN (SELECT sk FROM sensors WHERE id = ?)", []any{"bulk"})
 	if err != nil {
 		t.Fatalf("deleteRowsBatched: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestDeleteRowsBatchedArgSliceBuiltOnce(t *testing.T) {
 		if err != nil {
 			t.Fatalf("begin reseed: %v", err)
 		}
-		if _, err := tx.Exec("DELETE FROM probes WHERE sensor_id = 'bulk'"); err != nil {
+		if _, err := tx.Exec("DELETE FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'bulk')"); err != nil {
 			t.Fatalf("reseed clear: %v", err)
 		}
 		base := time.Now().UTC().Add(-24 * time.Hour)
@@ -151,12 +151,12 @@ func TestDeleteRowsBatchedArgSliceBuiltOnce(t *testing.T) {
 				end = rows
 			}
 			var sb strings.Builder
-			sb.WriteString("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES ")
+			sb.WriteString("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ")
 			for i := start; i < end; i++ {
 				if i > start {
 					sb.WriteString(",")
 				}
-				fmt.Fprintf(&sb, "('bulk', '%s', 5.0, '127.0.0.1')", base.Add(time.Duration(i)*time.Second).Format(time.RFC3339Nano))
+				fmt.Fprintf(&sb, "((SELECT sk FROM sensors WHERE id = 'bulk'), %d, 5.0, '127.0.0.1')", base.Add(time.Duration(i)*time.Second).UnixMilli())
 			}
 			if _, err := tx.Exec(sb.String()); err != nil {
 				t.Fatalf("reseed %d-%d: %v", start, end, err)

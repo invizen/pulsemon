@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"pulsemon/internal/store"
 	"testing"
 	"time"
 )
@@ -34,18 +33,17 @@ func TestFix_g6_GraphTotalsMatchBuckets(t *testing.T) {
 			rtt = 0
 			isLost = true
 		}
-		// The seekable ts >= bound in handleSensorGraph presumes the
-		// single-writer store.FormatTS format (Z-suffix, db.go store.TSLayout) — seed with
-		// it, not RFC3339Nano, which on a UTC host renders "+00:00" and
-		// sorts lexicographically BELOW the bound.
-		ts := store.FormatTS(now.Add(time.Duration(-i) * time.Minute))
+		// ts_ms is INTEGER epoch-ms (migration 14): the legacy seeding
+		// concern (FormatTS vs RFC3339Nano lexicographic order) no
+		// longer applies to integer comparison.
+		ts := now.Add(time.Duration(-i) * time.Minute).UnixMilli()
 		var rttVal any
 		if isLost {
 			rttVal = nil
 		} else {
 			rttVal = rtt
 		}
-		_, err := d.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, ?)", sensorID, ts, rttVal)
+		_, err := d.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)", sensorID, ts, rttVal)
 		if err != nil {
 			t.Fatalf("exec: %v", err)
 		}

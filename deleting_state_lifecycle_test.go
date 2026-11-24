@@ -22,6 +22,10 @@ import (
 // still UNIQUE-held (re-creation 409s), no probe loop, Pulse Now 409.
 func TestDeleteCompletesWhenClientGoesAwayMidCascade(t *testing.T) {
 	db, _, srv := seedSensorWithHistory(t, "gone1", "gone1")
+	var gone1sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = 'gone1'`).Scan(&gone1sk); err != nil {
+		t.Fatal(err)
+	}
 	reqCtx, clientCancel := context.WithCancel(context.Background())
 	orig := deleteRowsBatched
 	deleteRowsBatched = func(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
@@ -49,7 +53,6 @@ func TestDeleteCompletesWhenClientGoesAwayMidCascade(t *testing.T) {
 		t.Fatalf("sensor row = %d, want 0 — the cascade must outlive the client (a stranded 'deleting' row holds its name and hides the sensor with no path back)", n)
 	}
 	for table, col := range map[string]string{
-		"probes":      "sensor_id",
 		"events":      "sensor_id",
 		"sensor_tags": "sensor_id",
 		"alert_state": "sensor_id",
@@ -60,6 +63,12 @@ func TestDeleteCompletesWhenClientGoesAwayMidCascade(t *testing.T) {
 		if n != 0 {
 			t.Errorf("%s rows = %d, want 0 (the cascade must finish after the client is gone)", table, n)
 		}
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk = ?`, gone1sk).Scan(&n); err != nil {
+		t.Fatalf("count probes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("probes rows = %d, want 0 (the cascade must finish after the client is gone)", n)
 	}
 }
 
@@ -119,6 +128,10 @@ func TestRunCompletesInterruptedDeletesAtBoot(t *testing.T) {
 	// The interrupted delete: the row in the handler's transient
 	// 'deleting' mark, with its full cascade footprint.
 	fcSensor(t, db, "dying1", "dying1", "deleting")
+	var dying1sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = 'dying1'`).Scan(&dying1sk); err != nil {
+		t.Fatal(err)
+	}
 	fcProbe(t, db, "dying1", time.Now().Add(-time.Hour), 1.5)
 	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES ('dying1', ?, 'up', 'down', 'up -> down')`, store.FormatTS(time.Now().Add(-time.Hour))); err != nil {
 		t.Fatalf("seed event: %v", err)
@@ -154,7 +167,6 @@ func TestRunCompletesInterruptedDeletesAtBoot(t *testing.T) {
 		t.Errorf("interrupted-delete row = %d, want 0 — boot must finish the deletion (its name stays UNIQUE-held and the row is otherwise unmanageable)", n)
 	}
 	for table, col := range map[string]string{
-		"probes":      "sensor_id",
 		"events":      "sensor_id",
 		"sensor_tags": "sensor_id",
 		"alert_state": "sensor_id",
@@ -166,13 +178,19 @@ func TestRunCompletesInterruptedDeletesAtBoot(t *testing.T) {
 			t.Errorf("%s rows for the interrupted delete = %d, want 0 (the FK cascade must clean the footprint)", table, n)
 		}
 	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk = ?`, dying1sk).Scan(&n); err != nil {
+		t.Fatalf("count probes: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("probes rows for the interrupted delete = %d, want 0 (the FK cascade must clean the footprint)", n)
+	}
 	if err := db.QueryRow(`SELECT COUNT(*) FROM sensors WHERE id = 'live1'`).Scan(&n); err != nil {
 		t.Fatalf("count live1: %v", err)
 	}
 	if n != 1 {
 		t.Errorf("live1 sensor row = %d, want 1 (boot cleanup must touch only 'deleting' rows)", n)
 	}
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id = 'live1'`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'live1')`).Scan(&n); err != nil {
 		t.Fatalf("count live1 probes: %v", err)
 	}
 	if n != 1 {

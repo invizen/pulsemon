@@ -44,7 +44,7 @@ func TestDeriveStatusDBErrorNeverFakesUp(t *testing.T) {
 	// Build the config the way doProbe does; the broken-probe gate reads
 	// c.probeBroken (per probe), never a global counter, so an unset
 	// field simply means "not broken".
-	c := sensorConfig{id: "dberr-down", lossWarn: 25, downAfter: 4}
+	c := sensorConfig{id: "dberr-down", sk: sensorSK(t, db, "dberr-down"), lossWarn: 25, downAfter: 4}
 	if got := pw.deriveStatus(c, "up"); got != "error" {
 		t.Fatalf("deriveStatus with healthy DB = %q, want error (test precondition)", got)
 	}
@@ -81,7 +81,7 @@ func TestDeriveStatusDBErrorRetainsLastError(t *testing.T) {
 	}
 	pw := seedSensor(t, db, "dberr-last", 25, 4, 3,
 		[]*float64{f64(10), f64(10), f64(10), f64(10), nil, nil, nil, nil})
-	c := sensorConfig{id: "dberr-last", lossWarn: 25, downAfter: 4}
+	c := sensorConfig{id: "dberr-last", sk: sensorSK(t, db, "dberr-last"), lossWarn: 25, downAfter: 4}
 
 	// Sanity: healthy DB reads "error" for a downed sensor.
 	if got := pw.deriveStatus(c, "error"); got != "error" {

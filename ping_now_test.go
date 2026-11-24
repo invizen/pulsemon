@@ -37,7 +37,7 @@ func TestPingNowCancelledRecordsNothing(t *testing.T) {
 		t.Fatal("PingNow on a cancelled ctx = nil error, want a cancellation error")
 	}
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "pcancel").Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "pcancel").Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
@@ -76,7 +76,7 @@ func TestEchoNowProbeRowCount(t *testing.T) {
 
 	count := func() int {
 		var n int
-		if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "echotest").Scan(&n); err != nil {
+		if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "echotest").Scan(&n); err != nil {
 			t.Fatalf("count: %v", err)
 		}
 		return n
@@ -97,7 +97,7 @@ func TestEchoNowProbeRowCount(t *testing.T) {
 		t.Fatalf("post-ping probe rows = %d, want 1 (Echo Now must record its sample)", got)
 	}
 	var rtt sql.NullFloat64
-	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sensor_id = ?", "echotest").Scan(&rtt); err != nil {
+	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "echotest").Scan(&rtt); err != nil {
 		t.Fatalf("read rtt_ms: %v", err)
 	}
 	if rtt.Valid {
@@ -230,7 +230,7 @@ func TestEchoNowCooldownThrottles(t *testing.T) {
 
 	// Only ONE probe row recorded — the throttled pulse must not record.
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "echocd").Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "echocd").Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 1 {
@@ -274,15 +274,12 @@ func TestPingNowCacheUsesPostProbeTimestamp(t *testing.T) {
 		t.Fatalf("PingNow: %v", err)
 	}
 
-	// The DB row's ts (post-probe instant, RFC3339Nano).
-	var tsStr string
-	if err := db.QueryRow("SELECT ts FROM probes WHERE sensor_id = ?", "echots").Scan(&tsStr); err != nil {
-		t.Fatalf("read ts: %v", err)
+	// The DB row's ts_ms (post-probe instant, epoch-ms).
+	var tsMS int64
+	if err := db.QueryRow("SELECT ts_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "echots").Scan(&tsMS); err != nil {
+		t.Fatalf("read ts_ms: %v", err)
 	}
-	dbTs, err := time.Parse(time.RFC3339Nano, tsStr)
-	if err != nil {
-		t.Fatalf("parse ts: %v", err)
-	}
+	dbTs := time.UnixMilli(tsMS)
 
 	// The stats-cache entry's ts — must be the SAME instant.
 	pw.statsMu.Lock()
@@ -344,7 +341,7 @@ func TestPingNowSlowHTTPTargetReadsUp(t *testing.T) {
 	}
 	// The recorded row carries a valid rtt (not NULL = not a loss).
 	var rtt sql.NullFloat64
-	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sensor_id = 'slow'").Scan(&rtt); err != nil {
+	if err := db.QueryRow("SELECT rtt_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'slow')").Scan(&rtt); err != nil {
 		t.Fatalf("read rtt_ms: %v", err)
 	}
 	if !rtt.Valid {

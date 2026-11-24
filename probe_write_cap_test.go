@@ -40,7 +40,7 @@ func TestDoProbeWritesCappedUnderWriteStall(t *testing.T) {
 	probeTarget = func(ctx context.Context, typ, target string, d time.Duration) probeOutcome {
 		return probeOutcome{broken: true} // up -> warning transition
 	}
-	c := sensorConfig{id: "a", name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
 
 	// Stall the writer: hold the write lock on a main-pool connection for
 	// the whole test body (simulates a long-running writer; busy_timeout

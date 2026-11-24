@@ -48,19 +48,19 @@ func TestPurgeOldKeepsLast60Tail(t *testing.T) {
 	pw.purgeOld(context.Background())
 
 	var nSlow int
-	var oldest string
-	if err := db.QueryRow(`SELECT COUNT(*), MIN(ts) FROM probes WHERE sensor_id='slow'`).Scan(&nSlow, &oldest); err != nil {
+	var oldest int64
+	if err := db.QueryRow(`SELECT COUNT(*), MIN(ts_ms) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'slow')`).Scan(&nSlow, &oldest); err != nil {
 		t.Fatal(err)
 	}
 	if nSlow != seriesTailProbes {
 		t.Fatalf("slow sensor kept %d probes, want exactly the last %d (24h window + tail exemption)", nSlow, seriesTailProbes)
 	}
-	// survivors are the 60 NEWEST: exact seeded ts of hoursAgo 59.
-	if want := store.FormatTS(t59); oldest != want {
-		t.Fatalf("oldest surviving slow probe = %s, want the 60th newest (%s); the exemption must keep the newest tail, not older rows", oldest, want)
+	// survivors are the 60 NEWEST: exact seeded ts of hoursAgo 59 (epoch-ms).
+	if oldest != t59.UnixMilli() {
+		t.Fatalf("oldest surviving slow probe = %d, want the 60th newest (%d); the exemption must keep the newest tail, not older rows", oldest, t59.UnixMilli())
 	}
 	var nFast int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='fast'`).Scan(&nFast); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'fast')`).Scan(&nFast); err != nil {
 		t.Fatal(err)
 	}
 	if nFast != 11 {
@@ -76,7 +76,7 @@ func TestPurgeOldKeepsLast60Tail(t *testing.T) {
 
 	// Idempotent: a second sweep changes nothing.
 	pw.purgeOld(context.Background())
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id='slow'`).Scan(&nSlow); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'slow')`).Scan(&nSlow); err != nil {
 		t.Fatal(err)
 	}
 	if nSlow != seriesTailProbes {

@@ -300,10 +300,10 @@ func TestDoProbeRecordsDNSLossOnRow(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pw.doProbe(ctx, sensorConfig{id: "dnsr", name: "dnsr", target: "no-such-host-pulsemon-test.invalid", probeType: "icmp", intervalS: 15, timeoutMS: 1000, lossWarn: 25, downAfter: 1})
+	pw.doProbe(ctx, sensorConfig{id: "dnsr", sk: sensorSK(t, db, "dnsr"), name: "dnsr", target: "no-such-host-pulsemon-test.invalid", probeType: "icmp", intervalS: 15, timeoutMS: 1000, lossWarn: 25, downAfter: 1})
 
 	var dnsErr any
-	if err := db.QueryRow("SELECT dns_error FROM probes WHERE sensor_id = 'dnsr'").Scan(&dnsErr); err != nil {
+	if err := db.QueryRow("SELECT dns_error FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'dnsr')").Scan(&dnsErr); err != nil {
 		t.Fatalf("read dns_error: %v", err)
 	}
 	if s, ok := dnsErr.(string); !ok || s == "" {
@@ -318,8 +318,8 @@ func TestDoProbeRecordsDNSLossOnRow(t *testing.T) {
 	probeTarget = func(ctx context.Context, probeType, target string, timeout time.Duration) probeOutcome {
 		return probeOutcome{lost: true, ip: "127.0.0.1"}
 	}
-	pw.doProbe(ctx, sensorConfig{id: "pktr", name: "pktr", target: "127.0.0.1", probeType: "icmp", intervalS: 15, timeoutMS: 1000, lossWarn: 25, downAfter: 1})
-	if err := db.QueryRow("SELECT dns_error FROM probes WHERE sensor_id = 'pktr'").Scan(&dnsErr); err != nil {
+	pw.doProbe(ctx, sensorConfig{id: "pktr", sk: sensorSK(t, db, "pktr"), name: "pktr", target: "127.0.0.1", probeType: "icmp", intervalS: 15, timeoutMS: 1000, lossWarn: 25, downAfter: 1})
+	if err := db.QueryRow("SELECT dns_error FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'pktr')").Scan(&dnsErr); err != nil {
 		t.Fatalf("read dns_error: %v", err)
 	}
 	if dnsErr != nil {

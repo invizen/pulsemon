@@ -30,8 +30,8 @@ func seedSensorWithHistory(t *testing.T, id, name string) (*store.Store, *ProbeW
 		t.Fatalf("insert sensor: %v", err)
 	}
 	for i := 0; i < 50; i++ {
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, ?)`,
-			id, time.Now().Add(-time.Duration(i)*time.Minute).UTC().Format(time.RFC3339Nano), 1.5); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)`,
+			id, time.Now().Add(-time.Duration(i)*time.Minute).UTC().UnixMilli(), 1.5); err != nil {
 			t.Fatalf("seed probe %d: %v", i, err)
 		}
 	}
@@ -58,6 +58,10 @@ func seedSensorWithHistory(t *testing.T, id, name string) (*store.Store, *ProbeW
 // class deleteRowsBatched (clear-history, retention purge) exists to avoid.
 func TestDeleteSensorRemovesCascade(t *testing.T) {
 	db, pw, srv := seedSensorWithHistory(t, "del1", "del1")
+	var del1sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = 'del1'`).Scan(&del1sk); err != nil {
+		t.Fatal(err)
+	}
 
 	req := httptest.NewRequest(http.MethodDelete, "/api/sensors/del1", nil)
 	w := httptest.NewRecorder()
@@ -68,7 +72,6 @@ func TestDeleteSensorRemovesCascade(t *testing.T) {
 
 	// Every cascade table is empty for the deleted sensor.
 	for table, col := range map[string]string{
-		"probes":      "sensor_id",
 		"events":      "sensor_id",
 		"sensor_tags": "sensor_id",
 		"alert_state": "sensor_id",
@@ -80,6 +83,13 @@ func TestDeleteSensorRemovesCascade(t *testing.T) {
 		if n != 0 {
 			t.Errorf("%s rows = %d, want 0 (cascade footprint must be removed)", table, n)
 		}
+	}
+	var probes int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk = ?`, del1sk).Scan(&probes); err != nil {
+		t.Fatalf("count probes: %v", err)
+	}
+	if probes != 0 {
+		t.Errorf("probes rows = %d, want 0 (cascade footprint must be removed)", probes)
 	}
 	var sensors int
 	if err := db.QueryRow("SELECT COUNT(*) FROM sensors WHERE id = ?", "del1").Scan(&sensors); err != nil {
@@ -178,7 +188,7 @@ func TestPingNowRejectsDeletingSensor(t *testing.T) {
 	}
 	// No manual row may have been written.
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sensor_id = 'del4' AND manual = 1`).Scan(&n); err != nil {
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'del4') AND manual = 1`).Scan(&n); err != nil {
 		t.Fatalf("count manual probes: %v", err)
 	}
 	if n != 0 {

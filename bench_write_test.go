@@ -52,8 +52,8 @@ func TestProbeWriteSoakFleetCadence(t *testing.T) {
 			for j := 0; j < writesN; j++ {
 				ts := base.Add(time.Duration(i*writesN+j) * time.Millisecond)
 				if _, err := pw.db.ProbeExecContext(ctx,
-					`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?,?,?)`,
-					id, store.FormatTS(ts), 1.0); err != nil {
+					`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)`,
+					id, ts.UnixMilli(), 1.0); err != nil {
 					errCh <- fmt.Errorf("sensor %s write %d: %w", id, j, err)
 					return
 				}
@@ -124,8 +124,8 @@ func BenchmarkProbeWrites(b *testing.B) {
 				k := atomic.AddInt64(&seq, 1)
 				ts := base.Add(time.Duration(k) * time.Millisecond)
 				if _, err := db.ProbeExecContext(ctx,
-					`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?,?,?)`,
-					fmt.Sprintf("wbench-%03d", s), store.FormatTS(ts), 1.0); err != nil {
+					`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)`,
+					fmt.Sprintf("wbench-%03d", s), ts.UnixMilli(), 1.0); err != nil {
 					b.Errorf("wave %d sensor %d: %v", i, s, err)
 				}
 			}(s)

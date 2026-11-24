@@ -57,8 +57,8 @@ func TestGraphTimeWindowRegression(t *testing.T) {
 		if now.Sub(ts) <= 24*time.Hour {
 			within24h++
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')",
-			id, ts.Format(time.RFC3339Nano), float64(10+i)); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')",
+			id, ts.UnixMilli(), float64(10+i)); err != nil {
 			t.Fatalf("insert probe: %v", err)
 		}
 	}
@@ -134,15 +134,15 @@ func TestGraphExcludesManualRows(t *testing.T) {
 		{10 * time.Minute, 10.0},
 		{20 * time.Minute, nil}, // scheduled loss
 	} {
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, manual) VALUES (?, ?, ?, '127.0.0.1', 0)",
-			id, now.Add(-row.age).Format(time.RFC3339Nano), row.rtt); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1', 0)",
+			id, now.Add(-row.age).UnixMilli(), row.rtt); err != nil {
 			t.Fatalf("insert scheduled probe: %v", err)
 		}
 	}
 	// One LOST manual pulse 5 minutes ago — inside the 1h window, and the
 	// finding's scenario: a diagnostic click on an otherwise healthy sensor.
-	if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip, manual) VALUES (?, ?, ?, '127.0.0.1', 1)",
-		id, now.Add(-5*time.Minute).Format(time.RFC3339Nano), nil); err != nil {
+	if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip, manual) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1', 1)",
+		id, now.Add(-5*time.Minute).UnixMilli(), nil); err != nil {
 		t.Fatalf("insert manual pulse: %v", err)
 	}
 

@@ -91,7 +91,7 @@ func TestImmediateTxCommitFailureRescuesPool(t *testing.T) {
 		}
 		// FK to sensors(id) — violation is deferred to COMMIT, where it fails.
 		_, err := c.ExecContext(context.Background(),
-			"INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('ghost-sensor', '2026-01-01T00:00:00Z', 1.0)")
+			"INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'ghost-sensor'), 1767247200000, 1.0)")
 		return err
 	})
 	if err == nil {
@@ -99,7 +99,7 @@ func TestImmediateTxCommitFailureRescuesPool(t *testing.T) {
 	}
 
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = 'ghost-sensor'").Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = 'ghost-sensor')").Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {

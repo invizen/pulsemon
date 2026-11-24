@@ -60,8 +60,8 @@ func TestConcurrentProbeWritesDoNotBusy(t *testing.T) {
 			t.Errorf("begin lock-holder: %v", err)
 			return
 		}
-		if _, err := hx.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('w0', ?, 5.0)",
-			time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := hx.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'w0'), ?, 5.0)",
+			time.Now().UTC().UnixMilli()); err != nil {
 			_ = hx.Rollback()
 			t.Errorf("lock-holder write: %v", err)
 			return
@@ -84,8 +84,8 @@ func TestConcurrentProbeWritesDoNotBusy(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < iters; i++ {
 				id := fmt.Sprintf("w%d", (seed+i)%nSensors)
-				ts := time.Now().UTC().Format(time.RFC3339Nano)
-				if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?,?,?)", id, ts, "10.5"); err != nil {
+				ts := time.Now().UTC().UnixMilli()
+				if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)", id, ts, "10.5"); err != nil {
 					mu.Lock()
 					errCount++
 					mu.Unlock()

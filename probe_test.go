@@ -10,7 +10,7 @@ import (
 )
 
 // baseProbeTime is the start of the synthetic probe timeline; each probe in
-// a test is 1s after the previous one so ORDER BY ts is deterministic.
+// a test is 1s after the previous one so ORDER BY ts_ms is deterministic.
 var baseProbeTime = time.Now().Add(-time.Minute).UTC().Truncate(time.Second)
 
 var probeSeq int
@@ -28,12 +28,12 @@ func seedSensor(t *testing.T, db *store.Store, id string, lossWarn, downAfter, s
 	}
 	for _, v := range rtt {
 		probeSeq++
-		ts := baseProbeTime.Add(time.Duration(probeSeq) * time.Second).Format(time.RFC3339Nano)
+		ts := baseProbeTime.Add(time.Duration(probeSeq) * time.Second).UnixMilli()
 		var val any
 		if v != nil {
 			val = *v
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", id, ts, val); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", id, ts, val); err != nil {
 			t.Fatalf("insert probe for %s: %v", id, err)
 		}
 	}
@@ -234,7 +234,7 @@ func TestDeriveStatus(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.id, func(t *testing.T) {
 			pw := seedSensor(t, db, tt.id, tt.lossWarn, tt.downAfter, tt.spikeMult, tt.rtt)
-			c := sensorConfig{id: tt.id, lossWarn: tt.lossWarn, downAfter: tt.downAfter}
+			c := sensorConfig{id: tt.id, sk: sensorSK(t, db, tt.id), lossWarn: tt.lossWarn, downAfter: tt.downAfter}
 			if got := pw.deriveStatus(c, tt.last); got != tt.want {
 				t.Errorf("deriveStatus(%s, last=%q): got %q, want %q", tt.id, tt.last, got, tt.want)
 			}

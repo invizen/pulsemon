@@ -36,7 +36,7 @@ func TestFix_M10a_DeriveStatusFallsBackToDBWhenCacheCold(t *testing.T) {
 		fcProbe(t, db, "a", now.Add(time.Duration(i-10)*time.Second), nil)
 	}
 	pw.recordProbe("a", probeEntry{ts: now.Unix(), rtt: float32(math.NaN())}) // 1 cached entry < limit => DB path
-	c := sensorConfig{id: "a", downAfter: 2, lossWarn: 25}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), downAfter: 2, lossWarn: 25}
 	if got := pw.deriveStatus(c, "up"); got != "error" {
 		t.Fatalf("derived %q via cold cache fallback, want error", got)
 	}
@@ -52,7 +52,7 @@ func TestFix_M10a_DoProbeStopsReadingStatusPerTick(t *testing.T) {
 	probeTarget = func(ctx context.Context, typ, target string, d time.Duration) probeOutcome {
 		return probeOutcome{rttMs: 1}
 	}
-	c := sensorConfig{id: "a", name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
 	pw.doProbe(context.Background(), c) // first tick reads status from DB once
 	if pw.sensors["a"].lastStatus != "up" {
 		t.Fatalf("lastStatus = %q after first probe", pw.sensors["a"].lastStatus)
@@ -82,7 +82,7 @@ func TestFix_M10a_StatusStaysConsistentWhenUpdateFails(t *testing.T) {
 	if _, err := db.Exec(`CREATE TRIGGER nostatus BEFORE UPDATE OF status ON sensors BEGIN SELECT RAISE(ABORT,'nope'); END`); err != nil {
 		t.Fatal(err)
 	}
-	c := sensorConfig{id: "a", name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
 	for i := 0; i < 3; i++ {
 		pw.doProbe(context.Background(), c)
 	}

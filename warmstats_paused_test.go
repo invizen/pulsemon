@@ -39,8 +39,8 @@ func TestWarmStatsLoadsPausedSensors(t *testing.T) {
 		// 10 recent probes (all within the last 24h) — enough to populate the
 		// series and drive the slow-sensor (n24 < 60) phase-2 backfill.
 		for i := 0; i < 10; i++ {
-			ts := now.Add(-time.Duration(9-i) * 30 * time.Second).Format(time.RFC3339)
-			if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')",
+			ts := now.Add(-time.Duration(9-i) * 30 * time.Second).UnixMilli()
+			if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')",
 				id, ts, 12.0); err != nil {
 				t.Fatalf("insert probe %d for %s: %v", i, id, err)
 			}

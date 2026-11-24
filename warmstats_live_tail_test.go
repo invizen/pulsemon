@@ -34,8 +34,8 @@ func TestWarmStatsKeepsLiveTail(t *testing.T) {
 	// DB rows: three scheduled probes, newest 60s ago.
 	for i := 0; i < 3; i++ {
 		ts := now.Add(-time.Duration(180-i*60) * time.Second)
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, 1.0, '127.0.0.1')`,
-			id, ts.Format(time.RFC3339Nano)); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, 1.0, '127.0.0.1')`,
+			id, ts.UnixMilli()); err != nil {
 			t.Fatalf("insert probe %d: %v", i, err)
 		}
 	}

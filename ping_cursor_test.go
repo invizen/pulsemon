@@ -113,8 +113,8 @@ func TestPoolDoesNotDrainUnderProbeLoad(t *testing.T) {
 			if j%2 == 0 {
 				rtt = "20.0"
 			}
-			if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, ?)",
-				id, time.Now().UTC().Format(time.RFC3339Nano), rtt); err != nil {
+			if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?)",
+				id, time.Now().UTC().UnixMilli(), rtt); err != nil {
 				t.Fatalf("insert probe: %v", err)
 			}
 		}

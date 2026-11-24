@@ -65,12 +65,12 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	// 30 recent probes: 30s apart, newest ~now-30s (all within the last 24h).
 	// A few deterministic losses (nil rtt_ms) to exercise the NULL path.
 	for i := 0; i < nRecent; i++ {
-		ts := now.Add(-time.Duration(nRecent-1-i) * 30 * time.Second).Format(time.RFC3339)
+		ts := now.Add(-time.Duration(nRecent-1-i) * 30 * time.Second).UnixMilli()
 		var val any
 		if i%10 != 7 {
 			val = 10 + float64(i%5)
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')",
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')",
 			id, ts, val); err != nil {
 			t.Fatalf("insert recent probe %d: %v", i, err)
 		}
@@ -78,8 +78,8 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	// 40 old probes: 24h+ apart, oldest ~now-40*25h, newest ~now-25h (all
 	// older than the 24h cutoff).
 	for i := 0; i < nOld; i++ {
-		ts := now.Add(-time.Duration(25*60+(nOld-1-i)*1440) * time.Minute).Format(time.RFC3339)
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')",
+		ts := now.Add(-time.Duration(25*60+(nOld-1-i)*1440) * time.Minute).UnixMilli()
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')",
 			id, ts, 20.0); err != nil {
 			t.Fatalf("insert old probe %d: %v", i, err)
 		}
@@ -125,18 +125,18 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 	joined := strings.Join(ph, ",")
 	// Anchor the 24h cutoff to the same wall clock so branch B is populated.
 	cutoff := time.Now().UTC().Add(-24 * time.Hour)
-	args := []any{id, id, cutoff.Format(time.RFC3339)}
+	args := []any{id, id, cutoff.UnixMilli()}
 	run := func(union string) (rows, dups int, ascending bool) {
 		ascending = true
-		q := `SELECT sensor_id, ts, rtt_ms FROM (
-			SELECT sensor_id, ts, rtt_ms,
-			       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
-			FROM probes WHERE sensor_id IN (` + joined + `)
+		q := `SELECT sk, ts_ms, rtt_ms FROM (
+			SELECT sk, ts_ms, rtt_ms,
+			       ROW_NUMBER() OVER (PARTITION BY sk ORDER BY ts_ms DESC) AS rn
+			FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id IN (` + joined + `))
 		) WHERE rn <= 60
 		` + union + `
-		SELECT sensor_id, ts, rtt_ms FROM probes
-		WHERE sensor_id IN (` + joined + `) AND ts >= ?
-		ORDER BY sensor_id, ts`
+		SELECT sk, ts_ms, rtt_ms FROM probes
+		WHERE sk IN (SELECT sk FROM sensors WHERE id IN (` + joined + `)) AND ts_ms >= ?
+		ORDER BY sk, ts_ms`
 		r, err := db.Query(q, args...)
 		if err != nil {
 			t.Fatalf("query (%s): %v", union, err)
@@ -146,13 +146,13 @@ func TestWarmStatsUNIONDedupAndOrder(t *testing.T) {
 		var prev int64
 		first := true
 		for r.Next() {
-			var sid string
-			var ts time.Time
+			var sid int64
+			var tsMS int64
 			var rtt *float64
-			if err := r.Scan(&sid, &ts, &rtt); err != nil {
+			if err := r.Scan(&sid, &tsMS, &rtt); err != nil {
 				t.Fatalf("scan: %v", err)
 			}
-			u := ts.UTC().Unix()
+			u := tsMS / 1000
 			rows++
 			if saw[u] {
 				dups++
@@ -211,8 +211,8 @@ func TestWarmStatsCursorDrains(t *testing.T) {
 			t.Fatalf("insert sensor %d: %v", i, err)
 		}
 		for j := 0; j < 3; j++ {
-			ts := time.Unix(testNowUnix-int64(j)*30, 0).UTC().Format(time.RFC3339)
-			_, _ = db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')",
+			ts := time.Unix(testNowUnix-int64(j)*30, 0).UnixMilli()
+			_, _ = db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')",
 				id, ts, 10.0)
 		}
 	}

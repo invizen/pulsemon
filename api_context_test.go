@@ -10,6 +10,7 @@ import (
 	"pulsemon/internal/store"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFix_HandlerDBCallsHonorRequestContext pins the contract that HTTP
@@ -40,7 +41,7 @@ func TestFix_HandlerDBCallsHonorRequestContext(t *testing.T) {
 		VALUES ('ctx-s1', 'ctx-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('ctx-s1', ?, 1.0)`, store.Now()); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'ctx-s1'), ?, 1.0)`, time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,7 +226,7 @@ func TestSensorExistenceCheckDistinguishesErrors(t *testing.T) {
 		VALUES ('exist-s1', 'exist-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('exist-s1', ?, 1.0)`, store.Now()); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'exist-s1'), ?, 1.0)`, time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
 

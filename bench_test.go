@@ -91,7 +91,7 @@ func seedPurgeBenchmark(b *testing.B, db *store.Store) {
 		b.Fatalf("prepare sensor: %v", err)
 	}
 	defer sensSt.Close()
-	probeSt, err := tx.Prepare(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, 10.0)`)
+	probeSt, err := tx.Prepare(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, 10.0)`)
 	if err != nil {
 		b.Fatalf("prepare probe: %v", err)
 	}
@@ -106,13 +106,13 @@ func seedPurgeBenchmark(b *testing.B, db *store.Store) {
 			b.Fatalf("insert sensor %s: %v", id, err)
 		}
 		for i := 0; i < benchPurgeRowsPerSensor; i++ {
-			ts := oldBase.Add(time.Duration(i) * time.Second).Format(time.RFC3339Nano)
+			ts := oldBase.Add(time.Duration(i) * time.Second).UnixMilli()
 			if _, err := probeSt.Exec(id, ts); err != nil {
 				b.Fatalf("insert old probe %s/%d: %v", id, i, err)
 			}
 		}
 		for i := 0; i < 10; i++ {
-			ts := youngBase.Add(time.Duration(i) * time.Minute).Format(time.RFC3339Nano)
+			ts := youngBase.Add(time.Duration(i) * time.Minute).UnixMilli()
 			if _, err := probeSt.Exec(id, ts); err != nil {
 				b.Fatalf("insert young probe %s/%d: %v", id, i, err)
 			}
@@ -215,7 +215,7 @@ func BenchmarkWarmStats(b *testing.B) {
 		b.Fatalf("prepare sensor: %v", err)
 	}
 	defer sensSt.Close()
-	probeSt, err := tx.Prepare(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES (?, ?, 10.0)`)
+	probeSt, err := tx.Prepare(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, 10.0)`)
 	if err != nil {
 		b.Fatalf("prepare probe: %v", err)
 	}
@@ -229,7 +229,7 @@ func BenchmarkWarmStats(b *testing.B) {
 		}
 		for i := 0; i < benchWarmRowsPerSensor; i++ {
 			// 17s spacing x 5000 = ~85000s ≈ 23.6h: every row inside the 24h window.
-			ts := now.Add(-time.Duration(i*17) * time.Second).Format(time.RFC3339Nano)
+			ts := now.Add(-time.Duration(i*17) * time.Second).UnixMilli()
 			if _, err := probeSt.Exec(id, ts); err != nil {
 				b.Fatalf("insert probe %s/%d: %v", id, i, err)
 			}

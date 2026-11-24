@@ -144,50 +144,53 @@ func indexExists(t *testing.T, db *Store, name string) bool {
 	return n == 1
 }
 
-// TestProbesIndexCoveringFresh pins the fresh-DB shape: the probes read
-// path (warmStats Phase 1/2, recentFromDB, /history) selects
-// (sensor_id, ts, rtt_ms, manual), so the index must COVER that list —
-// the old (sensor_id, ts) index forced a random table B-tree lookup per
-// row (~1.7M lookups / ~6.3s on the live fleet). The old index must be
-// gone (two equivalent indexes double every probe INSERT), and the
-// planner must serve the warm-stats query from the covering index.
+// TestProbesIndexCoveringFresh pins the fresh-DB shape after migration 14:
+// the probes read path (warmStats Phase 1/2, recentFromDB, /history)
+// selects (sk, ts_ms, rtt_ms, manual), so the index must COVER that list —
+// the TEXT-era (sensor_id, ts) indexes forced both a column decode and a
+// random table B-tree lookup per row. The old index names must be gone
+// (two equivalent indexes double every probe INSERT), and the planner must
+// serve the warm-stats query from the covering index.
 func TestProbesIndexCoveringFresh(t *testing.T) {
 	db := openTestStore(t)
 
-	want := []string{"sensor_id", "ts", "rtt_ms", "manual"}
-	got := indexColumns(t, db, "idx_probes_sensor_ts_cov")
+	want := []string{"sk", "ts_ms", "rtt_ms", "manual"}
+	got := indexColumns(t, db, "idx_probes_cov")
 	if len(got) != len(want) {
-		t.Fatalf("idx_probes_sensor_ts_cov columns = %v, want %v", got, want)
+		t.Fatalf("idx_probes_cov columns = %v, want %v", got, want)
 	}
 	for i := range want {
 		if got[i] != want[i] {
-			t.Fatalf("idx_probes_sensor_ts_cov column %d = %q, want %q (the SELECT list must be the index prefix, in order)", i, got[i], want[i])
+			t.Fatalf("idx_probes_cov column %d = %q, want %q (the SELECT list must be the index prefix, in order)", i, got[i], want[i])
 		}
 	}
-	if indexExists(t, db, "idx_probes_sensor_ts") {
-		t.Error("the old non-covering idx_probes_sensor_ts is still present — it duplicates the covering index and doubles every probe INSERT")
+	for _, dead := range []string{"idx_probes_sensor_ts", "idx_probes_sensor_ts_cov"} {
+		if indexExists(t, db, dead) {
+			t.Errorf("TEXT-era index %s is still present — it duplicates the covering index and doubles every probe INSERT", dead)
+		}
 	}
 
 	// Seed rows so the planner has stats to choose the index (an empty
 	// table makes it prefer the trivial empty scan). The sensor row must
 	// exist first: the probes FK (foreign_keys=1 on every DSN) rejects
-	// orphan probe rows.
+	// orphan probe rows. sk is NULL here — the autogen trigger assigns it.
 	if _, err := db.Exec(`INSERT INTO sensors (id, name, target, interval_s, timeout_ms, loss_warn, down_after, state, status, created_at)
 		VALUES ('s1', 's1', '10.0.0.1', 30, 1000, 25, 2, 'active', 'up', ?)`, Now()); err != nil {
 		t.Fatalf("seed sensor: %v", err)
 	}
 	for i := 0; i < 200; i++ {
-		if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms, manual) VALUES ('s1', ?, ?, 0)`,
-			FormatTS(time.Now().UTC().Add(-time.Duration(86400-i)*time.Second)), 5.0+float64(i%50)); err != nil {
+		if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms, manual)
+			VALUES ((SELECT sk FROM sensors WHERE id = 's1'), ?, ?, 0)`,
+			time.Now().UTC().Add(-time.Duration(86400-i)*time.Second).UnixMilli(), 5.0+float64(i%50)); err != nil {
 			t.Fatalf("seed probe row: %v", err)
 		}
 	}
 	// EXPLAIN QUERY PLAN is a top-level statement (it cannot be nested in
 	// a subquery): run it raw and collect the detail column.
 	rows, err := db.Query(`EXPLAIN QUERY PLAN
-		SELECT sensor_id, ts, rtt_ms, manual FROM probes
-		WHERE sensor_id = 's1' AND ts >= ? ORDER BY sensor_id, ts`,
-		"2026-01-01T00:00:00Z")
+		SELECT sk, ts_ms, rtt_ms, manual FROM probes
+		WHERE sk = (SELECT sk FROM sensors WHERE id = 's1') AND ts_ms >= ? ORDER BY sk, ts_ms`,
+		time.Now().UTC().Add(-time.Hour).UnixMilli())
 	if err != nil {
 		t.Fatalf("EXPLAIN QUERY PLAN: %v", err)
 	}
@@ -204,62 +207,13 @@ func TestProbesIndexCoveringFresh(t *testing.T) {
 	if err := rows.Err(); err != nil {
 		t.Fatalf("EQP ended early: %v", err)
 	}
-	if !strings.Contains(detail, "COVERING INDEX") || !strings.Contains(detail, "idx_probes_sensor_ts_cov") {
+	if !strings.Contains(detail, "COVERING INDEX") || !strings.Contains(detail, "idx_probes_cov") {
 		t.Errorf("the warm-stats query is not served by the covering index: %q", detail)
 	}
 }
 
-// TestProbesCoveringIndexMigration pins the UPGRADE path: a fleet DB
-// stamped at version 12 with the old (sensor_id, ts) index boots through
-// InitSchema into the covering index — created, old one dropped, version
-// at the head — in the single step-13 transaction.
-func TestProbesCoveringIndexMigration(t *testing.T) {
-	legacy := filepath.Join(t.TempDir(), "legacy.db")
-	st, err := NewStore(legacy)
-	if err != nil {
-		t.Fatalf("NewStore: %v", err)
-	}
-	if err := st.InitSchema(); err != nil {
-		t.Fatalf("InitSchema: %v", err)
-	}
-	// Revert to the pre-migration-13 shape: the old index, no covering
-	// index, stamped 12 (the head before this change — the live fleet
-	// state this upgrade must handle).
-	if _, err := st.Exec(`DROP INDEX idx_probes_sensor_ts_cov`); err != nil {
-		t.Fatalf("drop cov: %v", err)
-	}
-	if _, err := st.Exec(`CREATE INDEX idx_probes_sensor_ts ON probes(sensor_id, ts)`); err != nil {
-		t.Fatalf("recreate old index: %v", err)
-	}
-	if _, err := st.Exec(`PRAGMA user_version = 12`); err != nil {
-		t.Fatalf("stamp 12: %v", err)
-	}
-	st.Close()
-
-	// Boot again: InitSchema must run migration 13 over the v12 DB.
-	st2, err := NewStore(legacy)
-	if err != nil {
-		t.Fatalf("NewStore (reboot): %v", err)
-	}
-	defer st2.Close()
-	if err := st2.InitSchema(); err != nil {
-		t.Fatalf("InitSchema over v12 DB: %v", err)
-	}
-
-	want := []string{"sensor_id", "ts", "rtt_ms", "manual"}
-	got := indexColumns(t, st2, "idx_probes_sensor_ts_cov")
-	if len(got) != len(want) {
-		t.Fatalf("post-migration covering index columns = %v, want %v", got, want)
-	}
-	for i := range want {
-		if got[i] != want[i] {
-			t.Fatalf("post-migration covering index column %d = %q, want %q", i, got[i], want[i])
-		}
-	}
-	if indexExists(t, st2, "idx_probes_sensor_ts") {
-		t.Error("migration 13 left the old non-covering idx_probes_sensor_ts in place")
-	}
-	if v := getUserVersion(t, st2); v != schemaVersionHead {
-		t.Fatalf("user_version after migration = %d, want head %d", v, schemaVersionHead)
-	}
-}
+// The pre-migration-14 version of this file pinned migration 13's replay
+// (old index -> covering index on the TEXT layout). That replay is no
+// longer reachable on a fresh DB — migration 14 supersedes the layout —
+// and the v13->v14 upgrade path is pinned by TestMigration14UpgradesV13ToV14
+// in probes_int_schema_test.go.

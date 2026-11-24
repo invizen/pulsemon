@@ -9,6 +9,7 @@ import (
 	"pulsemon/internal/store"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestFix_ScanErrorsLoggedNotSilent pins the per-row scan-error contract
@@ -17,13 +18,15 @@ import (
 // logs — a corrupt row would produce a 200 with a truncated list and zero
 // visibility in the service log).
 //
-// Trigger: a probe/event row with an INTEGER ts. The ts columns are TEXT
-// (RFC3339Nano) and both handlers scan into time.Time, so an int64 value
-// fails the scan deterministically. The graph's WHERE clause
-// (strftime('%s', ts) >= cutoff) drops NULL-bucket rows before they reach
-// the scan loop, so a data-level corrupt row cannot reach the graph scan —
-// that log line is the schema-level defensive one; the identical pattern is
-// pinned here via history and events.
+// Trigger: a probe row with a TEXT ts_ms. The ts_ms column is INTEGER
+// (epoch-ms, migration 14) and the history handler scans it into int64, so a
+// non-numeric value fails the scan deterministically (INTEGER affinity does
+// not convert non-numeric text on insert). The events side keeps its
+// TEXT-column vector (an INTEGER ts in a TEXT column fails the time.Time
+// scan). The graph's WHERE clause (ts_ms >= cutoff) drops non-numeric rows
+// before they reach the scan loop, so a data-level corrupt row cannot reach
+// the graph scan — that log line is the schema-level defensive one; the
+// identical pattern is pinned here via history and events.
 func TestFix_ScanErrorsLoggedNotSilent(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
@@ -32,11 +35,12 @@ func TestFix_ScanErrorsLoggedNotSilent(t *testing.T) {
 		VALUES ('scan-s1', 'scan-s1', '127.0.0.1', 'icmp', 60, 1000, 25, 2, 3, 'active', 'up', ?)`, store.Now()); err != nil {
 		t.Fatal(err)
 	}
-	// One good row (valid RFC3339 ts) plus one corrupt row (INTEGER ts).
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('scan-s1', ?, 1.0)`, store.Now()); err != nil {
+	// One good row (valid epoch-ms) plus one corrupt row (TEXT ts_ms).
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'scan-s1'), ?, 1.0)`,
+		time.Now().UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`INSERT INTO probes (sensor_id, ts, rtt_ms) VALUES ('scan-s1', 12345, 2.0)`); err != nil {
+	if _, err := db.Exec(`INSERT INTO probes (sk, ts_ms, rtt_ms) VALUES ((SELECT sk FROM sensors WHERE id = 'scan-s1'), 'corrupt', 2.0)`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db.Exec(`INSERT INTO events (sensor_id, ts, from_status, to_status, note) VALUES ('scan-s1', ?, 'up', 'error', 'good')`, store.Now()); err != nil {

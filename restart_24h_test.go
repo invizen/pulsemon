@@ -40,14 +40,14 @@ func TestRestartRebuilds24hGraphAndUptime(t *testing.T) {
 	// the 24h warm window; the newest is 5 min ago so none land on the now
 	// boundary.
 	for i := 0; i < 288; i++ {
-		ts := now.Add(-time.Duration(288-i) * 5 * time.Minute).Format(time.RFC3339)
+		ts := now.Add(-time.Duration(288-i) * 5 * time.Minute).UnixMilli()
 		var rtt any
 		if i%10 == 0 {
 			rtt = nil // a loss
 		} else {
 			rtt = 12.5
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", id, ts, rtt); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", id, ts, rtt); err != nil {
 			t.Fatalf("insert probe %d: %v", i, err)
 		}
 	}

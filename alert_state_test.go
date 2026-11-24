@@ -31,6 +31,13 @@ func TestSensorDeleteCascadesAlertState(t *testing.T) {
 	if _, err := db.Exec(`INSERT INTO alert_state (sensor_id, status, last_ts) VALUES (?, 'error', ?)`, id, store.Now()); err != nil {
 		t.Fatal(err)
 	}
+	// Capture the surrogate key BEFORE the delete: post-migration-14 the
+	// probes table is keyed on sk, so the cascade check for probes must use
+	// the captured key (the id subquery would be empty after the delete).
+	var sk int64
+	if err := db.QueryRow(`SELECT sk FROM sensors WHERE id = ?`, id).Scan(&sk); err != nil {
+		t.Fatal(err)
+	}
 	res, err := db.Exec(`DELETE FROM sensors WHERE id = ?`, id)
 	if err != nil {
 		t.Fatal(err)
@@ -38,7 +45,14 @@ func TestSensorDeleteCascadesAlertState(t *testing.T) {
 	if n, _ := res.RowsAffected(); n != 1 {
 		t.Fatalf("RowsAffected = %d, want 1", n)
 	}
-	for _, table := range []string{"probes", "events", "sensor_tags", "alert_state"} {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM probes WHERE sk = ?`, sk).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("probes rows for deleted sensor = %d, want 0 (ON DELETE CASCADE)", n)
+	}
+	for _, table := range []string{"events", "sensor_tags", "alert_state"} {
 		var n int
 		if err := db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE sensor_id = ?`, id).Scan(&n); err != nil {
 			t.Fatal(err)

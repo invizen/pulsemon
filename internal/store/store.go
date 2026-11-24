@@ -228,13 +228,14 @@ func (db *Store) InitSchema() error {
 		FOREIGN KEY (sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
 	);
 
-	-- Covering index for the probes read path: warmStats Phase 1/2 and
-	-- recentFromDB select (sensor_id, ts, rtt_ms, manual) — the old
-	-- (sensor_id, ts) index served the range but forced a random table
-	-- B-tree lookup per row for rtt_ms + manual (~1.7M lookups at 100
-	-- sensors / 5s, ~6.3s on the live fleet). The covering index reads
-	-- everything from the leaf pages.
-	CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts_cov ON probes(sensor_id, ts, rtt_ms, manual);
+	-- The probes covering index is deliberately NOT created here: this
+	-- base DDL runs on EVERY boot (all statements are IF NOT EXISTS),
+	-- and after migration 14 the probes table has no sensor_id/ts
+	-- columns — a legacy index line would fail every boot of a migrated
+	-- DB. Migration 13 owns the TEXT-era index (transient: it exists
+	-- only on fresh installs until migration 14 drops the table that
+	-- carries it); migration 14 creates the new layout's index
+	-- (idx_probes_cov).
 	CREATE INDEX IF NOT EXISTS idx_events_sensor_ts ON events(sensor_id, ts);
 	-- /api/events sorts the whole feed by e.ts (across all sensors), which the
 	-- composite (sensor_id, ts) index above cannot serve. The table is 24h-
@@ -525,12 +526,137 @@ var schemaMigrations = []schemaMigration{
 		// History: docs/DECISIONS.md → sqlite-scalability-container-hazards
 		name: "idx_probes_sensor_ts -> covering",
 		run: func(db *Store, tx *sql.Tx) error {
+			// Shape guard (migration 14 era): on a DB that already went
+			// through the INTEGER-layout swap, probes has no sensor_id/
+			// ts columns — creating the TEXT-era index would fail.
+			// Replay-from-0 must be a no-op here; migration 14 owns the
+			// new layout's index.
+			var legacyTS int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'ts'`).Scan(&legacyTS); err != nil {
+				return err
+			}
+			if legacyTS == 0 {
+				return nil
+			}
 			if _, err := tx.Exec(`CREATE INDEX IF NOT EXISTS idx_probes_sensor_ts_cov ON probes(sensor_id, ts, rtt_ms, manual)`); err != nil {
 				return err
 			}
 			if _, err := tx.Exec(`DROP INDEX IF EXISTS idx_probes_sensor_ts`); err != nil {
 				return err
 			}
+			return nil
+		},
+	},
+	{
+		// 14: probes row layout -> INTEGER keys (sk + epoch-ms ts_ms).
+		// Every probe row AND its covering index carried a 36-byte TEXT
+		// UUID plus a 30-byte TEXT timestamp: 197 B/row simulated at the
+		// 100-sensor / 5s / 24h envelope vs 68 B/row for an INTEGER key +
+		// epoch-ms (317 MB -> 99.5 MB, 3.2x — the single biggest lever on
+		// purge time, warm-up time, VACUUM-INTO backup size, and SD-card
+		// wear). The swap is a single atomic replacement as far as the app
+		// is concerned: no code path ever reads both shapes and there is
+		// no dual-write transition. The table name stays `probes` (build
+		// probes_v2 -> copy -> drop old -> rename), so the write/read
+		// sites change only column names (sensor_id -> sk, ts -> ts_ms).
+		//
+		// sensors.sk is the surrogate key: a rowid backfill for existing
+		// rows, and the sensors_sk_autogen trigger for every future
+		// insert — one DDL line covers all creation paths (API create,
+		// clone, seed, CLI, tests) without touching a single INSERT.
+		//
+		// The whole swap runs in the step transaction (the framework's
+		// crash contract: a crash rolls the step back whole, the stamp
+		// commits with it). Consequence: the WAL grows to the size of the
+		// copied table for the duration of the step — a ~30 MB spike at
+		// the current 22-sensor fleet, a ~500 MB spike at the 100-sensor
+		// envelope (journal_size_limit caps post-commit checkpoints, not
+		// in-tx growth). Accepted: the fleet is far from the envelope,
+		// and the alternative (chunked copies across commits) breaks the
+		// step's single-tx atomicity. If the envelope becomes real, the
+		// lever is a chunked startup pass, not a renumbered step.
+		//
+		// The ts backfill is exact INTEGER arithmetic (strftime %s ->
+		// seconds, %f -> .SSS): sub-millisecond storage precision is
+		// deliberately dropped — ms is the design granularity, and the
+		// old covering index dies with DROP TABLE (indexes belong to
+		// their table).
+		//
+		// Replay guard: a probes table that already has ts_ms (this step
+		// ran, or a fresh install replaying 1..N from 0 over its
+		// legacy-anchor DDL) skips the step. Integrity guard: a ts that
+		// is not TEXT, or TEXT SQLite cannot parse, fails the step
+		// LOUDLY — strftime on a numeric ts interprets integers as Julian
+		// day numbers (12345 -> year 33 AD) and would backfill
+		// plausible-looking garbage. History: docs/DECISIONS.md ->
+		// probe-rows-int-schema
+		name: "probes -> (sk, ts_ms) INTEGER layout",
+		run: func(db *Store, tx *sql.Tx) error {
+			var hasNewLayout int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('probes') WHERE name = 'ts_ms'`).Scan(&hasNewLayout); err != nil {
+				return err
+			}
+			if hasNewLayout > 0 {
+				return nil
+			}
+			var bad int
+			if err := tx.QueryRow(`SELECT COUNT(*) FROM probes WHERE typeof(ts) IS NOT 'text' OR date(ts) IS NULL`).Scan(&bad); err != nil {
+				return err
+			}
+			if bad > 0 {
+				return fmt.Errorf("%d probes row(s) carry a ts that is not parseable TEXT: refusing to convert (restore a backup or repair the rows)", bad)
+			}
+			if _, err := tx.Exec(`ALTER TABLE sensors ADD COLUMN sk INTEGER`); err != nil {
+				return err
+			}
+			// rowid is stable and unique (sensors is a rowid table); the
+			// WHERE keeps a replay at zero touched rows.
+			if _, err := tx.Exec(`UPDATE sensors SET sk = rowid WHERE sk IS NULL`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_sensors_sk ON sensors(sk)`); err != nil {
+				return err
+			}
+			// Auto-generate sk for every future sensor insert (the WHEN
+			// guard leaves explicit sk values alone).
+			if _, err := tx.Exec(`CREATE TRIGGER IF NOT EXISTS sensors_sk_autogen AFTER INSERT ON sensors
+				WHEN NEW.sk IS NULL
+				BEGIN
+					UPDATE sensors SET sk = rowid WHERE rowid = NEW.rowid;
+				END`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`CREATE TABLE IF NOT EXISTS probes_v2 (
+				id INTEGER PRIMARY KEY,
+				sk INTEGER NOT NULL REFERENCES sensors(sk) ON DELETE CASCADE,
+				ts_ms INTEGER NOT NULL,
+				rtt_ms REAL,
+				resolved_ip TEXT,
+				http_status INTEGER,
+				dns_error TEXT,
+				manual INTEGER NOT NULL DEFAULT 0
+			)`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`INSERT INTO probes_v2 (id, sk, ts_ms, rtt_ms, resolved_ip, http_status, dns_error, manual)
+				SELECT p.id, s.sk,
+					CAST(strftime('%s', p.ts) AS INTEGER) * 1000 + CAST(SUBSTR(strftime('%f', p.ts), 4) AS INTEGER),
+					p.rtt_ms, p.resolved_ip, p.http_status, p.dns_error, p.manual
+				FROM probes p JOIN sensors s ON s.id = p.sensor_id`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`DROP TABLE probes`); err != nil {
+				return err
+			}
+			if _, err := tx.Exec(`ALTER TABLE probes_v2 RENAME TO probes`); err != nil {
+				return err
+			}
+			// Same covering shape as the pre-swap index, on the new
+			// columns (the old one died with DROP TABLE).
+			if _, err := tx.Exec(`CREATE INDEX idx_probes_cov ON probes(sk, ts_ms, rtt_ms, manual)`); err != nil {
+				return err
+			}
+			log.Println("schema: migrated probes -> (sk, ts_ms) INTEGER layout")
 			return nil
 		},
 	},
@@ -1335,25 +1461,32 @@ func (db *Store) ActiveSensorIDs(ctx context.Context) ([]string, error) {
 	return ids, rows.Err()
 }
 
-// SensorIDs lists the ids of every sensor in ANY state, in name order.
-// Used by the retention purge: every probes/events row references a current
-// sensor (FK ON DELETE CASCADE removes a deleted sensor's rows), so
-// per-sensor purging over this set covers the whole table.
-func (db *Store) SensorIDs() ([]string, error) {
-	rows, err := db.Query("SELECT id FROM sensors ORDER BY name")
+// SensorKey is one sensor's durable identity pair: the TEXT id (API
+// surface, tags, events' FK) and the INTEGER sk (probes' FK key since
+// the INTEGER row-layout migration).
+type SensorKey struct {
+	ID string
+	Sk int64
+}
+
+// SensorKeys lists every sensor's (id, sk) pair, in name order. The
+// retention purge walks this set: its probes branch keys on sk, its
+// events branch on the TEXT id (events keep the TEXT layout).
+func (db *Store) SensorKeys() ([]SensorKey, error) {
+	rows, err := db.Query("SELECT id, sk FROM sensors ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var ids []string
+	var keys []SensorKey
 	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return ids, err
+		var k SensorKey
+		if err := rows.Scan(&k.ID, &k.Sk); err != nil {
+			return nil, err
 		}
-		ids = append(ids, id)
+		keys = append(keys, k)
 	}
-	return ids, rows.Err()
+	return keys, rows.Err()
 }
 
 func (db *Store) SeedSensors() error {

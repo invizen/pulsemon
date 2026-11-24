@@ -68,7 +68,7 @@ func (pw *ProbeWorker) deriveStatus(c sensorConfig, lastStatus string) string {
 	recent, ok := pw.recentFromCache(c.id, limit)
 	if !ok {
 		var err error
-		recent, err = pw.recentFromDB(c.id, limit)
+		recent, err = pw.recentFromDB(c.sk, limit)
 		if err != nil {
 			// Can't read the probe history, so we can't know the real state.
 			// Retain the last known status (lastStatus) rather than manufacturing a
@@ -191,9 +191,10 @@ func (pw *ProbeWorker) recentFromCache(id string, limit int) ([]float32, bool) {
 }
 
 // recentFromDB is the durable equivalent of recentFromCache. manual = 0
-// excludes "Pulse Now" rows from status derivation (see PingNow).
-func (pw *ProbeWorker) recentFromDB(id string, limit int) ([]float32, error) {
-	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sensor_id = ? AND manual = 0 ORDER BY ts DESC LIMIT ?", id, limit)
+// excludes "Pulse Now" rows from status derivation (see PingNow). sk is
+// the sensor's INTEGER probes key (migration 14).
+func (pw *ProbeWorker) recentFromDB(sk int64, limit int) ([]float32, error) {
+	rows, err := pw.db.Query("SELECT rtt_ms FROM probes WHERE sk = ? AND manual = 0 ORDER BY ts_ms DESC LIMIT ?", sk, limit)
 	if err != nil {
 		return nil, err
 	}

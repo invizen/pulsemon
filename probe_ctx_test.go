@@ -54,7 +54,7 @@ func TestDoProbeDropsResultWhenCancelled(t *testing.T) {
 	}
 
 	var n int
-	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sensor_id = ?", "ctxd").Scan(&n); err != nil {
+	if err := db.QueryRow("SELECT COUNT(*) FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)", "ctxd").Scan(&n); err != nil {
 		t.Fatalf("count: %v", err)
 	}
 	if n != 0 {

@@ -25,7 +25,7 @@ func TestDoProbeStatusAndEventCommitAtomically(t *testing.T) {
 		// a clean single up->warning transition with no probe-history seeding.
 		return probeOutcome{broken: true}
 	}
-	c := sensorConfig{id: "a", name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
+	c := sensorConfig{id: "a", sk: sensorSK(t, db, "a"), name: "a", target: "10.0.0.1", probeType: "icmp", intervalS: 60, timeoutMS: 100, lossWarn: 25, downAfter: 2}
 
 	// Make the events INSERT fail while the status UPDATE succeeds.
 	if _, err := db.Exec(`CREATE TRIGGER noevent BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'nope'); END`); err != nil {
