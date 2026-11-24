@@ -43,19 +43,19 @@ func seedStatsSensor(t *testing.T, db *store.Store, id string) {
 	}
 	// Recent block: 120 probes, newest at testNowUnix, 30s apart.
 	for i := 0; i < 120; i++ {
-		ts := time.Unix(testNowUnix-int64(119-i)*30, 0).UTC().Format(time.RFC3339)
+		ts := time.Unix(testNowUnix-int64(119-i)*30, 0).UnixMilli()
 		var val any
 		if i%10 != 7 { // 12 losses at i=7,17,...,117
 			val = 10 + float64(i%5) // RTT 10..14ms, deterministic
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", id, ts, val); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", id, ts, val); err != nil {
 			t.Fatalf("insert recent probe %s#%d: %v", id, i, err)
 		}
 	}
 	// Old block: 10 probes ~12h back, 10min apart, all successful RTT 100.
 	for i := 0; i < 10; i++ {
-		ts := time.Unix(testNowUnix-43200-int64(i)*600, 0).UTC().Format(time.RFC3339)
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", id, ts, 100.0); err != nil {
+		ts := time.Unix(testNowUnix-43200-int64(i)*600, 0).UnixMilli()
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", id, ts, 100.0); err != nil {
 			t.Fatalf("insert old probe %s#%d: %v", id, i, err)
 		}
 	}
@@ -66,28 +66,28 @@ func seedStatsSensor(t *testing.T, db *store.Store, id string) {
 // 24h window — the exact set the live series holds).
 func readSeries(t *testing.T, db *store.Store, id string) []probeEntry {
 	t.Helper()
-	rows, err := db.Query(`SELECT sensor_id, ts, rtt_ms FROM (
-		SELECT sensor_id, ts, rtt_ms,
-		       ROW_NUMBER() OVER (PARTITION BY sensor_id ORDER BY ts DESC) AS rn
-		FROM probes WHERE sensor_id IN (?)
+	rows, err := db.Query(`SELECT sk, ts_ms, rtt_ms FROM (
+		SELECT sk, ts_ms, rtt_ms,
+		       ROW_NUMBER() OVER (PARTITION BY sk ORDER BY ts_ms DESC) AS rn
+		FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?)
 	) WHERE rn <= 60
 	UNION
-	SELECT sensor_id, ts, rtt_ms FROM probes WHERE sensor_id IN (?) AND ts >= ?
-	ORDER BY sensor_id, ts`,
-		id, id, time.Unix(testNowUnix-retentionSeconds, 0).UTC().Format(time.RFC3339))
+	SELECT sk, ts_ms, rtt_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) AND ts_ms >= ?
+	ORDER BY sk, ts_ms`,
+		id, id, time.Unix(testNowUnix-retentionSeconds, 0).UnixMilli())
 	if err != nil {
 		t.Fatalf("readSeries query: %v", err)
 	}
 	defer rows.Close()
 	var out []probeEntry
 	for rows.Next() {
-		var sid string
-		var ts time.Time
+		var sid int64
+		var tsMS int64
 		var rtt *float64
-		if err := rows.Scan(&sid, &ts, &rtt); err != nil {
+		if err := rows.Scan(&sid, &tsMS, &rtt); err != nil {
 			t.Fatalf("readSeries scan: %v", err)
 		}
-		e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN())}
+		e := probeEntry{ts: tsMS / 1000, rtt: float32(math.NaN())}
 		if rtt != nil {
 			e.rtt = float32(*rtt)
 		}
@@ -107,8 +107,8 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 
 	// (1) 60-probe window: total, lost, recent(30, newest first), rtt stats.
 	const q1 = `SELECT rtt_ms, COUNT(*) OVER (), SUM(CASE WHEN rtt_ms IS NULL THEN 1 ELSE 0 END) OVER (),
-		ROW_NUMBER() OVER (ORDER BY ts DESC)
-		FROM (SELECT rtt_ms, ts FROM probes WHERE sensor_id = ? ORDER BY ts DESC LIMIT 60)`
+		ROW_NUMBER() OVER (ORDER BY ts_ms DESC)
+		FROM (SELECT rtt_ms, ts_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) ORDER BY ts_ms DESC LIMIT 60)`
 	var min, max, sum float64
 	have := false
 	r1, err := db.Query(q1, id)
@@ -123,7 +123,14 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 			t.Fatalf("q1 scan: %v", err)
 		}
 		if rn <= 30 {
-			st.Recent = append(st.Recent, rtt)
+			if rtt != nil {
+				// Round like the API does (rttToPtr): the reference must
+				// compare against the rounded wire values.
+				v := roundRTT(*rtt)
+				st.Recent = append(st.Recent, &v)
+			} else {
+				st.Recent = append(st.Recent, nil)
+			}
 		}
 		if rtt != nil {
 			v := *rtt
@@ -139,7 +146,7 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 			}
 			sum += v
 			if st.RTTLast == nil {
-				l := v
+				l := roundRTT(v)
 				st.RTTLast = &l
 			}
 		}
@@ -148,7 +155,9 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 		st.LossPct = float64(st.LostCount) / float64(st.Total) * 100
 	}
 	if have {
-		mn, mx, avg := min, max, sum/float64(st.Total-st.LostCount)
+		// Round at the exit, like computeSensorStats: raw values feed
+		// min/max/sum, the response gets 1µs-rounded values.
+		mn, mx, avg := roundRTT(min), roundRTT(max), roundRTT(sum/float64(st.Total-st.LostCount))
 		st.RTTMin, st.RTTMax, st.RTTAvg = &mn, &mx, &avg
 	}
 
@@ -159,22 +168,25 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 	// the raw history.
 	var h1, l1 int
 	var h1avg *float64
-	hcutoff := time.Unix(testNowUnix-3600, 0).UTC().Format(time.RFC3339)
+	hcutoff := time.Unix(testNowUnix-3600, 0).UnixMilli()
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0), AVG(rtt_ms)
-		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ?`, id, hcutoff).Scan(&h1, &l1, &h1avg); err != nil {
+		FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) AND manual = 0 AND ts_ms >= ?`, id, hcutoff).Scan(&h1, &l1, &h1avg); err != nil {
 		t.Fatalf("q2: %v", err)
 	}
 	if h1 > 0 {
 		st.HourLossPct = float64(l1) / float64(h1) * 100
-		st.HourRTTAvg = h1avg
+		if h1avg != nil {
+			a := roundRTT(*h1avg)
+			st.HourRTTAvg = &a
+		}
 	}
 
 	// (3) 24h uptime (epoch cutoff = testNowUnix - 86400), scheduled rows
 	// only (manual exclusion — see q2).
 	var d24, l24 int
-	dcutoff := time.Unix(testNowUnix-retentionSeconds, 0).UTC().Format(time.RFC3339)
+	dcutoff := time.Unix(testNowUnix-retentionSeconds, 0).UnixMilli()
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ?`, id, dcutoff).Scan(&d24, &l24); err != nil {
+		FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) AND manual = 0 AND ts_ms >= ?`, id, dcutoff).Scan(&d24, &l24); err != nil {
 		t.Fatalf("q3: %v", err)
 	}
 	if d24 > 0 {
@@ -186,7 +198,7 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 	st.StatusWindowSize = statusWindow
 	var swTotal, swLost int
 	if err := db.QueryRow(`SELECT COUNT(*), COALESCE(SUM(rtt_ms IS NULL), 0)
-		FROM (SELECT rtt_ms FROM probes WHERE sensor_id = ? AND manual = 0 ORDER BY ts DESC LIMIT ?)`,
+		FROM (SELECT rtt_ms FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) AND manual = 0 ORDER BY ts_ms DESC LIMIT ?)`,
 		id, statusWindow).Scan(&swTotal, &swLost); err != nil {
 		t.Fatalf("q3b: %v", err)
 	}
@@ -201,8 +213,8 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 	for i := range st.Hour {
 		st.Hour[i] = &nd
 	}
-	r4, err := db.Query(`SELECT (strftime('%s', ts) / 60) * 60 AS bucket, MIN(rtt_ms)
-		FROM probes WHERE sensor_id = ? AND manual = 0 AND ts >= ? GROUP BY bucket`, id, hcutoff)
+	r4, err := db.Query(`SELECT (ts_ms / 60000) * 60 AS bucket, MIN(rtt_ms)
+		FROM probes WHERE sk IN (SELECT sk FROM sensors WHERE id = ?) AND manual = 0 AND ts_ms >= ? GROUP BY bucket`, id, hcutoff)
 	if err != nil {
 		t.Fatalf("q4: %v", err)
 	}
@@ -218,7 +230,14 @@ func sqlStats(t *testing.T, db *store.Store, id string) *SensorStats {
 		if pos < 0 || pos > 59 {
 			continue
 		}
-		st.Hour[pos] = minRTT
+		if minRTT != nil {
+			v := roundRTT(*minRTT)
+			st.Hour[pos] = &v
+		} else {
+			// Probes existed in the bucket, all lost: production maps
+			// that to nil, overriding the -2 sentinel above.
+			st.Hour[pos] = nil
+		}
 	}
 
 	if st.Total == 0 {
@@ -331,12 +350,12 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 		t.Fatalf("insert sparse sensor: %v", err)
 	}
 	for i := 0; i < 5; i++ {
-		ts := time.Unix(testNowUnix-int64(90-15*i), 0).UTC().Format(time.RFC3339)
+		ts := time.Unix(testNowUnix-int64(90-15*i), 0).UnixMilli()
 		var val any
 		if i%2 == 0 {
 			val = float64(20 + i)
 		}
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", "sparse", ts, val); err != nil {
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", "sparse", ts, val); err != nil {
 			t.Fatalf("insert sparse: %v", err)
 		}
 	}
@@ -349,14 +368,14 @@ func TestComputeSensorStatsMatchesSQL(t *testing.T) {
 		t.Fatalf("insert all-lost sensor: %v", err)
 	}
 	for i := 0; i < 12; i++ {
-		ts := time.Unix(testNowUnix-int64(1800-120*i), 0).UTC().Format(time.RFC3339)
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, NULL, '127.0.0.1')", "all-lost-hour", ts); err != nil {
+		ts := time.Unix(testNowUnix-int64(1800-120*i), 0).UnixMilli()
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, NULL, '127.0.0.1')", "all-lost-hour", ts); err != nil {
 			t.Fatalf("insert all-lost recent: %v", err)
 		}
 	}
 	for i := 0; i < 20; i++ {
-		ts := time.Unix(testNowUnix-36000-int64(i)*180, 0).UTC().Format(time.RFC3339)
-		if _, err := db.Exec("INSERT INTO probes (sensor_id, ts, rtt_ms, resolved_ip) VALUES (?, ?, ?, '127.0.0.1')", "all-lost-hour", ts, 55.0); err != nil {
+		ts := time.Unix(testNowUnix-36000-int64(i)*180, 0).UnixMilli()
+		if _, err := db.Exec("INSERT INTO probes (sk, ts_ms, rtt_ms, resolved_ip) VALUES ((SELECT sk FROM sensors WHERE id = ?), ?, ?, '127.0.0.1')", "all-lost-hour", ts, 55.0); err != nil {
 			t.Fatalf("insert all-lost old: %v", err)
 		}
 	}
