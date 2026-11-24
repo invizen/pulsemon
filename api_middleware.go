@@ -14,13 +14,11 @@ import (
 	"unicode/utf8"
 )
 
+// maxRequestBytes bounds every incoming request body (authGate wraps
+// r.Body with http.MaxBytesReader). The largest real payload — a TLS
+// cert+key upload — is ~16 KB; sensor/user/settings payloads are bytes.
+// Anything past 1 MiB is either a bug or a DoS attempt.
 const maxRequestBytes = 1 << 20
-
-// minIntervalS is the floor on a sensor's probe interval. At 1s a sensor
-// holds ~86,400 in-memory entries per day and copies ~1.4 MB per dashboard
-// poll, so the API refuses to store intervals below 5s. Existing rows are
-// NOT migrated (a legacy 1s sensor keeps running until the operator edits
-// it); the floor is enforced only on new writes via the API.
 
 func respondWithError(w http.ResponseWriter, code int, message string) {
 	w.Header().Set("Content-Type", "application/json")
@@ -33,7 +31,6 @@ func respondWithError(w http.ResponseWriter, code int, message string) {
 // belongs) and returns a generic body to the dashboard, so internal error
 // text never leaks to the client. 4xx validation messages are user-facing
 // and keep their specific text via respondWithError.
-
 func respondInternal(w http.ResponseWriter, what string, err error) {
 	log.Printf("API: %s: %v", logSafe(what), err)
 	respondWithError(w, http.StatusInternalServerError, "internal error")
@@ -46,7 +43,6 @@ func respondInternal(w http.ResponseWriter, what string, err error) {
 // corrupt terminals and shippers, and an unbounded value lets any session
 // write arbitrarily long log lines. Sanitizing
 // HERE covers every current and future call site in one place.
-
 func logSafe(s string) string {
 	const max = 120
 	mapped := strings.Map(func(c rune) rune {
@@ -72,7 +68,6 @@ func logSafe(s string) string {
 // Every JSON handler routes its json.Decoder error through this, so an
 // oversized body never surfaces as "invalid request body: http: request
 // body too large".
-
 func requestBodyErr(err error) (int, string) {
 	var mbe *http.MaxBytesError
 	if errors.As(err, &mbe) {
@@ -97,7 +92,6 @@ func respondWithJSON(w http.ResponseWriter, code int, payload any) {
 // The throttle/lockout sites (login per-IP, login per-username, setup,
 // password-change per-IP, password-change per-username) share this instead
 // of copy-pasting the secs computation + header + body.
-
 func respondThrottled(w http.ResponseWriter, wait time.Duration, msg string) {
 	secs := int((wait + time.Second - 1) / time.Second)
 	if secs < 1 {
@@ -107,6 +101,8 @@ func respondThrottled(w http.ResponseWriter, wait time.Duration, msg string) {
 	respondWithError(w, http.StatusTooManyRequests, msg)
 }
 
+// parseAllowedHosts splits PULSEMON_ALLOWED_HOSTS (comma-separated host or
+// host:port entries) into a lower-cased list, dropping blanks
 func parseAllowedHosts(v string) []string {
 	var out []string
 	for _, h := range strings.Split(v, ",") {
@@ -122,7 +118,6 @@ func parseAllowedHosts(v string) []string {
 // bracketed IPv6 with NO port ("[::1]"), which SplitHostPort rejects — the
 // allowlist commonly stores IPv6 that way. It returns the bare host, the
 // port ("" if none), and whether a port was present.
-
 func splitHostPortLenient(v string) (host, port string, hasPort bool) {
 	v = strings.ToLower(strings.TrimSpace(v))
 	if strings.HasPrefix(v, "[") {
@@ -148,7 +143,6 @@ func splitHostPortLenient(v string) (host, port string, hasPort bool) {
 // client-controlled, so this is the only Host check that a DNS-rebinding
 // page can't satisfy — the Origin==Host CSRF gate compares two values the
 // attacker's page both controls.
-
 func (s *Server) hostAllowed(host string) bool {
 	reqHost, _, _ := splitHostPortLenient(host)
 	for _, a := range s.allowedHosts {
@@ -174,7 +168,6 @@ func (s *Server) hostAllowed(host string) bool {
 // no session cookie protecting the endpoints, every mutating route is
 // reachable by it. /api/auth/login is deliberately NOT gated (the auth entry
 // point must keep working; it has its own per-IP rate limiting).
-
 func (s *Server) unauthMutateAllowed(r *http.Request) bool {
 	if len(s.allowedHosts) == 0 {
 		return true
@@ -182,6 +175,25 @@ func (s *Server) unauthMutateAllowed(r *http.Request) bool {
 	return s.hostAllowed(r.Host)
 }
 
+// authGate wraps the mux with a per-request auth check. The enabled state
+// (at least one user in the users table) is memoized in AuthState for
+// enabledTTL, so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on the
+// hot path. In-app user mutations refresh it immediately; an out-of-band
+// `pulsemon auth-user add/remove` is honored within the TTL (≤2s), no
+// restart required.
+//
+// Setup mode (no users exist yet): only the bootstrap surface is reachable —
+// static UI assets, /api/healthz, /api/auth/status, and POST /api/auth/users
+// (the first account). Everything else is 403 until an account exists, so an
+// unauthenticated LAN host can't use the fresh-install window for SSRF or
+// internal port scanning.
+//
+// Every request body is additionally bounded to maxRequestBytes via
+// http.MaxBytesReader: a malformed or malicious client can no longer stream
+// an arbitrarily large body into the JSON decoders (sensors, users, TLS
+// upload, settings). The largest real payload — a TLS cert+key upload — fits
+// in ~16 KB, so 1 MiB is generous. Oversized bodies surface as a clean 413
+// instead of a generic decode error.
 func (s *Server) authGate() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Content-Type-Options", "nosniff")

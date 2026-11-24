@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 )
 
+// webhookMasked shows only scheme://host/*** — the path and query carry the credential for every supported provider.
 func webhookMasked(raw string) string {
 	if raw == "" {
 		return ""
@@ -36,7 +37,6 @@ func webhookMasked(raw string) string {
 // written back as the operator's intent, overwriting the real settings.
 // A read failure is now an error: the handlers 500 and the UI shows
 // "Failed to load settings" instead of an editable form of fabrications.
-
 func (s *Server) settingsPayload() (map[string]any, error) {
 	// ONE settings snapshot, not six: each GetSettingErr was its own
 	// query on its own pool connection, so a concurrent PUT
@@ -119,7 +119,6 @@ func (s *Server) handleSettingsGet(w http.ResponseWriter, r *http.Request) {
 // settings tx committed, maintenance tx failed → the
 // alert snapshot must still reload. Production is a plain method call
 // (same seam pattern as deliverDestinations in alerts.go).
-
 var enterMaintenance = func(db *store.Store, ctx context.Context) ([]string, error) {
 	return db.EnterMaintenanceWithFreshSnapshot(ctx)
 }
@@ -588,7 +587,6 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 // see the tls_mode=none guard. The withDNS variants split the URL checks:
 // the in-transaction save path must not run the 5s DNS lookup under the
 // SQLite write lock.
-
 func validateProviderUpdate(kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	return validateProviderUpdateInternal(kind, url, enabled, extra, storedExtra, true)
 }
@@ -597,7 +595,6 @@ func validateProviderUpdate(kind string, url *string, enabled *bool, extra, stor
 // in-transaction save path (see N6 above). DNS reachability is already
 // enforced by the pre-transaction pass in handleSettingsPut, so a URL that
 // cannot be resolved is rejected before the write begins.
-
 func validateProviderUpdateNoDNS(kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	return validateProviderUpdateInternal(kind, url, enabled, extra, storedExtra, false)
 }
@@ -713,7 +710,6 @@ func validateProviderUpdateInternal(kind string, url *string, enabled *bool, ext
 // state validation, so a swallowed DB failure must not degrade it to
 // "nothing stored". The settings-PUT path shares its one bulk pre-flight
 // read via providerExtrasFrom; this is the standalone twin.
-
 func (s *Server) storedProviderExtra(kind string) (map[string]string, error) {
 	m, err := getAllSettings(s.db)
 	if err != nil {
@@ -724,7 +720,6 @@ func (s *Server) storedProviderExtra(kind string) (map[string]string, error) {
 
 // providerExtrasFrom filters a settings snapshot down to a provider's
 // extra keys (the pure half of storedProviderExtra).
-
 func providerExtrasFrom(m map[string]string, kind string) map[string]string {
 	keys, ok := extraFields[kind]
 	if !ok {
@@ -740,7 +735,6 @@ func providerExtrasFrom(m map[string]string, kind string) map[string]string {
 // errSMTPNoneWithCreds: the tls_mode=none-with-credentials rejection. A
 // sentinel (not an inline error) so the settings PUT can map it to 400
 // even when it surfaces from the IN-TX re-check.
-
 var errSMTPNoneWithCreds = errors.New("smtp tls_mode=none cannot use credentials (clear username/password)")
 
 // guardSMTPNoCredsOverTLSInTx re-applies the tls_mode=none + credentials
@@ -761,7 +755,6 @@ var errSMTPNoneWithCreds = errors.New("smtp tls_mode=none cannot use credentials
 // (normal on a fresh DB), any other scan error is returned, so the guard
 // can never answer "no stored credentials" off a read that never ran (a
 // canceled ctx, disk I/O) and wave tls_mode=none through over real ones.
-
 func guardSMTPNoCredsOverTLSInTx(ctx context.Context, tx *sql.Tx, incoming map[string]string) error {
 	stored := func(k string) (string, error) {
 		var v string
@@ -828,7 +821,6 @@ func guardSMTPNoCredsOverTLSInTx(ctx context.Context, tx *sql.Tx, incoming map[s
 // value is validated first. This is the single write path for provider
 // config, so the validation and key-naming stay consistent no matter how
 // many providers exist.
-
 func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, extra map[string]string) error {
 	// Standalone (non-HTTP) entry point — no request context to thread, so
 	// the plain Begin() stays and statements run under context.Background()
@@ -853,7 +845,6 @@ func (s *Server) applyProviderUpdate(kind string, url *string, enabled *bool, ex
 // applyProviderUpdateInTx is applyProviderUpdate's body, writing through the
 // caller's transaction so handleSettingsPut can apply every provider and
 // routing field atomically (mirrors db.SetSensorTags).
-
 func applyProviderUpdateInTx(ctx context.Context, tx *sql.Tx, kind string, url *string, enabled *bool, extra, storedExtra map[string]string) error {
 	// Format-only validation: the DNS reachability
 	// check runs in the PRE-transaction pass (handleSettingsPut →
@@ -936,7 +927,6 @@ func applyProviderUpdateInTx(ctx context.Context, tx *sql.Tx, kind string, url *
 // it is stored. The extra loop below persists its keys without host
 // validation, so accepting "host" here let a client write smtp_host — e.g.
 // 127.0.0.1 or 169.254.169.254 — straight to SQLite, bypassing the check.
-
 var extraFields = map[string]map[string]bool{
 	"telegram": {"chat_id": true},
 	"smtp": {"port": true, "from": true, "to": true,

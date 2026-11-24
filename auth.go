@@ -54,7 +54,6 @@ import (
 // URL must not expose the dashboard", not "an anonymous internet scanner
 // must not probe it". History: docs/DECISIONS.md →
 // login-throttle-per-username, knowngood-bound, login-lockout-429-refund.
-
 const (
 	authSessionName = "pulsemon_session"
 	// authSessionTTL is the SLIDING inactivity window: a session lapses if it
@@ -542,7 +541,6 @@ func (a *AuthState) refreshEnabledNow() {
 
 // UserCount/CRUD live on *store.Store (internal/store); AuthState adds the password
 // hashing, validation, and session bookkeeping on top.
-
 var (
 	errUsernameInvalid = fmt.Errorf("username must start with a letter and contain only letters, digits, . _ - (max %d)", maxUsernameLen)
 	errPasswordWeak    = fmt.Errorf("password must be at least %d characters", minPasswordLen)

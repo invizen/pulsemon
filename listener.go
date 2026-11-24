@@ -38,7 +38,6 @@ import (
 // lives in listener_linux.go / listener_windows.go — each OS respawns the
 // process differently (systemctl / container SIGTERM / re-exec vs the
 // Windows SCM).
-
 const defaultHTTPSPort = 443
 
 type listenerCfg struct {

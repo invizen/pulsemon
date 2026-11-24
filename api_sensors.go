@@ -15,10 +15,14 @@ import (
 	"unicode/utf8"
 )
 
+// minIntervalS is the floor on a sensor's probe interval. At 1s a sensor
+// holds ~86,400 in-memory entries per day and copies ~1.4 MB per dashboard
+// poll, so the API refuses to store intervals below 5s. Existing rows are
+// NOT migrated (a legacy 1s sensor keeps running until the operator edits
+// it); the floor is enforced only on new writes via the API.
 const minIntervalS = 5
 
 // Sensor mirrors the sensors table. JSON is snake_case per SPEC §4.
-
 type Sensor struct {
 	ID        string   `json:"id"`
 	Name      string   `json:"name"`
@@ -45,25 +49,21 @@ type Sensor struct {
 // the column order stays in lockstep with scanSensorRow. Adding a column to
 // the sensors table means updating this list and scanSensorRow in ONE place
 // (the list used to be copy-pasted at all three SELECT sites).
-
 const sensorCols = "id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, status, created_at"
 
 // sensorScanner is the narrow interface both *sql.Row and *sql.Rows satisfy,
 // so scanSensorRow serves the single-row and list queries alike.
-
 type sensorScanner interface{ Scan(dest ...any) error }
 
 // scanSensorRow reads one full-sensor row (the sensorCols columns) into sn.
 // The 12-field scan lives here once instead of being repeated at every
 // full-sensor SELECT site.
-
 func scanSensorRow(sc sensorScanner, sn *Sensor) error {
 	return sc.Scan(&sn.ID, &sn.Name, &sn.Target, &sn.Type, &sn.IntervalS, &sn.TimeoutMS,
 		&sn.LossWarn, &sn.DownAfter, &sn.SpikeMult, &sn.State, &sn.Status, &sn.CreatedAt)
 }
 
 // SensorView is what GET /api/sensors returns: sensor + window stats.
-
 type SensorView struct {
 	Sensor
 	Stats *SensorStats `json:"stats"` // nil when paused or no probes yet
@@ -75,7 +75,6 @@ type SensorView struct {
 }
 
 // SensorStats is a 60-probe window summary (SPEC §4).
-
 type SensorStats struct {
 	RTTLast     *float64   `json:"rtt_last"`
 	RTTMin      *float64   `json:"rtt_min"`
@@ -104,6 +103,9 @@ type ProbeRow struct {
 	Lost bool     `json:"lost"`
 }
 
+// cachedSensorCount returns the sensor count, re-querying only when the cached
+// value is older than ~2s (see handleHealthz for the why). A query error is
+// NOT cached, so a transient DB blip is retried on the next call.
 func (s *Server) cachedSensorCount(ctx context.Context) (int, error) {
 	s.sensorCountMu.Lock()
 	if time.Since(s.sensorCountAt) < 2*time.Second {
@@ -182,7 +184,6 @@ func (s *Server) fetchSensors(ctx context.Context) []Sensor {
 // expiry to a view (HTTP sensors only). It is a no-op for ICMP sensors:
 // the card renders the status code + cert-expiry note from these, and both
 // stay omitted from the JSON for ICMP (pointer omitempty + nil).
-
 func (s *Server) fillHTTPView(v *SensorView) {
 	if v.Type != "http" {
 		return
@@ -203,7 +204,6 @@ func (s *Server) fillHTTPView(v *SensorView) {
 // a masked value can never be saved back — the reason target masking was
 // previously declined for the shared UI does not apply to this read path.
 // History: docs/DECISIONS.md → viewer-target-redaction.
-
 func (s *Server) viewerTarget(r *http.Request, target string) string {
 	if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
 		return alertTarget(target)
@@ -352,7 +352,6 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 // CJK/emoji names to ~20 chars and the server 400'd what the form allowed.
 // Invalid UTF-8 is refused at the write path so SQLite never stores a
 // mojibake name.
-
 func validSensorName(name string) bool {
 	if name == "" || utf8.RuneCountInString(name) > 60 {
 		return false
@@ -382,7 +381,6 @@ func validSensorName(name string) bool {
 // non-HTML consumers (alert cards, logs, inspector) clean and is
 // belt-and-braces on top of the CSP + esc() output escaping (see
 // validSensorName).
-
 func cleanTags(in []string) []string {
 	seen := map[string]bool{}
 	out := []string{}
@@ -813,7 +811,6 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 // that is why this in-conn twin lives here rather than in the store package.
 // The caller's ctx is threaded through, so every statement on this path
 // honors request cancellation, matching the ImmediateTx boundary.
-
 func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []string) error {
 	if _, err := c.ExecContext(ctx, "DELETE FROM sensor_tags WHERE sensor_id = ?", id); err != nil {
 		return err
@@ -832,7 +829,6 @@ func setSensorTagsInConn(ctx context.Context, c *sql.Conn, id string, tags []str
 // the loss/uptime aggregates — see ProbeWorker.PingNow. It runs with the
 // sensor's own configured timeout (the pulse is the same probe the sensor
 // runs on schedule; 1s fallback for a legacy zeroed row).
-
 func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -870,7 +866,6 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 // dashboard keys off `lost` for the toast. http_status is present only for
 // HTTP sensors that got a response, so an HTTP card's toast can say
 // "HTTP 503" instead of a bare loss.
-
 func pulseResponse(o probeOutcome) map[string]any {
 	var rttMs *float64
 	if !o.lost {
@@ -888,7 +883,6 @@ func pulseResponse(o probeOutcome) map[string]any {
 }
 
 // handleSensorHistory returns the last N probe records (SPEC §4, fix #4).
-
 func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -968,7 +962,6 @@ func (s *Server) handleSensorHistory(w http.ResponseWriter, r *http.Request) {
 // alert state and resets its status to up — the next probe tick rebuilds
 // the 60-probe window from scratch. Use after changing a sensor's target,
 // or to flush bad data (e.g. from a period when probing was broken).
-
 func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1064,7 +1057,6 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // force the post-mark failure path (sensor marked 'deleting' → batched
 // delete failed → compensating state restore) — the same seam pattern as
 // enterMaintenance/leaveMaintenance above.
-
 var deleteRowsBatched = func(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
 	w := ""
 	if where != "" {
@@ -1097,7 +1089,6 @@ var deleteRowsBatched = func(ctx context.Context, db *store.Store, table, where 
 // handleClearAllHistory is the bulk version of handleSensorClearHistory:
 // every sensor's probes/events/alert_state are wiped and statuses reset,
 // so the whole fleet rebuilds its windows from the next probe tick.
-
 func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodDelete {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1149,21 +1140,18 @@ func (s *Server) handleClearAllHistory(w http.ResponseWriter, r *http.Request) {
 
 // cloneMaxAttempts bounds the INSERT retries when concurrent clones race for
 // the same name.
-
 const cloneMaxAttempts = 5
 
 // globEscaper quotes the GLOB wildcards so a base name is matched
 // literally. validSensorName is a blacklist, so [ * ? are legal name
 // characters; an unescaped pattern distorts the taken-name set ("[b]"
 // becomes a character class, an unterminated '[' never matches).
-
 var globEscaper = strings.NewReplacer("[", "[[]", "*", "[*]", "?", "[?]")
 
 // Sentinel errors from the PATCH sensor write transaction: the re-validation runs inside the BEGIN IMMEDIATE tx, so its
 // failures are returned as sentinels and mapped to HTTP codes by the
 // handler (the response can't be written from inside the closure without
 // tangling the commit/rollback path).
-
 var (
 	errPatchSensorGone                = errors.New("sensor not found")
 	errPatchTargetNotURL              = errors.New("target must be a URL")
@@ -1177,12 +1165,10 @@ var (
 // PATCH-sensor in-tx sensor-read scan error before the handler classifies
 // it, so a non-ErrNoRows failure (SQLITE_BUSY, canceled context, I/O) is
 // exercisable without a real DB fault. Production always leaves it nil.
-
 var patchScanHook func(err error) error
 
 // handleSensorClone creates a copy of a sensor with a new unique name
 // (name-copy, name-copy2, ...). The clone starts PAUSED, like a new sensor.
-
 func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1373,7 +1359,6 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 
 // handleTags lists every tag in use (with sensor counts) and supports
 // DELETE for removing a tag from all its sensors.
-
 func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1441,7 +1426,6 @@ type GraphPoint struct {
 }
 
 // handleSensorGraph returns bucketed RTT/loss points for a 1h or 24h range.
-
 func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -1584,8 +1568,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	respondWithJSON(w, http.StatusOK, events)
 }
-
-// webhookMasked shows only scheme://host/*** — the path and query carry the credential for every supported provider.
 
 func normalizeProbeType(t string) string {
 	switch strings.ToLower(strings.TrimSpace(t)) {

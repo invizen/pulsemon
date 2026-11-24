@@ -21,11 +21,6 @@ import (
 //go:embed web/index.html web/app.js web/styles.css web/theme.js web/favicon.svg web/favicon-16x16.png web/favicon-32x32.png web/favicon-48x48.png web/apple-touch-icon.png web/vendor
 var content embed.FS
 
-// maxRequestBytes bounds every incoming request body (authGate wraps
-// r.Body with http.MaxBytesReader). The largest real payload — a TLS
-// cert+key upload — is ~16 KB; sensor/user/settings payloads are bytes.
-// Anything past 1 MiB is either a bug or a DoS attempt.
-
 type APIError struct {
 	Error string `json:"error"`
 }
@@ -61,32 +56,9 @@ func NewServer(db *store.Store, pw *ProbeWorker) *Server {
 	return s
 }
 
-// parseAllowedHosts splits PULSEMON_ALLOWED_HOSTS (comma-separated host or
-// host:port entries) into a lower-cased list, dropping blanks
-
 func (s *Server) Mux() *http.ServeMux {
 	return s.mux
 }
-
-// authGate wraps the mux with a per-request auth check. The enabled state
-// (at least one user in the users table) is memoized in AuthState for
-// enabledTTL, so the 5s dashboard poll doesn't pay a SELECT COUNT(*) on the
-// hot path. In-app user mutations refresh it immediately; an out-of-band
-// `pulsemon auth-user add/remove` is honored within the TTL (≤2s), no
-// restart required.
-//
-// Setup mode (no users exist yet): only the bootstrap surface is reachable —
-// static UI assets, /api/healthz, /api/auth/status, and POST /api/auth/users
-// (the first account). Everything else is 403 until an account exists, so an
-// unauthenticated LAN host can't use the fresh-install window for SSRF or
-// internal port scanning.
-//
-// Every request body is additionally bounded to maxRequestBytes via
-// http.MaxBytesReader: a malformed or malicious client can no longer stream
-// an arbitrarily large body into the JSON decoders (sensors, users, TLS
-// upload, settings). The largest real payload — a TLS cert+key upload — fits
-// in ~16 KB, so 1 MiB is generous. Oversized bodies surface as a clean 413
-// instead of a generic decode error.
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /api/healthz", s.handleHealthz)
@@ -174,7 +146,6 @@ func (s *Server) routes() {
 }
 
 // handleHealthz is a real check: DB must be reachable (SPEC §8, fix #5).
-
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// The sensor count is a liveness signal, not a precise gauge: cache it for
 	// ~2s so frequent unauthenticated health checks don't do a DB COUNT per hit.
@@ -226,10 +197,6 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	}
 	respondWithJSON(w, http.StatusOK, hz)
 }
-
-// cachedSensorCount returns the sensor count, re-querying only when the cached
-// value is older than ~2s (see handleHealthz for the why). A query error is
-// NOT cached, so a transient DB blip is retried on the next call.
 
 func (s *Server) handleStatic(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {

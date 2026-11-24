@@ -97,9 +97,7 @@ func cleanupStaleBinary() {
 //
 // No systemctl, no PowerShell.
 //
-// History: docs/DECISIONS.md -> windows-vsa-scm-rights,
-//          windows-recovery-restart
-
+// History: docs/DECISIONS.md -> windows-vsa-scm-rights, windows-recovery-restart
 func init() {
 	detectRestart = detectRestartWindows
 	performRestart = performRestartWindows

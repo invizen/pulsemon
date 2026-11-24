@@ -38,7 +38,6 @@ import (
 //     the tool also works where the datagram socket is unavailable.
 //
 // EngineMode() reports which transport is active (shown in /api/healthz).
-
 const (
 	probeID     = 0x5a11
 	payloadSize = 32 // max probe payload in bytes (probePayload must fit within this)
