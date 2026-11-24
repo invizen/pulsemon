@@ -48,7 +48,7 @@ func ptrStr(p *float64) string {
 // Recent values, HourRTTAvg, and all 60 hour buckets — carries 1µs-clean
 // values, and the MARSHALED JSON contains no widening-noise digits.
 func TestComputeSensorStatsRTTWireValuesAreClean(t *testing.T) {
-	now := int64(1767225600) // fixed instant; all entries fall inside the hour
+	now := int64(1767225600)    // fixed instant; all entries fall inside the hour
 	const lo, hi = 12.34, 15.67 // both inexact in float32 — the noise case
 	entries := make([]probeEntry, 0, 60)
 	for i := 59; i >= 0; i-- {

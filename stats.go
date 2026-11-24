@@ -136,31 +136,21 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// sensor's history, so a paused-then-resumed sensor would otherwise come
 	// back with a blank 24h graph and an empty 60-probe inspector while
 	// /history (a direct DB read) still shows the data.
-	// (sk, id) pairs: probes are keyed by the INTEGER sk (migration 14),
-	// the stats cache by the TEXT id — skByID bridges the two.
-	type warmKey struct {
-		sk int64
-		id string
-	}
-	rows, err := pw.db.QueryContext(ctx, "SELECT sk, id FROM sensors WHERE state IN ('active','paused')")
+	ids, err := pw.db.QueryContext(ctx, "SELECT id FROM sensors WHERE state IN ('active','paused')")
 	if err != nil {
 		log.Printf("stats warm: failed to list sensors: %v", err)
 		return
 	}
-	defer rows.Close()
-	var keys []warmKey
-	for rows.Next() {
-		var k warmKey
-		if rows.Scan(&k.sk, &k.id) == nil {
-			keys = append(keys, k)
+	defer ids.Close()
+	var idList []string
+	for ids.Next() {
+		var id string
+		if ids.Scan(&id) == nil {
+			idList = append(idList, id)
 		}
 	}
-	if err := rows.Err(); err != nil {
+	if err := ids.Err(); err != nil {
 		log.Printf("stats warm: sensor list ended early: %v", err)
-	}
-	skByID := make(map[int64]string, len(keys))
-	for _, k := range keys {
-		skByID[k.sk] = k.id
 	}
 
 	// The warm-up is two phases, matching exactly what the live series
@@ -193,51 +183,47 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// cursor close per chunk (top-level defer, not a bare close below the
 	// loop) so no pooled connection is held across chunks. History:
 	// docs/DECISIONS.md → probe-series-memory-tiers, purge-tail-exemption.
-	cutoffMS := time.Now().UTC().Add(-24 * time.Hour).UnixMilli()
+	cutoff := time.Now().UTC().Add(-24 * time.Hour)
 	type acc struct {
 		series *probeSeries
 		n24    int // rows loaded from phase 1 (drives the slow-sensor split)
 	}
-	byID := make(map[string]*acc, len(keys))
+	byID := make(map[string]*acc, len(idList))
 
-	// Phase 1: the 24h window for all sensors (batched, no window
-	// function). Skewed to the INTEGER layout: sk + epoch-ms, exact
-	// comparison, covering index idx_probes_cov.
-	fetchChunk24 := func(chunk []warmKey) {
+	// Phase 1: the 24h window for all sensors (batched, no window function).
+	fetchChunk24 := func(chunk []string) {
 		q := make([]string, len(chunk))
 		for i := range q {
 			q[i] = "?"
 		}
 		args := make([]any, 0, len(chunk)+1)
-		for _, k := range chunk {
-			args = append(args, k.sk)
+		for _, id := range chunk {
+			args = append(args, id)
 		}
-		args = append(args, cutoffMS)
+		args = append(args, store.FormatTS(cutoff))
 		rows, err := pw.db.QueryContext(ctx,
-			`SELECT sk, ts_ms, rtt_ms, manual FROM probes
-			WHERE sk IN (`+strings.Join(q, ",")+`) AND ts_ms >= ?
-			ORDER BY sk, ts_ms`, args...)
+			`SELECT sensor_id, ts, rtt_ms, manual FROM probes
+			WHERE sensor_id IN (`+strings.Join(q, ",")+`) AND ts >= ?
+			ORDER BY sensor_id, ts`, args...)
 		if err != nil {
 			log.Printf("stats warm: 24h chunk fetch failed: %v", err)
 			return
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var sk int64
-			var tsMS int64
+			var sid string
+			var ts time.Time
 			var rtt *float64
 			var mRaw int
-			if err := rows.Scan(&sk, &tsMS, &rtt, &mRaw); err != nil {
+			if err := rows.Scan(&sid, &ts, &rtt, &mRaw); err != nil {
 				continue
 			}
-			id := skByID[sk]
-			a, ok := byID[id]
+			a, ok := byID[sid]
 			if !ok {
 				a = &acc{series: &probeSeries{}}
-				byID[id] = a
+				byID[sid] = a
 			}
-			// ts_ms (epoch ms) -> the series' epoch-seconds unit.
-			e := probeEntry{ts: tsMS / 1000, rtt: float32(math.NaN()), manual: mRaw == 1}
+			e := probeEntry{ts: ts.UTC().Unix(), rtt: float32(math.NaN()), manual: mRaw == 1}
 			if rtt != nil {
 				e.rtt = float32(*rtt)
 			}
@@ -248,16 +234,16 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 			log.Printf("stats warm: 24h chunk read ended early: %v", err)
 		}
 	}
-	for i := 0; i < len(keys); i += store.InQueryChunk {
+	for i := 0; i < len(idList); i += store.InQueryChunk {
 		if ctx.Err() != nil {
 			log.Printf("stats warm: aborted during 24h phase (shutdown)")
 			return
 		}
 		end := i + store.InQueryChunk
-		if end > len(keys) {
-			end = len(keys)
+		if end > len(idList) {
+			end = len(idList)
 		}
-		fetchChunk24(keys[i:end])
+		fetchChunk24(idList[i:end])
 	}
 
 	// Phase 2: backfill the last 60 for the slow sensors. A sensor with fewer
@@ -265,56 +251,56 @@ func (pw *ProbeWorker) warmStats(ctx context.Context) {
 	// has a 60-probe inspector window that spans past the 24h cutoff, so phase
 	// 1 alone under-fills it. The per-sensor LIMIT 60 is a superset of the 24h
 	// rows, so it replaces the phase-1 series (no dedupe).
-	var slow []warmKey
-	for _, k := range keys {
-		if a, ok := byID[k.id]; !ok || a.n24 < seriesTailProbes {
-			slow = append(slow, k)
+	var slow []string
+	for _, id := range idList {
+		if a, ok := byID[id]; !ok || a.n24 < seriesTailProbes {
+			slow = append(slow, id)
 		}
 	}
-	backfillLast60 := func(k warmKey) {
+	backfillLast60 := func(id string) {
 		rows, err := pw.db.QueryContext(ctx,
-			`SELECT ts_ms, rtt_ms, manual FROM probes
-			WHERE sk = ? ORDER BY ts_ms DESC LIMIT ?`, k.sk, seriesTailProbes)
+			`SELECT ts, rtt_ms, manual FROM probes
+			WHERE sensor_id = ? ORDER BY ts DESC LIMIT ?`, id, seriesTailProbes)
 		if err != nil {
-			log.Printf("stats warm: last-60 backfill failed for %s: %v", k.id, err)
+			log.Printf("stats warm: last-60 backfill failed for %s: %v", id, err)
 			return
 		}
 		defer rows.Close()
 		type row struct {
-			tsMS int64
+			ts   time.Time
 			rtt  *float64
 			mRaw int
 		}
 		var got []row
 		for rows.Next() {
 			var r row
-			if err := rows.Scan(&r.tsMS, &r.rtt, &r.mRaw); err != nil {
+			if err := rows.Scan(&r.ts, &r.rtt, &r.mRaw); err != nil {
 				continue
 			}
 			got = append(got, r)
 		}
 		if err := rows.Err(); err != nil {
-			log.Printf("stats warm: last-60 backfill read ended early for %s: %v", k.id, err)
+			log.Printf("stats warm: last-60 backfill read ended early for %s: %v", id, err)
 		}
 		if len(got) == 0 {
 			return // no history: leave the sensor out of the cache
 		}
 		s := &probeSeries{}
 		for i := len(got) - 1; i >= 0; i-- { // append oldest-first
-			e := probeEntry{ts: got[i].tsMS / 1000, rtt: float32(math.NaN()), manual: got[i].mRaw == 1}
+			e := probeEntry{ts: got[i].ts.UTC().Unix(), rtt: float32(math.NaN()), manual: got[i].mRaw == 1}
 			if got[i].rtt != nil {
 				e.rtt = float32(*got[i].rtt)
 			}
 			s.append(e)
 		}
-		byID[k.id] = &acc{series: s, n24: 60}
+		byID[id] = &acc{series: s, n24: 60}
 	}
-	for _, k := range slow {
+	for _, id := range slow {
 		if ctx.Err() != nil {
 			log.Printf("stats warm: aborted during last-60 phase (shutdown)")
 			return
 		}
-		backfillLast60(k)
+		backfillLast60(id)
 	}
 	pw.statsMu.Lock()
 	built := 0
