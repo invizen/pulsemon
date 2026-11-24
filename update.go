@@ -659,14 +659,42 @@ var restartSensorWait = func(db *store.Store, timeout time.Duration) (int, bool,
 // DB's last session and must NOT replay over the restored file: remove
 // them first (SQLite would replay them on the next open, mixing stale WAL
 // pages into the snapshot).
+//
+// The copy is STREAMED to a temp file in the live file's directory and
+// then renamed into place — never read wholesale into RAM (the backup is
+// hundreds of MB at the declared fleet), and never written in place
+// (an in-place rewrite truncates the live file first, so a power loss
+// mid-write strands a truncated DB; this path already runs only after
+// the watchdog proved data loss, which is exactly when a second failure
+// is least acceptable). Same-directory temp + rename is what makes the
+// swap atomic: the live path sees the old file whole or the new one
+// whole, never a prefix. The .preupdate backup survives either way.
 func restoreDatabaseFile(backup, live string) error {
 	_ = os.Remove(live + "-wal")
 	_ = os.Remove(live + "-shm")
-	data, err := os.ReadFile(backup)
+	src, err := os.Open(backup)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(live, data, 0o644)
+	defer src.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(live), ".pulsemon-restore-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after a successful rename
+	if _, err = io.Copy(tmp, src); err == nil {
+		err = tmp.Chmod(0o600)
+	}
+	if err == nil {
+		err = tmp.Sync()
+	}
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), live)
 }
 
 // verifySensorsIntactWatchdog is the post-restart data-integrity check the
