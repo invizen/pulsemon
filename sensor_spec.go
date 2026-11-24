@@ -73,9 +73,12 @@ func (s *sensorSpec) validate() error {
 	if !validSensorName(s.Name) {
 		return errors.New("name must be 1-60 characters and may not contain quotes, angle brackets, backslash, or control characters")
 	}
-	if err := s.validateCrossField(); err != nil {
-		return err
-	}
+	// Range checks BEFORE the cross-field rules: a cross-field message
+	// about an out-of-range field is misleading (interval_s=4 with
+	// timeout_ms=4500 should report "interval_s must be 5-3600", not
+	// "timeout_ms must not exceed interval_s*1000"), and an out-of-range
+	// interval_s can overflow the IntervalS*1000 product in
+	// validateCrossField.
 	for _, f := range []struct {
 		field string
 		value int
@@ -89,6 +92,9 @@ func (s *sensorSpec) validate() error {
 		if b, ok := sensorBound(f.field); ok && (f.value < b[0] || f.value > b[1]) {
 			return fmt.Errorf("%s must be %d-%d", f.field, b[0], b[1])
 		}
+	}
+	if err := s.validateCrossField(); err != nil {
+		return err
 	}
 	return nil
 }

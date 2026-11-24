@@ -218,14 +218,19 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusInternalServerError, "failed to read sensors")
 			return
 		}
+		// Viewers (non-admin sessions) get every target with any userinfo
+		// stripped — the stored target can carry operator credentials
+		// (https://user:pass@host/), which the admin-only settings gate
+		// exists to keep from them. The decision is per REQUEST, not per
+		// sensor: sessionFrom / IsAdmin are invariant across the loop, so
+		// compute it once instead of once per sensor.
+		redact := s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r))
 		views := make([]SensorView, 0, len(sensors))
 		for _, sn := range sensors {
 			v := SensorView{Sensor: sn}
-			// Viewers (non-admin sessions) get the target with any
-			// userinfo stripped — the stored target can carry operator
-			// credentials (https://user:pass@host/), which the
-			// admin-only settings gate exists to keep from them.
-			v.Target = s.viewerTarget(r, v.Target)
+			if redact {
+				v.Target = alertTarget(v.Target)
+			}
 			if sn.State == "active" {
 				// In-memory stats (v0.1.18): one map lookup, no per-sensor
 				// SQLite queries. This was 4 queries per sensor per poll —

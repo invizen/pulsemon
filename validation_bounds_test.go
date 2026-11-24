@@ -287,3 +287,48 @@ func TestPatchTCPInvalidTargetGetsTCPMessage(t *testing.T) {
 		t.Fatalf("ICMP target error = %q, want the ICMP 'IPv4 address or hostname' message", msg)
 	}
 }
+
+// TestValidateRangeBeforeCrossField (review 2026-11-24 nits) pins the
+// CHECK ORDER in sensorSpec.validate(): per-field range checks must run
+// BEFORE validateCrossField. When both a range violation and a cross-field
+// violation are present, the RANGE error wins — a cross-field message about
+// an out-of-range field is misleading (interval_s=4 + timeout_ms=4500 must
+// say "interval_s must be 5-3600", not "timeout_ms must not exceed
+// interval_s*1000"), and an out-of-range interval_s makes the
+// IntervalS*1000 / DownAfter*IntervalS products in validateCrossField
+// meaningless (they can overflow int).
+// History: docs/DECISIONS.md → validation-range-before-cross-field.
+func TestValidateRangeBeforeCrossField(t *testing.T) {
+	_, do := newM10bServer(t)
+
+	// interval_s=4 is below the 5-3600 bound AND timeout_ms=4500 exceeds
+	// 4*1000 — the range error must be reported, not the timeout rule.
+	code, out := do(http.MethodPost, "/api/sensors", `{"name":"ord1","target":"192.0.2.1","interval_s":4,"timeout_ms":4500}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST 4s+4500ms = %d, want 400: %v", code, out)
+	}
+	if msg := out["error"].(string); msg != "interval_s must be 5-3600" {
+		t.Fatalf("POST 4s+4500ms error = %q, want the interval_s range error (cross-field fired first = order regression)", msg)
+	}
+
+	// Huge interval_s (1e18): DownAfter*IntervalS overflows the 24h
+	// cross-field comparison — the range check must fire before any
+	// cross-field product is computed.
+	code, out = do(http.MethodPost, "/api/sensors", `{"name":"ord2","target":"192.0.2.1","interval_s":1000000000000000000,"timeout_ms":100}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST 1e18s interval = %d, want 400: %v", code, out)
+	}
+	if msg := out["error"].(string); msg != "interval_s must be 5-3600" {
+		t.Fatalf("POST 1e18s interval error = %q, want the interval_s range error (a cross-field product overflowed)", msg)
+	}
+
+	// Positive control: both fields IN range, timeout over interval — the
+	// cross-field rule must still fire with its own message.
+	code, out = do(http.MethodPost, "/api/sensors", `{"name":"ord3","target":"192.0.2.1","interval_s":5,"timeout_ms":6000}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST 5s+6000ms = %d, want 400: %v", code, out)
+	}
+	if msg := out["error"].(string); msg != "timeout_ms must not exceed interval_s*1000" {
+		t.Fatalf("POST 5s+6000ms error = %q, want the cross-field message (range-first broke the in-range path)", msg)
+	}
+}

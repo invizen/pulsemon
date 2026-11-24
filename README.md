@@ -23,16 +23,17 @@ pulsemon
 - **Status derivation** — `up` / `warning` / `error` from the sensor's most
   recent probes (see *Alert behavior*)
 - **1h / 24h latency graphs** with whole-ms display
-- **Alerts** — Google Chat + Discord, fan-out to every enabled destination,
-  re-alerts, one-click test from Settings
+- **Alerts** — Google Chat, Discord, Telegram, SMTP, fan-out to every
+  enabled destination, re-alerts, one-click test from Settings
 - **Alert controls** — routing (all / by tag / by sensor), re-alert interval
   (0 = alert once only), one-click **maintenance mode**
 - **Dashboard** — card ⇄ table views, inspector with history, activity feed,
   optimized for 1080p and up
 - **Authentication** — optional username/password gate (Settings →
   Authentication): create the first account to turn it on, add/remove more,
-  change your password, or disable it (removes all accounts). Sessions last
-  30 days; `/api/healthz` stays open for external monitors
+  change your password, or disable it (removes all accounts). Sessions
+  renew on activity (7-day sliding window) with a 30-day absolute cap;
+  `/api/healthz` stays open for external monitors
 
 ## Requirements
 
