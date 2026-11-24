@@ -183,3 +183,40 @@ func toInt(v any) (int, bool) {
 	}
 	return 0, false
 }
+
+// TestWorkerGraphMethodParity: ProbeWorker.Graph returns exactly what
+// graphPoints computes under the same anchor, nil for an unknown sensor,
+// and is the only lock-taking door into the series for handlers.
+func TestWorkerGraphMethodParity(t *testing.T) {
+	pw := NewProbeWorker(nil)
+	now := time.Now().Unix()
+	for i := 0; i < 10; i++ {
+		pw.recordProbe("g", probeEntry{ts: now - int64(10-i)*60, rtt: 2.0})
+	}
+	for _, tc := range []struct{ bucket, rng int }{{60, 3600}, {900, 86400}} {
+		pw.statsMu.RLock()
+		ser := pw.statsCache["g"]
+		want := ser.graphPoints(tc.bucket, tc.rng, now)
+		pw.statsMu.RUnlock()
+		got := pw.Graph("g", tc.bucket, tc.rng)
+		if len(got) != len(want) {
+			t.Fatalf("bucket=%d: Graph returned %d points, graphPoints %d", tc.bucket, len(got), len(want))
+		}
+		for i := range want {
+			fv := func(p *float64) float64 {
+				if p == nil {
+					return -1
+				}
+				return *p
+			}
+			if got[i].T != want[i].T || got[i].Total != want[i].Total ||
+				got[i].Lost != want[i].Lost || got[i].LossPct != want[i].LossPct ||
+				fv(got[i].Avg) != fv(want[i].Avg) || fv(got[i].Max) != fv(want[i].Max) {
+				t.Fatalf("bucket=%d point %d: Graph %+v != graphPoints %+v", tc.bucket, i, got[i], want[i])
+			}
+		}
+	}
+	if pw.Graph("missing", 60, 3600) != nil {
+		t.Fatal("Graph(unknown sensor) must be nil (handler maps nil -> empty graph)")
+	}
+}

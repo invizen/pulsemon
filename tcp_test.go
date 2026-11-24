@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -163,4 +164,21 @@ func TestSensorSpecValidateTCP(t *testing.T) {
 	check("10.0.0.5", true)                   // portless
 	check("10.0.0.5:70000", true)             // out of range
 	check("https://example.com/health", true) // an http URL is not a tcp target
+}
+
+// TestProbeTCPIPv6LiteralIsCleanLoss pins the probeTCP nil-IP guard: an IPv6
+// literal (a hand-edited row; save-time validation rejects these) resolves to
+// no IPv4 (resolveICMPTarget returns nil, nil). Before the fix probeTCP dialed
+// ":port" (an empty host is localhost); now it is a clean loss.
+func TestProbeTCPIPv6LiteralIsCleanLoss(t *testing.T) {
+	res := probeTCP(context.Background(), "[2001:db8::1]:80", time.Second)
+	if !res.Lost {
+		t.Fatalf("probeTCP on an IPv6 literal: want Lost, got %+v", res)
+	}
+	if res.IP != "" {
+		t.Fatalf("probeTCP on an IPv6 literal: want empty IP, got %q", res.IP)
+	}
+	if res.Err == nil || !strings.Contains(res.Err.Error(), "no IPv4 address") {
+		t.Fatalf("probeTCP on an IPv6 literal: want a 'no IPv4 address' error, got %v", res.Err)
+	}
 }

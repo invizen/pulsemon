@@ -224,3 +224,66 @@ func TestPatchCrossFieldSentinelsNotSubstrings(t *testing.T) {
 		t.Errorf("POST http invalid target: %d %v, want 400 with the detailed example text", code, out)
 	}
 }
+
+// TestPatchSensorRejectsUnknownField pins the strict-decode fix: a misspelled
+// field alongside a valid one is now a 400 (before the fix the misspelled
+// field was silently ignored and the valid one applied). Well-formed payloads
+// are unaffected.
+func TestPatchSensorRejectsUnknownField(t *testing.T) {
+	_, do := newM10bServer(t)
+	code, out := do(http.MethodPost, "/api/sensors", `{"name":"uf","target":"192.0.2.1"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("seed sensor: %d %v", code, out)
+	}
+	id, _ := out["id"].(string)
+
+	// "timout_ms" is a typo for "timeout_ms" — with a valid "name" present.
+	code, out = do(http.MethodPatch, "/api/sensors/"+id, `{"name":"renamed","timout_ms":5000}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("PATCH with a misspelled field = %d, want 400: %v", code, out)
+	}
+	// The valid-only request still works (strict decode must not reject
+	// well-formed payloads).
+	code, out = do(http.MethodPatch, "/api/sensors/"+id, `{"name":"renamed"}`)
+	if code != http.StatusOK {
+		t.Fatalf("PATCH with a valid field = %d, want 200: %v", code, out)
+	}
+}
+
+// TestPatchTCPInvalidTargetGetsTCPMessage pins the PATCH error-message fix:
+// a TCP sensor with an invalid target must get the TCP "host:port" message,
+// not the ICMP "IPv4 address or hostname" text (the old hardcoded case returned
+// the ICMP text for BOTH types). The ICMP path is the positive control — it
+// still gets its own message.
+func TestPatchTCPInvalidTargetGetsTCPMessage(t *testing.T) {
+	_, do := newM10bServer(t)
+
+	code, out := do(http.MethodPost, "/api/sensors", `{"name":"tcp1","target":"192.0.2.1:80","type":"tcp"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("seed TCP sensor: %d %v", code, out)
+	}
+	id, _ := out["id"].(string)
+
+	// PATCH the TCP target to a bare IP (no port) — invalid for TCP.
+	code, out = do(http.MethodPatch, "/api/sensors/"+id, `{"target":"192.0.2.1"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("PATCH TCP target without port = %d, want 400: %v", code, out)
+	}
+	msg, _ := out["error"].(string)
+	if !strings.Contains(msg, "host:port") {
+		t.Fatalf("TCP target error = %q, want the TCP 'host:port' message", msg)
+	}
+	if strings.Contains(msg, "IPv4 address or hostname") {
+		t.Fatalf("TCP target error = %q leaked the ICMP 'IPv4 address or hostname' text", msg)
+	}
+
+	// Positive control: an ICMP sensor with an IPv6 literal (neither an IPv4
+	// address nor a hostname) still gets the ICMP message.
+	code, out = do(http.MethodPost, "/api/sensors", `{"name":"icmp1","target":"2001:db8::1"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("POST ICMP sensor with an IPv6 target = %d, want 400: %v", code, out)
+	}
+	if msg, _ := out["error"].(string); msg != "target must be an IPv4 address or hostname" {
+		t.Fatalf("ICMP target error = %q, want the ICMP 'IPv4 address or hostname' message", msg)
+	}
+}

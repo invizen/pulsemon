@@ -589,3 +589,24 @@ func TestValidateWebhookURLHTTPPublicHostname(t *testing.T) {
 		t.Errorf("validateWebhookURL(https://public.example/hook) = %v, want nil", err)
 	}
 }
+
+// TestWebhookTransportHasBoundedIdleLifetime pins the transport clone: a bare
+// &http.Transport{} leaves IdleConnTimeout and MaxIdleConns at 0 (unbounded
+// idle conns, no handshake timeout). The transport must now inherit
+// http.DefaultTransport's sane limits while keeping the no-proxy + dialChecked
+// security contract.
+func TestWebhookTransportHasBoundedIdleLifetime(t *testing.T) {
+	tt := webhookTransport
+	if tt.IdleConnTimeout == 0 {
+		t.Fatal("webhookTransport.IdleConnTimeout is 0 (unbounded idle conns) — it must inherit http.DefaultTransport's 90s limit")
+	}
+	if tt.MaxIdleConns == 0 {
+		t.Fatal("webhookTransport.MaxIdleConns is 0 (unbounded) — it must inherit http.DefaultTransport's 100")
+	}
+	if tt.Proxy != nil {
+		t.Fatal("webhookTransport.Proxy is not nil — webhook egress must never route through an ambient proxy")
+	}
+	if tt.DialContext == nil {
+		t.Fatal("webhookTransport.DialContext is nil — the dial-time blocklist check is gone")
+	}
+}

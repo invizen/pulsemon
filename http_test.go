@@ -1095,3 +1095,75 @@ func TestProbeHTTPKeepAliveRecordsResolvedIP(t *testing.T) {
 		}
 	}
 }
+
+// TestProbeHTTPStampsUserAgent: probeHTTP stamps probeUserAgent on the
+// request it builds (the stamp lives here now, not in uaRoundTripper).
+func TestProbeHTTPStampsUserAgent(t *testing.T) {
+	var mu sync.Mutex
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		got = r.Header.Get("User-Agent")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	if res := probeHTTP(context.Background(), srv.URL, 5*time.Second); res.Lost {
+		t.Fatalf("probe lost: %+v", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if got != probeUserAgent {
+		t.Fatalf("probe sent User-Agent %q, want %q", got, probeUserAgent)
+	}
+}
+
+// TestProbeHTTPRedirectHopsCarryUA: the stamp rides every redirect hop
+// because Client copies the initial request's headers onto each hop — the
+// property that made the in-wrapper stamp redundant.
+func TestProbeHTTPRedirectHopsCarryUA(t *testing.T) {
+	var mu sync.Mutex
+	seen := map[string]string{} // role -> UA
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen["dest"] = r.Header.Get("User-Agent")
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer dest.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen["origin"] = r.Header.Get("User-Agent")
+		mu.Unlock()
+		http.Redirect(w, r, dest.URL+"/", http.StatusFound)
+	}))
+	defer origin.Close()
+	if res := probeHTTP(context.Background(), origin.URL, 5*time.Second); res.Lost {
+		t.Fatalf("probe lost: %+v", res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, role := range []string{"origin", "dest"} {
+		if seen[role] != probeUserAgent {
+			t.Errorf("%s saw User-Agent %q, want %q (hop must inherit the stamp)", role, seen[role], probeUserAgent)
+		}
+	}
+}
+
+// TestUARoundTripperDoesNotMutateRequest: the wrapper is routing-only. A
+// RoundTripper must not modify the caller's request (net/http contract), so
+// RoundTrip leaves the header exactly as the caller built it.
+func TestUARoundTripperDoesNotMutateRequest(t *testing.T) {
+	rt := uaRoundTripper{
+		base:  roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil }),
+		fresh: roundTripFunc(func(*http.Request) (*http.Response, error) { return nil, nil }),
+	}
+	r, err := http.NewRequest(http.MethodGet, "https://h.example/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = rt.RoundTrip(r)
+	if ua := r.Header.Get("User-Agent"); ua != "" {
+		t.Fatalf("RoundTrip mutated the caller's request: stamped User-Agent %q", ua)
+	}
+}

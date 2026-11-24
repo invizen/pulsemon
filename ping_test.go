@@ -221,3 +221,37 @@ func TestDeliverRacesPublishStampSynchronized(t *testing.T) {
 		<-done
 	}
 }
+
+// TestPingHostBoundsDNSToTimeout pins the ICMP fix: the DNS lookup and the
+// reply wait are bounded TOGETHER by the probe timeout (mirror of probeTCP /
+// probeHTTP). Before the fix the DNS ran its own latency ON TOP of the
+// timeout, so a slow resolver + a 30s Pulse Now could outlast the server's
+// 30s WriteTimeout and the client got nothing. A resolver that takes 1s must
+// not make a 200ms probe take 1s.
+func TestPingHostBoundsDNSToTimeout(t *testing.T) {
+	const target = "slowdns.example"
+	stubResolver(t, func(ctx context.Context, host string, timeout time.Duration) (*net.IPAddr, error) {
+		// Simulate a slow/hung resolver (far longer than the probe timeout).
+		<-time.After(1 * time.Second)
+		return &net.IPAddr{IP: net.ParseIP("192.0.2.1")}, nil
+	})
+	clearDNSCache(t, target)
+
+	start := time.Now()
+	res := pingHost(context.Background(), target, 200*time.Millisecond)
+	elapsed := time.Since(start)
+	if !res.Lost || !res.DNS {
+		t.Fatalf("1s-slow DNS on a 200ms timeout: want a DNS loss, got %+v", res)
+	}
+	if elapsed > 800*time.Millisecond {
+		t.Fatalf("pingHost took %v; the DNS phase must be bounded by the 200ms probe timeout, not added on top of it", elapsed)
+	}
+	// Drain the background singleflight call so the stub-swap cleanup in
+	// t.Cleanup doesn't race the still-running shared-call goroutine: a
+	// second dnsLookup on the same target JOINS the in-flight call and
+	// blocks until it completes — the channel receive is the happens-before
+	// edge that orders the cleanup's write after the shared call's read.
+	// (pingHost returned early via ctx.Done() without joining, so without
+	// this the -race run flags the stub swap.)
+	_, _ = dnsLookup(context.Background(), target)
+}

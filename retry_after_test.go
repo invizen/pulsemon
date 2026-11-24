@@ -72,3 +72,31 @@ func TestPostJSONHonorsRetryAfter(t *testing.T) {
 		}
 	})
 }
+
+// TestRespondThrottledSetsRetryAfter pins the 429 helper: it derives
+// Retry-After by ceiling to whole seconds (minimum 1) and answers 429 with
+// the caller's message. The five throttle/lockout sites now share this.
+func TestRespondThrottledSetsRetryAfter(t *testing.T) {
+	cases := []struct {
+		name string
+		wait time.Duration
+		want string
+	}{
+		{"sub-second rounds up to 1", 200 * time.Millisecond, "1"},
+		{"exact second", 5 * time.Second, "5"},
+		{"ceiling to next second", 5*time.Second + time.Millisecond, "6"},
+		{"zero floors to 1", 0, "1"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			respondThrottled(rr, c.wait, "too many")
+			if rr.Code != http.StatusTooManyRequests {
+				t.Fatalf("status = %d, want 429", rr.Code)
+			}
+			if got := rr.Header().Get("Retry-After"); got != c.want {
+				t.Fatalf("Retry-After = %q, want %q", got, c.want)
+			}
+		})
+	}
+}

@@ -73,19 +73,18 @@ func (pw *ProbeWorker) enqueueAlert(id string, job func()) bool {
 	}
 }
 
-// alertGateConsumer drains one sensor's alert FIFO and exits after
-// idleDur with no queued jobs, reaping consumers of quiet sensors — the
-// channel is never closed (a send on a closed channel panics), so a
-// plain `range ch` consumer would leak one goroutine per deleted sensor.
+// alertGateConsumer drains one sensor's alert FIFO and exits after idleDur
+// with no queued jobs, reaping consumers of quiet sensors — the channel is
+// never closed (a send on a closed channel panics), so a plain `range ch`
+// consumer would leak one goroutine per deleted sensor.
 //
 // Invariants (docs/DECISIONS.md → alert-gate): the exit check runs under
 // alertMu — the same lock enqueueAlert holds across its send — so
 // len(ch) == 0 under the lock means no job is queued AND no send is in
 // flight; exiting drops nothing. idleDur arrives as a parameter (the
-// consumer must NOT read the alertGateIdle package var; tests swap it).
-// The Stop/drain/Reset timer lifecycle below is the canonical safe
-// pattern: a Reset that skips draining a fired value leaves a stale
-// ready in idle.C read as a spurious idle-fire.
+// consumer must NOT read the alertGateIdle package var; tests swap it). A
+// Reset that skips draining a fired timer value reads as a spurious
+// idle-fire, hence the Stop/drain/Reset lifecycle below.
 func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time.Duration) {
 	idle := time.NewTimer(idleDur)
 	for {
@@ -128,18 +127,17 @@ func (pw *ProbeWorker) alertGateConsumer(id string, ch chan func(), idleDur time
 // alertSettings is the typed, point-in-time snapshot of every setting the
 // alert hot path reads: the gate (maintenance, routing scope, filter,
 // re-alert interval) and the resolved delivery destinations (provider URL +
-// Telegram chat_id). It is loaded once at worker start and swapped
-// atomically after every successful PUT /api/settings commit — the gate and
-// delivery then read it lock-free, with ZERO per-probe / per-alert DB
-// queries.
+// Telegram chat_id). Loaded once at worker start, swapped atomically after
+// every successful PUT /api/settings commit — the gate and delivery then
+// read it lock-free, with ZERO per-probe / per-alert DB queries.
 //
-// Why a snapshot: GetSetting maps a read error to
-// "", so a transient DB lock mid-probe made maintenance_mode read as "0"
-// (alerts ENABLED) and alert_scope read as "" (scope "all") — a DB hiccup
-// during maintenance fired alerts for every sensor, and each errored probe /
-// alert paid 5-10 single-row settings queries. The snapshot keeps the last
-// GOOD state in memory: a hiccup between reloads never touches it, so
-// maintenance stays on, routing stays put, and the hot path is lock-free.
+// Why a snapshot: GetSetting maps a read error to "", so a transient DB
+// lock mid-probe made maintenance_mode read as "0" (alerts ENABLED) and
+// alert_scope read as "" (scope "all") — a DB hiccup during maintenance
+// fired alerts for every sensor. The snapshot keeps the last GOOD state in
+// memory: a hiccup between reloads never touches it, so maintenance stays
+// on, routing stays put, and the hot path is lock-free.
+// History: docs/DECISIONS.md → alert-settings-snapshot.
 type alertSettings struct {
 	maintenance bool            // maintenance_mode == "1"
 	scope       string          // alert_scope, normalized to "all" when empty
@@ -163,16 +161,16 @@ func defaultAlertSettings() *alertSettings {
 }
 
 // resolveDestinationsFromDB resolves the active, URL-configured providers
-// (with the Telegram chat_id) from the DB. It is the single place that
-// turns raw provider settings into delivery destinations, run at
-// snapshot-load time so the hot path reads the result lock-free. Every key
-// — Enabled, HasURL, URL, chat_id — is evaluated fail-loud from ONE bulk
-// settings read (getAllSettings): a real read failure aborts the load (the
-// caller keeps the previous snapshot), for EVERY key, rather than only the
-// URL/chat_id reads. Swallowing Enabled/HasURL (GetSetting) let a transient
-// lock silently DROP a provider from an installed snapshot — alerts for it
-// stopped until the next settings save, the exact half-read state the
-// snapshot design forbids
+// (with the Telegram chat_id) from the DB — the single place that turns
+// raw provider settings into delivery destinations, run at snapshot-load
+// time so the hot path reads the result lock-free. Every key — Enabled,
+// HasURL, URL, chat_id — is evaluated fail-loud from ONE bulk settings
+// read (getAllSettings): a real read failure aborts the load (the caller
+// keeps the previous snapshot), for EVERY key. Swallowing Enabled/HasURL
+// (GetSetting) let a transient lock silently DROP a provider from an
+// installed snapshot — alerts for it stopped until the next settings
+// save: the exact half-read state the snapshot design forbids.
+// History: docs/DECISIONS.md → provider-reads-bulk-fail-loud.
 func resolveDestinationsFromDB(db *store.Store) ([]dest, error) {
 	m, err := getAllSettings(db)
 	if err != nil {
@@ -488,32 +486,30 @@ func (pw *ProbeWorker) maybeRealert(ctx context.Context, c sensorConfig, status 
 	}
 }
 
-// setAlertState upserts a sensor's alert state. The write runs on the
-// capped probe-write handle (ProbeExecContext): setAlertState is on the
-// probe hot path (doProbe, maybeRealert), and a stalled writer must park
-// the sensor loop for at most store.ProbeWriteTimeout, not the main
-// pool's 15s busy_timeout — the same capping rationale as the probe
-// INSERT.
+// setAlertState upserts a sensor's alert state on the capped probe-write
+// handle (ProbeExecContext): it is on the probe hot path (doProbe,
+// maybeRealert), and a stalled writer must park the sensor loop for at
+// most store.ProbeWriteTimeout, not the main pool's 15s busy_timeout — the
+// same capping rationale as the probe INSERT.
 //
 // The INSERT is guarded by SELECTing the sensor id: for a sensor deleted
 // concurrently, the SELECT yields no row and nothing is written, so alert
-// state can never be resurrected for a deleted sensor. The guard is
-// explicit and self-contained rather than relying on the alert_state FK —
-// which IS enforced (schema ON DELETE CASCADE + DSN foreign_keys(1), see
-// store.NewStore) — and the write error is NOT swallowed: a failed
-// upsert is logged and the in-memory copy is deliberately NOT stamped,
-// so the durable row stays authoritative and the next tick's maybeRealert
-// re-reads it (cache miss), sees the status mismatch, and retries the
-// write — a transient DB failure self-heals, and a sustained one leaves a
-// log trail instead of silently resetting re-alert timing on the next
-// restart (review 2026-11-17 M1).
+// state can never be resurrected for a deleted sensor (the guard is
+// explicit and self-contained; the alert_state FK is also enforced —
+// schema ON DELETE CASCADE + DSN foreign_keys(1), see store.NewStore). The
+// write error is NOT swallowed: a failed upsert is logged and the in-
+// memory copy is deliberately NOT stamped, so the durable row stays
+// authoritative and the next tick's maybeRealert re-reads it (cache miss),
+// sees the status mismatch, and retries — a transient DB failure
+// self-heals; a sustained one leaves a log trail instead of silently
+// resetting re-alert timing on the next restart.
 //
 // The in-memory stamp is gated on RowsAffected > 0: a guard that matched
 // no sensor row (concurrent delete) writes nothing, and stamping would
-// leave a ghost alertMem entry for a sensor that no longer exists. For a
-// live sensor the SELECT yields exactly one row: behavior is identical to
-// a plain upsert, and the statement is atomic, so there is no
-// delete/upsert TOCTOU.
+// leave a ghost alertMem entry. For a live sensor the SELECT yields
+// exactly one row (identical to a plain upsert), and the statement is
+// atomic, so there is no delete/upsert TOCTOU.
+// History: docs/DECISIONS.md → sensor-delete-alert-state.
 func (pw *ProbeWorker) setAlertState(ctx context.Context, id, status string, ts time.Time) {
 	res, err := pw.db.ProbeExecContext(ctx, `INSERT INTO alert_state (sensor_id, status, last_ts)
 		SELECT id, ?, ? FROM sensors WHERE id = ?
@@ -584,11 +580,11 @@ var recoveryRetryDelay = time.Minute
 // scheduleRecoveryRetry re-offers a recovery / partial-recovery alert
 // (error -> up, error -> warning) whose first delivery failed — dropped on
 // a full per-sensor FIFO during provider degradation, or every provider
-// down. The error direction self-heals through
-// scheduleAlertRetry + the re-alert tick; recovery has NO such path:
-// setAlertState has already stamped "up", and maybeRealert only runs on
-// sustained-error ticks — so a dropped recovery was permanently lost, and
-// the chat's last word for a sensor that is UP stayed "error".
+// down. The error direction self-heals through scheduleAlertRetry + the
+// re-alert tick; recovery has NO such path: setAlertState has already
+// stamped "up" and maybeRealert only runs on sustained-error ticks, so a
+// dropped recovery is permanently lost — the chat's last word for a sensor
+// that is UP stays "error" without this.
 //
 // Contract:
 //   - Called from inside a launchAlert goroutine (the caller holds an
@@ -599,11 +595,13 @@ var recoveryRetryDelay = time.Minute
 //   - Guarded at FIRE time by currentStatus: a sensor that flapped back
 //     into error during the delay must not receive a stale "recovered"
 //     line after its fresh error alert (the per-sensor FIFO orders the
-//     queue, not the delayed re-entry). A deleted sensor reads as an
+//     queue, not the delayed re-entry); a deleted sensor reads as an
 //     error from currentStatus and is skipped the same way.
 //   - Exactly one retry. A second failure is logged: the sensor's state
 //     rows are correct, only the notification is lost, and an endless
 //     retry loop against a dead provider is worse.
+//
+// History: docs/DECISIONS.md → alert-retry-budget.
 func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newStatus string, rttMs float64) {
 	// Capture the delay BEFORE spawning: the repo's -race rule forbids
 	// reading a package var (tests swap it) inside the goroutine — the
@@ -642,11 +640,12 @@ func (pw *ProbeWorker) realertMin() int {
 // maintenance mode is turned off. The in-memory copies are stamped with the
 // same instant (write-through): maintenance pauses sensors, so no probe tick
 // refreshes alertMem while paused — a stale pre-maintenance mem.ts would
-// survive to the first post-maintenance tick and re-alert immediately. The
-// DB error is logged but the memory stamp is KEPT: the in-run behavior (no
-// immediate re-alert after maintenance ends) is the point of this function,
-// and a durable-row miss after a restart only re-exposes the pre-reset
-// timing, never a wrong state (review 2026-11-17 M1).
+// survive to the first post-maintenance tick and re-alert immediately. A DB
+// error is logged but the memory stamp is KEPT: the in-run behavior (no
+// immediate re-alert after maintenance ends) is the point of this function;
+// a durable-row miss after a restart only re-exposes the pre-reset timing,
+// never a wrong state.
+// History: docs/DECISIONS.md → reset-alert-states-mem-write-through.
 func (pw *ProbeWorker) ResetAlertStates() {
 	now := time.Now().UTC()
 	if _, err := pw.db.Exec(`UPDATE alert_state SET last_ts = ?`, store.FormatTS(now)); err != nil {
@@ -1019,16 +1018,14 @@ func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
 	if due < 0 {
 		due = 0
 	}
-	// Track the flush in alertWG from ARM time: the
-	// arming caller is an alert path that already holds a launchAlert
-	// count (sendWebhook runs inside launchAlert), so this Add can never
-	// be the "Add called concurrently with Wait" case at counter 0 — an
-	// untracked flush whose launchAlert Add landed after DrainAlerts'
-	// Wait began was the sole instance and threw a fatal on shutdown.
-	// DrainAlerts now JOINS a pending flush; the goroutine exits promptly
-	// on stopCtx, so shutdown is not delayed (the queued summary still
-	// drops on shutdown — StopAlerts has already aborted the network by
-	// then, so there is nothing to deliver; unchanged, documented).
+	// Track the flush in alertWG from ARM time: the arming caller is an alert
+	// path that already holds a launchAlert count (sendWebhook runs inside
+	// launchAlert), so this Add can never be the "Add called concurrently with
+	// Wait" case at counter 0. DrainAlerts JOINS a pending flush; the goroutine
+	// exits promptly on stopCtx, so shutdown is not delayed (the queued summary
+	// drops on shutdown — StopAlerts has aborted the network by then;
+	// unchanged, documented).
+	// History: docs/DECISIONS.md → alert-gate.
 	pw.alertWG.Add(1)
 	go func() {
 		defer pw.alertWG.Done()
@@ -1075,20 +1072,18 @@ func (pw *ProbeWorker) flushStorm() {
 		}
 		latest[e.id] = e
 	}
-	// Drop entries whose sensor has MOVED ON since the transition was
-	// queued: a summary line for a sensor that recovered (now "up") would
-	// contradict the recovery alert it raced, and one for a sensor that
-	// partially recovered (now "warning") would contradict the
-	// partial-recovery card — both recovery classes are always delivered
-	// individually (stormAdmit exempts them), so the individual alert is
-	// the operator's last word, not this summary. A sensor that degraded
-	// further (entry "warning", now "error") is dropped too: the newer
-	// error transition alerted individually, so the older line is stale.
-	// A vanished sensor (deleted mid-storm, read error) is kept — the
-	// operator should still see it in the storm that took it down. Read
-	// the status via currentStatus (in-memory first): during a storm the
-	// sensors are actively probed, so lastStatus is the freshest source
-	// and reading it avoids one SQLite round-trip per queued entry
+	// Drop entries whose sensor has MOVED ON since the transition was queued:
+	// a summary line for a sensor that recovered (now "up") would contradict
+	// the recovery alert it raced, and one that degraded further (entry
+	// "warning", now "error") is stale — the newer transition alerted
+	// individually. Both recovery classes are ALWAYS delivered individually
+	// (stormAdmit exempts them), so the individual alert is the operator's last
+	// word, not this summary. A vanished sensor (deleted mid-storm, read
+	// error) is KEPT — the operator should still see it in the storm that took
+	// it down. Status is read via currentStatus (in-memory first): actively-
+	// probed sensors make lastStatus the freshest source, and it avoids one
+	// SQLite round-trip per queued entry.
+	// History: docs/DECISIONS.md → storm-summary-caps-maintenance-gate-and-moved-on-filter.
 	still := q[:0]
 	for _, id := range order {
 		if s, err := pw.currentStatus(id); err == nil && s != latest[id].state {
@@ -1115,16 +1110,14 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	if !pw.alertsEnabled() {
 		return
 	}
-	// Re-check each entry's status immediately before building the summary
-	//: flushStorm's filter ran earlier, and this delivery is
-	// async (launchAlert) — a sensor that moved on in the gap would
-	// otherwise be listed under a state it no longer holds, contradicting
-	// the individual alert (recovery / partial recovery) that the
-	// per-sensor gate ordered ahead of this summary, which bypasses that
-	// gate (F4). The re-check narrows the race to the instant before the
-	// post. currentStatus is in-memory (lastStatus) for an actively-probed
-	// sensor, so this is cheap — no per-entry SQLite round-trip on the hot
-	// path.
+	// Re-check each entry's status immediately before building the summary:
+	// flushStorm's filter ran earlier and this delivery is async (launchAlert)
+	// — a sensor that moved on in the gap would be listed under a state it no
+	// longer holds, contradicting the individual alert the per-sensor gate
+	// ordered ahead of this summary (which bypasses that gate). The re-check
+	// narrows the race to the instant before the post. currentStatus is
+	// in-memory for an actively-probed sensor, so this is cheap.
+	// History: docs/DECISIONS.md → storm-summary-recheck-before-post.
 	still := make([]stormEntry, 0, len(entries))
 	for _, e := range entries {
 		if s, err := pw.currentStatus(e.id); err == nil && s != e.state {
@@ -1252,17 +1245,16 @@ func stormSummaryMarkdown(entries []stormEntry, maxRunes int) string {
 	lines := make([]string, len(entries))
 	for i, e := range entries {
 		// Escape the emphasis chars in the NAME only (free text — a name like
-		// db_primary_01 would otherwise render "primary" in italics, and a
-		// raw * in the name renders as literal formatting), with mention
-		// tokens neutralized. The TARGET is
-		// a URL/hostname and stays VERBATIM: mdEscape would inject backslashes
-		// into _ and ~ in the path and break the clickable link
-		// — but it IS mention-neutralized, exactly like the
-		// per-sensor discordCard/discordCardRe: this summary goes to Discord
-		// (case "discord" in deliverStormSummary), and a target path like
-		// https://example.com/@everyone would mass-ping the channel on
-		// clients/bridges that ignore allowed_mentions.parse = []
-		// The emphasis markers come from the format string.
+		// db_primary_01 would otherwise render "primary" in italics, and a raw *
+		// in the name renders as literal formatting), with mention tokens
+		// neutralized. The TARGET is a URL/hostname and stays VERBATIM: mdEscape
+		// would inject backslashes into _ and ~ in the path and break the clickable
+		// link — but it IS mention-neutralized, exactly like the per-sensor
+		// discordCard/discordCardRe: a target path like https://example.com/@every-
+		// one would mass-ping the channel on clients that ignore
+		// allowed_mentions.parse = []. The emphasis markers come from the format
+		// string.
+		// History: docs/DECISIONS.md → storm-summary-target-mention-safe.
 		lines[i] = "*" + mdEscape(discordMentionSafe(e.name)) + ": " + e.oldState + " → " + e.state + " (" + discordMentionSafe(alertTarget(e.target)) + ")*"
 	}
 	return truncateSummaryLines(header, lines, maxRunes)
@@ -1564,20 +1556,16 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 
 // DrainAlerts waits for in-flight alert deliveries to finish, bounded by
 // timeout. It is called from main AFTER Run returns and BEFORE db.Close, so
-// an alert fired on the final probe tick is not killed mid-delivery. main
-// calls StopAlerts first, so any delivery stuck in a network blip is
+// an alert fired on the final probe tick is not killed mid-delivery.
+// main calls StopAlerts first, so a delivery stuck in a network blip is
 // aborted at its next read (stopCtx) instead of holding this drain for the
 // client's full 10s timeout — the timeout here is a backstop only.
 //
 // The waiter goroutine below is intentionally untracked: sync.WaitGroup has
-// no cancellable Wait, so it lingers past a timeout until alertWG drains.
-// That is bounded and harmless — after StopAlerts cancels stopCtx (and with
-// the non-blocking enqueue, no enqueue blocks forever), in-flight deliveries
-// abort at their next read and alertWG hits zero promptly. In production the
-// process exits right after this returns, so a lingering waiter is moot; in
-// tests it is a short-lived bounded goroutine (Go tests do not fail on it).
-// There is no clean way to avoid it without redesigning the delivery
-// tracking.
+// no cancellable Wait, so it lingers past a timeout until alertWG drains —
+// bounded and harmless (after StopAlerts cancels stopCtx, in-flight
+// deliveries abort at their next read and alertWG hits zero promptly; in
+// production the process exits right after this returns).
 func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 	done := make(chan struct{})
 	go func() {
@@ -1631,43 +1619,20 @@ func statusIcon(state string) string { return statusIcons[state] }
 var statusIcons = map[string]string{"up": "✅", "warning": "⚠️", "error": "❌", "paused": "⏸️"}
 
 // alertTarget renders a sensor's target for third-party alert payloads,
-// stripping any userinfo AND the query/fragment: an HTTP target like
-// https://admin:***@nas.lan/health used to go VERBATIM into the
-// Discord/Telegram/Chat/SMTP card — the password readable by everyone who
-// can see the channel. A ?token=… in the target is a credential carrier
-// exactly like userinfo (the same shape webhookMasked treats as secret),
-// so it is cut too: a redaction that promises "safe for a third-party
-// channel" cannot ship the query string verbatim. The cut covers the
-// fragment as well (it never reaches the server, but tokens live there).
-//
-// The strip is RAW-STRING based and deliberately does NOT depend on
-// neturl.Parse succeeding: a malformed target (backslash or control
-// character in the host, a bad percent-escape — legacy or hand-edited
-// rows) fails Parse, and a parse-failure fallback of "return verbatim"
-// would ship the credentials to the channel — the exact leak this
-// function exists to prevent. A string with no authority (a bare IP, a
-// hostname) has nothing to strip and is returned unchanged.
-//
-// Strip ONLY the userinfo and the query/fragment, from the RAW string.
-// Rebuilding via u.String() would percent-encode the path — a target
-// like /<b>bold</b> would come back as /%3Cb%3Ebold%3C/b%3E, and the
-// card's HTML escaping would then show literal %3C… to the reader
-// instead of the escaped markup the target really is (telegram_test.go
-// pins both halves: & -> &amp; and <b> -> &lt;b&gt;, with the card's own
-// tags intact).
-//
-// The authority runs from after "scheme://" (or after a leading "//"
-// for a scheme-relative URL) to the first '/', '?' or '#' — exactly
-// net/url's boundary. A raw '?'/'#' cannot sit inside userinfo (RFC
-// 3986's userinfo excludes both), so there is no lenient case: in
-// https://user?x:pass@host/ the '?' starts the QUERY (host "user"),
-// there is no userinfo to strip, and the query is cut. userinfo
-// ENDS AT THE LAST '@' in the authority — net/url's validUserinfo
-// permits a raw '@', so the cut MUST mirror net/url's boundary:
-// cutting at the FIRST '@' of
-// https://admin:***@ss@nas.lan/health left "ss@nas.lan" in the card —
-// a password fragment shipped to Discord/Telegram/SMTP, and the
-// scheme-relative form leaked the whole credential verbatim.
+// stripping any userinfo AND the query/fragment from the RAW string: a
+// target like https://admin:***@nas.lan/health must not go verbatim into
+// the Discord/Telegram/Chat/SMTP card (the password would be readable in
+// the channel), and a ?token=… is a credential carrier too. Raw-string,
+// not net/url: a malformed target (legacy or hand-edited rows) fails
+// Parse, and a "return verbatim" fallback would ship the credentials — the
+// exact leak this function exists to prevent; and u.String() would
+// percent-encode the path. No authority (bare IP/hostname) → nothing to
+// strip. The authority ends at the first '/', '?' or '#' (a raw '?'/'#'
+// cannot sit inside userinfo — RFC 3986), and userinfo ends at the LAST
+// '@' in the authority (net/url permits a raw '@'; cutting at the first
+// '@' left a password fragment in the card).
+// History: docs/DECISIONS.md → alert-target-last-at, alert-target
+// parse-failure redaction, target-query-redaction.
 func alertTarget(target string) string {
 	prefix := authorityStart(target)
 	if prefix < 0 {
@@ -1682,8 +1647,7 @@ func alertTarget(target string) string {
 	// Cut the userinfo (to and including the LAST '@' in the authority)
 	// and the query/fragment (from the first '?'/'#' of the remainder —
 	// after the userinfo cut the remainder starts at host[:port], which
-	// cannot contain '?'/'#', so the first one is the true
-	// query/fragment start).
+	// cannot contain '?'/'#', so the first one is the true start).
 	out := rest
 	if at := strings.LastIndexByte(rest[:end], '@'); at >= 0 {
 		out = rest[at+1:]
@@ -1746,24 +1710,21 @@ func discordMentionSafe(s string) string {
 }
 
 // mdEscape backslash-escapes the Markdown metacharacters that
-// validSensorName permits: the emphasis characters * _ ~ ` (a sensor
-// named db_primary_01 would otherwise render with
-// "primary" italicized) and the link brackets [ ] (a sensor named
-// "[click here](https://evil.example)" is legal input and
-// would otherwise render as a masked hyperlink in the Discord/Google Chat
-// cards and storm summary). The parens are deliberately unescaped: with
-// the brackets neutralized no link syntax can form, so escaping them would
-// be noise.
+// validSensorName permits: the emphasis characters * _ ~ ` (a sensor named
+// db_primary_01 would otherwise render with "primary" italicized) and the
+// link brackets [ ] (a sensor named "[click here](https://evil.example)" is
+// legal input and would otherwise render as a masked hyperlink in the
+// Discord/Google Chat cards and storm summary). The parens are deliberately
+// unescaped: with the brackets neutralized no link syntax can form, so
+// escaping them would be noise.
 //
 // Applied to SENSOR NAMES ONLY, never to targets: a target is a URL/hostname
 // whose path may legally contain _ and ~, and backslash-escaping those
-// injects visible backslashes into the URL and breaks the clickable link
-// The URL host carries no emphasis chars, and the
-// intra-path _ / ~ do not trigger emphasis inside an auto-linked URL token
-// on either platform, so a verbatim target is both safe and clickable.
+// injects visible backslashes into the URL and breaks the clickable link.
 //
-// Applied ONLY to the Markdown (google_chat/discord) builders — the Telegram
-// (HTML) and SMTP (plain) paths carry the data verbatim.
+// Applied ONLY to the Markdown (google_chat/discord) builders — the
+// Telegram (HTML) and SMTP (plain) paths carry the data verbatim.
+// History: docs/DECISIONS.md → storm-summary-target-mention-safe.
 func mdEscape(s string) string {
 	return mdReplacer.Replace(s)
 }
@@ -1850,20 +1811,18 @@ func discordCardRe(state, name, target string, rttMs float64) string {
 	return card
 }
 
-// alertRetryDelays are the pauses between delivery attempts: 3 attempts total
-// (now, +2s, +10s). A var so tests can shrink or clear it.
+// alertRetryDelays are the pauses between delivery attempts: 3 attempts
+// total (now, +2s, +10s). A var so tests can shrink or clear it.
 //
 // Alert-retry-budget invariant (docs/DECISIONS.md → alert-retry-budget):
-// these sleeps and the maxAlertRetryAfter cap run INSIDE the sensor's 8-slot
-// alert-FIFO consumer (alertGateConsumer drains serially), so the worst-case
-// single job — 3 webhook attempts × 10s client timeout + the two in-band
-// sleeps, each max(alertRetryDelays[i], maxAlertRetryAfter) per retryAlert
-// = 50s — must stay under recoveryRetryDelay (60s).
-// Above it, a degraded provider's sustained re-alert arrivals (1/min per
-// error sensor) outrun FIFO completions, the queue saturates, and a dropped
-// recovery's scheduleRecoveryRetry re-finds a full queue one minute later —
-// the second drop loses the notification permanently.
-// Pinned by TestInFifoRetryBudgetUnderRecoveryRetryDelay.
+// these sleeps and the maxAlertRetryAfter cap run INSIDE the sensor's
+// 8-slot alert-FIFO consumer, so the worst-case single job (3 webhook
+// attempts × 10s client timeout + the two in-band sleeps) must stay under
+// recoveryRetryDelay (60s) — above it, a degraded provider's sustained
+// re-alert arrivals outrun FIFO completions, the queue saturates, and a
+// dropped recovery's re-finds a full queue a minute later: the second drop
+// loses the notification permanently. Pinned by
+// TestInFifoRetryBudgetUnderRecoveryRetryDelay.
 var alertRetryDelays = []time.Duration{2 * time.Second, 10 * time.Second}
 
 // redactErr strips the request URL out of a net/http error. url.Error.Error()
@@ -1879,16 +1838,16 @@ func redactErr(err error) error {
 }
 
 // maxAlertRetryAfter caps a provider's Retry-After so one hostile or buggy
-// header can't park a delivery goroutine (and DrainAlerts) for hours. The cap
-// is deliberately SHORT: in-band retries run on the
-// sensor's alert-FIFO consumer, so every second slept here lengthens the
-// drain of EVERY later alert queued for that sensor — a 60s cap let one
-// 429-with-Retry-After job hold the FIFO for 150s (see the alertRetryDelays
-// budget note: worst job must stay under recoveryRetryDelay, 60s). When a
-// provider asks for a longer backoff than the in-band cap allows, the job
-// fails fast and the OUTER retry (scheduleAlertRetry / scheduleRecoveryRetry,
-// ~1 min) re-offers it on a delay that respects the provider's window far
-// better than a second in-FIFO sleep that also congests eight queued alerts.
+// header can't park a delivery goroutine (and DrainAlerts) for hours. The
+// cap is deliberately SHORT: in-band retries run on the sensor's alert-FIFO
+// consumer, so every second slept here lengthens the drain of EVERY later
+// alert queued for that sensor (the worst job must stay under
+// recoveryRetryDelay — see alertRetryDelays). When a provider asks for a
+// longer backoff than the in-band cap allows, the job fails fast and the
+// OUTER retry (scheduleAlertRetry / scheduleRecoveryRetry, ~1 min) re-
+// offers it on a delay that respects the provider's window better than a
+// second in-FIFO sleep that also congests eight queued alerts.
+// History: docs/DECISIONS.md → alert-retry-budget.
 const maxAlertRetryAfter = 10 * time.Second
 
 // retryAlert runs try until it succeeds, reports a non-retryable failure, or

@@ -201,8 +201,7 @@ func (s *Server) fillHTTPView(v *SensorView) {
 // authority and come back unchanged.
 //
 // View-only: the DB row is untouched, and the edit modal is admin-only, so
-// a masked value can never be saved back — the reason target masking was
-// previously declined for the shared UI does not apply to this read path.
+// a masked value can never be saved back.
 // History: docs/DECISIONS.md → viewer-target-redaction.
 func (s *Server) viewerTarget(r *http.Request, target string) string {
 	if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
@@ -277,16 +276,13 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 		id := store.NewID()
 		now := store.Now()
 		// New sensors start PAUSED (no probing) so a freshly-added, possibly
-		// mistyped, target can't fire down alerts before the user has a chance
-		// to review it. The user resumes it from the dashboard.
+		// mistyped, target can't fire down alerts before the user has a chance to
+		// review it. The user resumes it from the dashboard.
 		//
-		// The row INSERT and the tag replace commit in ONE ImmediateTx (the
-		// same single-tx idiom as the PATCH path): a tag-write failure
-		// used to be logged and swallowed while the handler still returned 201
-		// with the requested tags — the UI then showed tags the DB never had,
-		// and with alert_scope='tags' the (paused) sensor would route no alerts
-		// once the user resumed it. Now the INSERT rolls back and the request
-		// fails instead of half-committing.
+		// The row INSERT and the tag replace commit in ONE ImmediateTx: a
+		// tag-write failure must fail the whole request — half-committing (201 with
+		// tags the DB never had) left the UI and the store disagreeing, and with
+		// alert_scope='tags' the sensor would route no alerts once resumed.
 		err := s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			if _, err := c.ExecContext(r.Context(), `INSERT INTO sensors (id, name, target, type, interval_s, timeout_ms, loss_warn, down_after, spike_mult, state, created_at, status)
 				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'paused', ?, 'up')`,
@@ -328,30 +324,24 @@ func (s *Server) handleSensors(w http.ResponseWriter, r *http.Request) {
 //
 // This is a defense-in-depth INPUT gate, NOT the primary XSS mitigation:
 // the dashboard's strict CSP (no 'unsafe-inline') plus esc() HTML-escaping
-// at every text render site is the primary layer, and the click handlers
-// read values from data-* attributes (there are no inline JS string
-// interpolations). The input gate keeps the stored data clean for the
-// non-HTML consumers (alert cards, logs, the inspector) where output
-// encoding does not apply, and stops a malicious account from planting a
-// sensor whose name runs JS in other operators' browsers if a render site
-// is ever missed.
+// at every text render site is the primary layer. The input gate keeps the
+// stored data clean for the non-HTML consumers (alert cards, logs, the
+// inspector) where output encoding does not apply.
 //
-// Why a blacklist and NOT the suggested whitelist: a narrow whitelist like ^[a-zA-Z0-9_\-. ]+$ is more idiomatic
-// but a REGRESSION — it rejects legitimate operator labels this gate is
-// meant to allow: non-ASCII names (ÜberNAS) and benign punctuation
-// (wifi:guest, nas/01, camera@front), all pinned VALID in
-// TestValidSensorName. A broad whitelist that re-admits those characters is
-// more complex, not less, and no safer: the ContainsAny below already blocks
-// the exact string-escape metacharacters (' " ` \ < >) plus control chars —
-// the complete set needed to prevent string-context escape in every consumer.
-// As a defense-in-depth gate behind output encoding, it needs to be precise,
-// not exhaustive.
+// Blacklist, not whitelist: a narrow whitelist (^[a-zA-Z0-9_\-. ]+$) is a
+// REGRESSION — it rejects legitimate operator labels this gate is meant to
+// allow (non-ASCII names like ÜberNAS, benign punctuation like wifi:guest,
+// nas/01, camera@front — all pinned VALID in TestValidSensorName). The
+// ContainsAny below blocks the exact string-escape metacharacters (' " ` \
+// < >) plus control chars — the complete set needed to prevent
+// string-context escape in every consumer. As a gate behind output
+// encoding, it needs to be precise, not exhaustive.
 //
-// The length cap is in RUNES, not bytes: the
-// UI's maxlength="60" counts characters, so a byte cap silently truncated
-// CJK/emoji names to ~20 chars and the server 400'd what the form allowed.
-// Invalid UTF-8 is refused at the write path so SQLite never stores a
-// mojibake name.
+// The length cap is in RUNES, not bytes: the UI's maxlength="60" counts
+// characters, so a byte cap silently truncated CJK/emoji names to ~20 chars
+// and the server 400'd what the form allowed. Invalid UTF-8 is refused at
+// the write path so SQLite never stores a mojibake name.
+// History: docs/DECISIONS.md → sensor-name-gate.
 func validSensorName(name string) bool {
 	if name == "" || utf8.RuneCountInString(name) > 60 {
 		return false
@@ -452,16 +442,14 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Target and type validate as a pair against the RESULTING type —
-		// INSIDE the ImmediateTx below, where the row is read under the
-		// write lock: the dashboard edits both in one modal, so a target
-		// must be valid for the type the sensor will end up with (URL for
-		// http, host for icmp), whether the user changed the target, the
-		// type, or both. (here against a pre-lock snapshot fed by up to two extra
-		// SELECTs, and in-tx against fresh values. The in-tx check is a
-		// superset returning the identical 400s, so only pure
-		// request-shape checks — empty fields, ranges — run before the
-		// write lock.)
+		// Target and type validate as a pair against the RESULTING type — INSIDE
+		// the ImmediateTx below, where the row is read under the write lock: the
+		// dashboard edits both in one modal, so a target must be valid for the type
+		// the sensor will end up with (URL for http, host for icmp), whether the
+		// user changed the target, the type, or both. The in-tx check is a superset
+		// of any pre-lock check and returns the identical 400s, so only pure
+		// request-shape checks (empty fields, ranges) run before the write lock.
+		// History: docs/DECISIONS.md → crossfield-sentinel-errors.
 		resultType := ""
 		if req.Type != nil {
 			resultType = normalizeProbeType(*req.Type)
@@ -561,17 +549,16 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondWithError(w, http.StatusBadRequest, "no fields to update")
 			return
 		}
-		// One BEGIN IMMEDIATE transaction (single-read shape): the row is read ONCE,
-		// INSIDE it, and the type/target pair (plus the effective
-		// interval/timeout cross-check) validated against those FRESH
-		// values before the UPDATE — this read also carries the 404. A
-		// concurrent PATCH that changed the target/type between a pre-lock
-		// read and the write used to slip through validated against the
-		// stale pair; BEGIN IMMEDIATE holds the write lock from the start,
-		// so no concurrent writer can change the row between the read and
-		// the UPDATE. The UPDATE and the tag replace commit together, so a
-		// constraint failure (rename) or a crash can't leave the tags
-		// changed while the row is not (or vice versa).
+		// One BEGIN IMMEDIATE transaction (single-read shape): the row is read
+		// ONCE, INSIDE it, and the type/target pair (plus the effective
+		// interval/timeout cross-check) validated against those FRESH values before
+		// the UPDATE — this read also carries the 404. BEGIN IMMEDIATE holds the
+		// write lock from the start, so no concurrent writer can change the row
+		// between the read and the UPDATE (a pre-lock snapshot let a concurrent
+		// PATCH slip through validated against the stale pair). The UPDATE and the
+		// tag replace commit together, so a constraint failure (rename) or a crash
+		// can't leave the tags changed while the row is not (or vice versa).
+		// History: docs/DECISIONS.md → crossfield-sentinel-errors.
 		var patchErr error
 		patchErr = s.db.ImmediateTx(r.Context(), func(c *sql.Conn) error {
 			ctx := r.Context()
@@ -704,18 +691,17 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 
 	case http.MethodDelete:
-		// The cascade and its compensating restore run on a context that
-		// OUTLIVES the client: a client that leaves mid-delete (tab closed,
-		// navigation) cancels r.Context(), and both the batched deletes and
-		// the rollback on top of it used to fail at once on that dead
-		// context — stranding the row in 'deleting' forever (no loop,
-		// hidden from the dashboard, its name still UNIQUE-held, no path
-		// back). WithoutCancel keeps the request's values but drops the
-		// cancel signal; the cascade is bounded (per-batch autocommits,
-		// milliseconds of write lock each), so it needs no deadline of its
-		// own. The pre-commit existence check below keeps r.Context(): a
-		// client that is already gone should not start a delete at all.
-		// History: docs/DECISIONS.md → deleting-state-stuck-recovery
+		// The cascade and its compensating restore run on a context that OUTLIVES
+		// the client: a client that leaves mid-delete (tab closed, navigation)
+		// cancels r.Context(), and both the batched deletes and the rollback on top
+		// of it would fail at once on that dead context — stranding the row in
+		// 'deleting' forever (no loop, hidden from the dashboard, its name still
+		// UNIQUE-held, no path back). WithoutCancel keeps the request's values but
+		// drops the cancel signal; the cascade is bounded (per-batch autocommits,
+		// milliseconds of write lock each), so it needs no deadline of its own. The
+		// pre-commit existence check below keeps r.Context(): a client that is
+		// already gone should not start a delete at all.
+		// History: docs/DECISIONS.md → sensor-delete-deleting-state
 		ctx := context.WithoutCancel(r.Context())
 		// Existence check up front drives the 404 (and skips the batched
 		// no-op deletes) — the sensor row's PK lookup is cheap. Scan yields
@@ -733,33 +719,29 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
-		// Mark the row 'deleting' BEFORE stopping the loop and cascading
-		// the rows: the batched deletes below take seconds (a 5s sensor
-		// carries ~17k probe rows), and a 5s syncSensors tick (or a
-		// syncReq) landing mid-delete used to see the row still 'active'
-		// and RESPAWN the loop Remove had just dropped — the respawned
-		// loop wrote new probes/alerts, repopulated statsCache, and then
-		// logged FK errors once the sensor row finally went away.
-		// 'deleting' is excluded from every state filter (syncSensors,
-		// stats rescan, maintenance enter, ActiveSensorIDs) and from the
-		// dashboard list, so the sensor is dead to the whole system for
-		// the entire cascade window. History:
-		// docs/DECISIONS.md → sensor-delete-deleting-state.
+		// Mark the row 'deleting' BEFORE stopping the loop and cascading the rows:
+		// the batched deletes take seconds (a 5s sensor carries ~17k probe rows),
+		// and a 5s syncSensors tick (or a syncReq) landing mid-delete would see the
+		// row still 'active' and RESPAWN the loop Remove had just dropped — the
+		// respawned loop wrote new probes/alerts, repopulated statsCache, and then
+		// logged FK errors once the sensor row finally went away. 'deleting' is
+		// excluded from every state filter (syncSensors, stats rescan, maintenance
+		// enter, ActiveSensorIDs) and from the dashboard list, so the sensor is
+		// dead to the whole system for the entire cascade window.
+		// History: docs/DECISIONS.md → sensor-delete-deleting-state
 		if _, err := s.db.ExecContext(ctx, "UPDATE sensors SET state = 'deleting' WHERE id = ?", id); err != nil {
 			respondInternal(w, "mark sensor deleting", err)
 			return
 		}
-		// restoreState puts the sensor back to its pre-delete state if any
-		// cascade step below fails, so a surviving sensor is never
-		// stranded in 'deleting' (no loop, invisible to syncSensors,
-		// pulses rejected) with no path back. It runs on a FRESH context
-		// detached from the request: the cascade is exactly where a client
-		// departure (or a crash) lands, and a rollback on the request's
-		// cancelled context fails at once — which is how the row used to
-		// get stranded. The state = 'deleting' guard rolls back only what
-		// THIS delete marked: a state written while the cascade ran is
-		// left as-is, and a row that finished deleting is untouched.
-		// History: docs/DECISIONS.md → deleting-state-stuck-recovery
+		// restoreState puts the sensor back to its pre-delete state if any cascade
+		// step below fails, so a surviving sensor is never stranded in 'deleting'
+		// (no loop, invisible to syncSensors, pulses rejected) with no path back.
+		// It runs on a FRESH context detached from the request: the cascade is
+		// exactly where a client departure (or a crash) lands, and a rollback on
+		// the request's cancelled context fails at once. The state = 'deleting'
+		// guard rolls back only what THIS delete marked: a state written while the
+		// cascade ran is left as-is, and a row that finished deleting is untouched.
+		// History: docs/DECISIONS.md → sensor-delete-deleting-state
 		restoreState := func() {
 			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
@@ -1045,18 +1027,13 @@ func (s *Server) handleSensorClearHistory(w http.ResponseWriter, r *http.Request
 // table/where strings are fixed call-site literals, never user input.
 //
 // The `id IN (SELECT id …)` shape is optimal as written (verified by
-// EXPLAIN QUERY PLAN): both probes.id and events.id are
-// INTEGER PRIMARY KEY — i.e. rowid aliases — so the outer delete already
-// seeks by rowid (SEARCH … USING INTEGER PRIMARY KEY (rowid=?)) and the
-// sensor_id-filtered subquery is a covering-index seek
-// (SEARCH … USING COVERING INDEX idx_*_sensor_ts (sensor_id=?)), NOT a
-// PK-B-tree or full-table scan. Rewriting it as `rowid IN (SELECT rowid …)`
-// is a byte-identical no-op (id IS rowid here), so the `id` form is kept
-// for clarity.
-// deleteRowsBatched: the batched cascade-delete as a var so a test can
-// force the post-mark failure path (sensor marked 'deleting' → batched
-// delete failed → compensating state restore) — the same seam pattern as
-// enterMaintenance/leaveMaintenance above.
+// EXPLAIN QUERY PLAN): both probes.id and events.id are INTEGER PRIMARY
+// KEY — i.e. rowid aliases — so the outer delete already seeks by rowid and
+// the sensor_id-filtered subquery is a covering-index seek, NOT a PK-B-tree
+// or full-table scan. Rewriting it as `rowid IN (SELECT rowid …)` is a
+// byte-identical no-op (id IS rowid here), so the `id` form is kept for
+// clarity.
+// History: docs/DECISIONS.md → delete-rows-batched-args-hoisted.
 var deleteRowsBatched = func(ctx context.Context, db *store.Store, table, where string, args []any) (int64, error) {
 	w := ""
 	if where != "" {
@@ -1201,16 +1178,16 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 
 	// The clone is a NEW write, so it must honor the CURRENT new-write
 	// floors/caps — the same ones the create and PATCH paths enforce
-	// (minIntervalS, the timeout/loss/down/spike ranges, and the
-	// timeout <= interval*1000 cross-field rule) — NOT copy the source's
-	// values verbatim. A legacy row can hold out-of-range values: those
-	// floors were added after the row existed and are deliberately not
-	// migrated (see minIntervalS — "a legacy 1s sensor keeps running until
-	// the operator edits it"). Copying verbatim let an operator multiply a
-	// legacy 1s sensor (or any out-of-range param) indefinitely via clone,
-	// bypassing the API floor. Clamp each copied
+	// (minIntervalS, the timeout/loss/down/spike ranges, and the timeout <=
+	// interval*1000 cross-field rule) — NOT copy the source's values verbatim.
+	// A legacy row can hold out-of-range values: those floors were added after
+	// the row existed and are deliberately not migrated (a legacy 1s sensor
+	// keeps running until the operator edits it). Copying verbatim let an
+	// operator multiply a legacy 1s sensor (or any out-of-range param)
+	// indefinitely via clone, bypassing the API floor. Clamp each copied
 	// numeric into its valid range; the clone starts PAUSED, so the operator
 	// reviews the normalized values before resuming it.
+	// History: docs/DECISIONS.md → clone-normalization.
 	spec := sensorSpec{
 		Name:      src.Name,
 		Target:    src.Target,
@@ -1227,26 +1204,22 @@ func (s *Server) handleSensorClone(w http.ResponseWriter, r *http.Request) {
 	// Pick the first free name and insert it. The existing clone names are
 	// fetched in ONE query and the first free suffix is picked in memory
 	// (the old loop ran up to 100 sequential SELECT COUNT(*) round-trips
-	// before the first INSERT). Another
-	// request can take the name between the fetch and the INSERT (the
-	// sensors.name UNIQUE index is the real arbiter), so a UNIQUE failure
-	// marks the name taken and moves on to the next candidate: at most
-	// cloneMaxAttempts inserts, then 409.
+	// before the first INSERT). Another request can take the name between the
+	// fetch and the INSERT (the sensors.name UNIQUE index is the real
+	// arbiter), so a UNIQUE failure marks the name taken and moves on to the
+	// next candidate: at most cloneMaxAttempts inserts, then 409.
 	//
-	// GLOB, not LIKE: the UNIQUE index is case-sensitive (BINARY
-	// collation) and GLOB matches case-sensitively, while LIKE folds ASCII
-	// case — a LIKE match set would drift from the uniqueness semantics.
-	// The base name is GLOB-escaped (globEscaper) so it matches
-	// literally. The old exact-match loop probed each candidate
-	// individually, so metacharacters there were harmless; under the
-	// one-query design an unescaped under-match (an unterminated '['
-	// never matches, "[b]" becomes a class) empties the taken set, every
-	// existing clone then burns one of the cloneMaxAttempts INSERT
-	// retries, and the 6th clone of a base like "nas[01]" died with 409
-	// "too many clones" while -copy6..-copy100 sat free.
-	// Over-matching was benign, so this closed the only half
-	// that distorted the outcome; the UNIQUE index stays the arbiter for
-	// the concurrent-race retries.
+	// GLOB, not LIKE: the UNIQUE index is case-sensitive (BINARY collation) and
+	// GLOB matches case-sensitively, while LIKE folds ASCII case — a LIKE match
+	// set would drift from the uniqueness semantics. The base name is
+	// GLOB-escaped (globEscaper) so it matches literally: under the one-query
+	// design an unescaped under-match (an unterminated '[' never matches, "[b]"
+	// becomes a class) empties the taken set, every existing clone then burns
+	// one of the cloneMaxAttempts INSERT retries, and the 6th clone of a base
+	// like "nas[01]" died with 409 "too many clones" while -copy6..-copy100
+	// sat free. Over-matching is benign; the UNIQUE index stays the arbiter
+	// for the concurrent-race retries.
+	// History: docs/DECISIONS.md → clone-glob-escape.
 	cloneID := store.NewID()
 	now := store.Now()
 	created := false
@@ -1397,16 +1370,16 @@ func (s *Server) handleTags(w http.ResponseWriter, r *http.Request) {
 			respondInternal(w, "delete tag "+tag, err)
 			return
 		}
-		// One Restart per tagged sensor is deliberate, not an oversight.
-		// Each Restart does a NON-BLOCKING send on the buffered-1 syncReq,
-		// so the N signals coalesce into a single syncSensors pass: this
-		// loop is fast (map ops, no I/O) and completes before Run can
-		// consume the buffer. Even if Run wakes mid-loop, the extra pass is
-		// ONE idempotent full-fleet reconciliation (the buffer drains once
-		// per syncSensors cycle, so it's bounded to ~1, not N) and the
-		// final state is correct. A RestartMany batch (one lock + one
-		// signal) would save at most that one rare extra pass for a rare
-		// operation (tag delete) — not worth the added surface.
+		// One Restart per tagged sensor is deliberate, not an oversight. Each
+		// Restart does a NON-BLOCKING send on the buffered-1 syncReq, so the N
+		// signals coalesce into a single syncSensors pass: this loop is fast (map
+		// ops, no I/O) and completes before Run can consume the buffer. Even if Run
+		// wakes mid-loop, the extra pass is ONE idempotent full-fleet
+		// reconciliation (bounded to ~1, not N) and the final state is correct. A
+		// RestartMany batch (one lock + one signal) would save at most that one
+		// rare extra pass for a rare operation (tag delete) — not worth the added
+		// surface.
+		// History: docs/DECISIONS.md → sync-reconcile-scale.
 		for _, id := range tagged {
 			s.probeWorker.Restart(id)
 		}
@@ -1457,17 +1430,17 @@ func (s *Server) handleSensorGraph(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Serve the buckets from the in-memory stats series (raw entries +
-	// per-minute buckets) instead of a per-request SQL aggregate (finding
-	// #8): the 24h graph folds the minute buckets into 15-min buckets and
-	// the 1h graph reads the raw hour, so neither touches the probes table.
-	// The series is the same data the warm-up loaded (the full 24h UNION),
-	// so the buckets match what the SQL path returned — including the
-	// epoch-based window (the series only holds entries within 24h of the
-	// newest probe) and the `manual = 0` exclusion (graphPoints skips
-	// manual rows). A sensor not in the cache (added after boot, before
-	// its first probe) has no series and serves an empty graph — the same
-	// as a zero-probe window. The cache lock lives inside ProbeWorker.Graph
-	// (nit: handlers must not touch statsMu/statsCache directly).
+	// per-minute buckets) instead of a per-request SQL aggregate: the 24h
+	// graph folds the minute buckets into 15-min buckets and the 1h graph reads
+	// the raw hour, so neither touches the probes table. The series is the same
+	// data the warm-up loaded (the full 24h UNION), so the buckets match what
+	// the SQL path returned — including the epoch-based window (the series only
+	// holds entries within 24h of the newest probe) and the `manual = 0`
+	// exclusion (graphPoints skips manual rows). A sensor not in the cache
+	// (added after boot, before its first probe) has no series and serves an
+	// empty graph — the same as a zero-probe window. The cache lock lives inside
+	// ProbeWorker.Graph (handlers must not touch statsMu/statsCache directly).
+	// History: docs/DECISIONS.md → graph-buckets-from-stats.
 	points := s.probeWorker.Graph(id, bucketSecs, rangeSecs)
 	if points == nil {
 		points = []GraphPoint{}

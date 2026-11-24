@@ -2,15 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"regexp"
 	"runtime"
@@ -19,41 +15,27 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
 	"pulsemon/internal/store"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
-// ---------- dashboard authentication (username / password) ----------
+// Authentication: the users table is the single source of truth for who may
+// log in; sessions are in-memory (a restart logs everyone out) and only
+// /api/auth/{status,login,logout} and /api/setup are unauthenticated.
 //
-// A `users` table holds every account: username + bcrypt password hash.
-// Authentication is enabled IFF at least one user exists — creating the
-// first account (from the still-open dashboard, or `pulsemon auth-user
-// add`) turns the gate on; removing the last one (the explicit "Disable
-// Authentication" action) opens it again. The user table is the single
-// source of truth — there is no separate enabled flag.
+// Invariants:
+//   - the last user cannot be removed, only disabled; the CLI
+//     (pulsemon auth-user) is the out-of-band recovery path and bypasses the
+//     login throttle.
+//   - the in-memory throttle resets on restart by design: the threat model
+//     is a LAN brute-forcer, and the only way to reset a lockout is a
+//     process restart, which already implies host access.
+//   - auth-off installs are a trusted-LAN single-operator mode: requireAdmin
+//     stands down and the dashboard is fully open.
 //
-// Login issues an httpOnly session cookie (7-day sliding expiry, 30-day
-// absolute cap, in-memory). Sessions are deliberately NOT persisted:
-// restart-invalidated logins are acceptable for a tool with a handful of
-// operators, and it keeps credentials to the users table. User management
-// (add/remove/change-password) requires a valid session; only
-// /api/healthz, /api/auth/status, /api/auth/login and /api/auth/logout
-// are reachable without one. The last user can be removed ONLY through
-// the explicit disable action, so a typo can't silently open the
-// dashboard.
-//
-// Login is throttled per-IP (loginFailMax failures in a rolling window →
-// lockout) AND per-username: failures for one account accumulate across
-// ALL source IPs, so a multi-IP botnet can't dodge the per-IP budget.
-// The per-username layer exempts IP buckets with a prior successful
-// login, so one LAN host can't lock the operator out of their own
-// account while a new-IP attacker stays hard-locked (and capped by the
-// per-IP budget, which the exemption does not touch). Every 401 carries a
-// constant-time delay. Locked out? `pulsemon auth-user ...` runs
-// out-of-band and is not subject to the throttle. Threat model: "a public
-// URL must not expose the dashboard", not "an anonymous internet scanner
-// must not probe it". History: docs/DECISIONS.md →
-// login-throttle-per-username, knowngood-bound, login-lockout-429-refund.
+// Incident history: docs/DECISIONS.md → login-throttle-per-username,
+// login-hourly-budget, knowngood-bound, oversized-login-guard.
 const (
 	authSessionName = "pulsemon_session"
 	// authSessionTTL is the SLIDING inactivity window: a session lapses if it
@@ -63,44 +45,23 @@ const (
 	// authSessionMaxAge (see below): with the two equal the sliding machinery
 	// was a no-op and every session died exactly 30 days after login.
 	authSessionTTL = 7 * 24 * time.Hour
-	// authSessionMaxAge is the ABSOLUTE lifetime of a session, counted from
-	// login time (authSession.created), independent of activity. With the
-	// sliding TTL alone a continuously-active session — an open dashboard tab
-	// polling every few seconds, or a stolen cookie used periodically — would
-	// never lapse (activity keeps pushing expiry out); the max-age cap bounds
-	// the total time any session can stay valid: after authSessionMaxAge from
-	// login the session is rejected and deleted even if it has been active the
-	// whole time, forcing a re-login.
-	//
-	// 7-day idle / 30-day absolute: an idle session lapses after a week (the
-	// better security posture — a stolen cookie stops working after 7 days of
-	// inactivity, not a month), an active operator's cookie is renewed every
-	// ~3.5 days (CookieRenewalDue) and stays logged in, and no session
-	// outlives 30 days from login.
+	// authSessionMaxAge is the ABSOLUTE session lifetime from login, independent
+	// of activity: a sliding TTL alone would let a continuously-active (or
+	// periodically-replayed stolen) cookie never lapse. Sliding 7-day, absolute
+	// 30-day; CookieRenewalDue keeps an active cookie ≥ half the TTL from
+	// expiring on the browser side.
+	// History: docs/DECISIONS.md → session-absolute-max-age.
 	authSessionMaxAge = 30 * 24 * time.Hour
 	bcryptCost        = bcrypt.DefaultCost
 	minPasswordLen    = 8
 	maxUsernameLen    = 32
 
-	// Login throttling (see AuthState.loginThrottle). An internet-reachable
-	// install must not be a free online password-cracking target against the
-	// 8-char minimum. Per-IP: up to loginFailMax failures in a rolling
-	// loginFailWindow, then the IP is locked for loginLockout. In-memory only
-	// (restarts clear it) — the threat model is "don't let an attacker spray
-	// passwords", not "survive a restart mid-attack".
-	//
-	// Why in-memory and NOT persisted to the settings table: an attacker who can force a process restart — the
-	// only way to reset the lockout — already has host/docker access, at
-	// which point brute-forcing the dashboard is moot (they can read the
-	// SQLite DB or change the password directly), OR a pre-existing remote
-	// crash bug, which is a separate finding to fix on its own. The
-	// realistic brute-forcer (LAN access to :9299, no host access) cannot
-	// restart the container, so the in-memory lockout holds for the
-	// process's uptime. Persisting the per-IP failure map to SQLite would add
-	// a write + a failure mode to the auth hot path for a vector the threat
-	// model excludes. And even a coincidental restart (deploy/OOM) only
-	// resets the attacker to a fresh loginFailMax budget at the
-	// loginSlowDown-limited ~5 guesses/s — not an unlimited free pass.
+	// Per-IP login throttle: up to loginFailMax failures in a rolling
+	// loginFailWindow, then locked for loginLockout. In-memory only by design —
+	// the threat model is "don't let an attacker spray passwords", and the only
+	// way to reset a lockout is a process restart, which already means host
+	// access.
+	// History: docs/DECISIONS.md → login-throttle-per-username.
 	loginFailMax    = 7
 	loginFailWindow = 60 * time.Second
 	loginLockout    = 5 * time.Minute
@@ -109,19 +70,12 @@ const (
 	// an online attacker gets at most ~5 guesses/second per IP.
 	loginSlowDown = 200 * time.Millisecond
 
-	// loginHourFailMax / loginHourWindow / loginHourLockout are a SECOND,
-	// SLOWER per-username limit alongside the 60s rolling budget above. The
-	// rolling window only catches bursts: an attacker pacing 6 guesses/minute
-	// stays under loginFailMax/60s forever (~8.6k guesses/day/account), so the
-	// rolling layer alone is not a password-cracking deterrent. The hourly
-	// budget caps a single account's total failed checks at loginHourFailMax
-	// per loginHourWindow, then locks the account for loginHourLockout. It
-	// PERSISTS across the 5-min rolling lockouts (a rolling expiry wipes
-	// userFails, not userHour), so 7-fail bursts every 6 min (~70/hr) can't
-	// outrun the 30/hr cap. The operator is unaffected: their known-good
-	// (account, IP) pair is exempt from the whole per-username layer
-	// (checkUserLock), and any successful login clears the budget
-	// (clearUserFail).
+	// Second, SLOWER per-username limit: the 60s window only catches bursts
+	// (6 guesses/min runs forever under it), so the hourly budget caps a single
+	// account's total failed checks, then locks it for loginHourLockout.
+	// Persists across rolling lockouts; known-good (account, IP) pairs are
+	// exempt; success clears it.
+	// History: docs/DECISIONS.md → login-hourly-budget.
 	loginHourFailMax = 30
 	loginHourWindow  = time.Hour
 	loginHourLockout = time.Hour
@@ -148,46 +102,24 @@ const (
 // lowercase; the UNIQUE constraint is on the lower-cased column value.
 var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
 
-// dummyBcryptHash is the "unknown user" KDF equalizer for VerifyUser: a
-// well-formed bcrypt hash built ONCE at package init, at the SAME cost every
-// real account hash is generated at (bcryptCost). An unknown user and a wrong
-// password both run a full cost-N KDF, so the two paths take the same time —
-// no username enumeration via timing.
-//
-// It is a package-level var (not rebuilt per call) so a login spike or
-// brute-force attempt doesn't re-format the string on every failed lookup.
-// The slice is shared read-only across concurrent logins (bcrypt never
-// mutates its hash argument), and because bcryptCost is a const it is
-// computed exactly once, so there is no cross-goroutine write to protect.
-// It MUST stay tied to bcryptCost (never hardcode a fixed cost): raising the
-// cost and leaving the dummy behind would make the unknown-user path run a
-// weaker KDF than real hashes — a timing oracle.
-//
-// The embedded hash body is the canonical public bcrypt test vector — the
-// cost-10 hash of the literal string "password" — and that is intentional:
-// nothing authenticates against it, only its SHAPE (well-formed bcrypt
-// syntax, 22-char salt, 31-char checksum) and its COST matter. Never
-// "fix" it by pasting a real account's hash here: the equalizer would stop
-// being public, and a leaked repo leaks the dummy's plaintext with it.
+// dummyBcryptHash is the unknown-user KDF equalizer: a well-formed hash
+// built ONCE at init at bcryptCost, so unknown-user and wrong-password
+// VerifyUser paths take the same time (no username-enumeration oracle).
+// Invariants: the cost stays tied to bcryptCost (a fixed cost re-opens the
+// oracle if the cost is ever raised), and the embedded body is the canonical
+// public bcrypt test vector — its shape and cost matter, nothing ever
+// authenticates against it. Never paste a real account's hash here.
+// History: docs/DECISIONS.md → login-throttle-per-username.
 var dummyBcryptHash = []byte(fmt.Sprintf("$2a$%02d$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy", bcryptCost))
 
-// bcryptSem bounds the number of CONCURRENT bcrypt KDFs. The
-// per-IP throttle caps a single source at ~loginFailMax in-flight KDFs, but a
-// multi-IP burst (an IPv6 /48 is 65k distinct /64 buckets) can drive
-// NumCPU-or-more parallel CompareHashAndPassword calls and saturate every
-// core — the KDF is cost 10, so a handful of them already pin a small box.
-// A BLOCKING semaphore (capacity runtime.NumCPU) QUEUES the excess rather
-// than rejecting it: under attack the operator's login waits for a free core
-// instead of failing, which is the exact regression the non-blocking
-// (select/default → 429) variant would cause (see the handleAuthLogin
-// security note). BOTH KDF flavors go through it — CompareHashAndPassword
-// (real + dummy hash paths, so the unknown-user equalizer keeps its constant
-// time AND its concurrency cap) and GenerateFromPassword (AddUserMode /
-// SetUserPassword — setup mode is an UNAUTHENTICATED surface, so without the
-// cap concurrent bootstrap POSTs would drive NumCPU-or-more parallel KDFs).
-// Acquire is ctx-aware (acquireBcryptSem): a client
-// that disconnected while queued stops waiting instead of burning a core for
-// a response nobody reads.
+// bcryptSem bounds CONCURRENT bcrypt KDFs to runtime.NumCPU, so a multi-IP
+// burst cannot drive more parallel KDFs than there are cores. Blocking (it
+// queues, never rejects) so under attack the operator's login waits for a
+// free core instead of 429ing — the exact regression a select/default
+// variant would cause. Both KDF flavors go through it (verify + generate;
+// setup mode is an unauthenticated surface). Acquire is ctx-aware: a
+// disconnected client stops waiting for a core.
+// History: docs/DECISIONS.md → bcrypt-sem-full-coverage.
 var bcryptSem = make(chan struct{}, runtime.NumCPU())
 
 // acquireBcryptSem blocks until a KDF slot frees up or ctx is canceled.
@@ -341,30 +273,18 @@ type AuthState struct {
 		// account count — recordUserFail only counts EXISTING users — so it
 		// never grows unboundedly and needs no sweep of its own.
 		userHour map[string]*userHourBudget
-		// knownGood: (username, IP bucket) → last successful login time
-		// for that account from that bucket.
-		// A previously-successful (account, client) pair is EXEMPT from the
-		// per-username lockout, so a single LAN host hammering the account
-		// can't lock the operator out: the operator's own (known-good)
-		// account/IP pair always gets through the per-ACCOUNT layer, while
-		// a new-IP attacker is still subject to the hard lockout (and to
-		// the per-IP budget, which the exemption does NOT touch). Scoped
-		// to the account: a success by any OTHER account on the same
-		// shared IP (workstation, jump box, NAT exit) does not exempt
-		// this one — a compromised low-privilege session must not void
-		// the cross-IP account lockout for admin. Bounded by
-		// sweepThrottle.
+		// knownGood: (username, IP bucket) → last successful login. A
+		// previously-successful (account, client) pair is EXEMPT from the
+		// per-username lockout, scoped to the account (a success by another account
+		// on the same IP does not exempt this one). Bounded by sweepThrottle.
+		// History: docs/DECISIONS.md → login-throttle-known-good-exemption.
 		knownGood map[string]time.Time
-		// nextSweep rate-limits the O(n) map GC:
-		// once a multi-IP spray pushes the map past the threshold, every
-		// entry is in-window so the sweep deletes nothing — running it per
-		// call made login O(n) and serialized all logins on an ever-
-		// growing full walk (O(n^2) total). At most one sweep per
-		// throttleSweepInterval now; memory is bounded by
-		// throttleHardCap below. The sweep/wipe trigger watches BOTH
-		// fails and userFails: userFails is keyed by arbitrary request
-		// usernames, so a small IP pool rotating random names can grow it
-		// while the per-IP map stays tiny.
+		// nextSweep rate-limits the O(n) map GC to once per throttleSweepInterval:
+		// a spray keeps every entry in-window, so a per-call sweep prunes nothing at
+		// O(n) cost. The sweep/wipe trigger watches ALL THREE maps — userFails is
+		// keyed by arbitrary request usernames, so a small IP pool rotating names
+		// grows it while the per-IP map stays tiny.
+		// History: docs/DECISIONS.md → knowngood-bound.
 		nextSweep time.Time
 	}
 
@@ -412,20 +332,13 @@ func (a *AuthState) userExists(username string) bool {
 	return n > 0
 }
 
-// userExistsCached is the TTL-cached wrapper session validation uses,
-// capping the users-table lookups at one per user per userOKTTL. Caller
-// must hold a.mu.
-//
-// The lookup runs UNDER the session lock on purpose (contention flagged; verified and kept): the query is a
-// point lookup on the tiny users table (local SQLite, sub-millisecond),
-// it runs at most once per user per userOKTTL (2s) because of the cache,
-// and moving it outside the lock would need an unlock → query → re-lock →
-// RE-VALIDATE dance — the session could be deleted (or the user
-// re-created) in the gap — adding a race window and a second code path
-// to buy back a sub-millisecond critical section. At homelab scale
-// (a handful of dashboard clients) the contention is not measurable;
-// the F1 correctness property (out-of-band deletions rejected within
-// userOKTTL) is what this check exists for.
+// userExistsCached is the TTL-cached wrapper session validation uses (one
+// users-table lookup per user per userOKTTL). Caller must hold a.mu.
+// Deliberately under the lock: it is a sub-millisecond point lookup at most
+// once per user per 2s, and moving it out needs an unlock→query→re-lock→
+// re-validate dance that opens a race window (session deleted or user
+// re-created in the gap). The property this check exists for: out-of-band
+// deletions are rejected within userOKTTL.
 func (a *AuthState) userExistsCached(username string) bool {
 	if t, ok := a.userOKCache[username]; ok && time.Since(t) < userOKTTL {
 		return true
@@ -439,52 +352,12 @@ func (a *AuthState) userExistsCached(username string) bool {
 	return exists
 }
 
-// parseTrustedProxies turns a comma-separated list of CIDRs (or bare IPs,
-// which become /32 / /128) into matchable networks. Entries that don't parse
-// are dropped with a warning rather than failing startup — a typo must not
-// take the dashboard down, it just means that entry isn't trusted.
-func parseTrustedProxies(raw string) []*net.IPNet {
-	var out []*net.IPNet
-	for _, part := range strings.Split(raw, ",") {
-		part = strings.TrimSpace(part)
-		if part == "" {
-			continue
-		}
-		var cidr string
-		if strings.Contains(part, "/") {
-			cidr = part
-		} else if ip := net.ParseIP(part); ip != nil {
-			ones := 32
-			if ip.To4() == nil {
-				ones = 128
-			}
-			cidr = fmt.Sprintf("%s/%d", ip.String(), ones)
-		} else {
-			log.Printf("auth: PULSEMON_TRUSTED_PROXIES: ignoring unparseable entry %q", part)
-			continue
-		}
-		if _, n, err := net.ParseCIDR(cidr); err == nil {
-			out = append(out, n)
-		} else {
-			log.Printf("auth: PULSEMON_TRUSTED_PROXIES: ignoring invalid CIDR %q: %v", part, err)
-		}
-	}
-	return out
-}
-
-// Enabled reports whether at least one user exists. The answer is memoized
-// for enabledTTL (a short-TTL cache) so the 5s dashboard poll — and every
-// other request — doesn't pay a SELECT COUNT(*) round-trip on the hot path.
-// In-app user mutations (AddUser/RemoveUser/Disable) call
-// refreshEnabledNow, so the dashboard is never stale; only OUT-OF-BAND
-// `pulsemon auth-user add/remove` is honored within enabledTTL (≤2s), which
-// is the documented tradeoff for removing the per-request query.
-//
-// The count source is userCountFn (defaults to db.UserCount); the seam lets
-// a test count reads and prove the cache actually stops the query.
-//
-// The count-and-fallback rules live in refreshEnabledLocked (a COUNT error
-// keeps the last known value; the first-ever read fails closed).
+// Enabled reports whether at least one user exists, memoized for enabledTTL
+// so the 5s dashboard poll doesn't pay a SELECT COUNT(*) per request.
+// In-app mutations call refreshEnabledNow (never stale in-app); out-of-band
+// CLI changes are honored within enabledTTL. The count-and-fallback rules
+// live in refreshEnabledLocked (a COUNT error keeps the last known value;
+// the first read fails closed).
 func (a *AuthState) Enabled() bool {
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
@@ -519,17 +392,11 @@ func (a *AuthState) refreshEnabledLocked() {
 }
 
 // refreshEnabledNow re-reads the user count and updates the Enabled() cache
-// immediately. Called by the in-app user mutations (AddUser/RemoveUser/
-// Disable) so the gate reflects them on the very next request with no TTL
-// wait. An out-of-band CLI write takes its OWN AuthState on a separate DB
-// handle and never reaches this method — which is exactly why the TTL exists.
-//
-// It also clears adminCache: these same mutation sites are the only in-app
-// places where an account's admin flag changes (bootstrap create, and
-// RemoveUser's last-admin promotion) — without the clear, a promoted
-// user's cached "non-admin" would 403 their next admin request for up to
-// userOKTTL. The map is tiny (one entry per user); clearing wholesale is
-// simpler than tracking the affected usernames.
+// immediately; called by the in-app user mutations (AddUser/RemoveUser/
+// Disable). It also clears adminCache — these same sites are the only
+// in-app places an admin flag changes (bootstrap create, last-admin
+// promotion); without the clear a promoted user's cached 'non-admin' 403s
+// for up to userOKTTL.
 func (a *AuthState) refreshEnabledNow() {
 	a.mu.Lock()
 	a.adminCache = map[string]adminEntry{}
@@ -572,21 +439,13 @@ var (
 	errBootstrappedEarly = fmt.Errorf("%w (pre-check)", errBootstrapped)
 )
 
-// setupNoKDF reports whether a setup-mode rejection paid NO bcrypt KDF cost.
-// The refund contract ("throttling is for KDF cost", refundAttempt) applies
-// to exactly these: the cheap validation sentinels, the early bootstrap
-// pre-check (errBootstrappedEarly), and a client that left while QUEUED on
-// the bcrypt semaphore (AddUserMode returns ctx.Err() before the KDF
-// starts — context.Canceled or context.DeadlineExceeded, the only values
-// ctx.Err() can take). An in-tx bootstrap race loss (errBootstrapped) DID
-// pay the KDF — bcrypt runs to completion and ignores ctx — and a db
-// failure ran it too, so neither is refunded, even when the request's ctx
-// is already canceled: a disconnect mid-KDF must not buy a free retry (it
-// would hand a scripted attacker an unbounded per-IP guessing channel).
-// This is the sentinel-precise version of the login path's kdfCostFloor
-// timing split: CreateSession returns only a bool, so that path has to
-// measure; AddUserMode returns the error, so this one can inspect it.
-// History: docs/DECISIONS.md → throttle-edge-cases
+// setupNoKDF reports whether a setup-mode rejection paid NO bcrypt KDF cost
+// — the cheap validation sentinels, the early bootstrap pre-check, and a
+// client that left while QUEUED on bcryptSem. In-tx race loss and db
+// failures DID pay the KDF (bcrypt runs to completion and ignores ctx) and
+// are NOT refunded: a disconnect mid-KDF must not buy a free retry (it would
+// hand a scripted attacker an unbounded per-IP guessing channel).
+// History: docs/DECISIONS.md → throttle-edge-cases.
 func setupNoKDF(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, errBootstrappedEarly) || errors.Is(err, errUsernameInvalid) ||
@@ -598,35 +457,26 @@ func validUsername(u string) bool {
 	return u != "" && len(u) <= maxUsernameLen && usernameRe.MatchString(u)
 }
 
-// AddUser validates and creates an account. The first AddUser is what
-// enables authentication.
-//
-// The check-and-create runs in ONE BEGIN IMMEDIATE transaction. On a fresh
-// install the unauthenticated bootstrap POST is open to the whole LAN, and
-// with a DEFERRED begin
-// every concurrent first-user POST reads user_count=0 before any of them
-// writes — N racers, N "first" accounts. BEGIN IMMEDIATE serializes the
-// writers: the winner commits the account (and the auth_bootstrapped flag
-// in the SAME transaction, so there is no window where the gate sees a
-// user without the flag), the losers see user_count > 0 and get
-// errBootstrapped (409). In-app adds (user_count > 0) keep their normal
-// path: a duplicate username is errUserExists (400).
+// AddUser validates and creates an account; the first AddUser enables
+// authentication. Check-and-create runs in ONE BEGIN IMMEDIATE transaction:
+// on a fresh install the bootstrap POST is unauthenticated and LAN-open, so
+// with a DEFERRED begin every concurrent first-user POST reads
+// user_count=0 first — N racers, N "first" accounts. BEGIN IMMEDIATE
+// serializes the writers: the winner commits the account and the
+// auth_bootstrapped flag in the SAME tx; losers get errBootstrapped (409).
+// In-app adds keep the normal path (duplicate → errUserExists 400).
 func (a *AuthState) AddUser(ctx context.Context, username, password string) error {
 	// In-app / CLI add: the user table may already be populated; a
 	// duplicate username is the expected client error (400).
 	return a.AddUserMode(ctx, username, password, false)
 }
 
-// AddUserMode is AddUser with the setup-mode flag made explicit.
-// setupMode=true means the caller reached this through the fresh-install
-// gate (no account existed when the gate checked, modulo its TTL): in that
-// world ONLY the first account may be created. The check must happen INSIDE
-// the ImmediateTx, on the serialized connection — the gate's Enabled()
-// result is TTL-cached, so N concurrent setup POSTs all pass the gate and
-// only the in-tx user_count (n > 0) distinguishes the winner from the
-// losers. Without it, four clients with four DIFFERENT usernames all see
-// an empty table at the gate, all pass the UNIQUE check (their names don't
-// collide), and four "first" accounts are created (// the ImmediateTx alone does not close the race; this check does).
+// AddUserMode is AddUser with the setup-mode flag explicit. setupMode=true
+// means the caller came through the fresh-install gate: ONLY the first
+// account may be created, and the check runs INSIDE the ImmediateTx on the
+// serialized connection — the gate's Enabled() is TTL-cached, so N
+// concurrent setup POSTs all pass the gate and only the in-tx user_count
+// distinguishes winner from losers.
 func (a *AuthState) AddUserMode(ctx context.Context, username, password string, setupMode bool) error {
 	username = strings.ToLower(username)
 	if !validUsername(username) {
@@ -729,19 +579,14 @@ func (a *AuthState) AddUserMode(ctx context.Context, username, password string, 
 	return nil
 }
 
-// Bootstrapped reports whether this install has ever had an account created
-// (settings row auth_bootstrapped=1, set by AddUser and never cleared —
-// including when the operator later disables auth). The auth gate uses it to
-// pick between the two zero-user states: a fresh install gets the
-// bootstrap-only surface (no unauthenticated sensor create/pulse before the
-// first account exists), an intentionally-disabled install stays fully open.
-//
-// The answer latches: the flag never goes back to false, so once a read sees
-// "1" the in-memory bootstrapped is set and every later call returns true
-// without touching SQLite (the per-request auth gate used to pay a GetSetting
-// on every request, static assets included). A not-yet-latched read always
-// re-queries, so an out-of-band `pulsemon auth-user add` (a separate process
-// writing the setting) is picked up on the next call.
+// Bootstrapped reports whether this install has ever had an account
+// (settings row auth_bootstrapped=1, set by AddUser, never cleared —
+// including after auth is later disabled). The gate uses it to pick between
+// the two zero-user states: fresh install → bootstrap-only surface;
+// intentionally disabled → fully open. The answer latches: once a read sees
+// '1', later calls return true without touching SQLite; a not-yet-latched
+// read re-queries, so an out-of-band CLI add is picked up on the next call.
+// History: docs/DECISIONS.md → auth-bootstrapped-latch.
 func (a *AuthState) Bootstrapped() bool {
 	if a.bootstrapped.Load() {
 		return true
@@ -758,19 +603,11 @@ func (a *AuthState) Bootstrapped() bool {
 }
 
 // IsAdmin reports whether the username holds the admin flag — the gate for
-// the account-management endpoints (add/remove user, disable auth) and the
-// admin routes (settings, TLS, self-update, history wipes). A deleted or
-// unknown user is not an admin; a db error fails closed.
-//
-// The answer is cached per username for userOKTTL (adminCache) — the same
-// staleness contract as userExistsCached/Enabled: in-app mutations clear
-// the cache via refreshEnabledNow (a last-admin promotion is visible on
-// the very next request), an out-of-band CLI flag change is honored within
-// the TTL. Without the cache this was the only per-request auth check that
-// hit SQLite on every call The query runs OUTSIDE
-// a.mu (unlike userExistsCached, which is called from the validation path
-// that already holds it): this is a standalone gate check, so no lock is
-// held across the I/O.
+// account management and the admin routes (settings, TLS, self-update,
+// history wipes). Unknown/deleted users are not admins; a db error fails
+// closed. Cached per username for userOKTTL (adminCache): in-app mutations
+// clear it via refreshEnabledNow, out-of-band CLI changes are honored within
+// the TTL. The query runs OUTSIDE a.mu (no lock held across I/O).
 func (a *AuthState) IsAdmin(username string) bool {
 	username = strings.ToLower(username)
 	a.mu.Lock()
@@ -821,44 +658,6 @@ func (a *AuthState) RemoveUser(ctx context.Context, username string) error {
 	return nil
 }
 
-// purgeUserThrottle drops every per-username throttle entry for username —
-// userFails, userLock, userHour, and the (username, ip) knownGood
-// exemptions (keyed username\x00ip; the \x00 makes the prefix collision-
-// free, since usernames match usernameRe). RemoveUser calls it after the
-// account row is gone: without the purge a RE-CREATED username inherits
-// the old account's IP exemptions (the new admin is exempt from the
-// per-username lockout at the old operator's IPs) and failure history (a
-// recreated account starts already-locked by the old account's 30/hr
-// debt).
-// History: docs/DECISIONS.md → throttle-edge-cases
-func (a *AuthState) purgeUserThrottle(username string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	delete(a.loginThrottle.userFails, username)
-	delete(a.loginThrottle.userLock, username)
-	delete(a.loginThrottle.userHour, username)
-	prefix := username + "\x00"
-	for k := range a.loginThrottle.knownGood {
-		if strings.HasPrefix(k, prefix) {
-			delete(a.loginThrottle.knownGood, k)
-		}
-	}
-}
-
-// purgeAllUserThrottle drops ALL per-username throttle state (userFails,
-// userLock, userHour, knownGood). Disable removes every user, so every
-// per-user entry is stale: without the purge a re-created account inherits
-// a removed account's exemptions and failure debt.
-// History: docs/DECISIONS.md → throttle-edge-cases
-func (a *AuthState) purgeAllUserThrottle() {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.loginThrottle.userFails = map[string][]time.Time{}
-	a.loginThrottle.userLock = map[string]time.Time{}
-	a.loginThrottle.userHour = map[string]*userHourBudget{}
-	a.loginThrottle.knownGood = map[string]time.Time{}
-}
-
 // SetUserPassword replaces a user's password and drops that user's other
 // sessions (the caller's own session, if any, is kept so "change my
 // password" does not log the operator out mid-panel).
@@ -902,20 +701,13 @@ func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (
 	username = strings.ToLower(username)
 	hash, err := a.db.UserHash(username)
 	if err != nil || hash == "" {
-		// Fail with a constant-time-ish bcrypt compare against a dummy hash so
-		// the "unknown user" and "wrong password" paths take the same time (no
-		// username enumeration via timing). dummyBcryptHash is built at
-		// bcryptCost — the same cost every stored hash is generated at — so the
-		// two paths ALWAYS run at the same KDF cost and can never diverge into
-		// a timing oracle if bcryptCost is ever raised. It is precomputed (see
-		// dummyBcryptHash) so a failed lookup doesn't re-format the string.
-		// Both paths go through bcryptSem: the dummy path is the
-		// one an unknown-username spray drives, so it needs the concurrency cap
-		// too — capping only the real-hash path would leave the spray unbounded.
-		// The acquire is ctx-aware: a client that
-		// disconnected while queued skips the KDF — no core burned for a
-		// response nobody reads. ctx cancel only skips work for a GONE client,
-		// so the live-client timing equalizer is untouched.
+		// Constant-time-ish compare against dummyBcryptHash (built at bcryptCost,
+		// so unknown-user and wrong-password ALWAYS run the same KDF cost — no
+		// timing oracle if the cost is ever raised). Both paths go through
+		// bcryptSem: the dummy path is the one an unknown-username spray drives, so
+		// it needs the concurrency cap too. The acquire is ctx-aware: a disconnected
+		// client skips the KDF; the live-client timing equalizer is untouched.
+		// History: docs/DECISIONS.md → login-throttle-per-username.
 		if !acquireBcryptSem(ctx) {
 			return "", false
 		}
@@ -933,738 +725,6 @@ func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (
 	return username, true
 }
 
-// maxSessionsPerUser caps the concurrent live sessions ONE user can hold:
-// CreateSession evicts that user's OLDEST session before minting a new one
-// once they're at the cap. The session map has no other bound —
-// sweepExpiredSessions evicts only EXPIRED sessions (30-day TTL / max-age),
-// and a repeated SUCCESSFUL login mints a fresh 30-day session while clearing
-// the IP's failure throttle (loginSuccess) and skipping loginSlowDown. So a
-// single valid credential — e.g. a lower-trust viewer account, or a
-// compromised one — driven by a script that discards each returned cookie
-// would otherwise mint unbounded sessions the GC never reclaims (unbounded
-// memory growth). A per-user cap (not a global one) bounds the total
-// (users × cap, and the users table is small) and targets the exact vector:
-// one principal can't exhaust the map. 32 is far above any real per-user
-// device count (a homelab operator runs 1–3 sessions); a var so tests shrink
-// it without minting 32 sessions.
-var maxSessionsPerUser = 32
-
-// CreateSession validates the credentials and returns a new opaque session
-// token tied to the user.
-func (a *AuthState) CreateSession(ctx context.Context, username, password string, cookieSecure bool) (string, bool) {
-	user, ok := a.VerifyUser(ctx, username, password)
-	if !ok {
-		return "", false
-	}
-	tok, err := newSessionToken()
-	if err != nil {
-		return "", false
-	}
-	a.mu.Lock()
-	now := time.Now()
-	// Re-verify the account STILL exists, under the session-map lock,
-	// BEFORE minting: VerifyUser's bcrypt check ran
-	// against the hash as of a moment ago; a concurrent RemoveUser in that
-	// gap used to mint a live 30-day session for an already-deleted user.
-	// This is a live check (no cache): the mint path is cold (login rate),
-	// and the first validation of the new token is live too (CreateSession
-	// never populates userOKCache), so the race window is zero.
-	if !a.userExists(user) {
-		a.mu.Unlock()
-		return "", false
-	}
-	// Opportunistic GC: see sweepExpiredSessions. Bounded O(n) work, run
-	// only once the map is large enough that abandoned sessions are the
-	// likely cause (mirrors sweepThrottle for the login-throttle maps) —
-	// and rate-limited to once per sweep interval for the same reason the
-	// throttle GC is: past the threshold a full walk per
-	// login is O(n^2) for a fleet of shared-credential devices.
-	if len(a.sessions) > 64 && now.After(a.nextSweepSessions) {
-		a.sweepExpiredSessions(now)
-		a.nextSweepSessions = now.Add(throttleSweepInterval)
-	}
-	// Per-user session cap (maxSessionsPerUser): before minting, evict this
-	// user's OLDEST session if they're already at the cap. This is the bound
-	// against the unbounded-mint vector — sweepExpiredSessions above only
-	// reclaims EXPIRED sessions, and a fresh login's session isn't expired,
-	// so without this a cookie-discarding login loop grows the map forever.
-	// The walk is O(n) but logins are bcrypt-rate-limited (cold) and n is
-	// bounded by the cap itself. Evicting the oldest (not the newest) keeps
-	// the latest login live — the "sign out the oldest device" behavior.
-	{
-		userCount := 0
-		oldestTok := ""
-		oldest := time.Time{}
-		for k, s := range a.sessions {
-			if s.user != user {
-				continue
-			}
-			userCount++
-			if oldestTok == "" || s.created.Before(oldest) {
-				oldestTok, oldest = k, s.created
-			}
-		}
-		if userCount >= maxSessionsPerUser && oldestTok != "" {
-			delete(a.sessions, oldestTok)
-		}
-	}
-	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), created: now, cookieIssued: now, cookieSecure: cookieSecure}
-	a.mu.Unlock()
-	return tok, true
-}
-
-// sweepExpiredSessions evicts sessions whose sliding TTL has lapsed or that
-// have passed their absolute authSessionMaxAge cap from login. Expired
-// entries are already rejected — and individually deleted — by
-// ValidSession/SessionUser when their token is presented; this sweep
-// covers the rest: abandoned sessions whose cookie was discarded and
-// will never be presented again, which would otherwise pin their map
-// entries for the process's entire uptime. It is called opportunistically
-// from CreateSession once the map grows past a threshold (no goroutine,
-// no ticker — mirrors sweepThrottle). Caller must hold a.mu.
-func (a *AuthState) sweepExpiredSessions(now time.Time) {
-	for tok, s := range a.sessions {
-		// Evict on the lapsed sliding TTL OR on the absolute authSessionMaxAge
-		// cap from login. A continuously-active session's sliding expiry is
-		// still in the future at max-age, so the TTL test alone would let it
-		// linger here until its (slid) expiry lapses; the cap test reclaims it
-		// now. (Both paths already reject the token on presentation — this is
-		// memory hygiene for sessions that won't be presented again.)
-		if now.After(s.expiry) || now.After(s.created.Add(authSessionMaxAge)) {
-			delete(a.sessions, tok)
-		}
-	}
-	for u, t := range a.userOKCache {
-		if now.After(t.Add(userOKTTL)) {
-			delete(a.userOKCache, u)
-		}
-	}
-	for u, e := range a.adminCache {
-		if now.After(e.at.Add(userOKTTL)) {
-			delete(a.adminCache, u)
-		}
-	}
-}
-
-// peerIP extracts the client's IP from the request's direct TCP peer
-// (r.RemoteAddr), stripping the port. This is the ONLY source of truth for
-// the login throttle unless the peer is a configured trusted proxy — see
-// ClientIP. Using the peer (and not X-Forwarded-For) means an attacker can't
-// rotate a spoofed X-Forwarded-For header to dodge the per-IP lockout.
-func peerIP(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
-}
-
-// ClientIP resolves the client's IP for the login throttle. The default is
-// the direct TCP peer (peerIP) — a spoofed X-Forwarded-For from an untrusted
-// peer is IGNORED, so an attacker cannot rotate it to reset the per-IP
-// counter and brute-force past loginFailMax.
-//
-// When PULSEMON_TRUSTED_PROXIES lists the CIDR(s) of the immediate TCP peer
-// (a reverse proxy in front of pulsemon), X-Forwarded-For is walked RIGHT to
-// LEFT and the first entry that parses and is NOT itself a trusted proxy is
-// used — attributing attempts to the real client, not the proxy. Rightmost-
-// untrusted, not leftmost: proxies APPEND, so everything left of the hop our
-// proxy added is client-supplied and rotatable per request. If every entry is trusted (nested trusted proxies only), the
-// leftmost parseable entry is used.
-// Trusting the header is gated on the PEER being in a trusted CIDR, so the
-// header is only ever read from a connection we know is our proxy; a direct
-// attacker (peer not in the list) gets the peer address and their rotation
-// attempt is pointless.
-//
-// X-Forwarded-For is trusted ONLY for rate-limiting — it is never used for
-// authentication.
-func (a *AuthState) ClientIP(r *http.Request) string {
-	peer := peerIP(r)
-	if a.trustedPeer(peer) {
-		// Combine ALL X-Forwarded-For lines before parsing: HAProxy-style proxies APPEND a new header line
-		// instead of extending the first, and r.Header.Get returns only
-		// the first — the CLIENT-CONTROLLED one. Reading it alone
-		// attributed every attempt to the attacker's chosen address.
-		// Joining with "," and running the existing rightmost-untrusted
-		// parse over the combined list keeps the original semantics for
-		// single-line XFF.
-		if vals := r.Header.Values("X-Forwarded-For"); len(vals) > 0 {
-			xf := strings.Join(vals, ",")
-			parts := strings.Split(xf, ",")
-			var leftmost net.IP
-			for i := len(parts) - 1; i >= 0; i-- {
-				ip := net.ParseIP(strings.TrimSpace(parts[i]))
-				if ip == nil {
-					continue
-				}
-				if !a.trustedIP(ip) {
-					return ip.String()
-				}
-				leftmost = ip
-			}
-			if leftmost != nil {
-				return leftmost.String()
-			}
-		}
-		return peer
-	}
-	// Untrusted peer: the header is IGNORED (a sender can rotate it to
-	// dodge the throttle — see the ClientIP doc), but its PRESENCE is the
-	// signature of a reverse proxy sitting in front of pulsemon WITHOUT
-	// PULSEMON_TRUSTED_PROXIES: every client behind that proxy is
-	// attributed to the proxy's IP and shares its throttle bucket, so
-	// loginFailMax bad guesses from ANYONE lock everyone out for
-	// loginLockout. Surface that misconfiguration once — the diagnostic is a log line only; the
-	// ignore-the-header security behavior is unchanged. (A direct
-	// connection that happens to send the header is a false positive,
-	// hence the hedged wording.)
-	if r.Header.Get("X-Forwarded-For") != "" && xffMisconfigWarned.CompareAndSwap(false, true) {
-		log.Printf("auth: ignoring X-Forwarded-For from untrusted peer %s — if pulsemon sits behind a reverse proxy, set PULSEMON_TRUSTED_PROXIES to the proxy's address; until then every client behind it shares the proxy's login-throttle bucket (so %d failed guesses from anyone lock everyone out for %s), and — behind a TLS-terminating proxy — the dashboard's API calls are blocked with 403 'cross-origin request blocked' (logged once)", peer, loginFailMax, loginLockout)
-	}
-	return peer
-}
-
-// xffMisconfigWarned: logged-once flag for the "untrusted peer carrying
-// X-Forwarded-For" shape (see ClientIP) — the signature of a reverse
-// proxy missing from PULSEMON_TRUSTED_PROXIES. atomic.Bool rather than
-// sync.Once so tests can reset it between runs.
-var xffMisconfigWarned atomic.Bool
-
-// trustedPeer reports whether the IP string (host, no port) is inside any of
-// the trusted-proxy CIDRs. An unparseable IP is never trusted.
-func (a *AuthState) trustedPeer(ip string) bool {
-	p := net.ParseIP(ip)
-	if p == nil {
-		return false
-	}
-	return a.trustedIP(p)
-}
-
-// trustedIP reports whether p is inside any of the trusted-proxy CIDRs.
-func (a *AuthState) trustedIP(p net.IP) bool {
-	for _, n := range a.trustedProxies {
-		if n.Contains(p) {
-			return true
-		}
-	}
-	return false
-}
-
-// throttleKey maps a client IP to its login-throttle bucket:
-//
-//   - private (RFC1918) and loopback IPv4 → the exact address (/32): on a
-//     LAN each device is a distinct host with no address rotation, so a
-//     shared /24 bucket let one misbehaving client (stale saved password,
-//     an old polling script) lock out every other device on the homelab
-//     subnet for loginLockout.
-//   - other IPv4 → the /24: an internet attacker rotating within a /24
-//     stays in one bucket.
-//   - IPv6 → the /64: one host owns a whole /64 (privacy-extension
-//     rotation), so per-address keying handed it 2^64 separate budgets.
-//
-// An unparseable string is returned as-is.
-// cgnetRange is 100.64.0.0/10 (RFC 6598). Addresses from this space can
-// only reach the socket over an overlay (Tailscale/Headscale): every one of
-// them is an individually assigned, individually trusted peer — exactly
-// like RFC1918 space — so the login throttle buckets it PER-IP. (/24
-// bucketing there collaterally locked up to 256 tailnet devices behind one
-// peer's bad guesses.) A public-internet attacker never
-// presents a 100.64/x source address: carrier NAT is invisible past the
-// carrier's public egress.
-var cgnetRange = func() *net.IPNet {
-	_, n, err := net.ParseCIDR("100.64.0.0/10")
-	if err != nil {
-		panic(err) // unreachable: literal
-	}
-	return n
-}()
-
-func throttleKey(ip string) string {
-	p := net.ParseIP(ip)
-	if p == nil {
-		return ip
-	}
-	if v4 := p.To4(); v4 != nil {
-		if v4.IsPrivate() || v4.IsLoopback() || cgnetRange.Contains(v4) {
-			return v4.String()
-		}
-		return fmt.Sprintf("%d.%d.%d.0", v4[0], v4[1], v4[2])
-	}
-	return p.Mask(net.CIDRMask(64, 128)).String()
-}
-
-// userHourBudget is one account's slow (hourly) failed-login budget: the
-// window anchor (start) and the failed-check count since it opened. A fail
-// at/after start+loginHourWindow re-anchors the window (count resets to 0),
-// so the budget is a rolling 1-hour total, not a fixed clock-aligned hour.
-type userHourBudget struct {
-	start time.Time
-	count int
-}
-
-// ensureThrottleMaps lazily initializes the throttle maps (cheap, idempotent).
-func (a *AuthState) ensureThrottleMaps() {
-	if a.loginThrottle.fails == nil {
-		a.loginThrottle.fails = map[string][]time.Time{}
-	}
-	if a.loginThrottle.lockout == nil {
-		a.loginThrottle.lockout = map[string]time.Time{}
-	}
-	if a.loginThrottle.userFails == nil {
-		a.loginThrottle.userFails = map[string][]time.Time{}
-	}
-	if a.loginThrottle.userLock == nil {
-		a.loginThrottle.userLock = map[string]time.Time{}
-	}
-	if a.loginThrottle.userHour == nil {
-		a.loginThrottle.userHour = map[string]*userHourBudget{}
-	}
-	if a.loginThrottle.knownGood == nil {
-		a.loginThrottle.knownGood = map[string]time.Time{}
-	}
-}
-
-// Throttle GC tuning. Vars, not consts, so tests
-// can exercise the cap paths without 100k-entry seeding.
-var (
-	throttleSweepThreshold = 1024
-	throttleSweepInterval  = 30 * time.Second
-	throttleHardCap        = 1 << 17
-)
-
-// beginAttempt atomically decides whether ip may run a credential check
-// NOW, and if so records the attempt in the SAME critical section — before
-// the caller runs bcrypt. Counting first is what closes the concurrency
-// bypass: the old check-then-KDF-then-record shape let N parallel requests
-// all pass loginAllowed before any of them recorded a failure, so a burst
-// ran the KDF N times (repro: 60 concurrent -> 59x 401). With the count
-// inside the lock, at most loginFailMax concurrent attempts can pass; the
-// rest get a fast 429 without touching the KDF.
-//
-// Returns (false, how-long-until-the-lockout-lifts) when the IP is locked
-// out or has exhausted its window; the caller answers 429 + Retry-After.
-// A failed attempt is NOT recorded again by the caller — it is already
-// counted here, for success OR failure alike (a success clears the counter
-// via loginSuccess).
-func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.ensureThrottleMaps()
-	now := time.Now()
-	// Opportunistic GC: see sweepThrottle. Rate-limited: a
-	// spray keeps every entry in-window, so the sweep prunes nothing while
-	// costing a full walk per login; it only needs to run often enough to
-	// reclaim entries AS the window ages, not per call.
-	//
-	// The trigger watches ALL THREE maps: userFails is keyed by the raw
-	// request username (up to the 1 MiB body limit), so a small IP pool
-	// rotating random usernames grows userFails while len(fails) stays far
-	// below the threshold — gating the sweep on the per-IP map alone left
-	// userFails unbounded. knownGood is the same class:
-	// loginSuccess DELETES the ip from fails and inserts it into knownGood,
-	// so successful logins from rotating source buckets (IPv6 /64s, XFF
-	// rotation behind a trusted proxy) grow knownGood while fails AND
-	// userFails hover near zero — the sweep never fired, and the 30-day-TTL
-	// map grew without bound.
-	if (len(a.loginThrottle.fails) > throttleSweepThreshold ||
-		len(a.loginThrottle.userFails) > throttleSweepThreshold ||
-		len(a.loginThrottle.knownGood) > throttleSweepThreshold) && !now.Before(a.loginThrottle.nextSweep) {
-		a.sweepThrottle(now)
-		a.loginThrottle.nextSweep = now.Add(throttleSweepInterval)
-		// Spray-proof memory bound: if a sweep still leaves a map huge
-		// (every entry fresh — a wide one-shot spray), drop ONLY that
-		// layer's throttle state. Each layer fails open on its own cap:
-		// a per-IP spray (>100k distinct sources) resets the per-IP maps,
-		// a username-rotation spray (>100k distinct names) resets the
-		// per-username maps, a successful-login spray resets knownGood.
-		// The layers must NOT wipe each other: the per-username maps are
-		// strictly bounded by the existing DB accounts (recordUserFail
-		// counts existing users only) and can hold an ACTIVE 30/hr
-		// account lockout — an all-or-nothing wipe let a per-IP spray
-		// clear the account lock and its hourly budget mid-attack.
-		// userHour is the same account-bounded class: it never trips the
-		// cap and is never wiped here. Chosen bound: 131072 entries ≈
-		// tens of MB worst case per map.
-		// History: docs/DECISIONS.md → throttle-edge-cases
-		if len(a.loginThrottle.fails) > throttleHardCap {
-			a.loginThrottle.fails = map[string][]time.Time{}
-			a.loginThrottle.lockout = map[string]time.Time{}
-		}
-		if len(a.loginThrottle.userFails) > throttleHardCap {
-			a.loginThrottle.userFails = map[string][]time.Time{}
-			a.loginThrottle.userLock = map[string]time.Time{}
-		}
-		if len(a.loginThrottle.knownGood) > throttleHardCap {
-			a.loginThrottle.knownGood = map[string]time.Time{}
-		}
-	}
-	if until, ok := a.loginThrottle.lockout[ip]; ok {
-		if now.Before(until) {
-			return false, until.Sub(now)
-		}
-		// Lockout elapsed: clear it and the stale failures.
-		delete(a.loginThrottle.lockout, ip)
-		delete(a.loginThrottle.fails, ip)
-	}
-	cutoff := now.Add(-loginFailWindow)
-	fails := a.loginThrottle.fails[ip]
-	kept := fails[:0]
-	for _, t := range fails {
-		if t.After(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	if len(kept) >= loginFailMax {
-		a.loginThrottle.lockout[ip] = now.Add(loginLockout)
-		a.loginThrottle.fails[ip] = kept
-		return false, loginLockout
-	}
-	// Counted NOW, before the KDF: this timestamp is the attempt itself.
-	a.loginThrottle.fails[ip] = append(kept, now)
-	return true, 0
-}
-
-// knownGoodKey keys the knownGood exemption by (username, ip bucket).
-// Usernames match usernameRe (letters, digits, . _ -) and ip buckets are
-// dotted/colon address strings, so neither side can contain \x00 and the
-// pair is collision-free.
-func knownGoodKey(username, ip string) string {
-	return username + "\x00" + ip
-}
-
-// loginSuccess clears all failure accounting for ip and marks
-// (username, ip) as known-good.
-func (a *AuthState) loginSuccess(username, ip string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.ensureThrottleMaps()
-	delete(a.loginThrottle.fails, ip)
-	delete(a.loginThrottle.lockout, ip)
-	// Mark this (username, IP bucket) pair known-good: a successful
-	// login is the signal that this is the operator (or a trusted
-	// client) for THAT account, so the per-username lockout must not
-	// block them on a later attempt. Scoped to the account — a success
-	// by any other user on the same shared IP must not exempt this one
-	// (see the knownGood field comment).
-	a.loginThrottle.knownGood[knownGoodKey(username, ip)] = time.Now()
-}
-
-// checkUserLock reports whether username is locked out by the per-username
-// fail counter — a multi-IP attacker that has exhausted the
-// account's budget. Returns (false, how-long-until-the-lockout-lifts) when
-// locked; the caller answers 429 + Retry-After. An elapsed lockout is
-// cleared here so the next attempt starts fresh.
-//
-// ipBucket is the request's throttle bucket (throttleKey of the client IP).
-// A (username, bucket) pair that has logged in successfully within
-// knownGoodTTL is EXEMPT from
-// the per-username lockout: the per-ACCOUNT layer
-// exists to stop a MULTI-IP botnet, but as a side effect it let a single LAN
-// host lock the operator out — 7 bad guesses for admin → 429 for 5 minutes,
-// even for the CORRECT password. Exempting a previously-successful
-// account/IP pair keeps
-// the operator's own device always able to get through while a new-IP
-// attacker is still hard-locked. The exemption does NOT touch the per-IP
-// budget (beginAttempt), so a known-good IP is still capped at loginFailMax
-// fails/60s. If the operator's IP is unknown (new device, a DHCP change),
-// the recovery path is the CLI: `pulsemon auth-user` runs out-of-band and is
-// not subject to the login throttle (see the file header).
-func (a *AuthState) checkUserLock(username, ipBucket string) (bool, time.Duration) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.ensureThrottleMaps()
-	now := time.Now()
-	// Known-good (username, IP bucket) pair: exempt from the per-username
-	// lockout (see knownGoodKey).
-	if t, ok := a.loginThrottle.knownGood[knownGoodKey(username, ipBucket)]; ok && now.Sub(t) < knownGoodTTL {
-		return true, 0
-	}
-	if until, ok := a.loginThrottle.userLock[username]; ok {
-		if now.Before(until) {
-			return false, until.Sub(now)
-		}
-		// Lockout elapsed: clear it and the stale failures.
-		delete(a.loginThrottle.userLock, username)
-		delete(a.loginThrottle.userFails, username)
-	}
-	return true, 0
-}
-
-// clearIPThrottle drops one bucket's per-IP failure accounting (fails +
-// lockout) without touching the per-username maps. The setup-success path
-// uses it to close out the dedicated "setup|ip" bucket: loginSuccess
-// records the (username, ip) known-good exemption under the BARE bucket
-// key (what checkUserLock looks up), so its own fails/lockout clear lands
-// on the login bucket and the setup bucket needs its own explicit clear.
-// History: docs/DECISIONS.md → throttle-edge-cases
-func (a *AuthState) clearIPThrottle(ip string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	delete(a.loginThrottle.fails, ip)
-	delete(a.loginThrottle.lockout, ip)
-}
-
-// recordUserFail counts ONE failed credential check against username (across
-// all source IPs — the per-username layer the per-IP throttle can't see) and
-// locks the account out when the in-window count reaches loginFailMax. Called
-// ONLY on a failed check, after the KDF ran; a success clears it via
-// clearUserFail, so typos that eventually succeed don't accumulate.
-func (a *AuthState) recordUserFail(username string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	a.ensureThrottleMaps()
-	now := time.Now()
-	// Fast layer: the rolling 60s window (unchanged).
-	cutoff := now.Add(-loginFailWindow)
-	fails := a.loginThrottle.userFails[username]
-	kept := fails[:0]
-	for _, t := range fails {
-		if t.After(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	kept = append(kept, now)
-	a.loginThrottle.userFails[username] = kept
-	// Slow layer: the hourly budget. It PERSISTS across rolling lockouts —
-	// checkUserLock's expiry wipes userFails (the rolling window) but NOT
-	// userHour, so a 7-fails/60s → 5-min burst repeated every 6 min (~70/hr)
-	// can't outrun the 30/hr cap. The window re-anchors by wall clock; >=
-	// (not >) so the budget is already reset the instant a 1h lockout lifts,
-	// never re-locking the account on the very next fail.
-	b := a.loginThrottle.userHour[username]
-	if b == nil {
-		b = &userHourBudget{}
-		a.loginThrottle.userHour[username] = b
-	}
-	if now.Sub(b.start) >= loginHourWindow {
-		b.start, b.count = now, 0
-	}
-	b.count++
-	// The hourly budget is the binding cap, so it outranks the rolling
-	// threshold: a paced attack that never trips 7/60s still locks at 30/hr.
-	// A rolling trip while UNDER the hourly cap takes the shorter 5-min
-	// lockout (the hourly counter keeps climbing in the background).
-	if b.count >= loginHourFailMax {
-		a.loginThrottle.userLock[username] = now.Add(loginHourLockout)
-	} else if len(kept) >= loginFailMax {
-		a.loginThrottle.userLock[username] = now.Add(loginLockout)
-	}
-}
-
-// clearUserFail clears the per-username fail accounting for username (a
-// successful login resets the account's budget).
-func (a *AuthState) clearUserFail(username string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	delete(a.loginThrottle.userFails, username)
-	delete(a.loginThrottle.userLock, username)
-	delete(a.loginThrottle.userHour, username)
-}
-
-// refundAttempt releases ONE counted admission (the timestamp
-// beginAttempt appended) when the caller discovers — BEFORE paying the
-// bcrypt KDF — that the check needn't run: the setup-mode bootstrap lost
-// the single-shot race (errBootstrappedEarly) or failed cheap validation.
-// Without refunds, ordinary traffic against a CLAIMED install would
-// accumulate toward the setup bucket's lockout while costing the server
-// nothing — throttling is for KDF cost, and no cost was paid. Best-effort:
-// it pops the most recent entry, which under concurrency may refund a
-// different same-IP attempt; the failure direction is at most one extra
-// admitted free attempt, never a false lockout. Caller must only refund
-// admissions beginAttempt ACCEPTED (returned ok).
-//
-// When a refund brings the count back UNDER loginFailMax it also clears any
-// lockout beginAttempt sets the 5-minute lockout the
-// instant the in-window count reaches loginFailMax, so a burst of
-// >loginFailMax no-KDF-cost requests that are all subsequently refunded
-// (browser double-submits, scripts hitting errBootstrappedEarly / invalid
-// usernames) would otherwise leave the IP locked out for the full lockout
-// despite paying zero KDF cost. The lockout is only ever set with
-// >= loginFailMax entries present, so dropping back under the threshold
-// means the IP no longer has enough real (KDF-cost) failures to justify it.
-// A genuine attacker who pays the KDF for loginFailMax failures never gets
-// those refunded, so their lockout is preserved.
-func (a *AuthState) refundAttempt(ip string) {
-	a.loginThrottle.Lock()
-	defer a.loginThrottle.Unlock()
-	f := a.loginThrottle.fails[ip]
-	if len(f) > 0 {
-		f = f[:len(f)-1]
-		a.loginThrottle.fails[ip] = f
-		if len(f) < loginFailMax {
-			delete(a.loginThrottle.lockout, ip)
-		}
-	}
-}
-
-// sweepThrottle drops throttle entries that can no longer affect a decision:
-// no unexpired lockout and no failure within the rolling window. It is called
-// opportunistically from beginAttempt once the maps grow past a threshold,
-// bounding memory under a multi-IP spray (one failed login per source IP,
-// where no single IP ever re-triggers its own prune). Caller must hold
-// a.loginThrottle.
-func (a *AuthState) sweepThrottle(now time.Time) {
-	cutoff := now.Add(-loginFailWindow)
-	for ip, ts := range a.loginThrottle.fails {
-		recent := false
-		for _, t := range ts {
-			if t.After(cutoff) {
-				recent = true
-				break
-			}
-		}
-		if recent {
-			continue
-		}
-		if until, ok := a.loginThrottle.lockout[ip]; ok && now.Before(until) {
-			continue // active lockout: keep
-		}
-		delete(a.loginThrottle.fails, ip)
-		delete(a.loginThrottle.lockout, ip)
-	}
-	// Per-username layer: same drop rule — no in-window failure
-	// and no active account lockout.
-	for u, ts := range a.loginThrottle.userFails {
-		recent := false
-		for _, t := range ts {
-			if t.After(cutoff) {
-				recent = true
-				break
-			}
-		}
-		if recent {
-			continue
-		}
-		if until, ok := a.loginThrottle.userLock[u]; ok && now.Before(until) {
-			continue // active lockout: keep
-		}
-		delete(a.loginThrottle.userFails, u)
-		delete(a.loginThrottle.userLock, u)
-	}
-	// Known-good IP buckets: drop entries older than
-	// knownGoodTTL, so a stale IP stops being exempt from the per-username
-	// lockout.
-	for ip, t := range a.loginThrottle.knownGood {
-		if now.Sub(t) > knownGoodTTL {
-			delete(a.loginThrottle.knownGood, ip)
-		}
-	}
-}
-
-// sessionWithinMaxAge reports whether the session is still within the
-// absolute authSessionMaxAge cap from its login time (s.created). Unlike
-// s.expiry — which ValidSession and SessionUser slide forward on every live
-// hit — created is fixed at login, so this is what bounds the total lifetime
-// of a continuously-active session. A session past the cap is rejected and
-// deleted by the caller even if its sliding expiry is still in the future.
-// Caller must hold a.mu.
-func (a *AuthState) sessionWithinMaxAge(s authSession) bool {
-	return time.Since(s.created) <= authSessionMaxAge
-}
-
-// SessionUser returns the username a live session belongs to, validating
-// the expiry (and deleting the entry if it has lapsed) so the result is
-// safe to use as an authorization check on its own. Like ValidSession it
-// re-checks the owner against the users table (TTL-cached): the in-memory
-// session map alone cannot see an out-of-band account deletion
-// and like ValidSession it slides the expiry on a
-// live hit: this is the validation path for
-// the gate-exempt /api/auth/status, so without the slide a
-// status-poll-only client would never extend its session. It also enforces
-// the absolute authSessionMaxAge cap, so a status-poll-only client (the
-// dashboard's /api/auth/status poll every few seconds) cannot be the thing
-// that slides a session past its login-time max age.
-func (a *AuthState) SessionUser(tok string) (string, bool) {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
-	if !ok || !time.Now().Before(s.expiry) || !a.sessionWithinMaxAge(s) {
-		delete(a.sessions, tok)
-		return "", false
-	}
-	if !a.userExistsCached(s.user) {
-		delete(a.sessions, tok)
-		return "", false
-	}
-	s.expiry = time.Now().Add(authSessionTTL)
-	a.sessions[tok] = s
-	return s.user, true
-}
-
-// CookieRenewalDue reports whether the session's browser cookie is old
-// enough to warrant a re-issue, and stamps cookieIssued=now when it is.
-// The cookie carries a fixed Max-Age=authSessionTTL set at login, so a
-// continuously-active user — whose in-memory expiry ValidSession slides on
-// every request — would still be logged out when the browser deletes the
-// cookie exactly TTL after login. Re-issuing once the cookie ages past
-// half the TTL keeps an active user's cookie at least half a TTL from its
-// browser-side expiry at all times, while an idle user's cookie and
-// session both lapse after TTL of inactivity (the intended sliding
-// behavior). The gate calls this after ValidSession and re-issues the
-// SAME token (no rotation) when it returns true — at most one Set-Cookie
-// per half-TTL of activity, never per request.
-//
-// The third return is the renewed cookie's lifetime: the full TTL, capped
-// at the session's REMAINING absolute lifetime (created +
-// authSessionMaxAge − now) Uncapped, a renewal near
-// the 30-day cap handed the browser a Max-Age=7d cookie for a session the
-// server rejects within a day: no security bypass (ValidSession/
-// SessionUser enforce the cap server-side), but the client believed it
-// held a fresh week-long session while every request was about to 401.
-// Capped, the browser drops the cookie when the session actually dies. A
-// session at/past the cap gets no renewal at all.
-func (a *AuthState) CookieRenewalDue(tok string) (due bool, pinSecure bool, maxAge time.Duration) {
-	if tok == "" {
-		return false, false, 0
-	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
-	if !ok || !time.Now().Before(s.expiry) {
-		return false, false, 0
-	}
-	maxAge = authSessionTTL
-	if rem := s.created.Add(authSessionMaxAge).Sub(time.Now()); rem < maxAge {
-		maxAge = rem
-	}
-	if maxAge <= 0 {
-		return false, s.cookieSecure, 0
-	}
-	if time.Since(s.cookieIssued) < authSessionTTL/2 {
-		return false, s.cookieSecure, maxAge
-	}
-	s.cookieIssued = time.Now()
-	a.sessions[tok] = s
-	return true, s.cookieSecure, maxAge
-}
-
-// DropSession removes one session (logout).
-func (a *AuthState) DropSession(tok string) {
-	a.mu.Lock()
-	delete(a.sessions, tok)
-	a.mu.Unlock()
-}
-
-func (a *AuthState) dropUserSessions(username string) {
-	a.mu.Lock()
-	for tok, s := range a.sessions {
-		if s.user == username {
-			delete(a.sessions, tok)
-		}
-	}
-	a.mu.Unlock()
-}
-
-func (a *AuthState) dropUserSessionsExcept(username, keepTok string) {
-	a.mu.Lock()
-	for tok, s := range a.sessions {
-		if s.user == username && tok != keepTok {
-			delete(a.sessions, tok)
-		}
-	}
-	a.mu.Unlock()
-}
-
 // Disable removes ALL users, opening the dashboard again.
 func (a *AuthState) Disable() error {
 	if err := a.db.RemoveAllUsers(); err != nil {
@@ -1677,827 +737,4 @@ func (a *AuthState) Disable() error {
 	a.refreshEnabledNow()    // all users gone — open the dashboard immediately
 	log.Println("Dashboard authentication disabled (all users removed)")
 	return nil
-}
-
-// newSessionToken returns an opaque random session id (base64url, 192 bits
-// of entropy — it lives only in the cookie and the in-memory map).
-func newSessionToken() (string, error) {
-	buf := make([]byte, 24)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
-}
-
-// ---------- handlers ----------
-
-type authStatusPayload struct {
-	Enabled bool   `json:"enabled"`
-	Authed  bool   `json:"authed"`
-	User    string `json:"user,omitempty"`
-	// Bootstrapped distinguishes the two "off" states for the UI: a
-	// fresh install (no account has ever existed) offers the bootstrap
-	// button, an operator-disabled install (flag set) must show the CLI
-	// re-enable hint instead — unauthenticated account creation is
-	// refused server-side there.
-	Bootstrapped bool `json:"bootstrapped,omitempty"`
-}
-
-// authUserCtxKey is the request-context key for the authenticated
-// username, stashed by authGate after ValidSession succeeds. Handlers
-// read it via sessionFrom, which avoids the second SessionUser lookup
-// (and its second expiry slide) that the old per-handler cookie re-read
-// performed.
-type authUserCtxKey int
-
-const authUserCtxKeyVal authUserCtxKey = 0
-
-func authUserFromContext(r *http.Request) string {
-	if u, ok := r.Context().Value(authUserCtxKeyVal).(string); ok {
-		return u
-	}
-	return ""
-}
-
-// sessionFrom returns the username the request's session belongs to
-// ("" when there is no live session).
-//
-// The fast path reads the username authGate stashed in the request
-// context (one SessionUser lookup per request, not three). The cookie
-// fallback covers routes that bypass authGate (tests, /api/auth/status
-// which is gate-exempt).
-func (s *Server) sessionFrom(r *http.Request) string {
-	if u := authUserFromContext(r); u != "" {
-		return u
-	}
-	c, err := r.Cookie(authSessionName)
-	if err != nil {
-		return ""
-	}
-	user, ok := s.auth.SessionUser(c.Value)
-	if !ok {
-		return ""
-	}
-	return user
-}
-
-func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	user := s.sessionFrom(r)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{
-		Enabled:      s.auth.Enabled(),
-		Authed:       user != "",
-		User:         user,
-		Bootstrapped: s.auth.Bootstrapped(),
-	})
-}
-
-// handleAuthLogin is the only unauthenticated credential-checking endpoint,
-// so its DoS surface is the per-IP throttle PLUS the per-username account
-// budget, not a global concurrency cap.
-//
-// Security-review note (deliberate, do NOT "fix" with a NON-BLOCKING in-flight
-// bcrypt semaphore): the single-attacker vector is already closed — beginAttempt
-// counts the attempt inside the throttle lock BEFORE any bcrypt runs, so at
-// most loginFailMax concurrent attempts can reach the KDF (7 fails/60s -> 5
-// min lockout, plus a constant 200ms delay on every 401 capping ~5
-// guesses/s/IP), and ClientIP keys the throttle to the TCP peer (a spoofed
-// X-Forwarded-For from an untrusted peer is ignored), so the counter cannot
-// be rotated to dodge the lockout. The residual is a MULTI-source-IP botnet —
-// the classic per-IP-limit bypass — which is OUT of this tool's threat model
-// (single-operator LAN dashboard, not an anonymous internet endpoint; see the
-// file header). For the internet-facing case, this adds the two hardenings
-// that note below calls for: (1) a BLOCKING bcrypt semaphore
-// (bcryptSem, capacity runtime.NumCPU) that QUEUES excess KDFs rather than
-// rejecting them — the operator's login waits for a free core instead of
-// failing, which is the exact regression a non-blocking (select/default ->
-// 429) variant would cause — and (2) a per-USERNAME fail counter
-// (checkUserLock/recordUserFail) that accumulates failures for one account
-// across ALL source IPs, so a /48-spraying attacker can't dodge the per-IP
-// budget by rotating addresses. A connection cap / fail2ban at the reverse
-// proxy (PULSEMON_TRUSTED_PROXIES already anticipates) remains the outermost
-// layer.
-func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var req struct {
-		Username string `json:"username"`
-		Password string `json:"password"`
-	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		// Route through the shared mapper like every other JSON handler:
-		// an oversized body (authGate's MaxBytesReader) is a 413, any other
-		// decode error a 400.
-		code, msg := requestBodyErr(err)
-		respondWithError(w, code, msg)
-		return
-	}
-	if req.Username == "" || req.Password == "" {
-		// Missing credentials: 400, and NOT counted against the
-		// login throttle — these never run the bcrypt KDF, so they're not a
-		// credential attempt (and not an online-cracking vector).
-		respondWithError(w, http.StatusBadRequest, "username and password required")
-		return
-	}
-	if len(req.Username) > maxUsernameLen || len(req.Password) > 72 {
-		// Structurally unmatchable AddUserMode enforces
-		// both bounds at creation, so no account can carry a longer name,
-		// and bcrypt rejects inputs over 72 bytes — a longer password can
-		// never verify. Reject in the SAME category as empty credentials:
-		// no KDF will run, so it is not a credential attempt — 400,
-		// uncharged, and critically BEFORE the ToLower, the checkUserLock
-		// map hash, and the userExists SQL binding that an unauthenticated
-		// attacker used to pay 1 MiB per request (the setup route already
-		// rejects these pre-KDF via the AddUserMode sentinels).
-		if len(req.Username) > maxUsernameLen {
-			respondWithError(w, http.StatusBadRequest, fmt.Sprintf("username exceeds %d characters", maxUsernameLen))
-		} else {
-			respondWithError(w, http.StatusBadRequest, "password exceeds 72 bytes")
-		}
-		return
-	}
-
-	// Per-IP failure throttle: reject a locked-out client FAST, before any
-	// bcrypt work (the KDF is the expensive part, and a locked-out attacker
-	// shouldn't get to run it at all). beginAttempt counts the attempt in
-	// the SAME locked section that admits it — a failed attempt is NOT
-	// recorded again below, it is already counted here.
-	// The throttle is bucketed, not keyed on the full address: private and
-	// loopback IPv4 per host (/32 — LAN devices are distinct hosts, and a
-	// shared /24 budget let one client lock out the whole homelab subnet),
-	// other IPv4 by /24 (an attacker rotating within a /24 stays in one
-	// bucket), IPv6 by /64 (one host owns a whole /64 via
-	// privacy-extension rotation, so per-address keying handed it 2^64
-	// separate budgets). ip
-	// stays the full address for log lines.
-	ip := s.auth.ClientIP(r)
-	key := throttleKey(ip)
-	if ok, wait := s.auth.beginAttempt(key); !ok {
-		respondThrottled(w, wait, "too many failed login attempts — try again in a few minutes")
-		return
-	}
-
-	// Per-username lockout: the per-IP throttle above can't see
-	// a multi-IP attacker hammering one account, so this second gate checks
-	// the account's own failure budget. It runs AFTER the per-IP gate so a
-	// single locked IP gets its 429 first (no extra KDF, no account counter
-	// touched). A locked account gets a 429 too — the KDF is skipped, so the
-	// account counter is not incremented by the rejection.
-	userKey := strings.ToLower(req.Username)
-	if ok, wait := s.auth.checkUserLock(userKey, key); !ok {
-		// Refund the per-IP admission beginAttempt appended:
-		// the account lockout rejects BEFORE the KDF, so no
-		// cost was paid — the same refund contract the setup-bootstrap path
-		// already honors ("throttling is for KDF cost"). Without it, an
-		// attacker who locks the account from IP A also locks out every
-		// fresh-IP client (new device / DHCP change — no known-good
-		// exemption) that clicks "Sign In" loginFailMax times while
-		// staring at the 429: the requests that never ran a KDF burn that
-		// IP's budget and trip its own 5-minute lockout. refundAttempt's
-		// n6 arm also clears a lockout the appends already tripped.
-		s.auth.refundAttempt(key)
-		respondThrottled(w, wait, "too many failed login attempts — try again in a few minutes")
-		return
-	}
-
-	t0 := time.Now()
-	tok, ok := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
-	if !ok {
-		// Client already gone (disconnected while queued on bcryptSem): a
-		// disconnect is not a failed password
-		// attempt, so it must not burn the account's failure budget, and
-		// the rejection delay buys nothing for a response nobody reads.
-		// Live clients take the full path below, so the timing equalizer
-		// is untouched.
-		if r.Context().Err() != nil {
-			// Refund the per-IP admission beginAttempt appended — but
-			// ONLY when the KDF never ran: a queued-
-			// then-canceled call returns in microseconds (the ctx.Done
-			// select), a canceled call that still paid the KDF (disconnect
-			// DURING bcrypt, which is ctx-ignoring) took bcrypt time.
-			// kdfCostFloor separates the two. Refunding the paid case
-			// would hand a scripted attacker an unbounded per-IP guessing
-			// channel (abort mid-KDF → budget refunded → re-spray, capped
-			// only by the global semaphore) — the refund contract is
-			// "throttling is for KDF cost", the exact split the setup-mode
-			// path draws ("the in-tx bootstrap race loss DID pay the
-			// KDF — it is deliberately not refunded").
-			if time.Since(t0) < kdfCostFloor {
-				s.auth.refundAttempt(key)
-			}
-			return
-		}
-		// Count the failure against the account (across all IPs) — the
-		// per-username layer the per-IP budget can't see.
-		// EXISTING accounts only: a failure for a name with no account
-		// protects nothing (the dummy-hash equalizer already hides the
-		// distinction from the client), and the username is
-		// attacker-chosen — counting it let a small IP pool rotate random
-		// names and grow userFails without bound. The
-		// point query runs on the cold failure path (throttled + 200 ms
-		// delay), sub-millisecond against the KDF + delay, so it adds no
-		// timing oracle.
-		if s.auth.userExists(userKey) {
-			s.auth.recordUserFail(userKey)
-		}
-		// Constant-time-ish delay on rejection: equalizes response time across
-		// the unknown-user / wrong-password paths (closes the timing oracle)
-		// and caps an online attacker at ~5 guesses/second per IP. The
-		// attempt was already counted by beginAttempt before the KDF.
-		time.Sleep(loginSlowDown)
-		respondWithError(w, http.StatusUnauthorized, "invalid username or password")
-		return
-	}
-	s.auth.loginSuccess(userKey, key)
-	s.auth.clearUserFail(userKey) // success resets the account's budget
-	s.setAuthCookie(w, r, tok, false)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
-}
-
-func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	if c, err := r.Cookie(authSessionName); err == nil {
-		s.auth.DropSession(c.Value)
-	}
-	s.setAuthCookie(w, r, "", false)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false, Bootstrapped: s.auth.Bootstrapped()})
-}
-
-// requireAuth runs h only for a valid session; otherwise 401 — but only
-// while authentication is enabled. With auth off the dashboard is fully
-// open, and creating the FIRST account (the bootstrap) happens through
-// exactly these endpoints: the "Create First Account" button in Settings
-// and, once the first user exists, normal user management.
-func (s *Server) requireAuth(h http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if s.auth.Enabled() && s.sessionFrom(r) == "" {
-			respondWithError(w, http.StatusUnauthorized, "authentication required")
-			return
-		}
-		h(w, r)
-	}
-}
-
-// requireAdmin runs h only for a valid session that holds the admin flag:
-// 401 when there is no session, 403 for a non-admin — but only while
-// authentication is enabled. With auth off the dashboard is fully open
-// (the "auth off = fully open" contract), so the admin gate stands down
-// with the auth gate, exactly like requireAuth. Applied to the mutating
-// admin surface (self-update, settings incl. test, TLS cert/key,
-// wipe-all-history): a regular account is meant to be lower-trust and
-// must not be able to swap the binary, repoint alerts, change certs, or
-// wipe data (IsAdmin was previously checked
-// only on the user-management handlers).
-func (s *Server) requireAdmin(h http.HandlerFunc) http.HandlerFunc {
-	return s.requireAuth(func(w http.ResponseWriter, r *http.Request) {
-		if s.auth.Enabled() && !s.auth.IsAdmin(s.sessionFrom(r)) {
-			respondWithError(w, http.StatusForbidden, "admin only")
-			return
-		}
-		h(w, r)
-	})
-}
-
-func (s *Server) handleAuthUsers(w http.ResponseWriter, r *http.Request) {
-	switch r.Method {
-	case http.MethodGet:
-		// requireAuth wraps this route (see routes()). The FULL roster
-		// (every username/created_at/is_admin) is admin-facing data — the
-		// users panel that consumes it is admin-gated, and the client
-		// hiding the panel was never a server gate.
-		// A non-admin session sees only its own row.
-		users, err := s.db.ListUsers()
-		if err != nil {
-			respondInternal(w, "list users", err)
-			return
-		}
-		if caller := s.sessionFrom(r); !s.auth.IsAdmin(caller) {
-			mine := make([]store.AuthUser, 0, 1)
-			for _, u := range users {
-				if u.Username == caller {
-					mine = append(mine, u)
-				}
-			}
-			users = mine
-		}
-		respondWithJSON(w, http.StatusOK, users)
-	case http.MethodPost:
-		var req struct {
-			Username string `json:"username"`
-			Password string `json:"password"`
-			// Required on the ADMIN-ADD path only (external review L1,
-			// 2026-11-23): the session minting a new account must prove
-			// it is its owner. Ignored in setup mode (there is no
-			// session by definition) — the field is optional there.
-			Current string `json:"current_password"`
-		}
-		dec := json.NewDecoder(r.Body)
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			code, msg := requestBodyErr(err)
-			respondWithError(w, code, msg)
-			return
-		}
-		// setupMode mirrors the fresh-install gate: unauthenticated
-		// POSTs only reach here while Enabled() is false (TTL-cached),
-		// so the in-tx user_count is the real arbiter
-		// An authenticated admin add is never setup mode.
-		//
-		// Key setup off a VALID session (sessionFrom), not raw cookie
-		// presence: a stale pulsemon_session cookie (30-day TTL, or one
-		// replayed via curl) would make setup=false and 403 the
-		// legitimate "Create First Account" bootstrap. sessionFrom
-		// returns "" for dead tokens (the F1 user-table re-check), so
-		// an invalid cookie counts as unauthenticated.
-		//
-		// Unauthenticated bootstrap is a FRESH-INSTALL surface only
-		// (mirrors the outer gate in api.go): once auth_bootstrapped is
-		// set, an intentionally-disabled install stays fully open, but
-		// account creation is the one open-mode operation with a
-		// lockout consequence — the new account is admin and
-		// re-enables auth server-wide, so any LAN client could lock
-		// the operator out. Re-enable from the CLI:
-		// `pulsemon auth-user add`.
-		caller := s.sessionFrom(r)
-		setup := !s.auth.Enabled() && caller == "" && !s.auth.Bootstrapped()
-		// Account creation is an admin operation: the setup-mode
-		// bootstrap (unauthenticated, first user) stays open, but an
-		// authenticated NON-admin session cannot mint accounts —
-		// otherwise a shared/compromised helper account grows its own
-		// persistence (admin-flag fix).
-		if !setup && !s.auth.IsAdmin(caller) {
-			respondWithError(w, http.StatusForbidden, "admin only")
-			return
-		}
-		// External review L1 (2026-11-23): account creation is the
-		// sharpest stolen-cookie primitive — a backdoor account mints
-		// persistence that survives password rotation and every recovery
-		// short of a reinstall — so an authenticated add requires the
-		// session's own current password (same helper, same throttle
-		// semantics as the password endpoint). The non-admin 403 above
-		// runs FIRST, so a helper session never reaches the KDF; the
-		// setup-mode bootstrap stays open (no session exists by
-		// definition).
-		if !setup && !s.reauthCurrentPassword(w, r, caller, req.Current) {
-			return
-		}
-		// Throttle the setup path: an unauthenticated
-		// setup POST pays a bcrypt KDF on every admitted request, so an
-		// install left unclaimed was an unlimited-KDF-CPU endpoint for any
-		// LAN host. Same bucket machinery as login, on a dedicated
-		// "setup|ip" key so it neither locks the operator's LOGIN bucket
-		// nor is diluted by it. Attempts that never reached the KDF are
-		// refunded below; a successful bootstrap clears the bucket.
-		var setupKey, ipKey string
-		if setup {
-			ipKey = throttleKey(s.auth.ClientIP(r))
-			setupKey = "setup|" + ipKey
-			if ok, wait := s.auth.beginAttempt(setupKey); !ok {
-				respondThrottled(w, wait, "too many setup attempts — try again in a few minutes")
-				return
-			}
-		}
-		if err := s.auth.AddUserMode(r.Context(), req.Username, req.Password, setup); err != nil {
-			// Refund the setup admission for exactly the no-KDF-cost
-			// rejections (setupNoKDF): cheap validation, the early
-			// bootstrap pre-check, and a client that left while QUEUED on
-			// the bcrypt semaphore (AddUserMode returns ctx.Err() before
-			// the KDF starts). "Throttling is for KDF cost" — none of
-			// these paid it. An in-tx bootstrap race loss DID pay the KDF
-			// (bcrypt runs to completion and ignores ctx) — it is
-			// deliberately NOT refunded, even when the client disconnected
-			// mid-KDF: refunding the paid case would hand a scripted
-			// attacker an unbounded per-IP guessing channel (abort
-			// mid-KDF → budget refunded → re-spray, capped only by the
-			// global semaphore).
-			if setup && setupNoKDF(err) {
-				s.auth.refundAttempt(setupKey)
-			}
-			// Client gone: drop the response (the write would be a no-op
-			// anyway) — the refund decision above already ran, and a
-			// disconnected client owes no delay.
-			if r.Context().Err() != nil {
-				return
-			}
-			// Only the duplicate-account and validation cases are client
-			// errors; any other failure (db, KDF) is a 500 with the detail
-			// logged. Validation sentinels (incl. the 72-byte bcrypt limit)
-			// are 400, not 500. A lost setup-mode
-			// bootstrap race is a 409: the winner's account already
-			// exists.
-			if errors.Is(err, errUserExists) || errors.Is(err, errUsernameInvalid) ||
-				errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
-				errors.Is(err, errPasswordCommon) {
-				respondWithError(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			if errors.Is(err, errBootstrapped) {
-				respondWithError(w, http.StatusConflict, err.Error())
-				return
-			}
-			respondInternal(w, "add user", err)
-			return
-		}
-		if setup {
-			// Record the known-good exemption under the BARE IP bucket —
-			// the same key checkUserLock looks up. (The "setup|" key is
-			// the admission bucket only; a knownGood entry suffixed with
-			// it never matches, so the operator's first post-bootstrap
-			// login from that IP would get no per-username exemption —
-			// a spray landing during bootstrap would lock them out of
-			// their own new account.)
-			s.auth.loginSuccess(strings.ToLower(req.Username), ipKey)
-			// loginSuccess's own fails/lockout clear targets the key it
-			// was passed (the login bucket); close out the dedicated
-			// setup bucket itself.
-			s.auth.clearIPThrottle(setupKey)
-		}
-		respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
-	default:
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-	}
-}
-
-// reauthCurrentPassword verifies that the session caller still knows their
-// own password before a destructive account operation proceeds (external
-// review L1, 2026-11-23: a stolen session cookie must not win
-// account-level decisions — the same threat model handleAuthUserPassword
-// already applies to password changes). It mirrors that handler's
-// credential-check semantics exactly, so every reauth surface gets the
-// same guarantees at once:
-//
-//   - empty or >72-byte input is a 400 NOT counted against the throttle
-//     (no KDF ran — same uncharged category as the login gate's
-//     empty-credential reject);
-//   - the check runs through the per-IP login throttle (beginAttempt)
-//     AND the shared per-username failure budget (checkUserLock), so a
-//     session holder spraying current_password from many /64 IPs locks
-//     the account exactly like a login spray, and a locked account 429s
-//     on every reauth surface;
-//   - a wrong password pays the same constant rejection delay as a
-//     rejected login and counts against the account's budget;
-//   - a correct one clears the caller's failure streak, so a legitimate
-//     reauth never consumes the operator's lockout budget.
-//
-// `caller` must be the SESSION user (s.sessionFrom(r)) — reauth is
-// always "prove you are who this session says you are", never the
-// password of the target account (the deleted/disabled one). Returns
-// true when the operation may proceed; false when a response was
-// already written.
-func (s *Server) reauthCurrentPassword(w http.ResponseWriter, r *http.Request, caller, current string) bool {
-	if current == "" {
-		respondWithError(w, http.StatusBadRequest, "current password required")
-		return false
-	}
-	if len(current) > 72 {
-		// bcrypt rejects inputs over 72 bytes: a longer current
-		// password can never verify (same category and text as the
-		// login gate).
-		respondWithError(w, http.StatusBadRequest, errPasswordTooLong.Error())
-		return false
-	}
-	// Per-IP failure throttle, identical bucketing to login: this
-	// endpoint verifies a real password, so it must carry the same
-	// 7-failures/60s → 5-minute lockout. beginAttempt counts the
-	// attempt in the same locked section that admits it (a failure is
-	// not recorded again below).
-	ip := s.auth.ClientIP(r)
-	key := throttleKey(ip)
-	if ok, wait := s.auth.beginAttempt(key); !ok {
-		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
-		return false
-	}
-	// Per-username lockout (mirror of /api/auth/login): the per-IP gate
-	// above can't see a multi-IP holder of a valid session (stolen
-	// cookie, unlocked browser — the session is a bearer token, usable
-	// from any number of sources) spraying current_password, so the
-	// account's shared failure budget applies here too. Runs AFTER the
-	// per-IP gate so a single locked IP gets its 429 first; the KDF is
-	// skipped on the 429, so the account counter is not incremented by
-	// the rejection.
-	if ok, wait := s.auth.checkUserLock(caller, key); !ok {
-		// Refund the per-IP admission: no KDF ran (mirror of the login
-		// path) — 429-only requests must not burn the caller's per-IP
-		// budget and self-lock a fresh IP holding a valid session.
-		s.auth.refundAttempt(key)
-		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
-		return false
-	}
-	t0 := time.Now()
-	if _, ok := s.auth.VerifyUser(r.Context(), caller, current); !ok {
-		// Client gone while queued on bcryptSem: a disconnect is not a
-		// failed current_password attempt — skip the failure budget and
-		// the rejection delay. Refund the per-IP admission ONLY for the
-		// zero-KDF-cost case (queued-then-canceled returns in
-		// microseconds; a disconnect DURING the ctx-ignoring KDF paid
-		// it and stays counted) — same split as the login path.
-		if r.Context().Err() != nil {
-			if time.Since(t0) < kdfCostFloor {
-				s.auth.refundAttempt(key)
-			}
-			return false
-		}
-		// Count the failure against the account (across all IPs) — the
-		// same shared budget login uses. The caller holds a live
-		// session, so the account exists by construction — no
-		// userExists gate needed (unlike the login path, where the
-		// username is attacker-chosen).
-		s.auth.recordUserFail(caller)
-		// Constant-time-ish delay on rejection, same as a rejected
-		// login: caps an online attacker at ~5 guesses/second per IP.
-		// The attempt was already counted by beginAttempt before the
-		// KDF.
-		time.Sleep(loginSlowDown)
-		respondWithError(w, http.StatusForbidden, "current password incorrect")
-		return false
-	}
-	s.auth.loginSuccess(caller, key)
-	s.auth.clearUserFail(caller) // success resets the account's budget
-	return true
-}
-
-// handleAuthUserPassword changes the password of the CALLER's own account
-// only (the {username} in the path must match the session's user — anyone
-// else gets 404, not 403, so the endpoint doesn't even confirm other
-// usernames exist).
-//
-// The CURRENT password is required: without
-// it, any valid session — a stolen cookie, an unlocked browser left on
-// the 30-day session — could set a new password, and SetUserPassword's
-// dropUserSessionsExcept would then log out every other session, so the
-// real owner was permanently locked out (account takeover). The check
-// runs through the login throttle (beginAttempt, same per-IP bucketing)
-// with the same constant rejection delay, so the endpoint is not a free
-// online-guessing channel for the current password either — and through
-// the SAME per-username failure budget as /api/auth/login:
-// a session holder spraying current_password across many
-// IPs (/64 buckets) locks the account just like a login spray, and a
-// locked account 429s on BOTH endpoints (shared userFails/userLock maps).
-func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	caller := s.sessionFrom(r)
-	user := strings.ToLower(r.PathValue("username"))
-	if user != caller {
-		respondWithError(w, http.StatusNotFound, "not found")
-		return
-	}
-	var req struct {
-		Current  string `json:"current_password"`
-		Password string `json:"password"`
-	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		code, msg := requestBodyErr(err)
-		respondWithError(w, code, msg)
-		return
-	}
-	if req.Current == "" || req.Password == "" {
-		// Malformed, not a credential attempt — same treatment as login's
-		// empty-credentials path: 400, and NOT counted against the throttle
-		// (no KDF ran, so it's not an online-cracking vector).
-		respondWithError(w, http.StatusBadRequest, "current password and new password required")
-		return
-	}
-	if len(req.Password) < minPasswordLen {
-		// Structurally doomed (parity with the login
-		// gate's empty-credential reject): SetUserPassword enforces the
-		// same floor, so this request can never succeed — reject in the
-		// empty-credential category (400, uncharged) BEFORE beginAttempt
-		// and before the KDF on req.Current that the old order paid first.
-		// Same sentinel text as the SetUserPassword 400 it replaces.
-		respondWithError(w, http.StatusBadRequest, errPasswordWeak.Error())
-		return
-	}
-	if isCommonPassword(req.Password) {
-		// Structurally doomed (same category as the min-length
-		// pre-rejection above): SetUserPassword enforces the same
-		// blocklist AddUser applies at creation, so this request can
-		// never succeed — reject (400, uncharged) BEFORE beginAttempt
-		// and before the KDF on req.Current. Same sentinel text as the
-		// SetUserPassword 400 it replaces.
-		respondWithError(w, http.StatusBadRequest, errPasswordCommon.Error())
-		return
-	}
-	if len(req.Password) > 72 {
-		// bcrypt rejects inputs over 72 bytes: a longer new password can
-		// never be stored. Same category, same text as the login gate.
-		// (The current-password half of this check lives in
-		// reauthCurrentPassword below.)
-		respondWithError(w, http.StatusBadRequest, errPasswordTooLong.Error())
-		return
-	}
-
-	// Credential check (reauth): per-IP throttle, per-username lockout,
-	// constant rejection delay, failure budget, success clear — all in
-	// one shared helper so this endpoint and the destructive-account
-	// endpoints (L1) can never drift apart in throttle semantics.
-	if !s.reauthCurrentPassword(w, r, user, req.Current) {
-		return
-	}
-
-	keep := ""
-	if c, err := r.Cookie(authSessionName); err == nil {
-		keep = c.Value
-	}
-	if err := s.auth.SetUserPassword(r.Context(), user, req.Password, keep); err != nil {
-		// Client gone while queued on bcryptSem:
-		// nothing left to tell.
-		if r.Context().Err() != nil {
-			return
-		}
-		// Only the validation sentinels are client errors; any other
-		// failure (db, KDF) is a 500 with the detail logged — a raw
-		// driver string (e.g. "database is locked") is not a client
-		// fault and must not be echoed back as a 400 (same pattern as AddUser).
-		if errors.Is(err, errPasswordWeak) || errors.Is(err, errPasswordTooLong) ||
-			errors.Is(err, errPasswordCommon) {
-			respondWithError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		respondInternal(w, "change password", err)
-		return
-	}
-	respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodDelete {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	// Removing an account is an admin operation (the UI offers it to
-	// admins only). Self-removal is allowed — the last-user guard in
-	// db.RemoveUser stops it from ever locking the install out, and
-	// removing the last admin promotes the oldest remaining user.
-	//
-	// External review L1 (2026-11-23): like every destructive account
-	// operation, a delete requires the session's own current password —
-	// a stolen cookie must not be able to erase accounts (including the
-	// real owner's, the clearest takeover tell).
-	var req struct {
-		Current string `json:"current_password"`
-	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		code, msg := requestBodyErr(err)
-		respondWithError(w, code, msg)
-		return
-	}
-	if !s.reauthCurrentPassword(w, r, s.sessionFrom(r), req.Current) {
-		return
-	}
-	user := strings.ToLower(r.PathValue("username"))
-	if err := s.auth.RemoveUser(r.Context(), user); err != nil {
-		// A name that doesn't exist is a 404 — the same policy as the
-		// password endpoint (unknown username → 404, not 403, so the
-		// endpoint doesn't confirm which names exist). Checked before
-		// the last-user guard so a mistyped name in a single-user
-		// install is 404, not 400. This used to report SUCCESS for a
-		// nonexistent user.
-		if errors.Is(err, store.ErrUserNotFound) {
-			respondWithError(w, http.StatusNotFound, err.Error())
-			return
-		}
-		// The last-user guard is a client-facing business rule (400);
-		// any other failure (db) is a 500 with the detail logged — a
-		// raw driver string is not a client fault (same pattern as AddUser).
-		if errors.Is(err, store.ErrLastUser) {
-			respondWithError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		respondInternal(w, "delete user", err)
-		return
-	}
-	respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
-}
-
-// handleAuthDisable removes every user, opening the dashboard. The
-// operator's own session dies with the last user, so the UI re-shows the
-// login gate — which, with zero users, immediately becomes the open
-// dashboard. The route is registered with requireAdmin.
-//
-// External review L1 (2026-11-23): disabling auth is a silent posture
-// downgrade (the dashboard goes open to the network, and if the operator
-// has allow_unauth_update set, self-update follows), so it requires the
-// session's own current password — a stolen cookie must not be able to
-// strip the credential gate from under the operator's feet.
-func (s *Server) handleAuthDisable(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
-		return
-	}
-	var req struct {
-		Current string `json:"current_password"`
-	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
-		code, msg := requestBodyErr(err)
-		respondWithError(w, code, msg)
-		return
-	}
-	if !s.reauthCurrentPassword(w, r, s.sessionFrom(r), req.Current) {
-		return
-	}
-	if err := s.auth.Disable(); err != nil {
-		respondInternal(w, "disable auth", err)
-		return
-	}
-	s.setAuthCookie(w, r, "", false)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: false, Authed: false, Bootstrapped: true})
-}
-
-// setAuthCookie sets (or, with an empty value, clears) the session cookie.
-// A clear uses a past Expires so the browser drops the cookie outright
-// (the value alone is not enough — an empty-valued cookie with a future
-// expiry is retained by some browsers). Secure is applied on HTTPS
-// requests — including plain-HTTP requests arriving from a trusted
-// TLS-terminating reverse proxy (see cookieSecure) — so a proxied install
-// never hands the session token to a plaintext hop. On a direct plain-HTTP
-// LAN install it is omitted so the dashboard keeps working.
-// pinSecure carries the session's mint-time Secure decision through
-// renewals (see authSession.cookieSecure); callers that are not renewing
-// an existing session pass false and the attribute is computed from this
-// request alone.
-func (s *Server) setAuthCookie(w http.ResponseWriter, r *http.Request, value string, pinSecure bool) {
-	s.setAuthCookieLifetime(w, r, value, pinSecure, authSessionTTL)
-}
-
-// setAuthCookieLifetime is setAuthCookie with an explicit cookie lifetime:
-// session-cookie RENEWALS pass the CookieRenewalDue-capped lifetime so a
-// renewal near the absolute session cap cannot advertise a full-TTL cookie
-// for a session about to die.
-func (s *Server) setAuthCookieLifetime(w http.ResponseWriter, r *http.Request, value string, pinSecure bool, lifetime time.Duration) {
-	expires := time.Now().Add(lifetime)
-	maxAge := int(lifetime.Seconds())
-	if value == "" {
-		expires = time.Unix(0, 0) // past: delete the cookie
-		maxAge = 0                // Max-Age=0: delete NOW. (Not -1 — a
-		// negative MaxAge OMITS the attribute in Go's http.Cookie,
-		// leaving only the 1970 Expires.)
-	}
-	// Both Expires and Max-Age are sent: RFC 6265 §5.3 gives Max-Age
-	// precedence, and it is relative to the client's receipt time — an
-	// absolute Expires computed from the SERVER clock is mishandled by a
-	// client whose clock runs ahead (unsynced homelab Pi): a "future"
-	// expiry can already be in the client's past, so the browser drops
-	// the session cookie immediately after a successful login.
-	http.SetCookie(w, &http.Cookie{
-		Name:     authSessionName,
-		Value:    value,
-		Path:     "/",
-		Domain:   "",
-		Expires:  expires,
-		MaxAge:   maxAge,
-		Secure:   pinSecure || s.cookieSecure(r),
-		HttpOnly: true,
-		SameSite: http.SameSiteStrictMode,
-	})
-}
-
-// cookieSecure reports whether the session cookie should carry the Secure
-// flag: always over TLS, and — for a TLS-terminating reverse proxy — when
-// the immediate TCP peer is in PULSEMON_TRUSTED_PROXIES and reports the
-// original scheme as https. The header is only trusted from a peer we've
-// explicitly whitelisted (the same rule ClientIP uses for X-Forwarded-For),
-// so a direct attacker cannot spoof it into a Secure cookie (or dodge one).
-func (s *Server) cookieSecure(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	return s.auth.trustedPeer(peerIP(r)) &&
-		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
-}
-
-// requestScheme reports the EXTERNAL scheme of the request: "https" over
-// direct TLS, and — for a TLS-terminating reverse proxy — when the immediate
-// TCP peer is in PULSEMON_TRUSTED_PROXIES and reports X-Forwarded-Proto:
-// https; "http" otherwise. The Origin CSRF gate compares the browser's
-// Origin scheme against this, so an http:// page can never masquerade as the
-// https dashboard's own origin (and vice versa). Same trusted-peer rule as
-// cookieSecure, so a direct attacker cannot spoof it.
-func (s *Server) requestScheme(r *http.Request) string {
-	if r.TLS != nil {
-		return "https"
-	}
-	if s.auth.trustedPeer(peerIP(r)) &&
-		strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https") {
-		return "https"
-	}
-	return "http"
 }

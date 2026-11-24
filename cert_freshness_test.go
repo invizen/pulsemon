@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -225,5 +226,57 @@ func TestStaleCertProbeForcesFreshDial(t *testing.T) {
 	mu.Unlock()
 	if n != 3 {
 		t.Fatalf("server saw %d distinct connections over 3 probes, want 3 — the stale-cert probe rode the pooled conn (cert re-read lags one probe)", n)
+	}
+}
+
+// TestCertReadTimesPrunedOnWrite: the cert-read write path deletes entries
+// older than certFreshness. Pruning is loss-free (the only reader treats a
+// stale entry exactly like a missing one — both force a fresh handshake),
+// and it is what bounds the map by LIVE HTTPS hosts: without it, every
+// edited or deleted sensor target leaves a permanent entry.
+func TestCertReadTimesPrunedOnWrite(t *testing.T) {
+	cert := testSelfSigned(t, time.Now().Add(48*time.Hour))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+	srv.StartTLS()
+	defer srv.Close()
+
+	hostKey := "https://" + srv.Listener.Addr().String()
+	certReadMu.Lock()
+	oldMap := certReadTimes
+	oldPrune := certReadLastPrune
+	certReadTimes = map[string]time.Time{
+		"https://ghost-a.invalid:443": time.Now().Add(-certFreshness - time.Minute),
+		"https://ghost-b.invalid:443": time.Now().Add(-certFreshness - time.Hour),
+		"https://ghost-c.invalid:443": time.Now().Add(-time.Second), // fresh: must survive
+	}
+	// Prune-window precondition: the window has elapsed, so this write
+	// MUST run the scan (pruning is throttled to once per window).
+	certReadLastPrune = time.Time{}
+	certReadMu.Unlock()
+	t.Cleanup(func() {
+		certReadMu.Lock()
+		certReadTimes = oldMap
+		certReadLastPrune = oldPrune
+		certReadMu.Unlock()
+	})
+
+	if res := probeHTTP(context.Background(), srv.URL, 5*time.Second); res.Lost {
+		t.Fatalf("probe lost: %+v", res)
+	}
+	certReadMu.Lock()
+	defer certReadMu.Unlock()
+	if _, ok := certReadTimes[hostKey]; !ok {
+		t.Fatalf("live host %q not recorded: %v", hostKey, certReadTimes)
+	}
+	for k := range certReadTimes {
+		if strings.HasPrefix(k, "https://ghost-a") || strings.HasPrefix(k, "https://ghost-b") {
+			t.Errorf("stale entry %q survived the write-time prune", k)
+		}
+	}
+	if _, ok := certReadTimes["https://ghost-c.invalid:443"]; !ok {
+		t.Error("fresh entry pruned: prune window must be certFreshness, not every write")
 	}
 }
