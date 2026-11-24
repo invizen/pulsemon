@@ -573,6 +573,21 @@ func (pw *ProbeWorker) Run(ctx context.Context) {
 	// bounded (per-sensor batches), so
 	// the one-time startup cost is a few milliseconds on a healthy DB.
 	pw.purgeOld(ctx)
+	// Finish sensor deletions interrupted by a process death: a crash, a
+	// kill, or a shutdown drain that expired mid-cascade leaves the row
+	// state='deleting' — no probe loop, hidden from the dashboard, its
+	// name still UNIQUE-held, and nothing else touches the row. Nothing is
+	// probing yet at this point (the loops spawn below), so a single
+	// FK-cascade delete is safe: there is no concurrent writer to stall,
+	// and the sweep frees the name for re-creation. A delete that is
+	// cancelled mid-cascade at RUN time is a different case — the handler
+	// runs on a client-detached context and its own restore compensates.
+	// History: docs/DECISIONS.md → deleting-state-stuck-recovery
+	if res, err := pw.db.ExecContext(ctx, "DELETE FROM sensors WHERE state = 'deleting'"); err != nil {
+		log.Printf("ProbeWorker: interrupted-delete cleanup: %v", err)
+	} else if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("ProbeWorker: completed %d interrupted sensor deletion(s)", n)
+	}
 	// Populate the stats cache from the DB so the first dashboard poll after a
 	// restart serves populated cards (RTT, sparkline, 24h uptime) instead of
 	// blanking them for up to an interval while probes re-accumulate. It MUST

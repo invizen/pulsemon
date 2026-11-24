@@ -579,14 +579,23 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 			ctx := r.Context()
 			var txType, txTarget string
 			var txIntervalS, txTimeoutMS, txDownAfter int
+			// A row marked 'deleting' is mid-cascade: it is going away,
+			// and letting a PATCH ({"state":"active"} in particular) match
+			// it would race the delete and revive a sensor halfway through
+			// its cascade — the delete then tears down a row someone just
+			// re-activated. Missing and mid-delete are both 404; only the
+			// delete's own restore (or its completion) changes a deleting
+			// row's fate.
+			// History: docs/DECISIONS.md → deleting-state-stuck-recovery
 			scanErr := c.QueryRowContext(ctx,
-				"SELECT type, target, interval_s, timeout_ms, down_after FROM sensors WHERE id = ?", id).
+				"SELECT type, target, interval_s, timeout_ms, down_after FROM sensors WHERE id = ? AND state <> 'deleting'", id).
 				Scan(&txType, &txTarget, &txIntervalS, &txTimeoutMS, &txDownAfter)
 			if patchScanHook != nil {
 				scanErr = patchScanHook(scanErr)
 			}
 			if scanErr != nil {
-				// Only a missing row is a 404. A transient SQLITE_BUSY, a
+				// A missing row — or one mid-delete, filtered out above — is a
+				// 404. A transient SQLITE_BUSY, a
 				// canceled context, or an I/O failure must surface as a
 				// logged 500 (respondInternal) — collapsing it into
 				// errPatchSensorGone told the client "sensor not found"
@@ -697,6 +706,19 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		respondWithJSON(w, http.StatusOK, map[string]string{"status": "updated"})
 
 	case http.MethodDelete:
+		// The cascade and its compensating restore run on a context that
+		// OUTLIVES the client: a client that leaves mid-delete (tab closed,
+		// navigation) cancels r.Context(), and both the batched deletes and
+		// the rollback on top of it used to fail at once on that dead
+		// context — stranding the row in 'deleting' forever (no loop,
+		// hidden from the dashboard, its name still UNIQUE-held, no path
+		// back). WithoutCancel keeps the request's values but drops the
+		// cancel signal; the cascade is bounded (per-batch autocommits,
+		// milliseconds of write lock each), so it needs no deadline of its
+		// own. The pre-commit existence check below keeps r.Context(): a
+		// client that is already gone should not start a delete at all.
+		// History: docs/DECISIONS.md → deleting-state-stuck-recovery
+		ctx := context.WithoutCancel(r.Context())
 		// Existence check up front drives the 404 (and skips the batched
 		// no-op deletes) — the sensor row's PK lookup is cheap. Scan yields
 		// sql.ErrNoRows (not a zero value) when the id is absent, so that
@@ -724,18 +746,25 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// dashboard list, so the sensor is dead to the whole system for
 		// the entire cascade window. History:
 		// docs/DECISIONS.md → sensor-delete-deleting-state.
-		if _, err := s.db.ExecContext(r.Context(), "UPDATE sensors SET state = 'deleting' WHERE id = ?", id); err != nil {
+		if _, err := s.db.ExecContext(ctx, "UPDATE sensors SET state = 'deleting' WHERE id = ?", id); err != nil {
 			respondInternal(w, "mark sensor deleting", err)
 			return
 		}
 		// restoreState puts the sensor back to its pre-delete state if any
 		// cascade step below fails, so a surviving sensor is never
 		// stranded in 'deleting' (no loop, invisible to syncSensors,
-		// pulses rejected) with no path back. A concurrent state PATCH
-		// that landed in the window is lost — the operator's retry is the
-		// expected next action either way.
+		// pulses rejected) with no path back. It runs on a FRESH context
+		// detached from the request: the cascade is exactly where a client
+		// departure (or a crash) lands, and a rollback on the request's
+		// cancelled context fails at once — which is how the row used to
+		// get stranded. The state = 'deleting' guard rolls back only what
+		// THIS delete marked: a state written while the cascade ran is
+		// left as-is, and a row that finished deleting is untouched.
+		// History: docs/DECISIONS.md → deleting-state-stuck-recovery
 		restoreState := func() {
-			if _, err := s.db.ExecContext(r.Context(), "UPDATE sensors SET state = ? WHERE id = ?", curState, id); err != nil {
+			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := s.db.ExecContext(rctx, "UPDATE sensors SET state = ? WHERE id = ? AND state = 'deleting'", curState, id); err != nil {
 				log.Printf("delete sensor %s: restore state failed: %v", id, err)
 			}
 		}
@@ -751,17 +780,17 @@ func (s *Server) handleSensorByID(w http.ResponseWriter, r *http.Request) {
 		// milliseconds per chunk instead of one long lock over the whole
 		// cascade. The small cascade tables (sensor_tags, alert_state — a
 		// few rows each) ride the final sensor-row DELETE's ON DELETE CASCADE.
-		if _, err := deleteRowsBatched(r.Context(), s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
+		if _, err := deleteRowsBatched(ctx, s.db, "probes", "sensor_id = ?", []any{id}); err != nil {
 			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
-		if _, err := deleteRowsBatched(r.Context(), s.db, "events", "sensor_id = ?", []any{id}); err != nil {
+		if _, err := deleteRowsBatched(ctx, s.db, "events", "sensor_id = ?", []any{id}); err != nil {
 			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
 		}
-		if _, err := s.db.ExecContext(r.Context(), "DELETE FROM sensors WHERE id = ?", id); err != nil {
+		if _, err := s.db.ExecContext(ctx, "DELETE FROM sensors WHERE id = ?", id); err != nil {
 			restoreState()
 			respondInternal(w, "delete sensor "+id, err)
 			return
