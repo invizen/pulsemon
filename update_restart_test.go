@@ -363,6 +363,7 @@ func TestBuildWatchdogCommandPrefersPrevBinary(t *testing.T) {
 		t.Fatalf("watchdog binary = %q, want the previous binary %q (the new one may be the broken one)", cmd.Args[0], prev)
 	}
 	want := []string{prev, "update", "watchdog", "--prev", prev, "--dst", exe,
+		"--bus", "user",
 		"--timeout", watchdogTimeout().String(), "--old-pid", strconv.Itoa(os.Getpid())}
 	if !reflect.DeepEqual(cmd.Args, want) {
 		t.Fatalf("args = %v, want %v", cmd.Args, want)

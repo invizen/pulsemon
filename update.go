@@ -309,7 +309,7 @@ func runUpdate(args []string) int {
 	rollback := false
 	watchdog := false
 	allowDowngrade := false
-	wdPrev, wdDst := "", ""
+	wdPrev, wdDst, wdBus := "", "", ""
 	wdTimeout := 30 * time.Second
 	wdOldPid := 0
 	version := "latest"
@@ -330,7 +330,7 @@ func runUpdate(args []string) int {
 		case "watchdog", "--watchdog":
 			// The detached post-restart guardian (I2) — see runWatchdog.
 			watchdog = true
-		case "--prev", "--dst", "--timeout", "--old-pid":
+		case "--prev", "--dst", "--timeout", "--old-pid", "--bus":
 			if i+1 >= len(args) {
 				uErr(a + " requires a value")
 				return 1
@@ -341,6 +341,18 @@ func runUpdate(args []string) int {
 				wdPrev = args[i]
 			case "--dst":
 				wdDst = args[i]
+			case "--bus":
+				// The authoritative bus captured BEFORE the restart
+				// (spawnUpdateWatchdog's detectRestart): at rollback
+				// time a crashed/stopped service is no longer "active",
+				// so re-detecting there reports no bus and the restart
+				// is lost. Validated: a garbage bus would be issued to
+				// systemctl for a unit that is not there.
+				if !validRestartBus(args[i]) {
+					uErr("invalid --bus: " + args[i] + " (want user, system, or windows-service)")
+					return 1
+				}
+				wdBus = args[i]
 			case "--old-pid":
 				n, perr := strconv.Atoi(args[i])
 				if perr != nil {
@@ -358,7 +370,7 @@ func runUpdate(args []string) int {
 			}
 		case "-h", "--help":
 			fmt.Println("usage: pulsemon update [check|rollback|watchdog|<version>] [--restart] [--allow-downgrade]")
-			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--timeout 30s] [--old-pid PID]")
+			fmt.Println("       pulsemon update watchdog --prev <bin.prev> --dst <bin> [--bus user|system|windows-service] [--timeout 30s] [--old-pid PID]")
 			return 0
 		default:
 			version = a
@@ -366,7 +378,7 @@ func runUpdate(args []string) int {
 	}
 
 	if watchdog {
-		return runWatchdog(wdPrev, wdDst, wdTimeout, wdOldPid)
+		return runWatchdog(wdPrev, wdDst, wdBus, wdTimeout, wdOldPid)
 	}
 
 	exe, err := runningExecutable()
@@ -509,7 +521,7 @@ func runUpdate(args []string) int {
 //
 // Exit codes: 0 = the new binary is healthy, or a rollback was performed
 // successfully; 1 = the rollback itself failed (the box needs a human).
-func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
+func runWatchdog(prev, dst, bus string, timeout time.Duration, oldPid int) int {
 	if prev == "" || dst == "" {
 		uErr("watchdog: --prev and --dst are required")
 		return 1
@@ -556,7 +568,7 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 		// incident left a HEALTHY service with its sensors wiped. This
 		// is the belt-and-suspenders check (DB restore + binary rollback
 		// if the live sensor count dropped below the pre-update one).
-		verifySensorsIntactWatchdog(db, prev, dst)
+		verifySensorsIntactWatchdog(db, prev, dst, bus)
 		return 0
 	}
 	uErr("watchdog: service not healthy after restart (" + detail + "); restoring " + prev)
@@ -565,8 +577,18 @@ func runWatchdog(prev, dst string, timeout time.Duration, oldPid int) int {
 		return 1
 	}
 	uInfo("watchdog: previous binary restored to " + dst)
-	if d := detectRestart(); d != "" {
-		if err := performRestart(d); err != nil {
+	// The SPAWN-TIME bus is authoritative for this restart: a broken
+	// binary has crashed the service into activating/failed, where
+	// detectRestart() (systemctl is-active) reports "" and a
+	// detect-only restart would be skipped, leaving the monitor dead.
+	// Detection is the fallback for a watchdog spawned without --bus
+	// (an older version, or a manual run) — the old safe default.
+	restartBus := bus
+	if restartBus == "" {
+		restartBus = detectRestart()
+	}
+	if restartBus != "" {
+		if err := performRestart(restartBus); err != nil {
 			uErr("watchdog: restart after rollback failed: " + err.Error())
 			return 1
 		}
@@ -728,7 +750,7 @@ func restoreDatabaseFile(backup, live string) error {
 // History: docs/DECISIONS.md -> windows-upgrade-safety,
 //
 //	windows-recovery-restart
-func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin string) {
+func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin, bus string) {
 	dbPath := healthzDBPath()
 	backup := filepath.Join(filepath.Dir(dbPath), "pulsemon.db.preupdate")
 	logLine := func(format string, a ...any) {
@@ -812,7 +834,19 @@ func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin string) {
 		return
 	}
 	logLine("previous binary restored to %s", dstBin)
-	if err := performRestart(detectRestart()); err != nil {
+	// The SPAWN-TIME bus is authoritative here too: the service was just
+	// stopped for the restore, so detectRestart() (is-active) reports ""
+	// and a detect-only restart would hit the SYSTEM bus without --user —
+	// failing on every user-bus install.
+	restartBus := bus
+	if restartBus == "" {
+		restartBus = detectRestart()
+	}
+	if restartBus == "" {
+		logLine("no service bus known (none passed and none detected) — if the service's recovery action is configured it will start the service on the restored pair by itself; otherwise start the pulsemon service manually")
+		return
+	}
+	if err := performRestart(restartBus); err != nil {
 		logLine("restart after restore: %v — if the service's SCM recovery action is configured it will start the service on the restored pair by itself; otherwise start the pulsemon service manually", err)
 		return
 	}
@@ -890,12 +924,20 @@ func spawnUpdateWatchdog(exe, bus string) error {
 //     implementation. No .prev (first update from a pre-.prev release)
 //     falls back to <exe>: nothing to roll back to, but the spawn must
 //     not fail for lack of a binary.
+//
 //  2. On systemd with a known bus it wraps the spawn in
 //     `systemd-run [--user] --scope`, placing the watchdog in an
 //     independent transient cgroup that `systemctl restart pulsemon`
 //     cannot kill (KillMode=control-group kills only the unit's own
 //     cgroup). Without systemd-run (non-systemd host) the plain command
 //     is returned and the caller's detach is all the isolation there is.
+//
+//  3. The bus rides into the watchdog argv (--bus) as the AUTHORITATIVE
+//     post-rollback restart target: at rollback time the service is
+//     crashed (activating/failed) or stopped (the DB-restore path), so a
+//     fresh detectRestart() there reports no bus and the restart is
+//     lost. An empty bus (non-systemd host) keeps the argv shape
+//     constant; the watchdog then falls back to detection.
 func buildWatchdogCommand(exe, bus string) *exec.Cmd {
 	watchdogBin := exe + ".prev"
 	if _, err := os.Stat(watchdogBin); err != nil {
@@ -903,6 +945,7 @@ func buildWatchdogCommand(exe, bus string) *exec.Cmd {
 	}
 	args := []string{"update", "watchdog",
 		"--prev", exe + ".prev", "--dst", exe,
+		"--bus", bus,
 		"--timeout", watchdogTimeout().String(),
 		"--old-pid", strconv.Itoa(os.Getpid())}
 	if run := systemdRunPath(); bus != "" && run != "" {
@@ -1885,24 +1928,53 @@ func systemctlActive(bus string) bool {
 	return cmd.Run() == nil
 }
 
+// validRestartBus reports whether bus names a bus the restart paths
+// understand: "user" or "system" (systemd) or "windows-service" (the
+// Windows SCM). "" is accepted (no bus — the caller detects at runtime).
+// The watchdog CLI validates --bus against this: a garbage value would
+// be issued to systemctl for a unit that is not there.
+func validRestartBus(bus string) bool {
+	switch bus {
+	case "", "user", "system", "windows-service":
+		return true
+	}
+	return false
+}
+
 // runRestart restarts the pulsemon service on the given bus and waits for the
 // command to return. Bounded by restartTimeout: systemctl restart can wait a
 // while for the unit to settle (a slow or stuck service), and the bound keeps
 // a wedged dbus from hanging the update indefinitely.
+//
+// A `reset-failed` on the SAME bus runs first: a crash-looped broken binary
+// trips StartLimitBurst, and until the failed state is reset the restart
+// fails with "start-limit-hit" no matter how often it is retried — exactly
+// the state the post-rollback restart faces. Best effort: on a healthy unit
+// reset-failed is a no-op, and a reset failure must not block the restart.
 func runRestart(bus string) error {
-	args := []string{"restart", "pulsemon"}
+	resetArgs := []string{"reset-failed", "pulsemon"}
+	restartArgs := []string{"restart", "pulsemon"}
 	if bus == "user" {
-		args = append([]string{"--user"}, args...)
+		resetArgs = append([]string{"--user"}, resetArgs...)
+		restartArgs = append([]string{"--user"}, restartArgs...)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, systemctlPath(), args...)
-	// If systemctl (or a wrapper) leaves a child holding the output pipe, the
-	// context kill alone would not release CombinedOutput: bound the wait too.
-	cmd.WaitDelay = 2 * time.Second
-	out, err := cmd.CombinedOutput()
+	run := func(args []string) (string, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), restartTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, systemctlPath(), args...)
+		// If systemctl (or a wrapper) leaves a child holding the output
+		// pipe, the context kill alone would not release CombinedOutput:
+		// bound the wait too.
+		cmd.WaitDelay = 2 * time.Second
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	// reset-failed first (see above); its result is deliberately
+	// discarded — the restart below is the load-bearing call.
+	_, _ = run(resetArgs)
+	out, err := run(restartArgs)
 	if err != nil {
-		return fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("%v: %s", err, strings.TrimSpace(out))
 	}
 	return nil
 }

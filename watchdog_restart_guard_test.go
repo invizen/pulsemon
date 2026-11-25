@@ -71,7 +71,7 @@ func TestWatchdogWaitsForOldPID(t *testing.T) {
 	t.Cleanup(func() { _ = child.Process.Kill() })
 
 	start := time.Now()
-	code := runWatchdog(prev, dst, 2*time.Second, child.Process.Pid)
+	code := runWatchdog(prev, dst, "", 2*time.Second, child.Process.Pid)
 	elapsed := time.Since(start)
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 (healthy once the old process is gone)", code)
@@ -101,7 +101,7 @@ func TestWatchdogGivesUpOnLiveOldPID(t *testing.T) {
 	wdOldProcTimeout = 200 * time.Millisecond
 	defer func() { wdOldProcTimeout = oT }()
 
-	code := runWatchdog(prev, dst, time.Second, child.Process.Pid)
+	code := runWatchdog(prev, dst, "", time.Second, child.Process.Pid)
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1 (old process still alive; no guard possible)", code)
 	}
@@ -127,7 +127,7 @@ func TestWatchdogRetriesUpdateLock(t *testing.T) {
 	defer func() { lockRetryBudget = oB }()
 
 	start := time.Now()
-	code := runWatchdog(prev, dst, time.Second, 0)
+	code := runWatchdog(prev, dst, "", time.Second, 0)
 	elapsed := time.Since(start)
 	if code != 1 {
 		t.Fatalf("exit = %d, want 1 (lock never released)", code)
@@ -155,7 +155,7 @@ func TestWatchdogAcquiresLockAfterRelease(t *testing.T) {
 		lock.Close()
 	}()
 
-	code := runWatchdog(prev, dst, 3*time.Second, 0)
+	code := runWatchdog(prev, dst, "", 3*time.Second, 0)
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0 (lock acquired after release, healthy)", code)
 	}

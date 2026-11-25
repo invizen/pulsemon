@@ -240,10 +240,27 @@ func TestWindowsUpdateStaged(t *testing.T) {
 	if strings.Contains(stripGoComments(readSource(t, "main.go")), `"__restart-helper"`) {
 		t.Error("main.go dispatch must not handle the retired __restart-helper subcommand")
 	}
-	// The watchdog's healthy path must run the data-integrity check.
+	// The watchdog's healthy path must run the data-integrity check,
+	// passing the spawn-time bus (the post-restore restart must hit the
+	// bus the service ran on — after the stop, re-detection reports "").
 	upd := stripGoComments(readSource(t, "update.go"))
-	if !strings.Contains(upd, "verifySensorsIntactWatchdog(db, prev, dst)") {
-		t.Error("runWatchdog's healthy path must call verifySensorsIntactWatchdog (the 'sensors wiped' guard)")
+	if !strings.Contains(upd, "verifySensorsIntactWatchdog(db, prev, dst, bus)") {
+		t.Error("runWatchdog's healthy path must call verifySensorsIntactWatchdog with the spawn-time bus (the 'sensors wiped' guard must restart on the bus the service ran on, not a post-stop re-detection)")
+	}
+}
+
+// TestWindowsStopToleratesAlreadyStopped pins the 1062 fix (CRITICAL-3,
+// 2026-11-25): ControlService(Stop) on an already-stopped service
+// returns ERROR_SERVICE_NOT_ACTIVE; stopWindowsServiceFn must treat that
+// as success (the goal state) — otherwise a restart of a stopped service
+// (the watchdog's post-rollback restart, an operator `pulsemon restart`
+// after a crash) fails at the stop step before the start ever runs.
+// Source-shape pin: the //go:build windows file never compiles on the
+// Linux gate box.
+func TestWindowsStopToleratesAlreadyStopped(t *testing.T) {
+	src := stripGoComments(readSource(t, "update_windows.go"))
+	if !strings.Contains(src, "windows.ERROR_SERVICE_NOT_ACTIVE") {
+		t.Error("stopWindowsServiceFn must treat windows.ERROR_SERVICE_NOT_ACTIVE (1062) as success — stopping an already-stopped service is the goal state, and without this a restart of a stopped service fails before the start runs")
 	}
 }
 

@@ -286,6 +286,15 @@ var stopWindowsServiceFn = func() error {
 	defer windows.CloseServiceHandle(s)
 	var st windows.SERVICE_STATUS
 	if err := windows.ControlService(s, uint32(svc.Stop), &st); err != nil {
+		// An already-stopped service (a crash, an earlier stop, an
+		// operator stop) IS the goal state of a stop: ControlService
+		// answers ERROR_SERVICE_NOT_ACTIVE (1062), and treating that as
+		// an error made every restart of a stopped service fail before
+		// the start ever ran (the watchdog's post-rollback restart, an
+		// operator `pulsemon restart` after a crash).
+		if err == windows.ERROR_SERVICE_NOT_ACTIVE {
+			return nil
+		}
 		return fmt.Errorf("stop service %s: %w", serviceName, err)
 	}
 	deadline := time.Now().Add(60 * time.Second)

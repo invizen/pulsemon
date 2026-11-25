@@ -114,7 +114,7 @@ func TestVerifySensorsIntactNoAction(t *testing.T) {
 	h := &verifyHarness{liveCount: 3, liveOK: true, serviceState: "running"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if h.stopped || h.restarted {
 		t.Error("intact sensors: no stop/restart expected")
@@ -137,7 +137,7 @@ func TestVerifySensorsDataLossStoppedServiceRestores(t *testing.T) {
 	h := &verifyHarness{liveCount: 1, liveOK: true, serviceState: "stopped"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if h.stopped {
 		t.Error("stopped service: no stop call expected")
@@ -170,7 +170,7 @@ func TestVerifySensorsDataLossRunningStopDenied(t *testing.T) {
 	}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if n := liveSensorCount(t, dir); n != 1 {
 		t.Errorf("live DB = %d sensors, want 1 (MUST be untouched when the stop is denied)", n)
@@ -193,7 +193,7 @@ func TestVerifySensorsDataLossRunningStopSucceeds(t *testing.T) {
 	h := &verifyHarness{liveCount: 1, liveOK: true, serviceState: "running"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if !h.stopped {
 		t.Error("running service: the stop must be attempted first")
@@ -215,7 +215,7 @@ func TestVerifySensorsNoBackupSkips(t *testing.T) {
 	h := &verifyHarness{liveCount: 3, liveOK: true, serviceState: "running"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if h.stopped || h.restarted {
 		t.Error("no backup: no action expected")
@@ -231,7 +231,7 @@ func TestVerifySensorsZeroBackupSkips(t *testing.T) {
 	h := &verifyHarness{liveCount: 0, liveOK: true, serviceState: "running"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if h.stopped || h.restarted {
 		t.Error("empty backup: no action expected")
@@ -248,7 +248,7 @@ func TestVerifySensorsLiveCountUnavailableSkips(t *testing.T) {
 	h := &verifyHarness{liveCount: -1, liveOK: false, serviceState: "running"}
 	withVerifyHarness(t, h)
 
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if h.stopped || h.restarted {
 		t.Error("unverifiable live count: no action expected")
@@ -270,7 +270,7 @@ func TestVerifySensorsIntactRemovesVerifiedBackup(t *testing.T) {
 	withVerifyHarness(t, h)
 
 	backup := filepath.Join(dir, "pulsemon.db.preupdate")
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if _, err := os.Stat(backup); !os.IsNotExist(err) {
 		t.Errorf("verified backup must be removed after a healthy update (stat err=%v) — a stale snapshot is a false-positive restore waiting to happen", err)
@@ -289,7 +289,7 @@ func TestVerifySensorsDataLossKeepsBackup(t *testing.T) {
 	withVerifyHarness(t, h)
 
 	backup := filepath.Join(dir, "pulsemon.db.preupdate")
-	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin, "")
 
 	if _, err := os.Stat(backup); err != nil {
 		t.Errorf("the data-loss path restores FROM the backup — it must keep it (stat err=%v)", err)
