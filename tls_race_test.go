@@ -3,9 +3,16 @@
 package main
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -36,12 +43,24 @@ func newTLSTestServer(t *testing.T) (*Server, string) {
 		t.Fatalf("InitSchema: %v", err)
 	}
 	setRestartFnsForTest(func() error { return nil }, func() {})
+	origTestBind := tlsTestBind
+	tlsTestBind = func(network, addr string) error { return nil }
+	t.Cleanup(func() { tlsTestBind = origTestBind })
 	return NewServer(db, NewProbeWorker(db)), tlsDir(db)
 }
 
 func tlsPut(srv *Server, t *testing.T, cert, key string) int {
 	t.Helper()
 	body, _ := json.Marshal(map[string]any{"cert": cert, "key": key})
+	req := httptest.NewRequest(http.MethodPost, "/api/settings/tls", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.handleTLSSettingsPut(rec, req)
+	return rec.Code
+}
+
+func tlsPutWithPort(srv *Server, t *testing.T, cert, key string, port int) int {
+	t.Helper()
+	body, _ := json.Marshal(map[string]any{"cert": cert, "key": key, "port": port})
 	req := httptest.NewRequest(http.MethodPost, "/api/settings/tls", strings.NewReader(string(body)))
 	rec := httptest.NewRecorder()
 	srv.handleTLSSettingsPut(rec, req)
@@ -238,5 +257,175 @@ func TestAuthUserHardensDataDirBeforeFirstBoot(t *testing.T) {
 	}
 	if got := fi.Mode().Perm(); got != 0o600 {
 		t.Fatalf("pulsemon.db mode = %o, want 0600 (a world-readable secret store)", got)
+	}
+}
+
+// makeExpiredCertPEM generates a self-signed RSA pair whose validity
+// window is entirely in the past (the MAJOR-10 expiry pin input).
+func makeExpiredCertPEM(t *testing.T) (string, string) {
+	t.Helper()
+	k, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(2),
+		Subject:      pkix.Name{CommonName: "expired.pulsemon"},
+		NotBefore:    time.Now().Add(-48 * time.Hour),
+		NotAfter:     time.Now().Add(-24 * time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER}))
+	keyPEM := string(pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der}))
+	return certPEM, keyPEM
+}
+
+// TestTLSUploadExpiredCertRejected is the MAJOR-10 expiry pin:
+// tlsValidatePair parsed the cert and matched the key but never checked
+// NotAfter, so an already-expired pair was installed, the process
+// restarted, and every TLS client failed the handshake while the
+// dashboard showed a confident cert_expiry in the past.
+func TestTLSUploadExpiredCertRejected(t *testing.T) {
+	certPEM, keyPEM := makeExpiredCertPEM(t)
+
+	if _, err := tlsValidatePair(certPEM, keyPEM); err == nil || !strings.Contains(err.Error(), "expired") {
+		t.Fatalf("expired cert accepted (err=%v), want an 'expired' rejection", err)
+	}
+
+	srv, tlsDirPath := newTLSTestServer(t)
+	if code := tlsPutWithPort(srv, t, certPEM, keyPEM, 8443); code != http.StatusBadRequest {
+		t.Fatalf("expired-cert PUT = %d, want 400", code)
+	}
+	for _, n := range []string{"cert.pem", "key.pem"} {
+		if _, err := os.Stat(filepath.Join(tlsDirPath, n)); err == nil {
+			t.Errorf("%s written for an expired cert", n)
+		}
+	}
+	if p := srv.db.GetSetting("listener_https_port"); p != "" {
+		t.Errorf("listener_https_port = %q, want unset", p)
+	}
+}
+
+// TestTLSUploadEnvSourceConflict is the MAJOR-10 env-guard pin: DELETE
+// refused to clobber an env-provided pair (409), but PUT had no such
+// guard — it wrote an UNUSED key to disk and restarted the process
+// while PULSEMON_CERT kept winning at boot.
+func TestTLSUploadEnvSourceConflict(t *testing.T) {
+	srv, tlsDirPath := newTLSTestServer(t)
+	t.Setenv("PULSEMON_CERT", filepath.Join(t.TempDir(), "env-cert.pem"))
+	t.Setenv("PULSEMON_KEY", filepath.Join(t.TempDir(), "env-key.pem"))
+
+	cert, key, _ := makeTestCert(t, "rsa")
+	if code := tlsPutWithPort(srv, t, cert, key, 8443); code != http.StatusConflict {
+		t.Fatalf("env-source PUT = %d, want 409", code)
+	}
+	for _, n := range []string{"cert.pem", "key.pem"} {
+		if _, err := os.Stat(filepath.Join(tlsDirPath, n)); err == nil {
+			t.Errorf("%s written while the env source is active", n)
+		}
+	}
+	if p := srv.db.GetSetting("listener_https_port"); p != "" {
+		t.Errorf("listener_https_port = %q, want unset", p)
+	}
+}
+
+// TestTLSUploadUnprivilegedPortRejected is the MAJOR-10 pre-flight pin:
+// the default port 443 pre-filled in Settings is unbindable on
+// unprivileged installs (Docker USER 1000:1000 cap_drop ALL, install.sh
+// systemd user unit) — pre-fix the PUT wrote the pair, stored 443, and
+// restarted into a `bind: permission denied` crash loop. The probe must
+// refuse BEFORE any file is written, for EACCES and EADDRINUSE alike.
+func TestTLSUploadUnprivilegedPortRejected(t *testing.T) {
+	simulate := func(cause error, wantSubstr string) {
+		t.Helper()
+		srv, tlsDirPath := newTLSTestServer(t)
+		orig := tlsTestBind
+		tlsTestBind = func(network, addr string) error {
+			return &net.OpError{Op: "listen", Net: "tcp", Err: &os.SyscallError{Syscall: "bind", Err: cause}}
+		}
+		t.Cleanup(func() { tlsTestBind = orig })
+
+		cert, key, _ := makeTestCert(t, "rsa")
+		body, _ := json.Marshal(map[string]any{"cert": cert, "key": key, "port": 443})
+		req := httptest.NewRequest(http.MethodPost, "/api/settings/tls", strings.NewReader(string(body)))
+		rec := httptest.NewRecorder()
+		srv.handleTLSSettingsPut(rec, req)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("unbindable-port PUT (cause=%v) = %d, want 409", cause, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), wantSubstr) {
+			t.Errorf("response %q does not explain the cause (%q)", rec.Body.String(), wantSubstr)
+		}
+		for _, n := range []string{"cert.pem", "key.pem"} {
+			if _, err := os.Stat(filepath.Join(tlsDirPath, n)); err == nil {
+				t.Errorf("%s written despite the unbindable port", n)
+			}
+		}
+		if p := srv.db.GetSetting("listener_https_port"); p != "" {
+			t.Errorf("listener_https_port = %q, want unset", p)
+		}
+	}
+	simulate(syscall.EACCES, "CAP_NET_BIND_SERVICE")
+	simulate(syscall.EADDRINUSE, "already in use")
+}
+
+// TestTLSUploadPreflightSkipsLivePort is the positive control for the
+// MAJOR-10 pre-flight: when the process already serves HTTPS on the
+// target port, the probe must NOT run (it would report EADDRINUSE by
+// us and refuse a legitimate same-port re-upload).
+func TestTLSUploadPreflightSkipsLivePort(t *testing.T) {
+	srv, _ := newTLSTestServer(t)
+	certA, keyA, _ := makeTestCert(t, "rsa")
+	if code := tlsPutWithPort(srv, t, certA, keyA, 8443); code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", code)
+	}
+
+	orig := tlsTestBind
+	probed := 0
+	tlsTestBind = func(network, addr string) error { probed++; return nil }
+	t.Cleanup(func() { tlsTestBind = orig })
+
+	certB, keyB, _ := makeTestCert(t, "ec")
+	if code := tlsPutWithPort(srv, t, certB, keyB, 8443); code != http.StatusOK {
+		t.Fatalf("same-port re-upload = %d, want 200", code)
+	}
+	if probed != 0 {
+		t.Fatalf("preflight probed the port the process already serves (probes=%d)", probed)
+	}
+}
+
+// TestTLSUploadPortOnlyChangePreflights pins that a PORT-ONLY change
+// (no pair in the body) is pre-flighted too when TLS is active: the
+// restart binds the new port, so an unbindable one must be refused
+// before the setting is persisted.
+func TestTLSUploadPortOnlyChangePreflights(t *testing.T) {
+	srv, _ := newTLSTestServer(t)
+	cert, key, _ := makeTestCert(t, "rsa")
+	if code := tlsPutWithPort(srv, t, cert, key, 8443); code != http.StatusOK {
+		t.Fatalf("seed PUT: %d", code)
+	}
+
+	orig := tlsTestBind
+	tlsTestBind = func(network, addr string) error {
+		return &net.OpError{Op: "listen", Net: "tcp", Err: &os.SyscallError{Syscall: "bind", Err: syscall.EACCES}}
+	}
+	t.Cleanup(func() { tlsTestBind = orig })
+
+	body, _ := json.Marshal(map[string]any{"port": 443})
+	req := httptest.NewRequest(http.MethodPost, "/api/settings/tls", strings.NewReader(string(body)))
+	rec := httptest.NewRecorder()
+	srv.handleTLSSettingsPut(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("port-only change to an unbindable port = %d, want 409", rec.Code)
+	}
+	if p := srv.db.GetSetting("listener_https_port"); p != "8443" {
+		t.Errorf("listener_https_port = %q, want 8443 (unchanged)", p)
 	}
 }

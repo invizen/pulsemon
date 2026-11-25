@@ -12,10 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -125,6 +127,9 @@ func tlsValidatePair(certPEM, keyPEM string) (*x509.Certificate, error) {
 	cert, err := x509.ParseCertificate(certBlock.Bytes)
 	if err != nil {
 		return nil, fmt.Errorf("certificate parse: %v", err)
+	}
+	if !time.Now().Before(cert.NotAfter) {
+		return nil, fmt.Errorf("certificate expired on %s", cert.NotAfter.UTC().Format(time.RFC3339))
 	}
 	pubKey, err := parsePrivateKey(keyBlock)
 	if err != nil {
@@ -266,6 +271,17 @@ var tlsRemoveTemp = os.Remove
 // state that tlsSettingsMu forbids).
 var tlsInstallBetweenRenames func()
 
+// tlsTestBind is the pre-install port probe (net.Listen + Close; tests
+// inject a simulated failure — a real privileged-port bind in a test is
+// environment-dependent).
+var tlsTestBind = func(network, addr string) error {
+	l, err := net.Listen(network, addr)
+	if err != nil {
+		return err
+	}
+	return l.Close()
+}
+
 // tlsSettingsMu serializes TLS pair installs (POST) and removals
 // (DELETE). The disk mutations (temp writes, renames, removes) and the
 // restart scheduling must be atomic with respect to each other: a
@@ -298,6 +314,15 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// A pair install while env serves TLS is dead storage (PULSEMON_CERT
+	// wins at boot) — refuse it the way DELETE does: no unused key on
+	// disk, no pointless restart.
+	c := loadListenerCfg(s.db)
+	if req.Cert != "" && c.source == "env" {
+		respondWithError(w, http.StatusConflict, "TLS is configured by environment (PULSEMON_CERT/PULSEMON_KEY); stop those to use the dashboard upload")
+		return
+	}
+
 	// Pair validation comes FIRST: when a cert+key arrive together with a
 	// port, a rejected pair must not have silently moved the stored port
 	// already (the running listener would then differ from the stored
@@ -324,6 +349,31 @@ func (s *Server) handleTLSSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if req.Port != nil {
 		if *req.Port < 1 || *req.Port > 65535 {
 			respondWithError(w, http.StatusBadRequest, "port out of range (1-65535)")
+			return
+		}
+	}
+
+	// Preflight the port the RESTARTED process will bind: an unprivileged
+	// install (Docker USER 1000, systemd user unit) gets EACCES on 443,
+	// and write-pair-then-restart turns that into a crash loop. Skip the
+	// probe when this process already serves HTTPS on the target port —
+	// probing our own live port would report EADDRINUSE by us.
+	targetPort := c.httpsPort
+	if req.Port != nil {
+		targetPort = *req.Port
+	}
+	if !(c.certPath != "" && c.httpsPort == targetPort) && (cert != "" || (req.Port != nil && c.certPath != "")) {
+		if err := tlsTestBind("tcp", httpsAddrFor(targetPort)); err != nil {
+			msg := "cannot bind to " + httpsAddrFor(targetPort)
+			switch {
+			case errors.Is(err, syscall.EACCES):
+				msg = fmt.Sprintf("port %d requires root privileges (CAP_NET_BIND_SERVICE); use a port above 1024 such as 8443, or run with the capability", targetPort)
+			case errors.Is(err, syscall.EADDRINUSE):
+				msg = fmt.Sprintf("port %d is already in use", targetPort)
+			default:
+				msg += ": " + err.Error()
+			}
+			respondWithError(w, http.StatusConflict, msg)
 			return
 		}
 	}

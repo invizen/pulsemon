@@ -46,6 +46,10 @@ func TestTLSInstallWriteFailureClosesTempFDs(t *testing.T) {
 	}
 	srv := NewServer(db, NewProbeWorker(db))
 
+	origTestBind := tlsTestBind
+	tlsTestBind = func(network, addr string) error { return nil }
+	t.Cleanup(func() { tlsTestBind = origTestBind })
+
 	cert, key, _ := makeTestCert(t, "rsa")
 	body, _ := json.Marshal(map[string]any{"cert": cert, "key": key})
 
