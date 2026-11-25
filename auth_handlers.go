@@ -163,8 +163,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	t0 := time.Now()
-	tok, ok := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
+	tok, ok, kdfRan := s.auth.CreateSession(r.Context(), req.Username, req.Password, s.cookieSecure(r))
 	if !ok {
 		// Client already gone (disconnected while queued on bcryptSem): a
 		// disconnect is not a failed password attempt, so it must not burn
@@ -172,13 +171,17 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		// nothing for a response nobody reads.
 		if r.Context().Err() != nil {
 			// Refund the per-IP admission — but ONLY when the KDF never
-			// ran: a queued-then-canceled call returns in microseconds
-			// (the ctx.Done select), a canceled call that still paid the
-			// KDF (disconnect DURING the ctx-ignoring bcrypt) took bcrypt
-			// time — kdfCostFloor separates the two. Refunding the paid
-			// case would hand a scripted attacker an unbounded per-IP
-			// guessing channel (abort mid-KDF → budget refunded → re-spray).
-			if time.Since(t0) < kdfCostFloor {
+			// ran. kdfRan is CreateSession's explicit acquire-site signal
+			// (false = canceled in the queue, zero cost; true = a slot was
+			// taken and bcrypt ran to completion, ctx or not). The old
+			// elapsed-time floor (kdfCostFloor) was a heuristic that
+			// failed both ways: on fast CPUs (cost 10 in 20–25ms) a PAID
+			// KDF read as "fast" and got refunded — an unbounded per-IP
+			// guessing channel with recordUserFail and loginSlowDown
+			// skipped; under a saturated semaphore a legitimate queue
+			// wait ≥25ms read as "paid" and was NOT refunded — operator
+			// self-lockout.
+			if !kdfRan {
 				s.auth.refundAttempt(key)
 			}
 			return
@@ -455,13 +458,15 @@ func (s *Server) reauthCurrentPassword(w http.ResponseWriter, r *http.Request, c
 		respondThrottled(w, wait, "too many failed attempts — try again in a few minutes")
 		return false
 	}
-	t0 := time.Now()
-	if _, ok := s.auth.VerifyUser(r.Context(), caller, current); !ok {
+	if _, ok, kdfRan := s.auth.VerifyUser(r.Context(), caller, current); !ok {
 		// Client gone while queued on bcryptSem: a disconnect is not a
 		// failed attempt — skip the budget and the delay; refund the
-		// per-IP admission ONLY for the zero-KDF-cost case (login split).
+		// per-IP admission ONLY for the zero-KDF-cost case. kdfRan is
+		// the explicit acquire-site signal (see VerifyUser) — the same
+		// split as login, and why the old elapsed-time floor (which
+		// misread fast-CPU paid KDFs and long queue waits) is gone.
 		if r.Context().Err() != nil {
-			if time.Since(t0) < kdfCostFloor {
+			if !kdfRan {
 				s.auth.refundAttempt(key)
 			}
 			return false

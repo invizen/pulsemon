@@ -138,17 +138,6 @@ func acquireBcryptSem(ctx context.Context) bool {
 
 func releaseBcryptSem() { <-bcryptSem }
 
-// kdfCostFloor separates a ZERO-KDF-COST return from the bcrypt queue
-// (acquireBcryptSem's ctx.Done select fires in microseconds) from a return
-// that PAID the KDF (bcrypt at bcryptCost=DefaultCost runs ≥50ms on any
-// supported hardware and cannot be interrupted by ctx — see the
-// api_context_test.go empirical pin) when the login and change-password
-// disconnect arms decide whether to refund the per-IP throttle admission.
-// The refund contract ("throttling is for KDF cost", refundAttempt) refunds
-// only the unpaid case; the margin is ≥2x under the paid side and ≥4
-// orders of magnitude over the unpaid side, so the split is deterministic.
-const kdfCostFloor = 25 * time.Millisecond
-
 type authSession struct {
 	user   string
 	expiry time.Time
@@ -726,8 +715,20 @@ func (a *AuthState) SetUserPassword(ctx context.Context, username, password, kee
 	return nil
 }
 
-// VerifyUser reports whether username/password is a valid account.
-func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (string, bool) {
+// VerifyUser reports whether username/password is a valid account. The
+// third return, kdfRan, says whether the bcrypt KDF actually RAN: false
+// only when ctx was canceled while queued on bcryptSem (zero KDF cost
+// paid); true on every path that acquired a slot — bcrypt runs
+// ctx-ignoring to completion, so a disconnect mid-KDF still paid. The
+// login and change-password disconnect arms key their per-IP throttle
+// refund on this explicit acquire-site signal. The old elapsed-time
+// heuristic (kdfCostFloor, 25ms) was replaced because it failed BOTH
+// ways: on fast CPUs where cost 10 finishes in 20–25ms, a PAID KDF read
+// as "fast" and got refunded — an unbounded per-IP guessing channel with
+// recordUserFail and loginSlowDown skipped; under a saturated semaphore,
+// a legitimate queue wait ≥25ms with zero KDF cost read as "paid" and was
+// NOT refunded — operator self-lockout.
+func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (string, bool, bool) {
 	username = strings.ToLower(username)
 	hash, err := a.db.UserHash(username)
 	if err != nil || hash == "" {
@@ -739,20 +740,20 @@ func (a *AuthState) VerifyUser(ctx context.Context, username, password string) (
 		// client skips the KDF; the live-client timing equalizer is untouched.
 		// History: docs/DECISIONS.md → login-throttle-per-username.
 		if !acquireBcryptSem(ctx) {
-			return "", false
+			return "", false, false // queued cancel: the KDF never ran
 		}
 		defer releaseBcryptSem()
 		bcrypt.CompareHashAndPassword(dummyBcryptHash, []byte(password))
-		return "", false
+		return "", false, true
 	}
 	if !acquireBcryptSem(ctx) {
-		return "", false
+		return "", false, false // queued cancel: the KDF never ran
 	}
 	defer releaseBcryptSem()
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
-		return "", false
+		return "", false, true
 	}
-	return username, true
+	return username, true, true
 }
 
 // Disable removes ALL users, opening the dashboard again.

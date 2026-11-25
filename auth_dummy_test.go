@@ -66,7 +66,7 @@ func TestVerifyUserDummyHash(t *testing.T) {
 	a := NewAuthState(db)
 	_ = a.AddUser(context.Background(), "admin", "secretpw") // enable auth
 	t0 := time.Now()
-	if _, ok := a.VerifyUser(context.Background(), "no-such-user", "attacker-pw"); ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "no-such-user", "attacker-pw"); ok {
 		t.Fatalf("VerifyUser accepted an unknown user")
 	}
 	elapsed := time.Since(t0)
@@ -116,12 +116,12 @@ func TestVerifyUserDummyMatchesRealHashCost(t *testing.T) {
 
 	// Unknown-user (dummy path).
 	t0 := time.Now()
-	_, _ = a.VerifyUser(context.Background(), "ghost", "attacker-pw")
+	_, _, _ = a.VerifyUser(context.Background(), "ghost", "attacker-pw")
 	unknown := time.Since(t0)
 
 	// Wrong-password (real hash path).
 	t0 = time.Now()
-	_, _ = a.VerifyUser(context.Background(), "admin", "wrong-pw")
+	_, _, _ = a.VerifyUser(context.Background(), "admin", "wrong-pw")
 	wrong := time.Since(t0)
 
 	// Both ran a full cost-10 KDF -> both well above the no-KDF floor.

@@ -94,13 +94,13 @@ func TestAuthStateVerifyRoundTrip(t *testing.T) {
 	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if u, ok := a.VerifyUser(context.Background(), "Admin", "secretpw"); !ok || u != "admin" {
+	if u, ok, _ := a.VerifyUser(context.Background(), "Admin", "secretpw"); !ok || u != "admin" {
 		t.Fatalf("VerifyUser = %q, %v; want admin (case-insensitive)", u, ok)
 	}
-	if _, ok := a.VerifyUser(context.Background(), "admin", "wrongpw123"); ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "admin", "wrongpw123"); ok {
 		t.Fatal("VerifyUser accepted a wrong password")
 	}
-	if _, ok := a.VerifyUser(context.Background(), "nobody", "secretpw"); ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "nobody", "secretpw"); ok {
 		t.Fatal("VerifyUser accepted an unknown user")
 	}
 	// The stored value must be a bcrypt hash, never the plaintext.
@@ -143,7 +143,7 @@ func TestAuthRemoveLastUserProtected(t *testing.T) {
 	if n, _ := db.UserCount(); n != 0 {
 		t.Fatalf("UserCount after Disable = %d, want 0", n)
 	}
-	if _, ok := a.VerifyUser(context.Background(), "second", "secretpw"); ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "second", "secretpw"); ok {
 		t.Fatal("VerifyUser must fail after Disable")
 	}
 }
@@ -156,10 +156,10 @@ func TestAuthSessions(t *testing.T) {
 	if err := a.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := a.CreateSession(context.Background(), "admin", "wrongpw123", false); ok {
+	if _, ok, _ := a.CreateSession(context.Background(), "admin", "wrongpw123", false); ok {
 		t.Fatal("CreateSession must reject a bad password")
 	}
-	sess, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+	sess, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok || sess == "" {
 		t.Fatal("CreateSession failed for valid credentials")
 	}
@@ -233,7 +233,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
 		t.Fatal(err)
 	}
-	sess, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	sess, ok, _ := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -250,7 +250,7 @@ func TestExpiredSessionRejected(t *testing.T) {
 
 	// A live session still slides: a hit moves expiry back to now+TTL.
 	// Backdate it an hour first so the slide is measurable.
-	sess2, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	sess2, ok, _ := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -311,7 +311,7 @@ func TestSessionAbsoluteMaxAge(t *testing.T) {
 	// the exact state a continuously-active session reaches createdAgo after
 	// login.
 	activeWithLoginAgo := func(createdAgo time.Duration) string {
-		tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+		tok, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 		if !ok {
 			t.Fatal("CreateSession failed")
 		}
@@ -358,7 +358,7 @@ func TestSessionAbsoluteMaxAge(t *testing.T) {
 	}
 
 	// 4. A just-logged-in session is unaffected by the cap.
-	fresh, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+	fresh, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
@@ -469,7 +469,7 @@ func TestAuthStateRefreshSeesExternalWrite(t *testing.T) {
 	if !a.Enabled() {
 		t.Fatal("live AuthState did not pick up the external user write after the TTL")
 	}
-	if u, ok := a.VerifyUser(context.Background(), "cliuser", "secretpw"); !ok || u != "cliuser" {
+	if u, ok, _ := a.VerifyUser(context.Background(), "cliuser", "secretpw"); !ok || u != "cliuser" {
 		t.Fatalf("VerifyUser after external write = %q, %v", u, ok)
 	}
 	// And back again: auth-user remove from the host clears it live.
@@ -827,7 +827,7 @@ func TestAuthLegacyTokenMigration(t *testing.T) {
 		t.Fatalf("UserCount after migration = %d, want 1", n)
 	}
 	a := NewAuthState(db)
-	if u, ok := a.VerifyUser(context.Background(), "admin", tok); !ok || u != "admin" {
+	if u, ok, _ := a.VerifyUser(context.Background(), "admin", tok); !ok || u != "admin" {
 		t.Fatalf("VerifyUser(admin, old token) = %q, %v; want ok", u, ok)
 	}
 	if got := db.GetSetting("auth_token"); got != "" {
@@ -1699,7 +1699,7 @@ func TestBcryptSemCoversGenerate(t *testing.T) {
 	if err := a.SetUserPassword(context.Background(), "semuser", "newpassword-1", ""); err != nil {
 		t.Fatalf("SetUserPassword (live ctx, free sem): %v", err)
 	}
-	if u, ok := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
+	if u, ok, _ := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
 		t.Fatalf("VerifyUser after SetUserPassword = %q, %v; want semuser, true", u, ok)
 	}
 
@@ -1730,7 +1730,7 @@ func TestBcryptSemCoversGenerate(t *testing.T) {
 	// live (non-canceled) ctx would park forever on a full sem.
 	release()
 	// The old password is still the one (the KDF never ran).
-	if u, ok := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
+	if u, ok, _ := a.VerifyUser(context.Background(), "semuser", "newpassword-1"); !ok || u != "semuser" {
 		t.Fatalf("password changed despite canceled ctx: VerifyUser = %q, %v", u, ok)
 	}
 }
@@ -1752,7 +1752,7 @@ func TestVerifyUserCtxCancelSkipsQueuedKDF(t *testing.T) {
 		ok   bool
 	}, 1)
 	go func() {
-		u, ok := a.VerifyUser(ctx, "nobody", "secretpw")
+		u, ok, _ := a.VerifyUser(ctx, "nobody", "secretpw")
 		done <- struct {
 			user string
 			ok   bool
@@ -1794,7 +1794,7 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	const n = 70
 	toks := make([]string, 0, n)
 	for i := 0; i < n; i++ {
-		tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+		tok, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 		if !ok {
 			t.Fatal("create session")
 		}
@@ -1820,7 +1820,7 @@ func TestSweepExpiredSessionsEvictsAbandoned(t *testing.T) {
 	a.mu.Lock()
 	a.nextSweepSessions = time.Time{}
 	a.mu.Unlock()
-	fresh, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+	fresh, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("create session after sweep")
 	}
@@ -1883,7 +1883,7 @@ func TestCreateSessionCapsPerUser(t *testing.T) {
 	a.mu.Unlock()
 
 	// admin's 4th login is at the cap → evict admin's OLDEST only.
-	tok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+	tok, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}

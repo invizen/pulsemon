@@ -31,15 +31,17 @@ import (
 var maxSessionsPerUser = 32
 
 // CreateSession validates the credentials and returns a new opaque session
-// token tied to the user.
-func (a *AuthState) CreateSession(ctx context.Context, username, password string, cookieSecure bool) (string, bool) {
-	user, ok := a.VerifyUser(ctx, username, password)
+// token tied to the user. The third return, kdfRan, is VerifyUser's
+// explicit KDF-cost signal (see VerifyUser) propagated to the login
+// disconnect arm's throttle-refund decision.
+func (a *AuthState) CreateSession(ctx context.Context, username, password string, cookieSecure bool) (string, bool, bool) {
+	user, ok, kdfRan := a.VerifyUser(ctx, username, password)
 	if !ok {
-		return "", false
+		return "", false, kdfRan
 	}
 	tok, err := newSessionToken()
 	if err != nil {
-		return "", false
+		return "", false, true
 	}
 	a.mu.Lock()
 	now := time.Now()
@@ -52,7 +54,7 @@ func (a *AuthState) CreateSession(ctx context.Context, username, password string
 	// never populates userOKCache), so the race window is zero.
 	if !a.userExists(user) {
 		a.mu.Unlock()
-		return "", false
+		return "", false, true
 	}
 	// Opportunistic GC: see sweepExpiredSessions. Bounded O(n) work, run
 	// only once the map is large enough that abandoned sessions are the
@@ -91,7 +93,7 @@ func (a *AuthState) CreateSession(ctx context.Context, username, password string
 	}
 	a.sessions[tok] = authSession{user: user, expiry: now.Add(authSessionTTL), created: now, cookieIssued: now, cookieSecure: cookieSecure}
 	a.mu.Unlock()
-	return tok, true
+	return tok, true, true
 }
 
 // sweepExpiredSessions evicts sessions whose sliding TTL has lapsed or that

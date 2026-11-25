@@ -105,7 +105,7 @@ func TestSessionSweepRateLimited(t *testing.T) {
 	a.sessions["expired"] = authSession{user: "admin", expiry: now.Add(-time.Minute), created: now, cookieIssued: now}
 	a.mu.Unlock()
 
-	if _, ok := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
+	if _, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
 		t.Fatal("CreateSession failed")
 	}
 	a.mu.Lock()
@@ -118,7 +118,7 @@ func TestSessionSweepRateLimited(t *testing.T) {
 	a.mu.Lock()
 	a.sessions["expired2"] = authSession{user: "admin", expiry: now.Add(-time.Minute), created: now, cookieIssued: now}
 	a.mu.Unlock()
-	if _, ok := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
+	if _, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false); !ok {
 		t.Fatal("CreateSession failed")
 	}
 	a.mu.Lock()

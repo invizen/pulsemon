@@ -337,7 +337,7 @@ func TestTagsEventsGetRequireSession(t *testing.T) {
 
 	// 3. Auth ON, valid session: GET is open to ANY session (the tag list
 	// and event feed are dashboard data, not an admin surface).
-	tok, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	tok, ok, _ := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}

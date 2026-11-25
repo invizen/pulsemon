@@ -31,7 +31,7 @@ func TestFix_QueuedCancelRefundsPerIPAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Live session for the change-password arm (KDF paid BEFORE saturation).
-	tok, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	tok, ok, _ := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession for test session failed")
 	}
@@ -104,11 +104,10 @@ func TestFix_QueuedCancelRefundsPerIPAttempt(t *testing.T) {
 // both skipped). Same split as the setup-mode path, which deliberately does
 // NOT refund its in-tx bootstrap race loss ("it DID pay the KDF").
 //
-// Cancel fires 20ms into a bcrypt that runs ≥50ms: the arm takes the
-// paid-KDF branch (elapsed ≥ kdfCostFloor → no refund). If the machine is
-// fast enough that the KDF finishes before the 20ms cancel lands, the
-// request takes the full 401 path — which counts the attempt too. Both
-// outcomes must leave exactly one counted admission.
+// Cancel fires 20ms into the bcrypt. When the cancel lands mid-KDF the
+// arm takes the paid-KDF branch (kdfRan=true → no refund); when the KDF
+// finishes first the request takes the full 401 path — which counts the
+// attempt too. Both outcomes must leave exactly one counted admission.
 func TestFix_PaidKDFDisconnectNotRefunded(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))

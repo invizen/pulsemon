@@ -170,7 +170,7 @@ func TestFix_RenewalCookieCappedByMaxAge(t *testing.T) {
 	}
 
 	// Method level: young session → full TTL on renewal.
-	tok, ok := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
+	tok, ok, _ := srv.auth.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}

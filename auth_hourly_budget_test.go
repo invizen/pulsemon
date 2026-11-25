@@ -205,10 +205,10 @@ func TestSetUserPasswordRejectsCommonPassword(t *testing.T) {
 		}
 	}
 	// Nothing changed: the old password still verifies, the new one does not.
-	if _, ok := a.VerifyUser(context.Background(), "admin", "secretpw"); !ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "admin", "secretpw"); !ok {
 		t.Fatal("old password stopped verifying after a REJECTED change")
 	}
-	if _, ok := a.VerifyUser(context.Background(), "admin", "password123"); ok {
+	if _, ok, _ := a.VerifyUser(context.Background(), "admin", "password123"); ok {
 		t.Fatal("the common password verified — the rejected change was stored")
 	}
 }

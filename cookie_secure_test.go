@@ -22,11 +22,11 @@ func TestCookieSecurePinAcrossRenewal(t *testing.T) {
 		a.mu.Unlock()
 	}
 
-	secureTok, ok := a.CreateSession(context.Background(), "admin", "secretpw", true)
+	secureTok, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", true)
 	if !ok {
 		t.Fatal("CreateSession(secure) failed")
 	}
-	plainTok, ok := a.CreateSession(context.Background(), "admin", "secretpw", false)
+	plainTok, ok, _ := a.CreateSession(context.Background(), "admin", "secretpw", false)
 	if !ok {
 		t.Fatal("CreateSession failed")
 	}
