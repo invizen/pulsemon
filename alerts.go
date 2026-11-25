@@ -959,35 +959,27 @@ func (pw *ProbeWorker) providerStatuses() ([]providerStatus, error) {
 }
 
 // sendWebhook delivers one alert to every active provider and reports
-// whether it was delivered. The delivery is QUEUED on the sensor's
-// alertGate FIFO first: alerts for one sensor run
-// strictly in launch order, so an "error" alert whose first attempt fails
-// and retries cannot be delivered AFTER the sensor's later "recovered"
-// alert — the chat's last word must match the sensor's current state.
-// The caller blocks until the delivery finishes (the launchAlert goroutine
-// is tracked in alertWG, so DrainAlerts still sees true completion).
+// whether it was delivered. The delivery is queued on the sensor's alertGate
+// FIFO so one sensor's alerts run strictly in launch order (a retried
+// "error" must never land after that sensor's "recovered" alert — the chat's
+// last word must match its current state), and the caller blocks until it
+// finishes (tracked in alertWG, so DrainAlerts sees true completion).
 func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
-	// Storm budget: over-budget transitions are coalesced into a single
-	// storm summary instead of delivered individually. A suppressed alert
-	// reports "delivered" (true) so the caller schedules no retry — the
-	// summary carries it. Re-alerts (oldState == state) NEVER ride the
-	// budget: they are the operator's re-alert cadence, not a transition
-	// burst, and coalescing them would burn budget meant for new
-	// transitions and render bogus "svc: error -> error" lines in a
-	// "sensors changed state" summary.
+	// Storm budget: over-budget transitions coalesce into the storm summary
+	// (reports "delivered" — the summary carries it, the caller schedules no
+	// retry). Re-alerts (oldState == state) never ride the budget: they are
+	// the operator's re-alert cadence, and coalescing them would burn
+	// transition budget and render bogus "svc: error -> error" lines.
+	// History: docs/DECISIONS.md → storm-summary-edges.
 	if !reAlert && !pw.stormAdmit(id, name, target, oldState, state, rttMs) {
 		return true
 	}
 	done := make(chan bool, 1)
 	if !pw.enqueueAlert(id, func() {
-		// Guarantee a `done` value even if the delivery panics: the
-		// consumer's per-job recover swallows the panic (sacrifice the job,
-		// keep the loop alive), but a skipped `done <-` would park this
-		// caller on `<-done` forever — leaking the goroutine and its
-		// alertWG count, so DrainAlerts burns the full backstop at every
-		// shutdown. The buffer-1 channel makes the
-		// defer exact: the normal send fills it and the defer is a no-op;
-		// on panic the defer is the sole writer.
+		// Guarantee a `done` value even if the delivery panics: a skipped
+		// send would park this caller on `<-done` forever and leak its
+		// alertWG count; the buffer-1 channel makes the defer exact (the
+		// normal send fills it, on panic the defer is the sole writer).
 		defer func() {
 			select {
 			case done <- false:
@@ -996,19 +988,16 @@ func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rtt
 		}()
 		done <- pw.sendWebhookDeliver(id, name, target, oldState, state, rttMs, reAlert)
 	}) {
-		// The sensor's FIFO was full (provider degradation): the alert was
-		// dropped, not delivered. Report false so the caller schedules its
-		// 1-minute-later retry (scheduleAlertRetry) once the queue drains.
+		// FIFO full (provider degradation): dropped, not delivered — report
+		// false so the caller schedules its 1-minute retry.
 		return false
 	}
 	select {
 	case ok := <-done:
 		return ok
 	case <-pw.stopCtx.Done():
-		// Shutdown began before the FIFO reached this job. Abort the wait
-		// so this caller (tracked in alertWG via launchAlert) releases its
-		// count and DrainAlerts can finish, instead of parking on `<-done`
-		// for the full backstop.
+		// Shutdown began before the FIFO reached this job: abort the wait so
+		// this caller releases its alertWG count (no full-backstop park).
 		return false
 	}
 }
