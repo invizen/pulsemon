@@ -157,25 +157,51 @@ func TestStormCoalescing(t *testing.T) {
 	})
 }
 
-// TestStormRecoveryAlwaysAdmitted: recoveries bypass the budget entirely —
-// even at budget 0 the operator hears every recovery individually.
-func TestStormRecoveryAlwaysAdmitted(t *testing.T) {
-	withStormBudget(t, 0, time.Hour, func() {
+// TestRecoveryStormCoalescingOverBudget (2026-11-25 MAJOR-6): recoveries
+// ride their OWN storm budget, symmetric with the down direction — at
+// recovery budget 0 the operator hears ONE coalesced "recovery storm"
+// summary, not N individual cards fanning out N×providers concurrent
+// deliveries. (Pre-fix this test pinned the opposite: recoveries were
+// ALWAYS admitted, and a 500-1,000-sensor mass recovery bypassed
+// coalescing entirely.)
+func TestRecoveryStormCoalescingOverBudget(t *testing.T) {
+	withRecoveryStormBudget(t, 0, 500*time.Millisecond, func() {
 		withPlainTransport(t, func() { // loopback httptest vs the SSRF blocklist
 			pw, db, getBodies, cleanup := newStormTestWorker(t)
 			defer cleanup()
 			insertStormSensor(t, db, "r0")
 			insertStormSensor(t, db, "r1")
+			// Mirror the engine: the probe loop stamps the new status in
+			// the DB before the alert fires — the flush filter reads it.
+			if _, err := db.Exec(`UPDATE sensors SET status = 'up' WHERE id IN ('r0','r1')`); err != nil {
+				t.Fatalf("set r0/r1 up: %v", err)
+			}
 			pw.launchAlert(func() { pw.sendAlert("r0", "r0", "127.0.0.1", "error", "up", 0) })
 			pw.launchAlert(func() { pw.sendAlert("r1", "r1", "127.0.0.1", "error", "up", 0) })
-			pw.DrainAlerts(5 * time.Second)
-			bodies := getBodies()
-			if len(bodies) != 2 {
-				t.Fatalf("recoveries at budget 0: deliveries = %d, want 2 (individual)", len(bodies))
+			// The flush lands at window end, AFTER alertWG drains — poll
+			// (same shape as TestStormCoalescing).
+			var bodies []string
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				bodies = getBodies()
+				if len(bodies) >= 1 || time.Now().After(deadline) {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
 			}
-			for _, b := range bodies {
-				if strings.Contains(b, "alert storm") {
-					t.Error("recovery must never be coalesced into a storm summary")
+			if len(bodies) != 1 {
+				t.Fatalf("deliveries at recovery budget 0 = %d, want 1 (the coalesced summary)", len(bodies))
+			}
+			b := bodies[0]
+			if !strings.Contains(b, "recovery storm") {
+				t.Fatalf("delivery must be a recovery storm summary:\n%s", b)
+			}
+			if !strings.Contains(b, "2 sensors recovered") {
+				t.Errorf("summary must count 2 recovered sensors:\n%s", b)
+			}
+			for _, id := range []string{"r0", "r1"} {
+				if !strings.Contains(b, id+": error → up") {
+					t.Errorf("summary missing %s:\n%s", id, b)
 				}
 			}
 		})
@@ -260,32 +286,39 @@ func TestStormFlushDropsRecovered(t *testing.T) {
 	})
 }
 
-// TestStormPartialRecoveryAlwaysAdmitted (2026-10-28 review): a partial
-// recovery (error -> warning) is a recovery — recoveryTitle already renders
-// it as a "partial recovery" card — so it bypasses the storm budget exactly
-// like error -> up. Pre-fix it counted against the non-recovery budget and,
-// over budget, was coalesced into the storm summary: good news delayed a
-// full window, and a sensor that went up -> error -> warning inside the
-// window left TWO conflicting lines in the summary.
-func TestStormPartialRecoveryAlwaysAdmitted(t *testing.T) {
-	withStormBudget(t, 0, time.Hour, func() {
+// TestPartialRecoveryStormCoalescing (2026-11-25 MAJOR-6): a partial
+// recovery (error -> warning) is a recovery — it rides the recovery storm
+// budget exactly like error -> up. At recovery budget 0 it is coalesced
+// into the "recovery storm" summary; the line shows "error → warning"
+// verbatim so the partial nature is not lost.
+func TestPartialRecoveryStormCoalescing(t *testing.T) {
+	withRecoveryStormBudget(t, 0, 500*time.Millisecond, func() {
 		withPlainTransport(t, func() { // loopback httptest vs the SSRF blocklist
 			pw, db, getBodies, cleanup := newStormTestWorker(t)
 			defer cleanup()
 			insertStormSensor(t, db, "p0")
-			pw.launchAlert(func() { pw.sendAlert("p0", "p0", "127.0.0.1", "error", "warning", 0) })
-			pw.DrainAlerts(5 * time.Second)
-			bodies := getBodies()
-			if len(bodies) != 1 {
-				t.Fatalf("partial recovery at budget 0: deliveries = %d, want 1 (individual)", len(bodies))
+			if _, err := db.Exec(`UPDATE sensors SET status = 'warning' WHERE id = 'p0'`); err != nil {
+				t.Fatalf("set p0 warning: %v", err)
 			}
-			for _, b := range bodies {
-				if strings.Contains(b, "alert storm") {
-					t.Fatal("partial recovery must never be coalesced into a storm summary")
+			pw.launchAlert(func() { pw.sendAlert("p0", "p0", "127.0.0.1", "error", "warning", 0) })
+			var bodies []string
+			deadline := time.Now().Add(2 * time.Second)
+			for {
+				bodies = getBodies()
+				if len(bodies) >= 1 || time.Now().After(deadline) {
+					break
 				}
-				if !strings.Contains(b, "partial recovery") {
-					t.Errorf("card must read as a partial recovery: %q", b)
-				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if len(bodies) != 1 {
+				t.Fatalf("partial recovery at recovery budget 0: deliveries = %d, want 1 (the coalesced summary)", len(bodies))
+			}
+			b := bodies[0]
+			if !strings.Contains(b, "recovery storm") {
+				t.Fatalf("delivery must be a recovery storm summary:\n%s", b)
+			}
+			if !strings.Contains(b, "p0: error → warning") {
+				t.Errorf("summary must show the partial transition verbatim:\n%s", b)
 			}
 		})
 	})
@@ -314,7 +347,7 @@ func TestStormFlushDedupesPerSensor(t *testing.T) {
 				stormEntry{id: "f0", name: "f0", target: "127.0.0.1", oldState: "warning", state: "error"},
 			)
 			pw.stormMu.Unlock()
-			pw.flushStorm()
+			pw.flushStorm(false)
 			var bodies []string
 			deadline := time.Now().Add(2 * time.Second)
 			for {
@@ -379,7 +412,7 @@ func TestStormFlushUsesInMemoryStatus(t *testing.T) {
 				stormEntry{id: "a1", name: "a1", target: "127.0.0.1", oldState: "up", state: "error"},
 			)
 			pw.stormMu.Unlock()
-			pw.flushStorm()
+			pw.flushStorm(false)
 			// a1 is kept, so a summary is delivered; poll for it.
 			var bodies []string
 			deadline := time.Now().Add(2 * time.Second)
@@ -439,7 +472,7 @@ func TestStormSummaryDropsRecoveredBeforePost(t *testing.T) {
 		// hands to launchAlert after its filter keeps r10. deliverStormSummary
 		// is synchronous here (no launchAlert), so the post is done by the
 		// time it returns.
-		pw.deliverStormSummary([]stormEntry{{id: "r10", name: "r10", target: "127.0.0.1", oldState: "up", state: "error"}})
+		pw.deliverStormSummary([]stormEntry{{id: "r10", name: "r10", target: "127.0.0.1", oldState: "up", state: "error"}}, false)
 		bodies := getBodies()
 		for _, b := range bodies {
 			if strings.Contains(b, "r10") {
@@ -681,7 +714,7 @@ func TestStormSummaryMarkdownEscapesAsterisks(t *testing.T) {
 	entries := []stormEntry{
 		{id: "a", name: "nas*01", target: "https://nas.lan/x*y", oldState: "up", state: "error"},
 	}
-	md := stormSummaryMarkdown(entries, 0)
+	md := stormSummaryMarkdown(entries, 0, false)
 	// Name's * is escaped; the URL target's * is verbatim (clickable).
 	want := "*nas\\*01: up → error (https://nas.lan/x*y)*"
 	if !strings.Contains(md, want) {
@@ -704,18 +737,18 @@ func TestStormSummaryMentionNeutralizationScopedToMarkdown(t *testing.T) {
 	}
 	const zwsp = "\u200b"
 	// Markdown (Discord/Google Chat): the mention IS neutralized.
-	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, zwsp) {
+	if md := stormSummaryMarkdown(entries, 0, false); !strings.Contains(md, zwsp) {
 		t.Errorf("markdown summary must neutralize the mention (want %q present): %q", zwsp, md)
 	}
 	// Plain (SMTP) and HTML (Telegram): the mention is NOT neutralized.
-	if p := stormSummaryPlain(entries, 0); strings.Contains(p, zwsp) {
+	if p := stormSummaryPlain(entries, 0, false); strings.Contains(p, zwsp) {
 		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
 	}
-	if h := stormSummaryHTML(entries, 0); strings.Contains(h, zwsp) {
+	if h := stormSummaryHTML(entries, 0, false); strings.Contains(h, zwsp) {
 		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
 	}
 	// The plain summary carries the sensor name verbatim.
-	if p := stormSummaryPlain(entries, 0); !strings.Contains(p, "@everyone") {
+	if p := stormSummaryPlain(entries, 0, false); !strings.Contains(p, "@everyone") {
 		t.Errorf("SMTP plain summary must carry the sensor name verbatim: %q", p)
 	}
 }
@@ -736,7 +769,7 @@ func TestStormSummaryMarkdownTargetMentionNeutralized(t *testing.T) {
 		{id: "a", name: "nas", target: "https://example.com/@everyone", oldState: "up", state: "error"},
 		{id: "b", name: "cam", target: "https://user:pass@nas.lan/@here", oldState: "up", state: "error"},
 	}
-	md := stormSummaryMarkdown(entries, 0)
+	md := stormSummaryMarkdown(entries, 0, false)
 	// The target path's @everyone is neutralized (ZWSP right after the @).
 	if !strings.Contains(md, "https://example.com/@"+zwsp+"everyone") {
 		t.Errorf("storm markdown must neutralize the target's @everyone: %q", md)
@@ -750,10 +783,10 @@ func TestStormSummaryMarkdownTargetMentionNeutralized(t *testing.T) {
 		t.Errorf("target credentials must be stripped, mention neutralized: %q", md)
 	}
 	// Non-Markdown paths are untouched (no ZWSP — email/Telegram stay clean).
-	if p := stormSummaryPlain(entries, 0); strings.Contains(p, zwsp) {
+	if p := stormSummaryPlain(entries, 0, false); strings.Contains(p, zwsp) {
 		t.Errorf("SMTP plain summary must not carry the zero-width space: %q", p)
 	}
-	if h := stormSummaryHTML(entries, 0); strings.Contains(h, zwsp) {
+	if h := stormSummaryHTML(entries, 0, false); strings.Contains(h, zwsp) {
 		t.Errorf("Telegram HTML summary must not carry the zero-width space: %q", h)
 	}
 }
@@ -789,14 +822,14 @@ func TestMarkdownEscapesEmphasisChars(t *testing.T) {
 		t.Errorf("discord re-alert card must escape the name's _ but keep the target verbatim: %q", dc)
 	}
 	// Storm summary (Markdown).
-	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, "db\\_primary\\_01") || !strings.Contains(md, "api_v1/health~check") {
+	if md := stormSummaryMarkdown(entries, 0, false); !strings.Contains(md, "db\\_primary\\_01") || !strings.Contains(md, "api_v1/health~check") {
 		t.Errorf("storm markdown must escape the name's _ but keep the target verbatim: %q", md)
 	}
 	// The non-Markdown paths must NOT carry backslash escapes.
-	if p := stormSummaryPlain(entries, 0); strings.Contains(p, "\\") {
+	if p := stormSummaryPlain(entries, 0, false); strings.Contains(p, "\\") {
 		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
 	}
-	if h := stormSummaryHTML(entries, 0); strings.Contains(h, "\\") {
+	if h := stormSummaryHTML(entries, 0, false); strings.Contains(h, "\\") {
 		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
 	}
 }
@@ -819,14 +852,14 @@ func TestMarkdownEscapesLinkBrackets(t *testing.T) {
 	if dc := discordCard("up", "error", name, target, 0); !strings.Contains(dc, wantEscaped) {
 		t.Errorf("discord card must escape the name's link brackets: %q", dc)
 	}
-	if md := stormSummaryMarkdown(entries, 0); !strings.Contains(md, wantEscaped) {
+	if md := stormSummaryMarkdown(entries, 0, false); !strings.Contains(md, wantEscaped) {
 		t.Errorf("storm markdown must escape the name's link brackets: %q", md)
 	}
 	// The non-Markdown paths must NOT carry backslash escapes.
-	if p := stormSummaryPlain(entries, 0); strings.Contains(p, "\\") {
+	if p := stormSummaryPlain(entries, 0, false); strings.Contains(p, "\\") {
 		t.Errorf("SMTP plain summary must not carry backslash escapes: %q", p)
 	}
-	if h := stormSummaryHTML(entries, 0); strings.Contains(h, "\\") {
+	if h := stormSummaryHTML(entries, 0, false); strings.Contains(h, "\\") {
 		t.Errorf("Telegram HTML summary must not carry backslash escapes: %q", h)
 	}
 }

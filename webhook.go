@@ -133,7 +133,7 @@ func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 // webhookTransport is a Clone of http.DefaultTransport so it inherits sane
 // idle-lifecycle limits (IdleConnTimeout 90s, MaxIdleConns 100,
 // MaxIdleConnsPerHost 2, TLSHandshakeTimeout 10s) — a bare &http.Transport{}
-// leaves those at 0 (unbounded idle conns, no handshake timeout). Two
+// leaves those at 0 (unbounded idle conns, no handshake timeout). Three
 // overrides preserve the security contract:
 //   - Proxy: nil — DefaultTransport uses ProxyFromEnvironment; webhook egress
 //     must never route through an ambient proxy (SSRF pivot).
@@ -144,10 +144,17 @@ func dialChecked(ctx context.Context, network, addr string) (net.Conn, error) {
 //     dialChecked verified against the blocklist. (Setting DialTLSContext
 //     instead would make the transport assume the returned conn is already
 //     past the handshake and skip TLSClientConfig entirely — wrong.)
+//   - MaxConnsPerHost: 8 — DefaultTransport leaves this at 0 (unlimited
+//     ACTIVE dials). A mass-recovery fan-out (N sensors × providers) must
+//     not open thousands of parallel TLS handshakes to one endpoint and
+//     slam its rate limit (Discord ~5 req/2s, Telegram ~1 msg/s); excess
+//     requests queue in the transport instead of dialing.
+//     History: docs/DECISIONS.md → recovery-storm-budget.
 var webhookTransport = func() *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.Proxy = nil
 	t.DialContext = dialChecked
+	t.MaxConnsPerHost = 8
 	return t
 }()
 

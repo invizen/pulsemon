@@ -224,6 +224,16 @@ func wantsStartTLS(cfg smtpConfig) bool {
 	}
 }
 
+// smtpSem caps concurrent SMTP conversations (dial + TLS + DATA) at
+// smtpConcurrency: a mass recovery fans out one conversation per sensor per
+// SMTP provider, and an unbounded fan-out would open hundreds of parallel
+// sessions against one relay. A var (re-created whole) so tests can shrink
+// it. History: docs/DECISIONS.md → recovery-storm-budget.
+var (
+	smtpConcurrency = 8
+	smtpSem         = make(chan struct{}, smtpConcurrency)
+)
+
 // sendSMTPWith delivers with an already-resolved config (zero settings
 // reads on the delivery hot path).
 func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject, body string) error {
@@ -239,6 +249,14 @@ func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject
 	addr := net.JoinHostPort(cfg.Host, strconv.Itoa(cfg.Port))
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	// Concurrency cap (see smtpSem): ctx-aware so shutdown never blocks on
+	// the semaphore.
+	select {
+	case smtpSem <- struct{}{}:
+		defer func() { <-smtpSem }()
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 	// dialChecked's shared dialer has no per-dial timeout of its own; keep
 	// the 10-second dial bound the plain net.Dialer used to provide.

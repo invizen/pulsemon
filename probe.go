@@ -506,16 +506,21 @@ type ProbeWorker struct {
 	// excess alerts are NOT delivered individually — they are queued and
 	// emitted as ONE coalesced "storm summary" alert when the window
 	// elapses, instead of N parallel bursts that trip provider 429s and
-	// the retry schedule into a storm of their own. Recoveries — full
-	// (state == "up") AND partial (error -> warning) — are ALWAYS
-	// admitted: the operator must hear a recovery even mid-storm, and a
-	// storm of recoveries is far less noisy than a storm of failures.
-	// Guarded by stormMu.
-	stormMu          sync.Mutex
-	stormWindowStart time.Time
-	stormCount       int
-	stormQueue       []stormEntry
-	stormFlushArmed  bool
+	// the retry schedule into a storm of their own. Recoveries (full and
+	// partial) ride a SYMMETRIC, independent budget (the recoveryStorm*
+	// twins): a mass recovery after an outage must coalesce the same way
+	// an outage storm does — N×providers concurrent deliveries for
+	// 500-1,000 sensors would slam provider 429 limits and drop most of
+	// the recoveries. Guarded by stormMu.
+	stormMu                  sync.Mutex
+	stormWindowStart         time.Time
+	stormCount               int
+	stormQueue               []stormEntry
+	stormFlushArmed          bool
+	recoveryStormWindowStart time.Time
+	recoveryStormCount       int
+	recoveryStormQueue       []stormEntry
+	recoveryStormFlushArmed  bool
 }
 
 // retentionSeconds is how long of a probe history the in-memory series keeps.

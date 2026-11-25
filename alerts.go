@@ -10,6 +10,7 @@ import (
 	"html"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
 	neturl "net/url"
 	"os"
@@ -577,6 +578,20 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 // can shorten it.
 var recoveryRetryDelay = time.Minute
 
+// recoveryRetryJitter spreads a mass-recovery retry herd: N dropped
+// recoveries scheduled at the same instant must not re-fire in lockstep a
+// minute later (a second thundering herd). Upward-only [base, 1.5×base] —
+// 60..90s at the production 1m base. The floor stays at base: the FIFO
+// budget invariant (TestInFifoRetryBudgetUnderRecoveryRetryDelay) checks
+// the worst in-band job against recoveryRetryDelay, so a sub-base jitter
+// would re-open the permanent-drop window it closes.
+func recoveryRetryJitter(base time.Duration) time.Duration {
+	if base < 2*time.Millisecond {
+		return base
+	}
+	return base + time.Duration(rand.Int63n(int64(base)/2))
+}
+
 // scheduleRecoveryRetry re-offers a recovery / partial-recovery alert
 // (error -> up, error -> warning) whose first delivery failed — dropped on
 // a full per-sensor FIFO during provider degradation, or every provider
@@ -607,8 +622,10 @@ func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newSta
 	// reading a package var (tests swap it) inside the goroutine — the
 	// retry outlives the test's restore, and the unsynchronized read/write
 	// is a data race the detector flags (same discipline as enqueueAlert,
-	// which passes alertGateIdle as a parameter).
-	delay := recoveryRetryDelay
+	// which passes alertGateIdle as a parameter). The jitter is drawn here
+	// too: a mass recovery schedules N retries at one instant, and they
+	// must not re-fire in lockstep (see recoveryRetryJitter).
+	delay := recoveryRetryJitter(recoveryRetryDelay)
 	pw.launchAlert(func() {
 		select {
 		case <-time.After(delay):
@@ -972,49 +989,83 @@ type stormEntry struct {
 }
 
 // stormBudget / stormWindow bound the global alert rate: at most
-// stormBudget individual non-recovery alerts per stormWindow. Vars so
-// tests can shrink them.
+// stormBudget individual non-recovery alerts per stormWindow.
+// recoveryStormBudget / recoveryStormWindow bound the recovery direction
+// symmetrically (see the stormMu field comment in probe.go). Vars so tests
+// can shrink them.
 var (
-	stormBudget = 10
-	stormWindow = 30 * time.Second
+	stormBudget         = 10
+	stormWindow         = 30 * time.Second
+	recoveryStormBudget = 10
+	recoveryStormWindow = 30 * time.Second
 )
 
-// stormAdmit reports whether this alert may be delivered individually.
-// See the stormMu field comment for the design.
+// isRecoveryState reports whether a transition is a recovery: full (up) or
+// partial (error -> warning). Both ride the recovery storm budget.
+func isRecoveryState(oldState, state string) bool {
+	return state == "up" || (oldState == "error" && state == "warning")
+}
+
+// stormAdmit reports whether this alert may be delivered individually,
+// applying the budget of ITS direction (recovery vs non-recovery). See the
+// stormMu field comment for the design.
 func (pw *ProbeWorker) stormAdmit(id, name, target, oldState, state string, rttMs float64) bool {
-	// A partial recovery (error -> warning) is a recovery: recoveryTitle
-	// already renders it as a "partial recovery" card, so coalescing it
-	// into a storm summary would delay good news and burn budget meant for
-	// down alerts.
-	if state == "up" || (oldState == "error" && state == "warning") {
-		return true
-	}
 	pw.stormMu.Lock()
 	defer pw.stormMu.Unlock()
-	now := time.Now()
-	if now.Sub(pw.stormWindowStart) >= stormWindow {
-		pw.stormWindowStart = now
-		pw.stormCount = 0
-	}
-	if pw.stormCount < stormBudget {
-		pw.stormCount++
-		return true
-	}
-	pw.stormQueue = append(pw.stormQueue, stormEntry{
+	return pw.stormAdmitLocked(isRecoveryState(oldState, state), stormEntry{
 		id: id, name: name, target: target, oldState: oldState, state: state, rttMs: rttMs,
 	})
-	pw.armStormFlushLocked(now)
+}
+
+// stormAdmitLocked applies ONE direction's budget. Caller holds stormMu.
+func (pw *ProbeWorker) stormAdmitLocked(recovery bool, e stormEntry) bool {
+	var (
+		windowStart *time.Time
+		count       *int
+		queue       *[]stormEntry
+		budget      int
+		window      time.Duration
+	)
+	if recovery {
+		windowStart, count, queue = &pw.recoveryStormWindowStart, &pw.recoveryStormCount, &pw.recoveryStormQueue
+		budget, window = recoveryStormBudget, recoveryStormWindow
+	} else {
+		windowStart, count, queue = &pw.stormWindowStart, &pw.stormCount, &pw.stormQueue
+		budget, window = stormBudget, stormWindow
+	}
+	now := time.Now()
+	if now.Sub(*windowStart) >= window {
+		*windowStart = now
+		*count = 0
+	}
+	if *count < budget {
+		*count++
+		return true
+	}
+	*queue = append(*queue, e)
+	pw.armStormFlushLocked(recovery, now)
 	return false
 }
 
 // armStormFlushLocked schedules the one-shot flush of the coalesced queue
-// at the end of the current storm window. Caller holds stormMu.
-func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
-	if pw.stormFlushArmed {
+// of ONE direction at the end of its current storm window. Caller holds
+// stormMu.
+func (pw *ProbeWorker) armStormFlushLocked(recovery bool, now time.Time) {
+	var (
+		armed       *bool
+		windowStart *time.Time
+		window      time.Duration
+	)
+	if recovery {
+		armed, windowStart, window = &pw.recoveryStormFlushArmed, &pw.recoveryStormWindowStart, recoveryStormWindow
+	} else {
+		armed, windowStart, window = &pw.stormFlushArmed, &pw.stormWindowStart, stormWindow
+	}
+	if *armed {
 		return
 	}
-	pw.stormFlushArmed = true
-	due := time.Until(pw.stormWindowStart.Add(stormWindow))
+	*armed = true
+	due := time.Until(windowStart.Add(window))
 	if due < 0 {
 		due = 0
 	}
@@ -1032,21 +1083,35 @@ func (pw *ProbeWorker) armStormFlushLocked(now time.Time) {
 		defer alertPanicRecovered("storm-flush")
 		select {
 		case <-time.After(due):
-			pw.flushStorm()
+			pw.flushStorm(recovery)
 		case <-pw.stopCtx.Done():
 		}
 	}()
 }
 
-// flushStorm delivers the coalesced storm summary (when the queue is
-// non-empty) and resets the budget for the next window.
-func (pw *ProbeWorker) flushStorm() {
+// flushStorm delivers the coalesced storm summary of ONE direction (when
+// its queue is non-empty) and resets that direction's budget for the next
+// window.
+func (pw *ProbeWorker) flushStorm(recovery bool) {
 	pw.stormMu.Lock()
-	q := pw.stormQueue
-	pw.stormQueue = nil
-	pw.stormFlushArmed = false
-	pw.stormWindowStart = time.Time{}
-	pw.stormCount = 0
+	var (
+		q           []stormEntry
+		windowStart *time.Time
+		count       *int
+		armed       *bool
+	)
+	if recovery {
+		q = pw.recoveryStormQueue
+		pw.recoveryStormQueue = nil
+		windowStart, count, armed = &pw.recoveryStormWindowStart, &pw.recoveryStormCount, &pw.recoveryStormFlushArmed
+	} else {
+		q = pw.stormQueue
+		pw.stormQueue = nil
+		windowStart, count, armed = &pw.stormWindowStart, &pw.stormCount, &pw.stormFlushArmed
+	}
+	*windowStart = time.Time{}
+	*count = 0
+	*armed = false
 	pw.stormMu.Unlock()
 	if len(q) == 0 {
 		return
@@ -1076,13 +1141,15 @@ func (pw *ProbeWorker) flushStorm() {
 	// a summary line for a sensor that recovered (now "up") would contradict
 	// the recovery alert it raced, and one that degraded further (entry
 	// "warning", now "error") is stale — the newer transition alerted
-	// individually. Both recovery classes are ALWAYS delivered individually
-	// (stormAdmit exempts them), so the individual alert is the operator's last
-	// word, not this summary. A vanished sensor (deleted mid-storm, read
-	// error) is KEPT — the operator should still see it in the storm that took
-	// it down. Status is read via currentStatus (in-memory first): actively-
-	// probed sensors make lastStatus the freshest source, and it avoids one
-	// SQLite round-trip per queued entry.
+	// individually. The same filter serves both directions symmetrically: a
+	// queued recovery (entry "up") whose sensor flapped back to "error" is
+	// dropped for the same reason — the newer transition owns its own budget
+	// path and is the operator's last word, not this summary. A vanished
+	// sensor (deleted mid-storm, read error) is KEPT — the operator should
+	// still see it in the storm that took it down. Status is read via
+	// currentStatus (in-memory first): actively-probed sensors make
+	// lastStatus the freshest source, and it avoids one SQLite round-trip
+	// per queued entry.
 	// History: docs/DECISIONS.md → storm-summary-caps-maintenance-gate-and-moved-on-filter.
 	still := q[:0]
 	for _, id := range order {
@@ -1095,15 +1162,15 @@ func (pw *ProbeWorker) flushStorm() {
 		return
 	}
 	pw.launchAlert(func() {
-		pw.deliverStormSummary(still)
+		pw.deliverStormSummary(still, recovery)
 	})
 }
 
-// deliverStormSummary sends the coalesced summary to every active provider
-// in parallel (same fan-out contract as sendWebhookDeliver). It is a
-// global meta-alert — NOT queued on any sensor's alertGate — so it cannot
-// disturb a sensor's per-sensor ordering guarantee (F4).
-func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
+// deliverStormSummary sends the coalesced summary of ONE direction to every
+// active provider in parallel (same fan-out contract as sendWebhookDeliver).
+// It is a global meta-alert — NOT queued on any sensor's alertGate — so it
+// cannot disturb a sensor's per-sensor ordering guarantee (F4).
+func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry, recovery bool) {
 	// Maintenance can begin between flushStorm's check and this delivery
 	// (launchAlert queues the job, it does not run it inline): re-check so
 	// a summary never lands in a chat silenced in the gap.
@@ -1140,10 +1207,14 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 	// replace the overflow with a "… and N more" footer, so every
 	// provider receives a body it will accept (see truncateSummaryLines).
 	// SMTP has no practical limit: 0 = uncapped.
-	mdChat := stormSummaryMarkdown(entries, googleChatMax)
-	mdDiscord := stormSummaryMarkdown(entries, discordContentMax)
-	subject := fmt.Sprintf("pulsemon: alert storm — %d sensors changed state", len(entries))
-	body := stormSummaryPlain(entries, 0)
+	kind := "alert"
+	if recovery {
+		kind = "recovery"
+	}
+	mdChat := stormSummaryMarkdown(entries, googleChatMax, recovery)
+	mdDiscord := stormSummaryMarkdown(entries, discordContentMax, recovery)
+	subject := fmt.Sprintf("pulsemon: %s storm — %d sensors %s", kind, len(entries), stormSummaryCountNoun(recovery))
+	body := stormSummaryPlain(entries, 0, recovery)
 	var wg sync.WaitGroup
 	var delivered atomic.Bool
 	for _, d := range dests {
@@ -1165,7 +1236,7 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry) {
 				// (see dest) — never a live re-read here.
 				ok = pw.postJSON(d.url, map[string]any{
 					"chat_id":    d.chatID,
-					"text":       stormSummaryHTML(entries, telegramTextMax),
+					"text":       stormSummaryHTML(entries, telegramTextMax, recovery),
 					"parse_mode": "HTML",
 				}) == nil
 			case "smtp":
@@ -1237,11 +1308,22 @@ func stormSummaryLine(e stormEntry) string {
 	return fmt.Sprintf("%s: %s → %s (%s)", e.name, e.oldState, e.state, alertTarget(e.target))
 }
 
+// stormSummaryCountNoun is the header's verb phrase per direction: a down
+// storm is a batch of state changes, a recovery storm a batch of recovered
+// sensors (a partial recovery's line shows "error → warning" verbatim).
+func stormSummaryCountNoun(recovery bool) string {
+	if recovery {
+		return "recovered"
+	}
+	return "changed state"
+}
+
 // stormSummaryMarkdown renders the summary for google_chat / discord.
 // maxRunes is the destination provider's content cap (googleChatMax /
 // discordContentMax); 0 = uncapped (see truncateSummaryLines).
-func stormSummaryMarkdown(entries []stormEntry, maxRunes int) string {
-	header := fmt.Sprintf("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*", len(entries))
+func stormSummaryMarkdown(entries []stormEntry, maxRunes int, recovery bool) string {
+	header := stormSummaryHeader("⚠️ *pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)*",
+		"✅ *pulsemon: recovery storm — %d sensors recovered (coalesced to limit alert noise)*", recovery, len(entries))
 	lines := make([]string, len(entries))
 	for i, e := range entries {
 		// Escape the emphasis chars in the NAME only (free text — a name like
@@ -1263,8 +1345,10 @@ func stormSummaryMarkdown(entries []stormEntry, maxRunes int) string {
 // stormSummaryHTML renders the summary for telegram (html-escaped).
 // maxRunes is the provider cap (telegramTextMax); 0 = uncapped. The cap is
 // measured on the ESCAPED output — that is what Telegram counts.
-func stormSummaryHTML(entries []stormEntry, maxRunes int) string {
-	header := html.EscapeString(fmt.Sprintf("⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)", len(entries)))
+func stormSummaryHTML(entries []stormEntry, maxRunes int, recovery bool) string {
+	header := html.EscapeString(stormSummaryHeader(
+		"⚠️ pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)",
+		"✅ pulsemon: recovery storm — %d sensors recovered (coalesced to limit alert noise)", recovery, len(entries)))
 	lines := make([]string, len(entries))
 	for i, e := range entries {
 		lines[i] = html.EscapeString(stormSummaryLine(e))
@@ -1274,13 +1358,24 @@ func stormSummaryHTML(entries []stormEntry, maxRunes int) string {
 
 // stormSummaryPlain renders the summary for SMTP (plain text).
 // maxRunes is 0 in production (email has no practical limit).
-func stormSummaryPlain(entries []stormEntry, maxRunes int) string {
-	header := fmt.Sprintf("pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)", len(entries))
+func stormSummaryPlain(entries []stormEntry, maxRunes int, recovery bool) string {
+	header := stormSummaryHeader(
+		"pulsemon: alert storm — %d sensors changed state (coalesced to limit alert noise)",
+		"pulsemon: recovery storm — %d sensors recovered (coalesced to limit alert noise)", recovery, len(entries))
 	lines := make([]string, len(entries))
 	for i, e := range entries {
 		lines[i] = stormSummaryLine(e)
 	}
 	return truncateSummaryLines(header, lines, maxRunes)
+}
+
+// stormSummaryHeader picks the direction's header format and fills in the
+// sensor count (the per-sensor lines follow in the formatters).
+func stormSummaryHeader(down, recoveryFmt string, recovery bool, n int) string {
+	if recovery {
+		return fmt.Sprintf(recoveryFmt, n)
+	}
+	return fmt.Sprintf(down, n)
 }
 
 // dest is one configured provider with its resolved URL (a webhook POST

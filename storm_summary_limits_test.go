@@ -40,14 +40,14 @@ func TestStormSummaryCapsPerProvider(t *testing.T) {
 	entries := stormCapEntries(40)
 
 	// Sizing sanity: the uncapped body must straddle the two caps.
-	full := stormSummaryPlain(entries, 0)
+	full := stormSummaryPlain(entries, 0, false)
 	if n := utf8.RuneCountInString(full); n <= discordContentMax || n >= telegramTextMax {
 		t.Fatalf("test sizing broken: uncapped body is %d runes, want (2000, 4096)", n)
 	}
 
 	// Discord (2,000): the body stays under the cap and the footer names
 	// exactly how many sensors were cut.
-	md := stormSummaryMarkdown(entries, discordContentMax)
+	md := stormSummaryMarkdown(entries, discordContentMax, false)
 	if n := utf8.RuneCountInString(md); n > discordContentMax {
 		t.Errorf("discord body is %d runes, exceeds the %d cap", n, discordContentMax)
 	}
@@ -72,7 +72,7 @@ func TestStormSummaryCapsPerProvider(t *testing.T) {
 	}
 
 	// Google Chat (4,096): the full list fits — no footer, every line.
-	gc := stormSummaryMarkdown(entries, googleChatMax)
+	gc := stormSummaryMarkdown(entries, googleChatMax, false)
 	if n := utf8.RuneCountInString(gc); n > googleChatMax {
 		t.Errorf("google_chat body is %d runes, exceeds the %d cap", n, googleChatMax)
 	}
@@ -85,7 +85,7 @@ func TestStormSummaryCapsPerProvider(t *testing.T) {
 
 	// Telegram HTML (4,096 in production; 2,000 here to exercise the cut):
 	// the cap is measured on the ESCAPED output — what Telegram counts.
-	tg := stormSummaryHTML(entries, 2000)
+	tg := stormSummaryHTML(entries, 2000, false)
 	if n := utf8.RuneCountInString(tg); n > 2000 {
 		t.Errorf("telegram body is %d runes, exceeds the 2000 cap", n)
 	}
@@ -94,7 +94,7 @@ func TestStormSummaryCapsPerProvider(t *testing.T) {
 	}
 
 	// SMTP (0 = uncapped): every line, no footer.
-	sm := stormSummaryPlain(entries, 0)
+	sm := stormSummaryPlain(entries, 0, false)
 	if strings.Contains(sm, "… and") {
 		t.Errorf("SMTP body is uncapped: no footer expected:\n%s", sm)
 	}
@@ -136,7 +136,7 @@ func TestStormFlushSilencedInMaintenance(t *testing.T) {
 		if pw.alertsEnabled() {
 			t.Fatal("test setup: alerts must be silenced in maintenance")
 		}
-		pw.flushStorm()
+		pw.flushStorm(false)
 		time.Sleep(100 * time.Millisecond) // settle any (bogus) async delivery
 		if bodies := getBodies(); len(bodies) != 0 {
 			t.Errorf("maintenance: storm summary delivered (%d bodies), want 0", len(bodies))
@@ -165,7 +165,7 @@ func TestStormSummarySilencedInMaintenance(t *testing.T) {
 		pw.reloadAlertSettings()
 		// Exactly what flushStorm hands to launchAlert for a still-down
 		// sensor — with maintenance on in the gap.
-		pw.deliverStormSummary([]stormEntry{{id: "g0", name: "g0", target: "127.0.0.1", oldState: "up", state: "error"}})
+		pw.deliverStormSummary([]stormEntry{{id: "g0", name: "g0", target: "127.0.0.1", oldState: "up", state: "error"}}, false)
 		if bodies := getBodies(); len(bodies) != 0 {
 			t.Errorf("maintenance: storm summary delivered (%d bodies), want 0", len(bodies))
 		}
@@ -210,7 +210,7 @@ func TestStormFlushDropsMovedOnSensors(t *testing.T) {
 			stormEntry{id: "k0", name: "k0", target: "127.0.0.1", oldState: "up", state: "error"},
 		)
 		pw.stormMu.Unlock()
-		pw.flushStorm()
+		pw.flushStorm(false)
 		// k0 is kept, so a summary is delivered; poll for it (same reason
 		// as TestStormCoalescing: the flush lands after alertWG drains).
 		var bodies []string
@@ -269,7 +269,7 @@ func TestStormSummaryDropsMovedOnBeforePost(t *testing.T) {
 		pw.deliverStormSummary([]stormEntry{
 			{id: "q0", name: "q0", target: "127.0.0.1", oldState: "up", state: "error"},
 			{id: "q1", name: "q1", target: "127.0.0.1", oldState: "up", state: "error"},
-		})
+		}, false)
 		bodies := getBodies()
 		if len(bodies) != 1 {
 			t.Fatalf("deliveries = %d, want 1 (q1 still down)", len(bodies))
