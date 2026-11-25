@@ -98,6 +98,17 @@ const (
 	enabledTTL = 2 * time.Second
 )
 
+// knownGoodRevokeFails: failed credential checks from an exempt
+// (username, bucket) pair that REVOKE its knownGood exemption. Without the
+// revocation a bucket-sharer (NAT / Docker bridge / VPN gateway collapses
+// clients into one throttleKey bucket) rides the 30-day exemption and paces
+// 6 guesses / 61s under the per-IP 7/60s cap — ~8,500 guesses/day — past
+// the account's hourly budget, which password_blocklist assumes is the
+// binding cap. A success re-mints the exemption and resets the count. A
+// var so tests can shrink it.
+// History: docs/DECISIONS.md → knowngood-revoke-on-bucket-fails.
+var knownGoodRevokeFails = 10
+
 // usernameRe: starts with a letter, then letters/digits/._- . Stored
 // lowercase; the UNIQUE constraint is on the lower-cased column value.
 var usernameRe = regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9._-]*$`)
@@ -275,6 +286,14 @@ type AuthState struct {
 		// on the same IP does not exempt this one). Bounded by sweepThrottle.
 		// History: docs/DECISIONS.md → login-throttle-known-good-exemption.
 		knownGood map[string]time.Time
+		// knownGoodFails: (username, IP bucket) → failed credential checks
+		// since the knownGood exemption was (re-)minted. At
+		// knownGoodRevokeFails the exemption is revoked — a bucket-sharer
+		// must not pace around the account's hourly budget for the full
+		// knownGoodTTL (see knownGoodRevokeFails). Bounded by knownGood's
+		// key space; reset on re-mint, swept/purged with knownGood.
+		// History: docs/DECISIONS.md → knowngood-revoke-on-bucket-fails.
+		knownGoodFails map[string]int
 		// nextSweep rate-limits the O(n) map GC to once per throttleSweepInterval:
 		// a spray keeps every entry in-window, so a per-call sweep prunes nothing at
 		// O(n) cost. The sweep/wipe trigger watches ALL THREE maps — userFails is

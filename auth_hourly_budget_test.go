@@ -28,7 +28,7 @@ func TestRecordUserFailHourlyBudgetLocks(t *testing.T) {
 	}
 
 	// One more fail: rolling stays at 1 (no 7/60s trip), hourly hits 30.
-	a.recordUserFail("admin")
+	a.recordUserFail("admin", "")
 
 	a.loginThrottle.Lock()
 	until, locked := a.loginThrottle.userLock["admin"]
@@ -53,7 +53,7 @@ func TestHourlyBudgetPersistsAcrossRollingLockout(t *testing.T) {
 	// Burst 1: 7 fails in the window → the 5-min ROLLING lockout (hourly is
 	// only at 7, under the cap).
 	for i := 0; i < 7; i++ {
-		a.recordUserFail("admin")
+		a.recordUserFail("admin", "")
 	}
 	a.loginThrottle.Lock()
 	firstUntil := a.loginThrottle.userLock["admin"]
@@ -87,7 +87,7 @@ func TestHourlyBudgetPersistsAcrossRollingLockout(t *testing.T) {
 		a.loginThrottle.Lock()
 		delete(a.loginThrottle.userFails, "admin") // fresh 60s window
 		a.loginThrottle.Unlock()
-		a.recordUserFail("admin")
+		a.recordUserFail("admin", "")
 	}
 	a.loginThrottle.Lock()
 	until, locked := a.loginThrottle.userLock["admin"]
@@ -116,7 +116,7 @@ func TestHourlyBudgetSelfResetsAfterWindow(t *testing.T) {
 		start: time.Now().Add(-70 * time.Minute),
 		count: 30,
 	}
-	a.recordUserFail("admin")
+	a.recordUserFail("admin", "")
 
 	a.loginThrottle.Lock()
 	b := a.loginThrottle.userHour["admin"]
@@ -136,7 +136,7 @@ func TestClearUserFailClearsHourlyBudget(t *testing.T) {
 	a := NewAuthState(newTestDB(t))
 	a.ensureThrottleMaps()
 
-	a.recordUserFail("admin")
+	a.recordUserFail("admin", "")
 	a.loginThrottle.Lock()
 	_, had := a.loginThrottle.userHour["admin"]
 	a.loginThrottle.Unlock()

@@ -188,7 +188,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		// Cold path: no timing oracle. History: docs/DECISIONS.md →
 		// userfails-bound.
 		if s.auth.userExists(userKey) {
-			s.auth.recordUserFail(userKey)
+			s.auth.recordUserFail(userKey, key)
 		}
 		// Constant-time-ish delay on rejection: equalizes the unknown-user /
 		// wrong-password paths (closes the timing oracle), ~5 guesses/s/IP.
@@ -463,7 +463,7 @@ func (s *Server) reauthCurrentPassword(w http.ResponseWriter, r *http.Request, c
 		// Count the failure against the account — the same shared budget
 		// login uses. The caller holds a live session, so the account
 		// exists by construction (no userExists gate, unlike login).
-		s.auth.recordUserFail(caller)
+		s.auth.recordUserFail(caller, key)
 		// Constant-time-ish delay on rejection, same as a rejected login:
 		// caps an online attacker at ~5 guesses/second per IP.
 		time.Sleep(loginSlowDown)

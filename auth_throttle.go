@@ -66,6 +66,7 @@ func (a *AuthState) purgeUserThrottle(username string) {
 	for k := range a.loginThrottle.knownGood {
 		if strings.HasPrefix(k, prefix) {
 			delete(a.loginThrottle.knownGood, k)
+			delete(a.loginThrottle.knownGoodFails, k)
 		}
 	}
 }
@@ -82,6 +83,7 @@ func (a *AuthState) purgeAllUserThrottle() {
 	a.loginThrottle.userLock = map[string]time.Time{}
 	a.loginThrottle.userHour = map[string]*userHourBudget{}
 	a.loginThrottle.knownGood = map[string]time.Time{}
+	a.loginThrottle.knownGoodFails = map[string]int{}
 }
 
 // peerIP extracts the client's IP from the request's direct TCP peer
@@ -252,6 +254,9 @@ func (a *AuthState) ensureThrottleMaps() {
 	if a.loginThrottle.knownGood == nil {
 		a.loginThrottle.knownGood = map[string]time.Time{}
 	}
+	if a.loginThrottle.knownGoodFails == nil {
+		a.loginThrottle.knownGoodFails = map[string]int{}
+	}
 }
 
 // Throttle GC tuning. Vars, not consts, so tests
@@ -318,6 +323,7 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		}
 		if len(a.loginThrottle.knownGood) > throttleHardCap {
 			a.loginThrottle.knownGood = map[string]time.Time{}
+			a.loginThrottle.knownGoodFails = map[string]int{}
 		}
 	}
 	if until, ok := a.loginThrottle.lockout[ip]; ok {
@@ -369,6 +375,10 @@ func (a *AuthState) loginSuccess(username, ip string) {
 	// by any other user on the same shared IP must not exempt this one
 	// (see the knownGood field comment).
 	a.loginThrottle.knownGood[knownGoodKey(username, ip)] = time.Now()
+	// Re-mint resets the revocation count: an operator who typos a few
+	// times and then logs in successfully keeps their exemption (the count
+	// is "since mint", so N fails must come from AFTER the last success).
+	delete(a.loginThrottle.knownGoodFails, knownGoodKey(username, ip))
 }
 
 // checkUserLock reports whether username is locked out by the per-username
@@ -420,7 +430,15 @@ func (a *AuthState) clearIPThrottle(ip string) {
 // locks the account out when the in-window count reaches loginFailMax. Called
 // ONLY on a failed check, after the KDF ran; a success clears it via
 // clearUserFail, so typos that eventually succeed don't accumulate.
-func (a *AuthState) recordUserFail(username string) {
+//
+// ipBucket is the request's throttle bucket: a fail from a KNOWN-GOOD
+// (username, bucket) pair is charged to the exemption itself, and
+// knownGoodRevokeFails such fails revoke it — the account budget above keeps
+// counting under the exemption, so without the revocation a bucket-sharer
+// paces the 30-day exemption past the hourly cap (the per-IP 7/60s layer
+// only forces a 5-minute pause per burst).
+// History: docs/DECISIONS.md → knowngood-revoke-on-bucket-fails.
+func (a *AuthState) recordUserFail(username, ipBucket string) {
 	a.loginThrottle.Lock()
 	defer a.loginThrottle.Unlock()
 	a.ensureThrottleMaps()
@@ -459,6 +477,17 @@ func (a *AuthState) recordUserFail(username string) {
 		a.loginThrottle.userLock[username] = now.Add(loginHourLockout)
 	} else if len(kept) >= loginFailMax {
 		a.loginThrottle.userLock[username] = now.Add(loginLockout)
+	}
+	// Known-good revocation: charge the fail to the pair's exemption.
+	// Only pairs WITH an active exemption accumulate (no entry is minted
+	// for non-exempt users — the map stays bounded by knownGood's keys).
+	k := knownGoodKey(username, ipBucket)
+	if _, ok := a.loginThrottle.knownGood[k]; ok {
+		a.loginThrottle.knownGoodFails[k]++
+		if a.loginThrottle.knownGoodFails[k] >= knownGoodRevokeFails {
+			delete(a.loginThrottle.knownGood, k)
+			delete(a.loginThrottle.knownGoodFails, k)
+		}
 	}
 }
 
@@ -558,6 +587,7 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 	for ip, t := range a.loginThrottle.knownGood {
 		if now.Sub(t) > knownGoodTTL {
 			delete(a.loginThrottle.knownGood, ip)
+			delete(a.loginThrottle.knownGoodFails, ip)
 		}
 	}
 }
