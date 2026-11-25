@@ -174,9 +174,18 @@ hex2bin() {
 # (PULSEMON_PUBKEYS_URL) serves fixtures over file://, so the proto pin
 # applies to https URLs only — it would break the file:// harness. Every
 # other download in this script is fixed-https and carries the pin inline.
+# The value below must NOT contain shell quotes: quotes inside a
+# double-quoted scalar are LITERAL characters, and the unquoted
+# $PUBKEYS_PROTO expansion below passes them to curl verbatim (quote
+# removal applies only to quotes in the source text, never to expansion
+# results). The old shape "--proto '=https' --tlsv1.2" made curl receive
+# the arg '=https' and exit 2 — aborting every production install.
+# =https carries no glob or shell metacharacters, so the unquoted
+# expansion splits into exactly the three intended argv tokens.
+# History: docs/DECISIONS.md → install-pubkeys-proto-argv
 PUBKEYS_PROTO=""
 case "$PUBKEYS_URL" in
-	https://*) PUBKEYS_PROTO="--proto '=https' --tlsv1.2" ;;
+	https://*) PUBKEYS_PROTO="--proto =https --tlsv1.2" ;;
 esac
 curl -sfL $PUBKEYS_PROTO -o "$TMP/release_pubkeys" "$PUBKEYS_URL" || {
   echo "pulsemon: could not fetch release_pubkeys from main — refusing to install an unverifiable binary" >&2
