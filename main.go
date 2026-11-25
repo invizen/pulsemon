@@ -245,13 +245,18 @@ var bindFatal = func(msg string) { log.Fatal(msg) }
 // re-exec parent may still hold the port. A successful serve and a clean
 // shutdown (http.ErrServerClosed) are both normal exits. Any other error:
 // fail immediately when not re-exec'ing (a port conflict or permission
-// error will not resolve on its own), or at the deadline when re-exec'ing.
-// A re-exec child that cannot bind must die loudly — a supervisor
-// restarts it — rather than return and leave the process alive as a
-// headless zombie with a probe worker but no listener.
-func bindServeWithRetry(retry bool, label string, bind func() error) {
+// error will not resolve on its own), or at the deadline when re-exec'ing —
+// UNLESS stop has closed: a shutdown in flight makes the bind failure moot,
+// and bindFatal's os.Exit(1) would skip runServer's deferred db.Close().
+func bindServeWithRetry(retry bool, stop <-chan struct{}, label string, bind func() error) {
 	deadline := time.Now().Add(reexecBindDeadline)
 	for {
+		select {
+		case <-stop:
+			log.Printf("bind (%s) interrupted by shutdown", label)
+			return
+		default:
+		}
 		err := bind()
 		if err == nil || errors.Is(err, http.ErrServerClosed) {
 			return
@@ -259,7 +264,12 @@ func bindServeWithRetry(retry bool, label string, bind func() error) {
 		if !retry || time.Now().After(deadline) {
 			bindFatal("Listen (" + label + "): " + err.Error())
 		}
-		time.Sleep(500 * time.Millisecond)
+		select {
+		case <-stop:
+			log.Printf("bind (%s) interrupted by shutdown", label)
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
 	}
 }
 
@@ -275,82 +285,98 @@ func bindServeWithRetry(retry bool, label string, bind func() error) {
 // When PULSEMON_RESTARTING is set (we are the child of a re-exec), the
 // bind may fail for up to ~30s while the parent still holds the port;
 // bindServeWithRetry retries it until reexecBindDeadline instead of
-// dying (and dies loudly if the parent never releases).
-func startListener(srv *http.Server, db *store.Store) {
+// dying (a shutdown landing in that window wins and exits cleanly).
+//
+// srv.Addr and srv.TLSConfig are configured SYNCHRONOUSLY, before the
+// serve goroutine spawns: srv.Shutdown reads both, and a concurrent
+// write from the goroutine is a data race (MAJOR-11).
+func startListener(srv *http.Server, db *store.Store, stop <-chan struct{}) {
 	cfg := loadListenerCfg(db)
 	retry := os.Getenv("PULSEMON_RESTARTING") == "1"
 
-	go func() {
-		if cfg.certPath != "" {
-			// A CONFIGURED pair must be servable. Silently serving
-			// plaintext when the operator believes TLS is on is the
-			// worse failure, so an unreadable pair is fatal — unless the
-			// operator opts back into the old warn-and-fallback behavior
-			// (an install that stages certs after first boot) with
-			// PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1.
-			var missing string
-			if _, err := os.Stat(cfg.certPath); err != nil {
-				missing = cfg.certPath + ": " + err.Error()
-			} else if _, err := os.Stat(cfg.keyPath); err != nil {
-				missing = cfg.keyPath + ": " + err.Error()
-			}
-			if missing != "" {
-				if os.Getenv("PULSEMON_ALLOW_PLAINTEXT_FALLBACK") == "1" {
-					log.Printf("WARNING: TLS is configured (%s) but %s is not readable; PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 — serving plain HTTP until it is in place", cfg.source, missing)
-				} else {
-					certFatal("CRITICAL: TLS is configured (" + cfg.source + ") but " + missing + " — fix the files, or set PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 to serve plain HTTP in the meantime")
-					return
-				}
-			} else if err := tlsKeyPairOK(cfg.certPath, cfg.keyPath); err != nil {
-				// A pair is in place but unusable (encrypted key,
-				// corrupt cert, mismatched pair). Fail fast with the
-				// reason instead of looping or serving plaintext.
-				certFatal(fmt.Sprintf("TLS: %s + %s are in place but cannot be loaded: %v", cfg.certPath, cfg.keyPath, err))
-				return
-			} else {
-				srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
-				addr := httpsAddrFor(cfg.httpsPort)
-				log.Println("Starting server on " + addr + " (TLS, cert " + cfg.source + ")")
-				bindServeWithRetry(retry, "TLS: "+addr, func() error {
-					return listenTLS(srv, addr, cfg.certPath, cfg.keyPath)
-				})
-				return
-			}
+	tlsOn := false
+	if cfg.certPath != "" {
+		// A CONFIGURED pair must be servable. Silently serving
+		// plaintext when the operator believes TLS is on is the
+		// worse failure, so an unreadable pair is fatal — unless the
+		// operator opts back into the old warn-and-fallback behavior
+		// (an install that stages certs after first boot) with
+		// PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1.
+		var missing string
+		if _, err := os.Stat(cfg.certPath); err != nil {
+			missing = cfg.certPath + ": " + err.Error()
+		} else if _, err := os.Stat(cfg.keyPath); err != nil {
+			missing = cfg.keyPath + ": " + err.Error()
 		}
-		addr := listenAddr()
-		srv.Addr = addr // listener is created explicitly below; keep srv.Addr in sync
-		log.Println("Starting server on " + addr)
-		bindServeWithRetry(retry, addr, func() error {
-			ln, err := net.Listen("tcp", addr)
-			if err != nil {
-				return err
+		if missing != "" {
+			if os.Getenv("PULSEMON_ALLOW_PLAINTEXT_FALLBACK") == "1" {
+				log.Printf("WARNING: TLS is configured (%s) but %s is not readable; PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 — serving plain HTTP until it is in place", cfg.source, missing)
+			} else {
+				certFatal("CRITICAL: TLS is configured (" + cfg.source + ") but " + missing + " — fix the files, or set PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 to serve plain HTTP in the meantime")
+				return
 			}
-			defer ln.Close() // no leaked socket on a retry after a failed serve
-			errCh := make(chan error, 1)
-			go func() { errCh <- srv.Serve(ln) }()
-			return <-errCh
-		})
+		} else if err := tlsKeyPairOK(cfg.certPath, cfg.keyPath); err != nil {
+			// A pair is in place but unusable (encrypted key,
+			// corrupt cert, mismatched pair). Fail fast with the
+			// reason instead of looping or serving plaintext.
+			certFatal(fmt.Sprintf("TLS: %s + %s are in place but cannot be loaded: %v", cfg.certPath, cfg.keyPath, err))
+			return
+		} else {
+			// ServeTLS(ln, "", "") (listenTLS) natively advertises
+			// the h2 + http/1.1 ALPN set; a manual tls.NewListener +
+			// Serve left NextProtos empty, forcing the dashboard's
+			// 5s polls onto multiple HTTP/1.1 connections.
+			// GetCertificate re-reads the pair when its (mtime, size)
+			// fingerprint changes (m10), so a renewal takes effect at
+			// the next handshake without a restart.
+			srv.TLSConfig = &tls.Config{
+				MinVersion:     tls.VersionTLS12,
+				GetCertificate: hotReloadCert(cfg.certPath, cfg.keyPath),
+			}
+			tlsOn = true
+		}
+	}
+	addr := listenAddr()
+	if tlsOn {
+		addr = httpsAddrFor(cfg.httpsPort)
+		log.Println("Starting server on " + addr + " (TLS, cert " + cfg.source + ")")
+	} else {
+		log.Println("Starting server on " + addr)
+	}
+	srv.Addr = addr // listener is created explicitly below; keep srv.Addr in sync
+	go func() {
+		if tlsOn {
+			bindServeWithRetry(retry, stop, "TLS: "+addr, func() error {
+				return listenTLS(srv, addr)
+			})
+		} else {
+			bindServeWithRetry(retry, stop, addr, func() error {
+				ln, err := net.Listen("tcp", addr)
+				if err != nil {
+					return err
+				}
+				defer ln.Close() // no leaked socket on a retry after a failed serve
+				errCh := make(chan error, 1)
+				go func() { errCh <- srv.Serve(ln) }()
+				return <-errCh
+			})
+		}
 	}()
 }
 
 // listenTLS binds and serves TLS on a fresh listener; returns when the
-// server is shut down. The listener is always closed so a retry after a
-// failed serve does not leak a socket.
-func listenTLS(srv *http.Server, addr, cert, key string) error {
+// server is shut down. ServeTLS(ln, "", "") uses srv.TLSConfig (set
+// synchronously by startListener) and natively advertises h2 + http/1.1
+// ALPN. The listener is always closed so a retry after a failed serve
+// does not leak a socket.
+func listenTLS(srv *http.Server, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
-	srv.Addr = addr
-	// m10: ServeTLS(ln, cert, key) loads the pair ONCE,
-	// so a renewed cert (dashboard TLS upload, acme.sh cron) needed a process
-	// restart. GetCertificate re-reads the files when their mtime changes, so
-	// the renewal takes effect at the next handshake.
-	srv.TLSConfig.GetCertificate = hotReloadCert(cert, key)
-	tlsLn := tls.NewListener(ln, srv.TLSConfig)
 	errCh := make(chan error, 1)
-	go func() { errCh <- srv.Serve(tlsLn) }()
+	go func() { errCh <- srv.ServeTLS(ln, "", "") }()
 	return <-errCh
 }
 
@@ -775,7 +801,7 @@ func runServer(stop <-chan struct{}) {
 	// host `pulsemon auth-user add/remove` must take effect on the very
 	// next request without a restart.
 	srv := newHTTPServer(server.authGate())
-	startListener(srv, db)
+	startListener(srv, db, stop)
 
 	<-stop
 	log.Println("Shutting down...")

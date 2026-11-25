@@ -1,10 +1,17 @@
 package main
 
 import (
+	"crypto/tls"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"pulsemon/internal/store"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -28,7 +35,7 @@ func TestBindServeWithRetryFailsFastWhenNotRetrying(t *testing.T) {
 	var msg string
 	func() {
 		defer func() { msg, _ = recover().(string) }()
-		bindServeWithRetry(false, ":9299", func() error {
+		bindServeWithRetry(false, make(chan struct{}), ":9299", func() error {
 			return errors.New("bind: address already in use")
 		})
 	}()
@@ -61,7 +68,7 @@ func TestBindServeWithRetryDiesAtDeadline(t *testing.T) {
 	var msg string
 	func() {
 		defer func() { msg, _ = recover().(string) }()
-		bindServeWithRetry(true, "TLS: :443", func() error {
+		bindServeWithRetry(true, make(chan struct{}), "TLS: :443", func() error {
 			attempts++
 			return errors.New("bind: address already in use")
 		})
@@ -89,7 +96,7 @@ func TestBindServeWithRetrySucceedsAfterRetries(t *testing.T) {
 	t.Cleanup(func() { bindFatal = orig })
 
 	attempts := 0
-	bindServeWithRetry(true, ":9299", func() error {
+	bindServeWithRetry(true, make(chan struct{}), ":9299", func() error {
 		attempts++
 		if attempts < 3 {
 			return errors.New("bind: address already in use")
@@ -109,8 +116,8 @@ func TestBindServeWithRetryNormalExits(t *testing.T) {
 	bindFatal = func(msg string) { t.Errorf("unexpected fatal: %s", msg) }
 	t.Cleanup(func() { bindFatal = orig })
 
-	bindServeWithRetry(false, ":9299", func() error { return nil })
-	bindServeWithRetry(true, ":9299", func() error { return http.ErrServerClosed })
+	bindServeWithRetry(false, make(chan struct{}), ":9299", func() error { return nil })
+	bindServeWithRetry(true, make(chan struct{}), ":9299", func() error { return http.ErrServerClosed })
 }
 
 // TestFix_m2_UnreadableTLSPairIsFatal pins the m2 fix: a TLS pair that is
@@ -138,7 +145,10 @@ func TestFix_m2_UnreadableTLSPairIsFatal(t *testing.T) {
 	}
 	defer db.Close()
 
-	startListener(newHTTPServer(http.NewServeMux()), db)
+	// The cert check (and its fatal) is now SYNCHRONOUS in startListener
+	// (MAJOR-11), so the blocking certFatal stub parks startListener's own
+	// goroutine — run it detached and watch the channel from here.
+	go startListener(newHTTPServer(http.NewServeMux()), db, make(chan struct{}))
 
 	select {
 	case msg := <-fatals:
@@ -178,7 +188,7 @@ func TestFix_m2_PlaintextFallbackEnv(t *testing.T) {
 	}
 	defer db.Close()
 
-	startListener(newHTTPServer(http.NewServeMux()), db)
+	startListener(newHTTPServer(http.NewServeMux()), db, make(chan struct{}))
 
 	select {
 	case msg := <-binds:
@@ -187,5 +197,162 @@ func TestFix_m2_PlaintextFallbackEnv(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("PULSEMON_ALLOW_PLAINTEXT_FALLBACK=1 did not fall through to the plain-HTTP listener")
+	}
+}
+
+// TestBindServeWithRetryHonorsShutdown is the MAJOR-11 stop pin: a
+// re-exec child stuck in the bind-retry loop (parent still holding the
+// port) that receives a shutdown must RETURN CLEANLY — pre-fix the loop
+// ignored stop and kept going to the 45s deadline, where bindFatal's
+// os.Exit(1) skipped runServer's deferred db.Close() mid-shutdown.
+func TestBindServeWithRetryHonorsShutdown(t *testing.T) {
+	origFatal := bindFatal
+	bindFatal = func(msg string) { panic(msg) }
+	t.Cleanup(func() { bindFatal = origFatal })
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		bindServeWithRetry(true, stop, ":9299", func() error {
+			return errors.New("bind: address already in use")
+		})
+	}()
+	// Let a couple of retry cycles elapse, then shut down.
+	time.Sleep(120 * time.Millisecond)
+	close(stop)
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shutdown did not stop the bind retry loop")
+	}
+}
+
+// TestStartListenerConfiguresServerBeforeServeGoroutine is the MAJOR-11
+// mutation-race pin (source-shape): srv.Shutdown reads srv.Addr and
+// srv.TLSConfig, so every `srv.* =` assignment in startListener must sit
+// OUTSIDE the serve goroutine's function literal — inside it, the write
+// races the concurrent shutdown read. A behavioral race test cannot see
+// this deterministically (the race only fires on the interleaving), so the
+// pin parses the AST: zero srv.* assignments inside any FuncLit, at least
+// one outside (positive control: the pin is not vacuous).
+func TestStartListenerConfiguresServerBeforeServeGoroutine(t *testing.T) {
+	f, err := parser.ParseFile(token.NewFileSet(), "main.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range f.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Name.Name == "startListener" {
+			fn = fd
+		}
+	}
+	if fn == nil {
+		t.Fatal("startListener not found in main.go")
+	}
+	srvAssign := func(n ast.Node) bool {
+		sel, ok := n.(*ast.SelectorExpr)
+		if !ok {
+			return false
+		}
+		id, ok := sel.X.(*ast.Ident)
+		return ok && id.Name == "srv"
+	}
+	inFuncLit, total := 0, 0
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if fl, ok := n.(*ast.FuncLit); ok {
+			ast.Inspect(fl, func(m ast.Node) bool {
+				if as, ok := m.(*ast.AssignStmt); ok {
+					for _, lhs := range as.Lhs {
+						if srvAssign(lhs) {
+							inFuncLit++
+						}
+					}
+				}
+				return true
+			})
+			return false
+		}
+		if as, ok := n.(*ast.AssignStmt); ok {
+			for _, lhs := range as.Lhs {
+				if srvAssign(lhs) {
+					total++
+				}
+			}
+		}
+		return true
+	})
+	if total == 0 {
+		t.Fatal("no srv.* assignments found in startListener — pin is vacuous")
+	}
+	if inFuncLit > 0 {
+		t.Fatalf("%d srv.* assignment(s) inside the serve goroutine — they race srv.Shutdown", inFuncLit)
+	}
+}
+
+// TestTLSServeAdvertisesHTTP2 is the MAJOR-11 ALPN pin, end to end: the
+// real startListener path (env pair + stored port) must negotiate "h2"
+// with an h2-capable client. Pre-fix, listenTLS wrapped the listener in
+// tls.NewListener + srv.Serve with NextProtos left empty, so ALPN never
+// advertised h2 and every dashboard tab rode multiple HTTP/1.1
+// connections for its 5s polls.
+func TestTLSServeAdvertisesHTTP2(t *testing.T) {
+	certPEM, keyPEM, _ := makeTestCert(t, "rsa")
+	certPath := filepath.Join(t.TempDir(), "cert.pem")
+	keyPath := filepath.Join(t.TempDir(), "key.pem")
+	if err := os.WriteFile(certPath, []byte(certPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyPEM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A free port for the TLS listener.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := probe.Addr().(*net.TCPAddr).Port
+	probe.Close()
+
+	db, err := store.NewStore(filepath.Join(t.TempDir(), "h2.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.InitSchema(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SetSetting("listener_https_port", strconv.Itoa(port)); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PULSEMON_CERT", certPath)
+	t.Setenv("PULSEMON_KEY", keyPath)
+
+	srv := newHTTPServer(http.NewServeMux())
+	stop := make(chan struct{})
+	defer close(stop)
+	startListener(srv, db, stop)
+
+	deadline := time.Now().Add(5 * time.Second)
+	var conn *tls.Conn
+	for {
+		var c net.Conn
+		var err error
+		c, err = tls.Dial("tcp", "127.0.0.1:"+strconv.Itoa(port), &tls.Config{
+			InsecureSkipVerify: true,
+			NextProtos:         []string{"h2", "http/1.1"},
+		})
+		if err == nil {
+			conn = c.(*tls.Conn)
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("TLS listener never came up on port %d: %v", port, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	defer conn.Close()
+	if got := conn.ConnectionState().NegotiatedProtocol; got != "h2" {
+		t.Fatalf("ALPN negotiated %q, want h2 (without it the dashboard is forced onto HTTP/1.1)", got)
 	}
 }
