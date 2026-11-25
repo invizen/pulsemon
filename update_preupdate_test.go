@@ -44,7 +44,7 @@ func TestBackupDatabasePreUpdateMakesConsistentCopy(t *testing.T) {
 	t.Setenv("PULSEMON_DB", dbPath)
 	seedSensors(t, dbPath, 3)
 
-	backupDatabasePreUpdate() // must not block/fail the (simulated) update
+	backupDatabasePreUpdate(nil) // must not block/fail the (simulated) update
 
 	backup := filepath.Join(dir, "pulsemon.db.preupdate")
 	b, err := store.NewStore(backup)
@@ -70,10 +70,50 @@ func TestBackupDatabasePreUpdateNoDBIsBestEffort(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("PULSEMON_DB", filepath.Join(dir, "no-such-dir", "pulsemon.db"))
 
-	backupDatabasePreUpdate() // must not panic
+	backupDatabasePreUpdate(nil) // must not panic
 
 	if _, err := os.Stat(filepath.Join(dir, "no-such-dir")); !os.IsNotExist(err) {
 		t.Fatalf("no directory/backup expected when the DB path is unreachable (err=%v)", err)
+	}
+}
+
+// CRITICAL-2 (2026-11-25): the SECOND pre-update backup (dst already
+// exists) must succeed and carry the CURRENT sensor state — the old
+// `VACUUM INTO` failed with "output file already exists" and the
+// warn-only path left the first, months-old, snapshot in place, which a
+// later watchdog would restore over a legitimately smaller live DB.
+func TestBackupDatabasePreUpdateSecondUpdateReplacesStaleBackup(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "pulsemon.db")
+	t.Setenv("PULSEMON_DB", dbPath)
+	seedSensors(t, dbPath, 3)
+
+	backupDatabasePreUpdate(nil) // update #1 (fresh dst)
+
+	// Months later: the operator decommissions a sensor.
+	st, err := store.NewStore(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Exec(`DELETE FROM sensors WHERE name = 'sa'`); err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+
+	backupDatabasePreUpdate(nil) // update #2 — must NOT warn-only-fail
+
+	backup := filepath.Join(dir, "pulsemon.db.preupdate")
+	ro, err := store.NewStoreReadOnly(backup)
+	if err != nil {
+		t.Fatalf("backup not openable: %v", err)
+	}
+	defer ro.Close()
+	got, err := ro.SensorCount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 2 {
+		t.Fatalf("backup SensorCount after update #2 = %d, want 2 (a stale 3-sensor snapshot would trigger a false-positive restore later)", got)
 	}
 }
 

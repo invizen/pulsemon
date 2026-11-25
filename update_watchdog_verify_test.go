@@ -66,18 +66,22 @@ func setupVerifyFixture(t *testing.T, liveSensors, backupSensors int) (dir, prev
 	seedSensors(t, dbPath, liveSensors)
 	backup := filepath.Join(dir, "pulsemon.db.preupdate")
 	if backupSensors >= 0 {
-		// A fresh store as the "pre-update" snapshot, then copy its bytes
-		// over: the verifier opens the backup with NewStore.
-		tmp := filepath.Join(dir, "backup-tmp.db")
-		seedSensors(t, tmp, backupSensors)
-		data, err := os.ReadFile(tmp)
+		// Make the "pre-update" snapshot the way PRODUCTION does —
+		// store.BackupTo (VACUUM INTO) — so the fixture has the real
+		// .preupdate shape: a delete-journal snapshot, NOT a byte-copy
+		// of a WAL file (a read-only open of a WAL-mode file creates
+		// -wal/-shm sidecars, which the read-only pin must not see).
+		src := filepath.Join(dir, "backup-src.db")
+		seedSensors(t, src, backupSensors)
+		st, err := store.NewStore(src)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(backup, data, 0o644); err != nil {
+		if err := st.BackupTo(backup); err != nil {
 			t.Fatal(err)
 		}
-		os.Remove(tmp)
+		st.Close()
+		os.Remove(src)
 	}
 	prevBin = filepath.Join(dir, "pulsemon.exe.prev")
 	dstBin = filepath.Join(dir, "pulsemon.exe")
@@ -251,5 +255,74 @@ func TestVerifySensorsLiveCountUnavailableSkips(t *testing.T) {
 	}
 	if n := liveSensorCount(t, dir); n != 1 {
 		t.Errorf("live DB = %d sensors, want 1 (untouched)", n)
+	}
+}
+
+// CRITICAL-2 (2026-11-25): a VERIFIED update (sensors intact) must remove
+// the pre-update backup. A surviving snapshot is the stale-baseline trap:
+// months of legitimate sensor deletion later, a future watchdog comparing
+// the lower live count against THIS months-old backup would declare data
+// loss and restore it — wiping the intervening months of config, users
+// and history.
+func TestVerifySensorsIntactRemovesVerifiedBackup(t *testing.T) {
+	dir, prevBin, dstBin := setupVerifyFixture(t, 3, 3)
+	h := &verifyHarness{liveCount: 3, liveOK: true, serviceState: "running"}
+	withVerifyHarness(t, h)
+
+	backup := filepath.Join(dir, "pulsemon.db.preupdate")
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+
+	if _, err := os.Stat(backup); !os.IsNotExist(err) {
+		t.Errorf("verified backup must be removed after a healthy update (stat err=%v) — a stale snapshot is a false-positive restore waiting to happen", err)
+	}
+	if log := watchdogVerifyLog(t, dir); !strings.Contains(log, "sensors intact") {
+		t.Errorf("log must record 'sensors intact', got: %s", log)
+	}
+}
+
+// Positive control to the pin above: the DATA-LOSS path restores FROM the
+// backup — it must NOT remove it (restoreDatabaseFile copies; the
+// operator may need the snapshot again after the rollback).
+func TestVerifySensorsDataLossKeepsBackup(t *testing.T) {
+	dir, prevBin, dstBin := setupVerifyFixture(t, 1, 3)
+	h := &verifyHarness{liveCount: 1, liveOK: true, serviceState: "stopped"}
+	withVerifyHarness(t, h)
+
+	backup := filepath.Join(dir, "pulsemon.db.preupdate")
+	verifySensorsIntactWatchdog(nil, prevBin, dstBin)
+
+	if _, err := os.Stat(backup); err != nil {
+		t.Errorf("the data-loss path restores FROM the backup — it must keep it (stat err=%v)", err)
+	}
+}
+
+// CRITICAL-2 (2026-11-25): the watchdog must open the backup READ-ONLY.
+// Source-shape pin: the behavioral discriminator is invisible to a
+// post-run directory check — a read-write WAL open DOES create -wal/-shm
+// sidecars, but the watchdog's own Close() (last connection) checkpoints
+// and removes them, so both shapes end with a clean directory. The
+// store-level proof that NewStoreReadOnly genuinely refuses writes lives
+// in internal/store/store_backup_replace_test.go; this pin proves the
+// watchdog is the consumer of it.
+func TestVerifySensorsOpensBackupReadOnly(t *testing.T) {
+	src, err := os.ReadFile("update.go")
+	if err != nil {
+		t.Fatalf("read update.go: %v", err)
+	}
+	body := string(src)
+	start := strings.Index(body, "func verifySensorsIntactWatchdog(")
+	if start < 0 {
+		t.Fatal("verifySensorsIntactWatchdog not found in update.go")
+	}
+	end := strings.Index(body[start:], "\n}")
+	if end < 0 {
+		t.Fatal("verifySensorsIntactWatchdog body not found")
+	}
+	fn := body[start : start+end]
+	if !strings.Contains(fn, "store.NewStoreReadOnly(backup)") {
+		t.Error("verifySensorsIntactWatchdog no longer opens the pre-update backup with store.NewStoreReadOnly — the verifier must never write to the safety copy")
+	}
+	if strings.Contains(fn, "store.NewStore(backup)") {
+		t.Error("verifySensorsIntactWatchdog opens the backup read-write (store.NewStore) — the safety copy becomes writable and WAL sidecars get created beside it")
 	}
 }

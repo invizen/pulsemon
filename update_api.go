@@ -262,8 +262,10 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
 	// while serving): the update watchdog compares the post-restart
 	// sensor count against this backup and restores it if the update lost
-	// data. Best effort - it never blocks the update.
-	backupDatabasePreUpdate()
+	// data. Best effort - it never blocks the update. s.db: this handler
+	// runs inside the server, so back up through the live store instead
+	// of opening a second connection pool on the same file.
+	backupDatabasePreUpdate(s.db)
 	if err := installBinary(tmp, exe, digest); err != nil {
 		respondInternal(w, "install", err)
 		return

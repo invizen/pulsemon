@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -1541,9 +1543,62 @@ func (db *Store) SeedSensors() error {
 // pre-update safety copy (pulsemon.db.preupdate, see
 // backupDatabasePreUpdate in update.go) uses this so the in-dashboard
 // self-update can make its copy without pausing the monitor.
+//
+// VACUUM INTO REFUSES an existing target file ("output file already
+// exists"), so the snapshot is written to a fresh sibling .tmp and
+// atomically renamed into place: the Nth backup of the same dst succeeds
+// and REPLACES the stale snapshot with current data (a failed second
+// backup used to leave the first — possibly months-old — snapshot in
+// place, which a later integrity check would restore over a
+// legitimately smaller live DB). A VACUUM that dies mid-flight leaves
+// only a .tmp orphan (cleaned below), never a truncated dst.
+// History: docs/DECISIONS.md → preupdate-vacuum-into-replace
 func (s *Store) BackupTo(dst string) error {
-	_, err := s.Exec("VACUUM INTO ?", dst)
-	return err
+	tmp := dst + ".tmp"
+	_ = os.Remove(tmp)
+	if _, err := s.Exec("VACUUM INTO ?", tmp); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// VACUUM INTO creates the file with umask-filtered permissions; the
+	// snapshot holds the full DB (users, history) — pin 0600.
+	_ = os.Chmod(tmp, 0o600)
+	return os.Rename(tmp, dst)
+}
+
+// NewStoreReadOnly opens a VACUUM INTO snapshot strictly read-only, for
+// consumers that must never modify the file (the pre-update backup
+// verifier counts sensors in pulsemon.db.preupdate). Two properties the
+// read-write NewStore shape does NOT give:
+//   - writes fail with SQLITE_READONLY instead of silently turning the
+//     safety copy into a writable DB;
+//   - no journal sidecars: NewStore's DSN pragmas set journal_mode(WAL)
+//     (itself a write) and a WAL open creates <dst>-wal/<dst>-shm beside
+//     the snapshot — for a file that must survive as a clean standalone
+//     snapshot, that pollutes the data dir and can strand uncheckpointed
+//     WAL frames a later reader (or a plain file copy) will not see.
+//
+// The DSN must be a `file:` URI: modernc.org/sqlite strips the query from
+// non-URI DSNs and hardcodes READWRITE|CREATE (a bare `path?mode=ro`
+// opens writable — probe-verified 2026-11-25), while a `file:` DSN passes
+// the query to SQLite under SQLITE_OPEN_URI, where mode=ro takes effect.
+// No pragmas at all: journal_mode(WAL) would fail on a read-only open,
+// and a one-off COUNT(*) needs no pool tuning.
+func NewStoreReadOnly(path string) (*Store, error) {
+	dsn := "file:" + filepath.ToSlash(path) + "?mode=ro"
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, err
+	}
+	// Verify the file is a readable database (mode=ro must NOT create a
+	// missing file).
+	if _, err := db.Exec("SELECT 1"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	// probeDB aliases the main handle: Store.Close joins both Close calls
+	// and *sql.DB.Close is idempotent, so nothing double-frees.
+	return &Store{DB: db, probeDB: db}, nil
 }
 
 // SensorCount returns the number of configured sensors. The post-restart

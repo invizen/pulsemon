@@ -487,7 +487,8 @@ func runUpdate(args []string) int {
 	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
 	// while serving): the post-restart verifier compares the sensor count
 	// against this backup. Best effort - it never blocks the update.
-	backupDatabasePreUpdate()
+	// nil: the CLI path has no in-process store of its own.
+	backupDatabasePreUpdate(nil)
 
 	if err := installBinary(tmp, exe, digest); err != nil {
 		uErr("install: " + err.Error())
@@ -749,7 +750,10 @@ func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin string) {
 		logLine("no pre-update backup at %s — sensor verification skipped", backup)
 		return
 	}
-	bst, err := store.NewStore(backup)
+	// Read-only: the verifier must never write to the safety copy, and a
+	// read-write open would set journal_mode(WAL) and strand -wal/-shm
+	// sidecars beside the snapshot (see store.NewStoreReadOnly).
+	bst, err := store.NewStoreReadOnly(backup)
 	if err != nil {
 		logLine("cannot open pre-update backup (%v) — sensor verification skipped", err)
 		return
@@ -773,6 +777,16 @@ func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin string) {
 	rest, reason := sensorRestoreDecision(live, want, true)
 	if !rest {
 		logLine("sensors intact: %s", reason)
+		// The update is VERIFIED: this snapshot has served its purpose, so
+		// remove it. A surviving backup is the stale-baseline trap — months
+		// later the operator may legitimately delete sensors, and a future
+		// watchdog comparing the lower live count against THIS months-old
+		// snapshot would declare data loss and restore it, wiping the
+		// intervening months of config, users and history. The next update
+		// writes a fresh snapshot atomically (BackupTo renames into place).
+		if err := os.Remove(backup); err != nil {
+			logLine("note: verified pre-update backup %s could not be removed (%v) — the next update replaces it atomically", backup, err)
+		}
 		return
 	}
 	logLine("DATA LOSS after update: %s — restoring the pre-update DB and the previous binary", reason)
@@ -2131,18 +2145,32 @@ func waitHealthyWithTimeout(db *store.Store, timeout time.Duration) (bool, strin
 // the pre-update one and restore the backup if the update lost data.
 // It uses `VACUUM INTO` (store.BackupTo), so the snapshot is consistent
 // even while the monitor keeps serving - no service pause needed.
+// live, when non-nil, is the in-process store the caller is already
+// serving from (the API update path runs INSIDE the server) — reusing it
+// avoids a second connection pool on the same file; the CLI update path
+// has no in-process store and passes nil (one short-lived pool).
 // Best effort: a failed backup must NEVER block an update; it degrades to
 // "no verification", which is exactly today's behavior.
-// History: docs/DECISIONS.md -> windows-upgrade-safety
-func backupDatabasePreUpdate() {
+// History: docs/DECISIONS.md -> windows-upgrade-safety,
+//
+//	preupdate-vacuum-into-replace
+func backupDatabasePreUpdate(live *store.Store) {
 	dbPath := healthzDBPath()
 	backup := filepath.Join(filepath.Dir(dbPath), "pulsemon.db.preupdate")
-	st, err := store.NewStore(dbPath)
-	if err != nil {
-		uWarn("pre-update DB backup skipped: " + err.Error())
-		return
+	st := live
+	owned := false
+	if st == nil {
+		var err error
+		st, err = store.NewStore(dbPath)
+		if err != nil {
+			uWarn("pre-update DB backup skipped: " + err.Error())
+			return
+		}
+		owned = true
 	}
-	defer st.Close()
+	if owned {
+		defer st.Close()
+	}
 	if err := st.BackupTo(backup); err != nil {
 		uWarn("pre-update DB backup failed: " + err.Error())
 	}

@@ -75,10 +75,14 @@ func TestInstallerPreStopDBBackup(t *testing.T) {
 // Item 3 (installer-adjacent wiring): BOTH self-update paths must make the
 // pre-swap DB backup BEFORE installBinary swaps the binary. Source-level
 // ordering pin (the behavior itself is pinned by update_preupdate_test.go).
+// The API path must back up through the LIVE store (s.db — the handler
+// runs inside the server; a second connection pool on the same file is
+// the CRITICAL-2 shape), and the CLI path passes nil (it has no
+// in-process store).
 func TestSelfUpdateBacksUpDBBeforeSwap(t *testing.T) {
 	for _, file := range []string{"update_api.go", "update.go"} {
 		src := readSource(t, file)
-		b := regexp.MustCompile(`backupDatabasePreUpdate\(\)`).FindStringIndex(src)
+		b := regexp.MustCompile(`backupDatabasePreUpdate\(`).FindStringIndex(src)
 		i := regexp.MustCompile(`installBinary\(tmp, exe, digest\)`).FindStringIndex(src)
 		if b == nil {
 			t.Fatalf("%s: backupDatabasePreUpdate() call missing from the update path", file)
@@ -86,5 +90,11 @@ func TestSelfUpdateBacksUpDBBeforeSwap(t *testing.T) {
 		if i == nil || i[0] < b[0] {
 			t.Fatalf("%s: the binary swap (installBinary) runs BEFORE the pre-update DB backup - a data-losing swap would have no safety copy", file)
 		}
+	}
+	if !regexp.MustCompile(`backupDatabasePreUpdate\(s\.db\)`).MatchString(readSource(t, "update_api.go")) {
+		t.Fatal("update_api.go: handleUpdate must back up via the live store (backupDatabasePreUpdate(s.db)), not open a second store on the same file")
+	}
+	if !regexp.MustCompile(`backupDatabasePreUpdate\(nil\)`).MatchString(readSource(t, "update.go")) {
+		t.Fatal("update.go: the CLI update path must call backupDatabasePreUpdate(nil) — it has no in-process store")
 	}
 }
