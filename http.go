@@ -815,6 +815,20 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 		certReadMu.Unlock()
 		if !ok || time.Since(lastRead) > certFreshness {
 			req.Close = true
+			// This probe forces a fresh handshake because the cert is
+			// stale, and the pre-renewal keep-alive conn is still sitting
+			// in probeTransport's idle pool. Evict it: without the
+			// eviction the NEXT probe (certReadTimes now fresh ->
+			// req.Close = false) reuses that conn and reports the cert
+			// from its ORIGINAL handshake - the dashboard's cert_expiry
+			// flips back to the pre-renewal cert for up to
+			// IdleConnTimeout (10 min) after every renewal, oscillating
+			// until the target closes the socket. Cost: one extra
+			// handshake per other host per 10-min freshness cycle; the
+			// displayed RTT is unaffected (measured from GotConn, after
+			// the handshake).
+			// History: docs/DECISIONS.md -> cert-freshness-pool-eviction
+			probeTransport.CloseIdleConnections()
 		}
 	}
 	start := time.Now()

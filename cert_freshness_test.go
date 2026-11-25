@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"net"
 	"net/http"
@@ -226,6 +227,90 @@ func TestStaleCertProbeForcesFreshDial(t *testing.T) {
 	mu.Unlock()
 	if n != 3 {
 		t.Fatalf("server saw %d distinct connections over 3 probes, want 3 — the stale-cert probe rode the pooled conn (cert re-read lags one probe)", n)
+	}
+}
+
+// TestCertRefreshEvictsPooledConn proves the pool rotates when the target
+// RENEWS its cert: probe 1 dials (no cert entry), probe 2 keep-alives the
+// pre-renewal conn into the pooled transport, the target then renews and
+// the entry is backdated past certFreshness, so probe 3 forces a fresh
+// handshake (must see the NEW cert) and probe 4 (entry fresh again,
+// req.Close = false) must NOT reuse probe 2's old conn — it must report
+// the new cert. Pre-fix, probe 4 reused the pooled pre-renewal conn and
+// flipped the reported cert_expiry back to the old cert for up to
+// IdleConnTimeout (10 min) after every renewal, oscillating until the
+// target closed the idle socket. The server's cert slice is swapped at
+// renewal, so each fresh dial presents the new cert while existing conns
+// keep the cert from their original handshake. History: docs/DECISIONS.md
+// -> cert-freshness-pool-eviction
+func TestCertRefreshEvictsPooledConn(t *testing.T) {
+	oldCert := testSelfSigned(t, time.Now().Add(24*time.Hour))
+	newCert := testSelfSigned(t, time.Now().Add(72*time.Hour))
+	newLeaf, err := x509.ParseCertificate(newCert.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse renewed cert: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	// Certificates is PRE-SEEDED: Go 1.27's StartTLS injects a default
+	// test cert whenever the slice is empty - and a non-empty Certificates
+	// takes precedence over GetCertificate (which it then never calls),
+	// so the GetCertificate hot-swap trick no longer works. Replacing the
+	// slice is the renewal hook: the next handshake presents the new cert
+	// while existing conns keep their original-handshake cert.
+	srv.TLS = &tls.Config{Certificates: []tls.Certificate{oldCert}}
+	srv.StartTLS()
+	defer srv.Close()
+	t.Cleanup(func() {
+		probeTransport.CloseIdleConnections()
+	})
+
+	hostKey := "https://" + srv.Listener.Addr().String()
+	certReadMu.Lock()
+	oldMap := certReadTimes
+	certReadTimes = make(map[string]time.Time)
+	certReadMu.Unlock()
+	t.Cleanup(func() {
+		certReadMu.Lock()
+		certReadTimes = oldMap
+		certReadMu.Unlock()
+	})
+
+	ctx := context.Background()
+	// Probe 1: no cert entry -> fresh dial on the no-reuse transport.
+	if res := probeHTTP(ctx, srv.URL, 5*time.Second); res.Lost {
+		t.Fatalf("probe 1 lost: %+v", res)
+	}
+	// Probe 2: entry fresh -> pooled transport dials and keep-alives the
+	// pre-renewal conn into the idle pool.
+	if res := probeHTTP(ctx, srv.URL, 5*time.Second); res.Lost {
+		t.Fatalf("probe 2 lost: %+v", res)
+	}
+	// The target renews its cert, and the freshness window elapses.
+	srv.TLS.Certificates = []tls.Certificate{newCert}
+	certReadMu.Lock()
+	certReadTimes[hostKey] = time.Now().Add(-certFreshness - time.Second)
+	certReadMu.Unlock()
+	// Probe 3: stale entry -> forced fresh handshake: must see the NEW
+	// cert (also proves the renewal landed before this probe's dial).
+	res3 := probeHTTP(ctx, srv.URL, 5*time.Second)
+	if res3.Lost {
+		t.Fatalf("probe 3 (stale) lost: %+v", res3)
+	}
+	if res3.CertExpiry == nil || !res3.CertExpiry.Equal(newLeaf.NotAfter) {
+		t.Fatalf("probe 3 reported cert expiry %v, want the renewed cert's %v (the renewal must land in the same probe)", res3.CertExpiry, newLeaf.NotAfter)
+	}
+	// Probe 4: entry fresh again -> pooled transport. Pre-fix this reused
+	// probe 2's old conn and reported the pre-renewal cert (the
+	// cert_expiry oscillation).
+	res4 := probeHTTP(ctx, srv.URL, 5*time.Second)
+	if res4.Lost {
+		t.Fatalf("probe 4 lost: %+v", res4)
+	}
+	if res4.CertExpiry == nil || !res4.CertExpiry.Equal(newLeaf.NotAfter) {
+		t.Fatalf("probe 4 reported cert expiry %v, want the renewed cert's %v — the pooled pre-renewal conn was not evicted on the cert refresh", res4.CertExpiry, newLeaf.NotAfter)
 	}
 }
 
