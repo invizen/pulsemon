@@ -170,17 +170,10 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 		// the account's failure budget, and the rejection delay buys
 		// nothing for a response nobody reads.
 		if r.Context().Err() != nil {
-			// Refund the per-IP admission — but ONLY when the KDF never
-			// ran. kdfRan is CreateSession's explicit acquire-site signal
-			// (false = canceled in the queue, zero cost; true = a slot was
-			// taken and bcrypt ran to completion, ctx or not). The old
-			// elapsed-time floor (kdfCostFloor) was a heuristic that
-			// failed both ways: on fast CPUs (cost 10 in 20–25ms) a PAID
-			// KDF read as "fast" and got refunded — an unbounded per-IP
-			// guessing channel with recordUserFail and loginSlowDown
-			// skipped; under a saturated semaphore a legitimate queue
-			// wait ≥25ms read as "paid" and was NOT refunded — operator
-			// self-lockout.
+			// Refund the per-IP admission only when the KDF never ran:
+			// kdfRan is the explicit acquire-site signal (see VerifyUser);
+			// the old elapsed-time floor misread fast-CPU paid KDFs and
+			// long queue waits. History: docs/DECISIONS.md → kdfRan-explicit-signal.
 			if !kdfRan {
 				s.auth.refundAttempt(key)
 			}
@@ -460,11 +453,7 @@ func (s *Server) reauthCurrentPassword(w http.ResponseWriter, r *http.Request, c
 	}
 	if _, ok, kdfRan := s.auth.VerifyUser(r.Context(), caller, current); !ok {
 		// Client gone while queued on bcryptSem: a disconnect is not a
-		// failed attempt — skip the budget and the delay; refund the
-		// per-IP admission ONLY for the zero-KDF-cost case. kdfRan is
-		// the explicit acquire-site signal (see VerifyUser) — the same
-		// split as login, and why the old elapsed-time floor (which
-		// misread fast-CPU paid KDFs and long queue waits) is gone.
+		// failed attempt — skip budget and delay; refund only when the KDF never ran (kdfRan — see VerifyUser; History: docs/DECISIONS.md → kdfRan-explicit-signal).
 		if r.Context().Err() != nil {
 			if !kdfRan {
 				s.auth.refundAttempt(key)
