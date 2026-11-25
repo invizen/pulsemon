@@ -578,14 +578,14 @@ func (pw *ProbeWorker) scheduleAlertRetry(id, status string) {
 // can shorten it.
 var recoveryRetryDelay = time.Minute
 
-// recoveryRetryJitter spreads a mass-recovery retry herd: N dropped
-// recoveries scheduled at the same instant must not re-fire in lockstep a
-// minute later (a second thundering herd). Upward-only [base, 1.5×base] —
-// 60..90s at the production 1m base. The floor stays at base: the FIFO
-// budget invariant (TestInFifoRetryBudgetUnderRecoveryRetryDelay) checks
-// the worst in-band job against recoveryRetryDelay, so a sub-base jitter
-// would re-open the permanent-drop window it closes.
-func recoveryRetryJitter(base time.Duration) time.Duration {
+// retryJitter spreads a mass-retry herd: N dropped alerts scheduled at the
+// same instant must not re-fire in lockstep a minute later (a second
+// thundering herd). Upward-only [base, 1.5×base] — 60..90s at the
+// production 1m base. The floor stays at base: the FIFO budget invariant
+// (TestInFifoRetryBudgetUnderRecoveryRetryDelay) checks the worst in-band
+// job against recoveryRetryDelay, so a sub-base jitter would re-open the
+// permanent-drop window it closes.
+func retryJitter(base time.Duration) time.Duration {
 	if base < 2*time.Millisecond {
 		return base
 	}
@@ -624,8 +624,8 @@ func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newSta
 	// is a data race the detector flags (same discipline as enqueueAlert,
 	// which passes alertGateIdle as a parameter). The jitter is drawn here
 	// too: a mass recovery schedules N retries at one instant, and they
-	// must not re-fire in lockstep (see recoveryRetryJitter).
-	delay := recoveryRetryJitter(recoveryRetryDelay)
+	// must not re-fire in lockstep (see retryJitter).
+	delay := retryJitter(recoveryRetryDelay)
 	pw.launchAlert(func() {
 		select {
 		case <-time.After(delay):
@@ -640,6 +640,38 @@ func (pw *ProbeWorker) scheduleRecoveryRetry(id, name, target, oldStatus, newSta
 		}
 		if !pw.sendAlert(id, name, target, oldStatus, newStatus, rttMs) {
 			log.Printf("alert: recovery retry for sensor %s failed again; notification dropped (state rows are correct)", id)
+		}
+	})
+}
+
+// scheduleStormRetry re-offers one entry of a storm summary that failed on
+// ALL providers — a brief WAN outage takes out the targets and the egress
+// together, and the batch would otherwise be discarded: on a realert_min ==
+// 0 install no re-alert tick comes, so the coalesced sensors (#11..#N)
+// never alert. Mirrors scheduleRecoveryRetry: one jittered re-offer
+// through the normal path (sendAlert → stormAdmit) — if the providers are
+// still down the entry re-coalesces into the next window's summary, which
+// carries its own retry; guarded at fire time by currentStatus (a sensor
+// that moved on owns the chat); exactly one retry, a second failure is
+// logged. Works in BOTH directions: a dropped recovery storm summary has
+// no re-alert path either.
+// History: docs/DECISIONS.md → storm-summary-total-failure-retry.
+func (pw *ProbeWorker) scheduleStormRetry(id, name, target, oldState, state string, rttMs float64) {
+	delay := retryJitter(recoveryRetryDelay)
+	pw.launchAlert(func() {
+		select {
+		case <-time.After(delay):
+		case <-pw.stopCtx.Done():
+			return
+		}
+		if cur, err := pw.currentStatus(id); err != nil || cur != state {
+			return
+		}
+		if !pw.alertsEnabled() {
+			return
+		}
+		if !pw.sendAlert(id, name, target, oldState, state, rttMs) {
+			log.Printf("alert: storm retry for sensor %s failed again; notification dropped (state rows are correct)", id)
 		}
 	})
 }
@@ -935,11 +967,15 @@ func (pw *ProbeWorker) providerStatuses() ([]providerStatus, error) {
 // The caller blocks until the delivery finishes (the launchAlert goroutine
 // is tracked in alertWG, so DrainAlerts still sees true completion).
 func (pw *ProbeWorker) sendWebhook(id, name, target, oldState, state string, rttMs float64, reAlert bool) bool {
-	// Storm budget: over-budget non-recovery alerts
-	// are coalesced into a single storm summary instead of delivered
-	// individually. A suppressed alert reports "delivered" (true) so the
-	// caller schedules no retry — the summary carries it.
-	if !pw.stormAdmit(id, name, target, oldState, state, rttMs) {
+	// Storm budget: over-budget transitions are coalesced into a single
+	// storm summary instead of delivered individually. A suppressed alert
+	// reports "delivered" (true) so the caller schedules no retry — the
+	// summary carries it. Re-alerts (oldState == state) NEVER ride the
+	// budget: they are the operator's re-alert cadence, not a transition
+	// burst, and coalescing them would burn budget meant for new
+	// transitions and render bogus "svc: error -> error" lines in a
+	// "sensors changed state" summary.
+	if !reAlert && !pw.stormAdmit(id, name, target, oldState, state, rttMs) {
 		return true
 	}
 	done := make(chan bool, 1)
@@ -1249,7 +1285,16 @@ func (pw *ProbeWorker) deliverStormSummary(entries []stormEntry, recovery bool) 
 	}
 	wg.Wait()
 	if len(dests) > 0 && !delivered.Load() {
-		log.Printf("alert: storm summary (%d sensors) failed on all %d providers", len(entries), len(dests))
+		// Every provider failed (a brief WAN outage takes out the targets
+		// AND the egress together): re-offer each entry through the normal
+		// path instead of discarding the batch. On a realert_min == 0
+		// install no re-alert tick ever comes, so the coalesced sensors
+		// (#11..#N) would never alert — exactly the visibility the storm
+		// path exists to preserve.
+		log.Printf("alert: storm summary (%d sensors) failed on all %d providers; re-offering each entry", len(entries), len(dests))
+		for _, e := range entries {
+			pw.scheduleStormRetry(e.id, e.name, e.target, e.oldState, e.state, e.rttMs)
+		}
 	}
 }
 
@@ -1281,9 +1326,15 @@ func truncateSummaryLines(header string, lines []string, maxRunes int) string {
 	b.WriteString(header)
 	runes := utf8.RuneCountInString(header)
 	shown := 0
+	// The worst-case footer (the "\n… and N more" at the FULL line count)
+	// is reserved up front: without the reservation a body ending exactly
+	// at maxRunes gets the footer appended on top, the "capped" output
+	// exceeds the provider's limit, and the provider rejects the WHOLE
+	// summary with a non-retryable HTTP 400.
+	limit := maxRunes - utf8.RuneCountInString(fmt.Sprintf("\n… and %d more", len(lines)))
 	for _, line := range lines {
 		lineRunes := utf8.RuneCountInString(line)
-		if maxRunes > 0 && runes+1+lineRunes > maxRunes {
+		if maxRunes > 0 && runes+1+lineRunes > limit {
 			fmt.Fprintf(&b, "\n… and %d more", len(lines)-shown)
 			break
 		}

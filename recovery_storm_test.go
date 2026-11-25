@@ -160,17 +160,19 @@ func TestRecoveryStormDropsFlappedBack(t *testing.T) {
 	})
 }
 
-// TestRecoveryRetryJitterRange: the recovery retry delay is jittered
+// TestRecoveryRetryJitterRange: the alert-retry delay is jittered
 // UPWARD only — [base, 1.5×base], 60..90s at the production 1m base. The
 // floor must stay at base: TestInFifoRetryBudgetUnderRecoveryRetryDelay
 // checks the worst in-band FIFO job (50s) against recoveryRetryDelay
 // (60s); a sub-base jitter (the finding's 45s floor) would re-open the
-// permanent-drop window that invariant closes.
+// permanent-drop window that invariant closes. The jitter is shared by
+// BOTH retry directions (recovery + storm-summary re-offers) since the
+// MAJOR-7 rename to retryJitter.
 func TestRecoveryRetryJitterRange(t *testing.T) {
 	const base = time.Minute
 	var maxD time.Duration
 	for i := 0; i < 200; i++ {
-		d := recoveryRetryJitter(base)
+		d := retryJitter(base)
 		if d < base {
 			t.Fatalf("jittered delay %v < base %v: a sub-base jitter re-opens the FIFO budget window (TestInFifoRetryBudgetUnderRecoveryRetryDelay)", d, base)
 		}
@@ -186,7 +188,7 @@ func TestRecoveryRetryJitterRange(t *testing.T) {
 	}
 	// Sub-millisecond bases must not panic (Int63n(0)) — they jitter to
 	// the base itself.
-	if d := recoveryRetryJitter(time.Nanosecond); d != time.Nanosecond {
+	if d := retryJitter(time.Nanosecond); d != time.Nanosecond {
 		t.Fatalf("nanosecond base: jitter = %v, want unchanged %v", d, time.Nanosecond)
 	}
 }
