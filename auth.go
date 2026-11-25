@@ -214,6 +214,13 @@ type AuthState struct {
 	enabled   bool
 	enabledAt time.Time
 
+	// enabledFast/enabledAtFast: lock-free mirrors of the two fields above
+	// (the gate calls Enabled() 3× per admin request). Written only under
+	// enabledMu via setEnabledLocked, read atomically in Enabled()'s fast
+	// path. History: docs/DECISIONS.md → auth-lock-io-split.
+	enabledFast   atomic.Bool
+	enabledAtFast atomic.Int64
+
 	// bootstrapped: one-way ratchet — true once this install has ever had an
 	// account (settings auth_bootstrapped=1, set by AddUser and never cleared,
 	// including when the operator later disables auth). The flag never goes
@@ -321,38 +328,27 @@ func (a *AuthState) userExists(username string) bool {
 	return n > 0
 }
 
-// userExistsCached is the TTL-cached wrapper session validation uses (one
-// users-table lookup per user per userOKTTL). Caller must hold a.mu.
-// Deliberately under the lock: it is a sub-millisecond point lookup at most
-// once per user per 2s, and moving it out needs an unlock→query→re-lock→
-// re-validate dance that opens a race window (session deleted or user
-// re-created in the gap). The property this check exists for: out-of-band
-// deletions are rejected within userOKTTL.
-func (a *AuthState) userExistsCached(username string) bool {
-	if t, ok := a.userOKCache[username]; ok && time.Since(t) < userOKTTL {
-		return true
-	}
-	exists := a.userExists(username)
-	if exists {
-		a.userOKCache[username] = time.Now()
-	} else {
-		delete(a.userOKCache, username)
-	}
-	return exists
-}
+// userExistsQuery is the live users-table check session validation runs
+// OUTSIDE a.mu (IsAdmin pattern — no lock held across I/O); a var so tests
+// can stub it to prove the lock is free while the query runs. History:
+// docs/DECISIONS.md → auth-lock-io-split.
+var userExistsQuery = func(a *AuthState, username string) bool { return a.userExists(username) }
 
 // Enabled reports whether at least one user exists, memoized for enabledTTL
 // so the 5s dashboard poll doesn't pay a SELECT COUNT(*) per request.
 // In-app mutations call refreshEnabledNow (never stale in-app); out-of-band
 // CLI changes are honored within enabledTTL. The count-and-fallback rules
 // live in refreshEnabledLocked (a COUNT error keeps the last known value;
-// the first read fails closed).
+// the first read fails closed). The atomic mirror is the lock-free fast
+// path: a fresh cache answer never takes enabledMu. History:
+// docs/DECISIONS.md → auth-lock-io-split.
 func (a *AuthState) Enabled() bool {
+	if at := a.enabledAtFast.Load(); at != 0 &&
+		time.Now().UnixNano()-at < enabledTTL.Nanoseconds() {
+		return a.enabledFast.Load()
+	}
 	a.enabledMu.Lock()
 	defer a.enabledMu.Unlock()
-	if time.Since(a.enabledAt) < enabledTTL && a.enabledAt != (time.Time{}) {
-		return a.enabled
-	}
 	a.refreshEnabledLocked()
 	return a.enabled
 }
@@ -371,13 +367,20 @@ func (a *AuthState) refreshEnabledLocked() {
 	if err != nil {
 		log.Printf("auth: user count failed (keeping previous state): %v", err)
 		if a.enabledAt.IsZero() {
-			a.enabled = true // never read: fail closed
+			a.setEnabledLocked(true, time.Now()) // never read: fail closed
 		}
-		a.enabledAt = time.Now()
 		return
 	}
-	a.enabled = n > 0
-	a.enabledAt = time.Now()
+	a.setEnabledLocked(n > 0, time.Now())
+}
+
+// setEnabledLocked records the enabled state and its lock-free mirror; the
+// caller holds enabledMu (the only writer, so the mirror can't desync).
+func (a *AuthState) setEnabledLocked(v bool, at time.Time) {
+	a.enabled = v
+	a.enabledAt = at
+	a.enabledFast.Store(v)
+	a.enabledAtFast.Store(at.UnixNano())
 }
 
 // refreshEnabledNow re-reads the user count and updates the Enabled() cache

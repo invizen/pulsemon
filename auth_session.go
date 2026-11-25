@@ -149,23 +149,70 @@ func (a *AuthState) sessionWithinMaxAge(s authSession) bool {
 // /api/auth/status, so without the slide a status-poll-only client would
 // never extend its session. It also enforces the absolute
 // authSessionMaxAge cap, so a status poll can't slide a session past its
-// login-time max age.
-// History: docs/DECISIONS.md → session-absolute-max-age.
+// login-time max age. The gate's per-request path uses
+// SessionUserAndRenewal (renew=true) so validation and the sliding-cookie
+// renewal share ONE lock pass; this is its renew=false form. The live
+// users-table query runs with NO a.mu held (IsAdmin pattern) — pre-fix a
+// cache miss stalled every concurrent authenticated request for the
+// query's duration under a 15s busy_timeout.
+// History: docs/DECISIONS.md → session-absolute-max-age, auth-lock-io-split.
 func (a *AuthState) SessionUser(tok string) (string, bool) {
+	u, ok, _, _, _ := a.SessionUserAndRenewal(tok, false)
+	return u, ok
+}
+
+// SessionUserAndRenewal is the gate's per-request session check: liveness
+// (expiry + absolute max age), the TTL-cached owner re-check, the sliding
+// expiry, and — when renew — the sliding-cookie renewal decision, all in
+// ONE lock pass (pre-fix the gate took a.mu twice per request). The live
+// users-table COUNT runs between two short critical sections, with NO a.mu
+// held (IsAdmin pattern); the session is re-validated after the query so a
+// logout/remove landing in the I/O window still wins. On a cache hit the
+// whole check is a single lock acquisition, same as pre-fix.
+// History: docs/DECISIONS.md → auth-lock-io-split.
+func (a *AuthState) SessionUserAndRenewal(tok string, renew bool) (user string, ok, due, pinSecure bool, maxAge time.Duration) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	s, ok := a.sessions[tok]
-	if !ok || !time.Now().Before(s.expiry) || !a.sessionWithinMaxAge(s) {
+	s, live := a.sessions[tok]
+	if !live || !time.Now().Before(s.expiry) || !a.sessionWithinMaxAge(s) {
 		delete(a.sessions, tok)
-		return "", false
+		a.mu.Unlock()
+		return "", false, false, false, 0
 	}
-	if !a.userExistsCached(s.user) {
-		delete(a.sessions, tok)
-		return "", false
+	queried := false
+	if t, fresh := a.userOKCache[s.user]; !fresh || time.Since(t) >= userOKTTL {
+		a.mu.Unlock()
+		exists := userExistsQuery(a, s.user)
+		a.mu.Lock()
+		queried = true
+		if !exists {
+			delete(a.sessions, tok)
+			a.mu.Unlock()
+			return "", false, false, false, 0
+		}
+		// Re-validate: the session may have been dropped while the query ran.
+		s, live = a.sessions[tok]
+		if !live || !time.Now().Before(s.expiry) || !a.sessionWithinMaxAge(s) {
+			a.mu.Unlock()
+			return "", false, false, false, 0
+		}
 	}
-	s.expiry = time.Now().Add(authSessionTTL)
+	now := time.Now()
+	s.expiry = now.Add(authSessionTTL)
+	if queried {
+		a.userOKCache[s.user] = now
+	}
+	if renew {
+		maxAge = authSessionTTL
+		if rem := s.created.Add(authSessionMaxAge).Sub(now); rem < maxAge {
+			maxAge = rem
+		}
+		if maxAge > 0 && time.Since(s.cookieIssued) >= authSessionTTL/2 {
+			due, pinSecure, s.cookieIssued = true, s.cookieSecure, now
+		}
+	}
 	a.sessions[tok] = s
-	return s.user, true
+	a.mu.Unlock()
+	return s.user, true, due, pinSecure, maxAge
 }
 
 // CookieRenewalDue reports whether the session's browser cookie is old

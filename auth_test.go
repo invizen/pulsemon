@@ -2744,7 +2744,7 @@ func TestLoginOversizedBodyIs413(t *testing.T) {
 // is cached per username for userOKTTL — a flag flip in the DB is served
 // stale inside the window and honored once the TTL expires. Pre-fix
 // IsAdmin hit SQLite on every call; its sibling checks (Enabled,
-// userExistsCached) were already TTL-cached.
+// the session user-existence check) were already TTL-cached.
 func TestIsAdminCachedWithinTTL(t *testing.T) {
 	db := newTestDB(t)
 	a := NewAuthState(db)

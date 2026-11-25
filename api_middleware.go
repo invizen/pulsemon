@@ -406,7 +406,11 @@ func (s *Server) authGate() http.Handler {
 		// (mechanism verified, documented
 		// as by design.)
 		if c, err := r.Cookie(authSessionName); err == nil {
-			if user, ok := s.auth.SessionUser(c.Value); ok {
+			// ONE lock pass for the gate's session work: liveness, the
+			// TTL-cached owner re-check (I/O runs outside a.mu), the
+			// sliding expiry, and the sliding-cookie renewal decision.
+			// History: docs/DECISIONS.md → auth-lock-io-split.
+			if user, ok, due, pinSecure, renewAge := s.auth.SessionUserAndRenewal(c.Value, true); ok {
 				r = r.WithContext(context.WithValue(r.Context(), authUserCtxKeyVal, user))
 				// Sliding cookie: the login cookie carries a fixed
 				// Max-Age=authSessionTTL (7d), so without a re-issue
@@ -420,7 +424,7 @@ func (s *Server) authGate() http.Handler {
 				// CookieRenewalDue-capped one: a renewal near the
 				// 30-day absolute cap expires with the session, not a
 				// week past it.
-				if due, pinSecure, renewAge := s.auth.CookieRenewalDue(c.Value); due {
+				if due {
 					s.setAuthCookieLifetime(w, r, c.Value, pinSecure, renewAge)
 				}
 				s.mux.ServeHTTP(w, r)

@@ -29,6 +29,7 @@ func TestFix_M2_EnabledFailsClosed(t *testing.T) {
 	a.userCountFn = func() (int, error) { return 0, errors.New("database is locked") }
 	a.enabledMu.Lock()
 	a.enabledAt = time.Time{} // expire the cache
+	a.enabledAtFast.Store(0)  // and its lock-free mirror
 	a.enabledMu.Unlock()
 	if !a.Enabled() {
 		t.Error("Enabled() = false after a transient DB error — the gate failed OPEN; it must keep the last known state (enabled)")
