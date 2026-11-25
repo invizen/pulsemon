@@ -315,57 +315,81 @@ func (s *Server) authGate() http.Handler {
 		}
 		if !s.auth.Enabled() {
 			if s.auth.Bootstrapped() {
-				// Auth was disabled by the operator (all accounts deleted):
-				// the documented "auth off = fully open" behavior applies.
-				// With PULSEMON_ALLOWED_HOSTS set, EVERY /api/ request from a
-				// non-allowlisted Host is refused — reads included. A DNS-
-				// rebinding page's whole attack is a same-origin GET: it reads
-				// /api/sensors (targets with user:pass@ creds) and
-				// /api/settings (SMTP user, Telegram chat ID), so gating only
-				// the mutations left the data wide open. healthz is served
-				// above (the container healthcheck must reach it in every
-				// state), and the static UI carries no data. With the
-				// allowlist unset the LAN-trust default stands (fully open);
-				// the startup warning names that exposure.
-				if strings.HasPrefix(r.URL.Path, "/api/") &&
+				// TORN-READ GUARD: (Enabled=false, Bootstrapped=true) is
+				// ambiguous. It is either the operator's documented "auth
+				// off = fully open" state (all accounts deleted) — OR the
+				// enabledTTL window after an out-of-band CLI first-user
+				// add: the user row and auth_bootstrapped committed
+				// together, Enabled() still caches a stale 'false', and
+				// Bootstrapped() just live-read '1'. In the second case
+				// this branch would open the dashboard to any LAN host at
+				// the exact moment authentication is being enabled — and
+				// the handlers' requireAuth/requireAdmin would stand down
+				// on the same stale cache, so the gate is the only line
+				// of defense left. Settle the ambiguity with a fresh count
+				// before opening: a real user exists → fall through to the
+				// authenticated path below (401 without a session). The
+				// extra COUNT lands only in this rare branch (the
+				// deliberately-open auth-off state), never on the hot
+				// authenticated path.
+				if !s.auth.EnabledNow() {
+					// Auth was disabled by the operator (all accounts
+					// deleted): the documented "auth off = fully open"
+					// behavior applies.
+					// With PULSEMON_ALLOWED_HOSTS set, EVERY /api/ request from a
+					// non-allowlisted Host is refused — reads included. A DNS-
+					// rebinding page's whole attack is a same-origin GET: it reads
+					// /api/sensors (targets with user:pass@ creds) and
+					// /api/settings (SMTP user, Telegram chat ID), so gating only
+					// the mutations left the data wide open. healthz is served
+					// above (the container healthcheck must reach it in every
+					// state), and the static UI carries no data. With the
+					// allowlist unset the LAN-trust default stands (fully open);
+					// the startup warning names that exposure.
+					if strings.HasPrefix(r.URL.Path, "/api/") &&
+						len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
+						respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
+						return
+					}
+					s.mux.ServeHTTP(w, r)
+					return
+				}
+				// Enabled() was stale — a CLI first-user add committed
+				// within the TTL. Fall through: this request needs a
+				// session like any other authenticated-state request.
+			} else {
+				// Fresh install: no account has ever existed. Only the bootstrap
+				// surface is reachable — static UI assets, /api/auth/status, and
+				// POST /api/auth/users (the first account). Everything else
+				// (sensor create/pulse, settings, TLS upload, user list) is 403
+				// until an account exists, so an unauthenticated LAN host can't
+				// use the fresh-install window for SSRF or internal port scanning.
+				//
+				// ACCEPTED LIMITATION: the first-user bootstrap itself is open to
+				// any LAN host — whoever POSTs /api/auth/users first wins it, and
+				// a rogue host that wins leaves the operator to create an account
+				// via `pulsemon auth-user add` (CLI). Closing that fully would
+				// need a setup token or loopback-only bootstrap, both worse UX
+				// than the risk justifies on a trusted homelab LAN. DNS
+				// rebinding also passes the Origin==Host gate above (both are
+				// attacker-controlled), so a remote page could win the bootstrap;
+				// operators who set PULSEMON_ALLOWED_HOSTS close that hole — the
+				// bootstrap POST is then refused unless r.Host is allowlisted
+				// Unset = the LAN-trust default above.
+				if r.Method == http.MethodPost && r.URL.Path == "/api/auth/users" &&
 					len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
 					respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
 					return
 				}
-				s.mux.ServeHTTP(w, r)
+				if r.URL.Path == "/api/auth/status" ||
+					(r.Method == http.MethodPost && r.URL.Path == "/api/auth/users") ||
+					!strings.HasPrefix(r.URL.Path, "/api/") {
+					s.mux.ServeHTTP(w, r)
+					return
+				}
+				respondWithError(w, http.StatusForbidden, "dashboard setup required: create the first account in Settings")
 				return
 			}
-			// Fresh install: no account has ever existed. Only the bootstrap
-			// surface is reachable — static UI assets, /api/auth/status, and
-			// POST /api/auth/users (the first account). Everything else
-			// (sensor create/pulse, settings, TLS upload, user list) is 403
-			// until an account exists, so an unauthenticated LAN host can't
-			// use the fresh-install window for SSRF or internal port scanning.
-			//
-			// ACCEPTED LIMITATION: the first-user bootstrap itself is open to
-			// any LAN host — whoever POSTs /api/auth/users first wins it, and
-			// a rogue host that wins leaves the operator to create an account
-			// via `pulsemon auth-user add` (CLI). Closing that fully would
-			// need a setup token or loopback-only bootstrap, both worse UX
-			// than the risk justifies on a trusted homelab LAN. DNS
-			// rebinding also passes the Origin==Host gate above (both are
-			// attacker-controlled), so a remote page could win the bootstrap;
-			// operators who set PULSEMON_ALLOWED_HOSTS close that hole — the
-			// bootstrap POST is then refused unless r.Host is allowlisted
-			// Unset = the LAN-trust default above.
-			if r.Method == http.MethodPost && r.URL.Path == "/api/auth/users" &&
-				len(s.allowedHosts) > 0 && !s.hostAllowed(r.Host) {
-				respondWithError(w, http.StatusMisdirectedRequest, "host not in PULSEMON_ALLOWED_HOSTS")
-				return
-			}
-			if r.URL.Path == "/api/auth/status" ||
-				(r.Method == http.MethodPost && r.URL.Path == "/api/auth/users") ||
-				!strings.HasPrefix(r.URL.Path, "/api/") {
-				s.mux.ServeHTTP(w, r)
-				return
-			}
-			respondWithError(w, http.StatusForbidden, "dashboard setup required: create the first account in Settings")
-			return
 		}
 		// Authenticated traffic is intentionally NOT host-gated:
 		// PULSEMON_ALLOWED_HOSTS is documented setup-mode hardening

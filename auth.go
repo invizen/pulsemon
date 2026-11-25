@@ -406,6 +406,23 @@ func (a *AuthState) refreshEnabledNow() {
 	a.refreshEnabledLocked()
 }
 
+// EnabledNow force-refreshes the Enabled() cache (bypassing the TTL) and
+// returns the fresh value. The gate calls it in the (Enabled=false,
+// Bootstrapped=true) branch before treating that pair as "operator
+// disabled auth": the CLI first-user add commits the user row and the
+// bootstrapped flag together, so a stale 'false' can outlive the commit
+// by up to enabledTTL, and only a fresh count tells a real auth-off state
+// from that torn window. Unlike refreshEnabledNow it does NOT clear
+// adminCache — a gate read is not a mutation site, and clearing on every
+// read in the (rare, deliberately open) auth-off state would trash the
+// admin TTL cache for no gain.
+func (a *AuthState) EnabledNow() bool {
+	a.enabledMu.Lock()
+	defer a.enabledMu.Unlock()
+	a.refreshEnabledLocked()
+	return a.enabled
+}
+
 // UserCount/CRUD live on *store.Store (internal/store); AuthState adds the password
 // hashing, validation, and session bookkeeping on top.
 var (
@@ -596,7 +613,20 @@ func (a *AuthState) Bootstrapped() bool {
 		read = a.bootstrappedFn
 	}
 	if read() == "1" {
-		a.bootstrapped.Store(true)
+		if !a.bootstrapped.Swap(true) {
+			// First in-process latch: refresh the Enabled() cache NOW.
+			// An out-of-band (CLI) first-user add commits the user row
+			// and this flag together, so the moment this process first
+			// sees '1', an Enabled() cache holding a stale 'false'
+			// (enabledTTL = 2s) makes the pair (Enabled=false,
+			// Bootstrapped=true) read as "operator disabled auth" — the
+			// gate and requireAuth/requireAdmin would stand down and
+			// open the dashboard for up to 2s. Refreshing at the latch
+			// moment heals the cache at the source, for every consumer,
+			// not just the gate. Swap (not Store) so the refresh fires
+			// exactly once: the latch ratchets true and never moves.
+			a.refreshEnabledNow()
+		}
 		return true
 	}
 	return false
