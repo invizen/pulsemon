@@ -9,6 +9,7 @@ package main
 
 import (
 	"regexp"
+	"strings"
 	"testing"
 )
 
@@ -96,5 +97,53 @@ func TestSelfUpdateBacksUpDBBeforeSwap(t *testing.T) {
 	}
 	if !regexp.MustCompile(`backupDatabasePreUpdate\(nil\)`).MatchString(readSource(t, "update.go")) {
 		t.Fatal("update.go: the CLI update path must call backupDatabasePreUpdate(nil) — it has no in-process store")
+	}
+}
+
+// MAJOR-8 (2026-11-25 review): all three installer stop sites used
+// asynchronous `sc.exe stop` + a fixed Sleep(2000), then immediately
+// copied pulsemon.db to .preupdate (upgrade/uninstall) and overwrote
+// pulsemon.exe / deleted the registration. Pulsemon's graceful shutdown
+// can drain up to 30s, so the fixed sleep raced it: the .preupdate copy
+// could capture the DB while its WAL was still open (a stale/corrupt
+// safety copy) and the overwrite/delete could hit a sharing violation
+// or be deferred by the SCM. The fix: WaitForServiceStopped() polls the
+// SCM until it reports STOPPED (or the service is absent), up to 35s,
+// at every stop site.
+// History: docs/DECISIONS.md -> windows-installer-stop-wait
+func TestInstallerWaitsForServiceStopped(t *testing.T) {
+	iss := readSource(t, "installer/pulsemon.iss")
+
+	if !regexp.MustCompile(`(?m)^function WaitForServiceStopped`).MatchString(iss) {
+		t.Fatal("installer/pulsemon.iss is missing the WaitForServiceStopped() function (SCM STOPPED poll before .exe/DB/registration access)")
+	}
+	if !strings.Contains(iss, "AddSeconds(35)") {
+		t.Fatal("WaitForServiceStopped() must bound the SCM poll at 35s (the graceful shutdown can drain for 30s)")
+	}
+	if !strings.Contains(iss, "Get-Service") {
+		t.Fatal("WaitForServiceStopped() must poll the SCM state via Get-Service (the same source `sc query` reads)")
+	}
+	if strings.Contains(iss, "Sleep(2000)") {
+		t.Fatal("installer/pulsemon.iss must not use a fixed Sleep(2000) after `sc stop` (async stop + fixed sleep races the 30s graceful shutdown)")
+	}
+	// All three stop sites must wait for STOPPED: the upgrade path
+	// (PrepareToInstall, before the DB copy + .exe overwrite), the
+	// uninstall path (StopAndDeleteService), and the service-rebuild
+	// path (CreateService's delete+recreate).
+	for _, proc := range []string{
+		`function PrepareToInstall`,
+		`procedure StopAndDeleteService`,
+		`procedure CreateService`,
+	} {
+		body := regexp.MustCompile(`(?s)` + proc + `.*?end;`).FindString(iss)
+		if body == "" {
+			t.Fatalf("%s not found in installer/pulsemon.iss", proc)
+		}
+		if !strings.Contains(body, "sc.exe', 'stop ") {
+			t.Fatalf("%s must request the service stop via sc.exe stop", proc)
+		}
+		if !strings.Contains(body, "WaitForServiceStopped") {
+			t.Fatalf("%s must call WaitForServiceStopped() after sc stop (before DB copy / .exe overwrite / sc delete)", proc)
+		}
 	}
 }

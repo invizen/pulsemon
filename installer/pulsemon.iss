@@ -185,8 +185,10 @@ begin
   if ServiceExists() then
   begin
     RunHidden('sc.exe', 'stop ' + ServiceName);
-    // Let the service finish its clean shutdown before deleting the registration.
-    Sleep(2000);
+    // sc stop is asynchronous: wait for STOPPED before deleting the
+    // registration (the stop in PrepareToInstall already waited; this is
+    // the safety-net path - see WaitForServiceStopped).
+    WaitForServiceStopped;
     RunHidden('sc.exe', 'delete ' + ServiceName);
   end;
   // obj= "NT SERVICE\Pulsemon": the service runs as its own VIRTUAL service
@@ -295,14 +297,42 @@ begin
   ShellExec('open', 'http://localhost:9299', '', '', SW_SHOWNORMAL, ewNoWait, rc);
 end;
 
+// Wait until the SCM reports the service STOPPED (or the service is
+// absent) before the installer touches its .exe, its DB, or its
+// registration. `sc.exe stop` is ASYNCHRONOUS: it only REQUESTS the stop,
+// and Pulsemon's graceful shutdown (probe drain, alert drain, HTTP drain)
+// can take up to 30s. The old fixed 2-second sleep raced that drain:
+// BackupDatabasePreUpdate could capture pulsemon.db while its WAL was
+// still open/uncheckpointed (a stale or corrupt .preupdate safety copy),
+// and the [Files] overwrite / `sc delete` could hit a sharing violation
+// or be deferred by the SCM. Poll the SCM (Get-Service reads the same
+// state `sc query` does) once per second, up to 35s; absent = stopped.
+// On timeout, warn and proceed: the backup is best-effort by design, and
+// a still-running binary makes the [Files] overwrite fail with a clear
+// Inno error the operator can act on.
+// History: docs/DECISIONS.md -> windows-installer-stop-wait
+function WaitForServiceStopped(): Boolean;
+var
+  rc: Integer;
+begin
+  Result := Exec('powershell.exe',
+    '-NoProfile -Command "$deadline = (Get-Date).AddSeconds(35); while ((Get-Date) -lt $deadline) { $svc = Get-Service -Name ' + ServiceName + ' -ErrorAction SilentlyContinue; if (-not $svc -or $svc.Status -eq ''Stopped'') { exit 0 }; Start-Sleep -Seconds 1 }; exit 1"',
+    '', SW_HIDE, ewWaitUntilTerminated, rc) and (rc = 0);
+  if not Result then
+    MsgBox('The Pulsemon service did not report STOPPED within 35 seconds. The pre-upgrade DB copy may be inconsistent, and the binary swap may fail.' #13#10 +
+           'If the install fails, stop the Pulsemon service in services.msc and run the installer again.',
+           mbInformation, MB_OK);
+end;
+
 procedure StopAndDeleteService;
 begin
   if not ServiceExists() then
     Exit;
   RunHidden('sc.exe', 'stop ' + ServiceName);
-  // Give the service a moment to finish its clean shutdown (probe drain,
-  // alert drain, HTTP drain) before deleting the registration.
-  Sleep(2000);
+  // sc stop is asynchronous: wait for the SCM to report STOPPED (up to 35s)
+  // before deleting the registration (a delete against a not-yet-stopped
+  // service is deferred by the SCM; see WaitForServiceStopped).
+  WaitForServiceStopped;
   RunHidden('sc.exe', 'delete ' + ServiceName);
 end;
 
@@ -334,9 +364,10 @@ begin
   if ServiceExists() then
   begin
     RunHidden('sc.exe', 'stop ' + ServiceName);
-    // Let the service finish its clean shutdown (probe/alert/HTTP drain) so the
-    // .exe handle is released before we overwrite it - same delay as uninstall.
-    Sleep(2000);
+    // sc stop is asynchronous: wait for STOPPED (up to 35s, the graceful
+    // shutdown can drain for 30s) so the .exe handle is released before
+    // the overwrite and the DB copy below is a consistent snapshot.
+    WaitForServiceStopped;
     // Service is stopped and its DB is consistent: make the pre-upgrade
     // safety copy now (see BackupDatabasePreUpdate).
     BackupDatabasePreUpdate;
