@@ -747,7 +747,14 @@ func main() {
 // stop is closed, then performs the clean shutdown sequence. It is the single
 // server body shared by every runtime: the Linux signal path and the Windows
 // service path both close `stop` to trigger the identical shutdown.
-func runServer(stop <-chan struct{}) {
+// runServer starts the probe worker and the HTTP server and blocks until stop
+// is closed. onReady (may be nil) is called once the server is actually
+// listening — after DB open and TLS setup, the moment the dashboard can
+// serve: the Windows service reports Running to the SCM only then, so a
+// DB/TLS init failure is a start failure (StartPending → exit), not a
+// runtime crash after the SCM has already marked the service Running
+// (2026-11-25 external review MINOR-26).
+func runServer(stop <-chan struct{}, onReady func()) {
 	// Ensure the platform data dir exists before the DB opens. On Linux this
 	// also refuses a RELATIVE PULSEMON_DB (F15) — a hard startup error,
 	// because a relative path would put the DB (and its secrets) in the
@@ -816,6 +823,9 @@ func runServer(stop <-chan struct{}) {
 	// next request without a restart.
 	srv, baseCancel := newHTTPServer(server.authGate())
 	startListener(srv, db, stop)
+	if onReady != nil {
+		onReady() // the service handler reports Running only from here
+	}
 
 	<-stop
 	log.Println("Shutting down...")

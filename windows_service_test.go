@@ -275,3 +275,126 @@ func TestWindowsRollbackStopsServiceFirst(t *testing.T) {
 		t.Errorf("Windows rollback must call stopWindowsServiceFn (idx %d) BEFORE os.Rename (idx %d)", stop, rename)
 	}
 }
+
+// funcBody returns the text of a top-level function from gofmt'd source:
+// from its "func name(" line to the first column-0 closing brace.
+func funcBody(src, name string) (string, bool) {
+	marker := "func " + name + "("
+	i := strings.Index(src, marker)
+	if i < 0 {
+		return "", false
+	}
+	j := strings.Index(src[i:], "\n}")
+	if j < 0 {
+		return "", false
+	}
+	return src[i : i+j+2], true
+}
+
+// TestServiceDetectionUsesSvcHelper pins MINOR-26 (2026-11-25 external
+// review): service detection must use svc.IsWindowsService() — which
+// checks session 0 AND the services.exe parent — not a bare
+// ProcessIdToSessionId == 0 check. The session-0-only shape misclassifies
+// Task Scheduler / WinRM / NSSM / CI-runner launches into the service
+// path, where svc.Run fatals.
+func TestServiceDetectionUsesSvcHelper(t *testing.T) {
+	src := stripGoComments(readSource(t, "main_windows.go"))
+	body, ok := funcBody(src, "isWindowsService")
+	if !ok {
+		// The var shape: isWindowsService is a func-typed var, not a func.
+		i := strings.Index(src, "isWindowsService = func() bool")
+		if i < 0 {
+			t.Fatal("main_windows.go must define isWindowsService")
+		}
+		body = src[i:]
+	}
+	if !strings.Contains(body, "svc.IsWindowsService()") {
+		t.Error("isWindowsService must call svc.IsWindowsService() (session 0 AND services.exe parent)")
+	}
+	if strings.Contains(src, "ProcessIdToSessionId") {
+		t.Error("main_windows.go must not use a bare ProcessIdToSessionId == 0 check (it misclassifies non-SCM Session 0 launches)")
+	}
+}
+
+// TestServiceReportsRunningOnlyWhenListening pins MINOR-26 (2026-11-25
+// external review): Execute must report svc.Running to the SCM only after
+// the server is actually listening (the onReady closure fires post-
+// startListener). The old shape posted Running before runServer began —
+// a DB/TLS init fatal then read as a RUNTIME crash, tripping the sc
+// failure loop, while the startup config error was masked.
+func TestServiceReportsRunningOnlyWhenListening(t *testing.T) {
+	src := stripGoComments(readSource(t, "main_windows.go"))
+	// Execute is a METHOD: func (h *pulsemonHandler) Execute(...) — anchor
+	// on the full receiver form.
+	i := strings.Index(src, "func (h *pulsemonHandler) Execute(")
+	if i < 0 {
+		t.Fatal("main_windows.go must define pulsemonHandler.Execute")
+	}
+	j := strings.Index(src[i:], "\n}")
+	if j < 0 {
+		t.Fatal("cannot find the end of pulsemonHandler.Execute")
+	}
+	body := src[i : i+j+2]
+	readyIdx := strings.Index(body, "case <-ready:")
+	runningIdx := strings.Index(body, "State: svc.Running")
+	if readyIdx < 0 {
+		t.Fatal("Execute must select on a ready signal before reporting Running")
+	}
+	if runningIdx < 0 || runningIdx < readyIdx {
+		t.Errorf("Execute must post svc.Running (idx %d) ONLY after the server is listening (ready select at idx %d) — an init fatal must exit while StartPending", runningIdx, readyIdx)
+	}
+	if !strings.Contains(body, "runServer(stop, ") {
+		t.Error("Execute must start runServer with the ready callback (runServer(stop, func() { close(ready) }))")
+	}
+	// main.go must fire the callback AFTER the listener is up.
+	mg := stripGoComments(readSource(t, "main.go"))
+	si := strings.Index(mg, "startListener(srv, db, stop)")
+	oi := strings.Index(mg, "onReady()")
+	if si < 0 || oi < 0 || oi < si {
+		t.Errorf("main.go must call onReady() (idx %d) AFTER startListener (idx %d)", oi, si)
+	}
+}
+
+// TestEnsureDataDirHardensNewDirs pins MINOR-26 (2026-11-25 external
+// review): a newly created data dir must be ACL-hardened (icacls
+// /inheritance:r + explicit grants) BEFORE the DB file is written — a
+// fresh %ProgramData% dir inherits BUILTIN\Users:(RX), leaving bcrypt
+// hashes and provider secrets readable by every local user on a portable
+// run. Existing dirs keep the installer's/prior run's ACL (no re-icacls).
+func TestEnsureDataDirHardensNewDirs(t *testing.T) {
+	src := stripGoComments(readSource(t, "main_windows.go"))
+	body, ok := funcBody(src, "ensureDataDir")
+	if !ok {
+		t.Fatal("main_windows.go must define ensureDataDir")
+	}
+	if !strings.Contains(body, `exec.Command("icacls", dir, "/inheritance:r"`) {
+		t.Error("ensureDataDir must icacls a newly created dir with /inheritance:r (break the BUILTIN\\Users:(RX) inheritance)")
+	}
+	if !strings.Contains(body, `Administrators:(OI)(CI)F`) {
+		t.Error("the hardened ACL must grant Administrators full control")
+	}
+	if !strings.Contains(body, `currentWindowsUser()`) {
+		t.Error("the hardened ACL must grant the running user full control (the portable-run owner)")
+	}
+	// Ordering: the existing-dir early return comes BEFORE the icacls —
+	// only NEWLY created dirs are hardened.
+	statIdx := strings.Index(body, "os.Stat(dir)")
+	icaIdx := strings.Index(body, "exec.Command(\"icacls\"")
+	if statIdx < 0 || icaIdx < 0 || statIdx > icaIdx {
+		t.Errorf("ensureDataDir must early-return for an existing dir (os.Stat at idx %d) BEFORE the icacls pass (idx %d)", statIdx, icaIdx)
+	}
+}
+
+// TestNoDeadServiceChannelGlobals pins MINOR-26 (2026-11-25 external
+// review): the package-level serviceStopCh/serviceDoneCh globals are dead
+// (the handler's local channels do the work) and must not come back —
+// package globals shared by a single service instance are a footgun the
+// review flagged.
+func TestNoDeadServiceChannelGlobals(t *testing.T) {
+	src := stripGoComments(readSource(t, "main_windows.go"))
+	for _, g := range []string{"serviceStopCh", "serviceDoneCh"} {
+		if strings.Contains(src, g) {
+			t.Errorf("main_windows.go must not define the dead %s global (the handler's local channels replace it)", g)
+		}
+	}
+}

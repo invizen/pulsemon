@@ -106,5 +106,5 @@ func runMain() {
 		<-sig
 		close(stop)
 	}()
-	runServer(stop)
+	runServer(stop, nil)
 }

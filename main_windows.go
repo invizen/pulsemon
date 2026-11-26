@@ -6,10 +6,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 
-	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
 )
 
@@ -44,15 +45,46 @@ func ensureDataDir() error {
 	if !filepath.IsAbs(dbPath) {
 		return fmt.Errorf("PULSEMON_DB must be an absolute path (got %q): a relative path would put the database — and its secrets — in the process's working directory", dbPath)
 	}
-	if err := os.MkdirAll(filepath.Dir(dbPath), 0o755); err != nil {
-		return fmt.Errorf("create data dir %s: %w", filepath.Dir(dbPath), err)
+	dir := filepath.Dir(dbPath)
+	if _, err := os.Stat(dir); err == nil {
+		// Existing dir: the installer's ACL (a service install) or a
+		// prior run's hardening stands — re-applying icacls would also
+		// strip grants the installer manages.
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create data dir %s: %w", dir, err)
+	}
+	// A NEWLY created dir inherits the parent's ACL — under %ProgramData%
+	// that is BUILTIN\Users:(RX), which would leave pulsemon.db (bcrypt
+	// hashes, webhook/SMTP secrets) readable by every local user on a
+	// portable run. Lock it down to Administrators + the running user
+	// BEFORE the DB file is written (2026-11-25 external review MINOR-26).
+	// The installer grants the VSA additively on service installs. A
+	// hardening failure is fatal: a world-readable secret store must not
+	// run silently.
+	if out, err := exec.Command("icacls", dir, "/inheritance:r",
+		"/grant", "Administrators:(OI)(CI)F",
+		"/grant", currentWindowsUser()+":(OI)(CI)F").CombinedOutput(); err != nil {
+		return fmt.Errorf("harden data dir %s ACL: %v: %s", dir, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
+// currentWindowsUser is "DOMAIN\user" from whoami (present on every
+// supported Windows): icacls's grant target for the portable-run owner.
+func currentWindowsUser() string {
+	out, err := exec.Command("whoami").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
 // hardenDataPath is a no-op on Windows: there is no umask, and the data
-// directory's ACL is the installer's (M1 in installer/pulsemon.iss), not
-// the process's.
+// directory's ACL is set by the installer (a service install) or by
+// ensureDataDir's icacls pass (a newly created portable dir) — the CLI
+// path opens the store in an already-existing dir.
 func hardenDataPath(dbPath string) {}
 
 // icmpHint is the /api/healthz hint shown when no ICMP transport could open.
@@ -60,19 +92,16 @@ func icmpHint() string {
 	return "ICMP socket unavailable: the unprivileged datagram socket failed to open. Check that a firewall / antivirus isn't blocking ICMP echo, and restart the service (a boot-timing race is the usual cause). Note: the raw-socket fallback needs elevation and is unavailable to the service's virtual account (NT SERVICE\\Pulsemon), so the datagram socket is the only ICMP path."
 }
 
-// isWindowsService reports whether this process is running under the Service
-// Control Manager. Services run in the non-interactive session 0, while
-// interactive user processes run in session 1+; ProcessIdToSessionId is the
-// standard, reliable discriminator. (x/sys/windows/svc in v0.48.0 has no
-// IsServiceRunning helper, so we check the session directly.) Var so the
-// windows test can stub it: a test process must not be reclassified as the
-// service.
+// isWindowsService reports whether this process runs under the Service
+// Control Manager. svc.IsWindowsService() (x/sys/windows/svc) checks BOTH
+// the session-0 AND the parent being services.exe — the session-0-only
+// check this file used misclassified Task Scheduler / WinRM / NSSM / CI
+// runner launches into the service path, where svc.Run then fatals
+// (2026-11-25 external review MINOR-26). Var so a windows test can stub
+// it: a test process must not be reclassified as the service.
 var isWindowsService = func() bool {
-	var sessionID uint32
-	if err := windows.ProcessIdToSessionId(uint32(os.Getpid()), &sessionID); err != nil {
-		return false
-	}
-	return sessionID == 0
+	ok, err := svc.IsWindowsService()
+	return err == nil && ok
 }
 
 // runMain is the Windows entry point. Under the SCM it runs as a service
@@ -88,7 +117,7 @@ func runMain() {
 			<-sig
 			close(stop)
 		}()
-		runServer(stop)
+		runServer(stop, nil)
 		return
 	}
 	if err := svc.Run(serviceName, &pulsemonHandler{}); err != nil {
@@ -96,18 +125,8 @@ func runMain() {
 	}
 }
 
-// serviceStopCh / serviceDoneCh are the running service's drain channels,
-// set when the service handler starts the server. The Stop/Shutdown control
-// path closes serviceStopCh and waits on serviceDoneCh for the clean
-// shutdown to finish before reporting Stopped (see pulsemonHandler). Nil
-// in a console (non-service) run.
-var (
-	serviceStopCh chan struct{}
-	serviceDoneCh chan struct{}
-)
-
 // pulsemonHandler is the Windows service control handler (x/sys/windows/svc
-// v0.48.0 API: Execute reads ChangeRequest from r, writes Status to s, and
+// v0.50.0 API: Execute reads ChangeRequest from r, writes Status to s, and
 // returns a service-specific-exit-code flag + exit code). It reports
 // StartPending → Running to the SCM, runs the server in a goroutine, and — on
 // a Stop/Shutdown command — closes the server's stop channel and WAITS for the
@@ -121,14 +140,25 @@ func (h *pulsemonHandler) Execute(args []string, r <-chan svc.ChangeRequest, s c
 
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	serviceStopCh = stop
-	serviceDoneCh = done
-	s <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
-
+	ready := make(chan struct{})
+	// Report Running ONLY once the server is actually listening: a DB/TLS
+	// init fatal then exits the process while the SCM still sees
+	// StartPending — a start failure, not a runtime crash (2026-11-25
+	// external review MINOR-26: the old shape posted Running before
+	// runServer began, masking startup config errors as runtime crashes).
 	go func() {
 		defer close(done)
-		runServer(stop)
+		runServer(stop, func() { close(ready) })
 	}()
+	select {
+	case <-ready:
+	case <-done:
+		// The server returned before it ever listened (an init fatal
+		// os.Exit's first; a clean return here is the only survivor).
+		s <- svc.Status{State: svc.Stopped}
+		return false, 0
+	}
+	s <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 
 	for {
 		select {
