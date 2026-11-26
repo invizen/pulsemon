@@ -173,3 +173,39 @@ test('positive control: a server that is up from the start never shows the banne
     'a healthy startup must not flash the waiting banner');
   assert.equal(app.get('connFails'), 0);
 });
+
+// Recovery from the server-down (fail-closed auth) state must RE-FETCH the
+// status: the server is answering again, so its answer is authoritative
+// again — auth enabled + unauthed brings the gate back (the inoperable
+// banner gave way to a working login form), auth off keeps the gate hidden
+// (the fail-closed value must not outlive the outage, 2026-11-26).
+test('recovery with auth enabled: the gate appears after the waiting banner', async () => {
+  const app = await makeAppWithFetch(deadFetch);
+  assert.ok(!app.doc.getElementById('conn-banner').classList.contains('hidden'),
+    'precondition: banner visible while the server is down');
+  app.setFetch(async (url) => {
+    if (url === '/api/auth/status') return resp({ enabled: true, authed: false });
+    return liveFetch(url);
+  });
+  await app.call('refresh');
+  await ticks();
+  assert.ok(app.doc.getElementById('conn-banner').classList.contains('hidden'),
+    'recovery must hide the waiting banner');
+  assert.equal(app.get('connFails'), 0);
+  assert.ok(!app.doc.getElementById('auth-gate').classList.contains('hidden'),
+    'auth enabled + unauthed after recovery: the (now working) gate must appear');
+});
+
+test('recovery with auth off: no gate, no banner, sensors land', async () => {
+  const app = await makeAppWithFetch(deadFetch);
+  assert.ok(!app.doc.getElementById('conn-banner').classList.contains('hidden'),
+    'precondition: banner visible while the server is down');
+  app.setFetch(liveFetch); // liveFetch answers /api/auth/status with auth off
+  await app.call('refresh');
+  await ticks();
+  assert.ok(app.doc.getElementById('conn-banner').classList.contains('hidden'),
+    'recovery must hide the waiting banner');
+  assert.ok(app.doc.getElementById('auth-gate').classList.contains('hidden'),
+    'the fail-closed state must not outlive the outage when auth is off');
+  assert.equal(app.get('SENSORS').length, 1, 'sensors must land after recovery');
+});

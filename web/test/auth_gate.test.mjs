@@ -165,15 +165,23 @@ test('checkAuth: a 502 with a live session preserves the session', async () => {
   assert.deepEqual(JSON.parse(JSON.stringify(app.get('authState'))), prior, 'no fabricated state on a blip');
 });
 
-test('checkAuth: first-load network failure fails closed (gate shows)', async () => {
+test('checkAuth: first-load network failure fails closed (banner, not gate)', async () => {
   const app = await makeApp();
   app.set('authState', null);
   app.setFetch(async () => { throw new Error('network down'); });
   const ok = await app.call('checkAuth');
   assert.equal(ok, false, 'no evidence = no unlock');
   assert.deepEqual(JSON.parse(JSON.stringify(app.get('authState'))), { enabled: true, authed: false },
-    'first-load failure must fail CLOSED (the old code set enabled:false, dismissing the gate)');
-  assert.ok(!app.doc.getElementById('auth-gate').classList.contains('hidden'), 'the gate must show');
+    'first-load failure must fail CLOSED on the STATE (the old code set enabled:false, dismissing the gate)');
+  // The UI is the waiting banner, not the login gate: the server is
+  // unreachable, so the form cannot work and there is no data to hide —
+  // a 200 status after recovery decides the gate (2026-11-26: the gate
+  // shape here re-broke the conn-banner upgrade-window contract,
+  // windows-upgrade-safety).
+  assert.ok(!app.doc.getElementById('conn-banner').classList.contains('hidden'),
+    'the waiting banner must show while the server is unreachable');
+  assert.ok(app.doc.getElementById('auth-gate').classList.contains('hidden'),
+    'the inoperable login gate must not cover the banner');
 });
 
 // ---------- is_admin rides the login/status response ----------

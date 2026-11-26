@@ -138,16 +138,26 @@ async function checkAuth() {
     authState = await res.json();
   } else if (authState === null) {
     // First load with no status answer (a 5xx proxy blip, a network
-    // down): FAIL CLOSED — show the gate. The old code set
+    // down): FAIL CLOSED on the STATE — { enabled: true, authed: false }
+    // so no dashboard data can render. The old code set
     // { enabled: false, authed: !r.ok } on non-2xx, which UNLOCKED the
     // dashboard on a 502 and dismissed the gate during proxy restarts
-    // (2026-11-25 external review MINOR-25).
+    // (2026-11-25 external review MINOR-25). The UI, though, is the
+    // waiting banner, not the gate: the server is unreachable, so the
+    // login form cannot work and there is no data to hide — a 200
+    // status after recovery decides the gate (2026-11-26: the gate
+    // shape here re-broke the conn-banner upgrade-window contract).
     authState = { enabled: true, authed: false };
+    serverDown = true;
   }
   // else: a non-2xx / network failure WITH a known prior state —
   // preserve it. A blip is not evidence; the next 200 status (or a 401
   // from a real API call) decides.
   if (authBlocking()) {
+    if (serverDown) {
+      updateConnBanner(); // banner owns the server-down UI (no gate)
+      return false;
+    }
     showAuthGate();
     return false;
   }
@@ -256,10 +266,20 @@ let refreshInFlight = false;
 // the "no sensors" empty state and reads as "the sensors were wiped".
 // History: docs/DECISIONS.md → windows-upgrade-safety
 let connFails = 0;
+// serverDown is the banner's owner state: true when the status/refresh
+// fetches cannot reach the server at all. While it is set, the waiting
+// banner owns the UI — the auth gate is inoperable (login cannot reach
+// the server) and there is no data to hide (every fetch fails), so a
+// fail-closed authState must NOT cover the screen with a login form
+// during the upgrade-restart window (2026-11-26: MINOR-25's fail-closed
+// first-load shape re-broke the conn-banner contract, windows-upgrade-
+// safety). A 200 status after recovery decides the gate (refresh
+// re-checks).
+let serverDown = false;
 function updateConnBanner() {
   const banner = $('conn-banner');
   if (!banner) return;
-  if (connFails === 0) { banner.classList.add('hidden'); return; }
+  if (connFails === 0 && !serverDown) { banner.classList.add('hidden'); return; }
   const text = $('conn-banner-text');
   if (text) {
     text.textContent = connFails < 3
@@ -267,9 +287,17 @@ function updateConnBanner() {
       : 'Cannot reach the pulsemon server — sensors appear as soon as it answers. If this persists, check the pulsemon service.';
   }
   banner.classList.remove('hidden');
+  // Server unreachable: the gate cannot be used (its POSTs would fail
+  // too) — the banner is the message, and the gate re-appears via
+  // checkAuth() once a 200 status lands.
+  hideAuthGate();
 }
 async function refresh() {
-  if (authBlocking()) return;
+  // While the server is known down (serverDown), keep polling even in a
+  // fail-closed state: the fetches fail harmlessly (no data exists to
+  // leak — the server is down), they drive the banner's escalation, and
+  // they are the only thing that detects recovery.
+  if (authBlocking() && !serverDown) return;
   if (refreshInFlight) return;
   refreshInFlight = true;
   try {
@@ -281,7 +309,13 @@ async function refresh() {
     SENSORS = s || [];
     EVENTS = e || [];
     connFails = 0;
+    serverDown = false;
     updateConnBanner();
+    // Recovery from a fail-closed (server-down) state: the server is
+    // answering now, so its status is authoritative again — re-fetch it
+    // (auth enabled + unauthed → the gate appears; auth off → it stays
+    // hidden). The old fail-closed value must not outlive the outage.
+    if (authBlocking()) await checkAuth();
     if (hz && hz.version) { const v = $('app-ver'); if (v) v.textContent = hz.version; }
     const banner = $('probe-banner');
     if (hz && hz.icmp_hint) {
@@ -297,6 +331,7 @@ async function refresh() {
   } catch (err) {
     console.error('refresh failed', err);
     connFails++;
+    serverDown = true;
     updateConnBanner();
   }
   finally { refreshInFlight = false; }
@@ -1795,8 +1830,15 @@ document.addEventListener('keydown', e => {
 });
 
 (async function boot() {
-  const ok = await checkAuth();
-  if (ok) startPolling();
+  await checkAuth();
+  // Arm the poller UNCONDITIONALLY: with the server down (fail-closed
+  // auth state) the poller IS the banner's retry loop — the refreshes
+  // fail harmlessly (no data exists to fetch: the server is down, and
+  // refresh() guards data rendering while auth blocks) and they are the
+  // only thing that detects recovery. (2026-11-26: `if (ok)` here left
+  // the upgrade-restart window with no retries at all — the banner could
+  // never escalate or clear on its own.)
+  startPolling();
 })();
 
 let _pollStarted = false;
