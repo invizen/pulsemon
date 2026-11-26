@@ -12,6 +12,7 @@ package main
 
 import (
 	"errors"
+	"strings"
 	"testing"
 )
 
@@ -106,5 +107,23 @@ func TestRunRestartCommandHelperFailureReports(t *testing.T) {
 	}
 	if blockingCalled {
 		t.Fatal("helper failure fell through to the blocking self-restart")
+	}
+}
+
+// TestRequestRestartReapsHelper (NIT-30): the systemd path of
+// requestRestart spawns a detached `pulsemon restart` helper with
+// cmd.Start() — without a (detached) cmd.Wait(), a helper that exits
+// (systemctl restart fails) lingers as a <defunct> zombie child until the
+// server dies. Source-shape pin: the Wait goroutine sits after the Start in
+// the isSystemdManaged case.
+func TestRequestRestartReapsHelper(t *testing.T) {
+	fn, ok := funcBody(stripGoComments(readSource(t, "listener_linux.go")), "requestRestart")
+	if !ok {
+		t.Fatal("requestRestart not found in listener_linux.go")
+	}
+	startAt := strings.Index(fn, "cmd.Start()")
+	waitAt := strings.Index(fn, "go func() { _ = cmd.Wait() }()")
+	if startAt < 0 || waitAt < 0 || waitAt < startAt {
+		t.Fatalf("systemd path: cmd.Start at %d, detached cmd.Wait at %d; want the reap AFTER the start", startAt, waitAt)
 	}
 }

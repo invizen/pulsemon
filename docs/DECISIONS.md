@@ -3837,3 +3837,9 @@ The load-bearing discovery: **Go 1.24+ snapshots the response header map at `Wri
 **Pinned by:** `redirect_rebinding_test.go` — `TestRedirectGuardRefusesEmptyAnswer` (source-shape: the `len(addrs) == 0` check sits between the `LookupIPAddr(ctx, host)` call and the `addrs[0]` index — the path is untriggerable through the global resolver, so ordering is the verifiable property). Sabotage-verified: guard removed → pin red.
 **Gate:** gofmt clean, `go vet .` OK, targeted `-race` green on esthero-zentest (Go 1.27.4). Full `-race` suite at batch end per protocol. No release, tag, or deploy — the user cuts releases.
 
+## restart-helper-reap (listener_linux.go, restart_command_test.go, 2026-11-26)
+
+**Decision:** external review NIT-30 — the systemd path of `requestRestart` spawns the detached `pulsemon restart` helper with `cmd.Start()` and never called `cmd.Wait()`. A helper that exits (systemctl restart fails, job queue, unit stuck) lingered as a `<defunct>` zombie child until the server died. A detached `go func() { _ = cmd.Wait() }()` now reaps it; the restart path does not block on it (the helper is a separate process by design — see startRestartHelper's contract).
+**Why:** unwaited children are a leak-by-construction: every failed TLS-change restart left a zombie entry in the process table, and on a long-lived service process zombies are never cleaned up by anyone but init-on-reparent.
+**Pinned by:** `restart_command_test.go` — `TestRequestRestartReapsHelper` (source-shape: the detached `go func() { _ = cmd.Wait() }()` sits after `cmd.Start()` inside `requestRestart`). Sabotage-verified: Wait removed → pin red.
+**Gate:** gofmt clean, `go vet .` OK, targeted `-race` green on esthero-zentest (Go 1.27.4). Full `-race` suite at batch end per protocol. No release, tag, or deploy — the user cuts releases.

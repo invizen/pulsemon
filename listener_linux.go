@@ -72,6 +72,11 @@ func requestRestart() restartOutcome {
 		if err := cmd.Start(); err != nil {
 			return restartOutcome{hint: "restart the pulsemon service to apply TLS"}
 		}
+		// Reap the helper when it exits (systemctl restart returns, the
+		// helper is done): without a Wait, a failing helper lingers as a
+		// <defunct> child until we die. Detached — the restart path must
+		// not block on it.
+		go func() { _ = cmd.Wait() }()
 		return restartOutcome{restarted: true}
 	case isContainer():
 		syscall.Kill(os.Getpid(), syscall.SIGTERM)
