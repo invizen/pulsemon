@@ -96,8 +96,9 @@ func TestDownloadAssetStagesInTargetDir(t *testing.T) {
 // TestInstallBinaryChownsStagedBeforeSwap: ownership must be restored on
 // the STAGED file before the rename (a failed post-swap chown leaves a live
 // binary with the wrong owner), and the post-swap os.Chown(dst) must be gone.
+// (installBinary lives in update_install.go since the NIT-33 split.)
 func TestInstallBinaryChownsStagedBeforeSwap(t *testing.T) {
-	fn, ok := funcBody(stripGoComments(readSource(t, "update.go")), "installBinary")
+	fn, ok := funcBody(stripGoComments(readSource(t, "update_install.go")), "installBinary")
 	if !ok {
 		t.Fatal("installBinary not found in update.go")
 	}
@@ -114,12 +115,13 @@ func TestInstallBinaryChownsStagedBeforeSwap(t *testing.T) {
 // TestUpdateLockAndWatchdogLogModes: the /tmp lock fallback and the
 // watchdog log must be created 0600 (a 0644 lock in world-writable /tmp is
 // probeable/tamperable by local users; the log carries update findings).
+// (The watchdog log lives in update_watchdog.go since the NIT-33 split.)
 func TestUpdateLockAndWatchdogLogModes(t *testing.T) {
 	lockSrc := readSource(t, "update_lock.go")
 	if !regexp.MustCompile(`os\.OpenFile\(lockPath, os\.O_CREATE\|os\.O_RDWR, 0o600\)`).MatchString(lockSrc) {
 		t.Fatal("update lock must be opened 0o600 (world-writable /tmp fallback)")
 	}
-	updSrc := readSource(t, "update.go")
+	updSrc := readSource(t, "update_watchdog.go")
 	if !regexp.MustCompile(`pulsemon-watchdog\.log"\),\s*os\.O_CREATE\|os\.O_APPEND\|os\.O_WRONLY, 0o600\)`).MatchString(updSrc) {
 		t.Fatal("pulsemon-watchdog.log must be created 0o600")
 	}

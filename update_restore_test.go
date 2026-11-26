@@ -150,14 +150,14 @@ func TestRestoreDatabaseFileFailureLeavesLiveIntact(t *testing.T) {
 // os.ReadFile of a hundreds-of-MB database is the memory regression this
 // fix removes, and it is the shape that pairs with in-place truncation.
 func TestRestoreDatabaseFileNoBulkRead(t *testing.T) {
-	src, err := os.ReadFile("update.go")
+	src, err := os.ReadFile("update_watchdog.go") // restoreDatabaseFile moved there in the NIT-33 split
 	if err != nil {
-		t.Fatalf("read update.go: %v", err)
+		t.Fatalf("read update_watchdog.go: %v", err)
 	}
 	body := string(src)
 	start := strings.Index(body, "func restoreDatabaseFile(")
 	if start < 0 {
-		t.Fatal("restoreDatabaseFile not found in update.go")
+		t.Fatal("restoreDatabaseFile not found in update_watchdog.go")
 	}
 	end := strings.Index(body[start:], "\n}")
 	if end < 0 {

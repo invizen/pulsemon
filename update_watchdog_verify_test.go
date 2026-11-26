@@ -305,14 +305,14 @@ func TestVerifySensorsDataLossKeepsBackup(t *testing.T) {
 // in internal/store/store_backup_replace_test.go; this pin proves the
 // watchdog is the consumer of it.
 func TestVerifySensorsOpensBackupReadOnly(t *testing.T) {
-	src, err := os.ReadFile("update.go")
+	src, err := os.ReadFile("update_watchdog.go") // verifySensorsIntactWatchdog moved there in the NIT-33 split
 	if err != nil {
-		t.Fatalf("read update.go: %v", err)
+		t.Fatalf("read update_watchdog.go: %v", err)
 	}
 	body := string(src)
 	start := strings.Index(body, "func verifySensorsIntactWatchdog(")
 	if start < 0 {
-		t.Fatal("verifySensorsIntactWatchdog not found in update.go")
+		t.Fatal("verifySensorsIntactWatchdog not found in update_watchdog.go")
 	}
 	end := strings.Index(body[start:], "\n}")
 	if end < 0 {

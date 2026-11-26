@@ -243,7 +243,8 @@ func TestWindowsUpdateStaged(t *testing.T) {
 	// The watchdog's healthy path must run the data-integrity check,
 	// passing the spawn-time bus (the post-restore restart must hit the
 	// bus the service ran on — after the stop, re-detection reports "").
-	upd := stripGoComments(readSource(t, "update.go"))
+	// (runWatchdog lives in update_watchdog.go since the NIT-33 split.)
+	upd := stripGoComments(readSource(t, "update_watchdog.go"))
 	if !strings.Contains(upd, "verifySensorsIntactWatchdog(db, prev, dst, bus)") {
 		t.Error("runWatchdog's healthy path must call verifySensorsIntactWatchdog with the spawn-time bus (the 'sensors wiped' guard must restart on the bus the service ran on, not a post-stop re-detection)")
 	}
