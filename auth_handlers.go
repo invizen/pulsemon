@@ -210,17 +210,15 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// Count the failure against the account (across all IPs) — the
-		// per-username layer the per-IP budget can't see. EXISTING accounts
-		// only: a failure for a name with no account protects nothing (the
-		// dummy-hash equalizer already hides the distinction), and the
-		// username is attacker-chosen — counting unknown names let a small
-		// IP pool rotate random names and grow userFails without bound.
-		// Cold path: no timing oracle. History: docs/DECISIONS.md →
-		// userfails-bound.
-		if s.auth.userExists(userKey) {
-			s.auth.recordUserFail(userKey, key)
-		}
+		// Count the failure against the NAME (across all IPs) — the
+		// per-username layer the per-IP budget can't see. Unknown names
+		// count TOO: the old userExists gate leaked an enumeration
+		// oracle (a multi-IP spray of an existing name → fast 429, the
+		// same spray of a phantom name → slow 401). The maps are
+		// bounded by sweep + hard cap, not account count. Cold path:
+		// no timing oracle. History: docs/DECISIONS.md → userfails-
+		// unknown-names.
+		s.auth.recordUserFail(userKey, key)
 		// Constant-time-ish delay on rejection: equalizes the unknown-user /
 		// wrong-password paths (closes the timing oracle), ~5 guesses/s/IP.
 		time.Sleep(loginSlowDown)

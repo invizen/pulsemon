@@ -306,13 +306,19 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		// layer's throttle state. Each layer fails open on its own cap: a
 		// per-IP spray resets the per-IP maps, a username-rotation spray
 		// resets the per-username maps, a successful-login spray resets
-		// knownGood. The layers must NOT wipe each other: the per-username
-		// maps are bounded by existing DB accounts (an all-or-nothing wipe
-		// let a per-IP spray clear an ACTIVE account lockout mid-attack);
-		// userHour is the same account-bounded class and is never wiped
-		// here. Chosen bound: 131072 entries ≈ tens of MB worst case per
+		// knownGood. The per-username maps are no longer bounded by
+		// account count (unknown names are counted — userfails-unknown-
+		// names), so a wide name-rotation spray can reach this cap and
+		// wipe an ACTIVE account lockout mid-attack; that trade is
+		// accepted: reaching it needs ~18k distinct IP buckets in 30s
+		// (the per-IP 7/60s cap), which is the out-of-model botnet the
+		// reverse proxy is for. userHour is wiped WITH its layer: it
+		// shares the per-username key space and its persist-across-
+		// lockouts contract is meaningless once the lockout is gone.
+		// Chosen bound: 131072 entries ≈ tens of MB worst case per
 		// map.
-		// History: docs/DECISIONS.md → throttle-edge-cases
+		// History: docs/DECISIONS.md → throttle-edge-cases,
+		// userfails-unknown-names
 		if len(a.loginThrottle.fails) > throttleHardCap {
 			a.loginThrottle.fails = map[string][]time.Time{}
 			a.loginThrottle.lockout = map[string]time.Time{}
@@ -320,6 +326,7 @@ func (a *AuthState) beginAttempt(ip string) (bool, time.Duration) {
 		if len(a.loginThrottle.userFails) > throttleHardCap {
 			a.loginThrottle.userFails = map[string][]time.Time{}
 			a.loginThrottle.userLock = map[string]time.Time{}
+			a.loginThrottle.userHour = map[string]*userHourBudget{}
 		}
 		if len(a.loginThrottle.knownGood) > throttleHardCap {
 			a.loginThrottle.knownGood = map[string]time.Time{}
@@ -580,6 +587,27 @@ func (a *AuthState) sweepThrottle(now time.Time) {
 		}
 		delete(a.loginThrottle.userFails, u)
 		delete(a.loginThrottle.userLock, u)
+	}
+	// The hourly budget: the same drop rule as userFails — an account
+	// with no in-window failures and no active lockout has nothing left
+	// to spend, and (now that unknown names are counted) the key space
+	// is attacker-chosen, so stale entries must go. An ACTIVE-lockout
+	// account keeps its budget (the lockout check mirrors userFails'),
+	// which is the persist-across-rolling-lockouts contract.
+	for u := range a.loginThrottle.userHour {
+		if until, ok := a.loginThrottle.userLock[u]; ok && now.Before(until) {
+			continue // active lockout: keep
+		}
+		recent := false
+		for _, t := range a.loginThrottle.userFails[u] {
+			if t.After(cutoff) {
+				recent = true
+				break
+			}
+		}
+		if !recent {
+			delete(a.loginThrottle.userHour, u)
+		}
 	}
 	// Known-good IP buckets: drop entries older than
 	// knownGoodTTL, so a stale IP stops being exempt from the per-username

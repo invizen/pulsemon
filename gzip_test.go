@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -418,12 +420,16 @@ func TestOversizedBody413ClosesConnection(t *testing.T) {
 	}
 }
 
-// TestGzipHeadResponse pins the HEAD path through the gzip wrapper: a HEAD
-// request must COMPLETE (a body-less response must not leave the gzip writer
-// blocked waiting to flush a body) and answer 200. 204/304 are covered by
-// TestGzipBodylessCarriesNoTrailer; HEAD is the other bodyless verb the
-// wrapper must not choke on.
-// History: docs/DECISIONS.md → testing-benchmark-gaps
+// TestGzipHeadResponse pins the HEAD path: a HEAD request must COMPLETE
+// (a body-less response must not leave any writer blocked waiting to
+// flush a body). MINOR-23(c) added the wrap exclusion — HEAD skips the
+// gzip wrapper entirely, so the response (405 here: the route's real
+// HEAD answer) must NOT declare Content-Encoding: gzip (a body the
+// client never receives) and the per-request ErrBodyNotAllowed log line
+// is gone with it. 204/304 are covered by
+// TestGzipBodylessCarriesNoTrailer.
+// History: docs/DECISIONS.md → testing-benchmark-gaps,
+// gzip-head-and-bodyless-fixes
 func TestGzipHeadResponse(t *testing.T) {
 	db := newTestDB(t)
 	if err := db.SetSetting("auth_bootstrapped", "1"); err != nil {
@@ -440,20 +446,197 @@ func TestGzipHeadResponse(t *testing.T) {
 	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{DisableCompression: true}}
 	req, _ := http.NewRequest(http.MethodHead, ts.URL+"/api/sensors", nil)
 	req.Header.Set("Accept-Encoding", "gzip")
-	done := make(chan error, 1)
+	type headResult struct {
+		resp *http.Response
+		err  error
+	}
+	done := make(chan headResult, 1)
 	go func() {
 		resp, err := client.Do(req)
-		if err == nil {
-			resp.Body.Close()
-		}
-		done <- err
+		done <- headResult{resp: resp, err: err}
 	}()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("HEAD /api/sensors through the gzip wrapper: %v (it must complete, not hang)", err)
+	case r := <-done:
+		if r.err != nil {
+			t.Fatalf("HEAD /api/sensors: %v (it must complete, not hang)", r.err)
+		}
+		defer r.resp.Body.Close()
+		// 405 is the route's real HEAD answer (the handler only serves
+		// GET/POST) — the pin is about the gzip contract, not routing.
+		if r.resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("HEAD /api/sensors: %d, want 405", r.resp.StatusCode)
+		}
+		if ce := r.resp.Header.Get("Content-Encoding"); ce != "" {
+			t.Fatalf("HEAD: Content-Encoding = %q, want empty (HEAD skips the gzip wrap — a body the client never gets must not be declared gzip)", ce)
 		}
 	case <-time.After(4 * time.Second):
-		t.Fatal("HEAD /api/sensors through the gzip wrapper hung (the gzip writer blocked on a body-less response)")
+		t.Fatal("HEAD /api/sensors hung (a body-less response blocked the writer)")
+	}
+}
+
+// headlessWriter mimics net/http's HEAD ResponseWriter: the header calls
+// succeed, Write refuses the body with http.ErrBodyNotAllowed.
+type headlessWriter struct{}
+
+func (headlessWriter) Header() http.Header       { return http.Header{} }
+func (headlessWriter) WriteHeader(int)           {}
+func (headlessWriter) Write([]byte) (int, error) { return 0, http.ErrBodyNotAllowed }
+
+// TestRespondWithJSONIgnoresBodyNotAllowed pins the log-noise half of
+// MINOR-23(c): a writer that refuses the body (net/http's HEAD outcome)
+// must produce NO log line — pre-fix every HEAD /api/* request logged
+// "respondWithJSON: encode: http: response with ...". A genuine marshal
+// failure must STILL be logged.
+func TestRespondWithJSONIgnoresBodyNotAllowed(t *testing.T) {
+	var buf bytes.Buffer
+	prev := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(prev)
+
+	respondWithJSON(headlessWriter{}, http.StatusOK, map[string]string{"ok": "1"})
+	if buf.Len() != 0 {
+		t.Fatalf("respondWithJSON logged for the expected HEAD outcome: %q", buf.String())
+	}
+
+	// A real marshal failure (top-level func: fails before any Write) must
+	// still surface in the log.
+	buf.Reset()
+	respondWithJSON(headlessWriter{}, http.StatusOK, func() {})
+	if !strings.Contains(buf.String(), "respondWithJSON: encode") {
+		t.Fatalf("genuine marshal failure was not logged: %q", buf.String())
+	}
+}
+
+// serverishWriter models the real net/http server's response semantics
+// (which httptest.ResponseRecorder can't represent — it keeps a 1xx as
+// the effective status): a 1xx is recorded and sent immediately, a final
+// status SNAPSHOTs the header map (Go 1.24+: later sets are lost), a
+// second final status is ignored, and a lone 1xx + body upgrades to 200.
+type serverishWriter struct {
+	header   http.Header
+	snapshot http.Header // the map as of the last final WriteHeader
+	status   int
+	body     bytes.Buffer
+}
+
+func (s *serverishWriter) Header() http.Header {
+	if s.header == nil {
+		s.header = http.Header{}
+	}
+	return s.header
+}
+
+func (s *serverishWriter) WriteHeader(code int) {
+	if code >= 100 && code < 200 {
+		s.status = code
+		return
+	}
+	if s.status >= 200 {
+		return // superfluous final status: ignored (the server logs it)
+	}
+	s.status = code
+	s.snapshot = s.header.Clone()
+}
+
+func (s *serverishWriter) Write(b []byte) (int, error) {
+	if s.status < 200 {
+		s.status = http.StatusOK
+		s.snapshot = s.header.Clone()
+	}
+	s.body.Write(b)
+	return len(b), nil
+}
+
+// TestGzipOneShotThenFinalBody pins MINOR-23(a): a 1xx WriteHeader (102
+// Processing) used to set bypass permanently, so the final 200 + body
+// after it was silently discarded — the client got Content-Encoding: gzip
+// and an empty body (ERR_CONTENT_DECODING_FAILED). The final status must
+// clear the bypass, and the CE must land in the header SNAPSHOT (set
+// before the server's WriteHeader — Go 1.24+ drops later sets).
+func TestGzipOneShotThenFinalBody(t *testing.T) {
+	inner := &serverishWriter{}
+	gzw := &gzipResponseWriter{ResponseWriter: inner}
+	gzw.WriteHeader(http.StatusProcessing) // 102
+	gzw.WriteHeader(http.StatusOK)
+	const body = `{"ok":true}`
+	if n, err := gzw.Write([]byte(body)); err != nil || n != len(body) {
+		t.Fatalf("Write after 1xx→200: %d, %v — the 1xx bypass was never cleared", n, err)
+	}
+	if err := gzw.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if inner.status != http.StatusOK {
+		t.Fatalf("final status = %d, want 200", inner.status)
+	}
+	if ce := inner.snapshot.Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding in the header snapshot = %q, want gzip (a CE set after the server's WriteHeader is dropped)", ce)
+	}
+	gr, err := gzip.NewReader(&inner.body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v (the body was discarded?)", err)
+	}
+	out, err := io.ReadAll(gr)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if string(out) != body {
+		t.Fatalf("decoded = %q, want %q", out, body)
+	}
+}
+
+// TestGzipOneShotEndToEnd pins the same contract through a real net/http
+// server (the server writes the 102 immediately, then the final 200):
+// the client must receive Content-Encoding: gzip and a body that decodes.
+func TestGzipOneShotEndToEnd(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gzw := &gzipResponseWriter{ResponseWriter: w}
+		defer gzw.Close()
+		w = gzw
+		w.WriteHeader(http.StatusProcessing)
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"ok":true}`))
+	}))
+	defer ts.Close()
+
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+	req, _ := http.NewRequest(http.MethodGet, ts.URL, nil)
+	req.Header.Set("Accept-Encoding", "gzip")
+	res, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer res.Body.Close()
+	if ce := res.Header.Get("Content-Encoding"); ce != "gzip" {
+		t.Fatalf("Content-Encoding = %q, want gzip", ce)
+	}
+	gr, err := gzip.NewReader(res.Body)
+	if err != nil {
+		t.Fatalf("gzip.NewReader: %v (the 1xx left the body bypassed?)", err)
+	}
+	out, _ := io.ReadAll(gr)
+	if string(out) != `{"ok":true}` {
+		t.Fatalf("decoded = %q, want %q", out, `{"ok":true}`)
+	}
+}
+
+// TestGzipBodylessStatusCarriesNoEncoding pins MINOR-23(b): a status-only
+// response (WriteHeader, no body) must NOT declare Content-Encoding: gzip
+// — pre-fix the header was set at WriteHeader and Close saw g.gz == nil,
+// so the client got a 0-byte "gzip" body: an invalid stream
+// (ERR_CONTENT_DECODING_FAILED).
+func TestGzipBodylessStatusCarriesNoEncoding(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusBadRequest, http.StatusUnauthorized} {
+		rec := httptest.NewRecorder()
+		gzw := &gzipResponseWriter{ResponseWriter: rec}
+		gzw.WriteHeader(status)
+		if err := gzw.Close(); err != nil {
+			t.Fatalf("status %d: Close: %v", status, err)
+		}
+		if ce := rec.Header().Get("Content-Encoding"); ce != "" {
+			t.Fatalf("status %d: Content-Encoding = %q, want empty (no body was written — a 0-byte gzip stream is invalid)", status, ce)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("status %d: %d body bytes, want 0", status, rec.Body.Len())
+		}
 	}
 }

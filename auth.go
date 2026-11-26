@@ -276,9 +276,12 @@ type AuthState struct {
 		// account's total failed checks per hour so a paced multi-IP attack
 		// can't stay under the 60s threshold indefinitely. It PERSISTS across
 		// rolling lockouts (a rolling expiry wipes userFails, not userHour)
-		// and self-resets by wall clock once the window elapses. Bounded by
-		// account count — recordUserFail only counts EXISTING users — so it
-		// never grows unboundedly and needs no sweep of its own.
+		// and self-resets by wall clock once the window elapses. The key
+		// space is attacker-chosen (unknown names are counted —
+		// userfails-unknown-names), so it is swept with userFails
+		// (sweepThrottle) and wiped with the per-username hard cap.
+		// History: docs/DECISIONS.md → login-hourly-budget,
+		// userfails-unknown-names.
 		userHour map[string]*userHourBudget
 		// knownGood: (username, IP bucket) → last successful login. A
 		// previously-successful (account, client) pair is EXEMPT from the

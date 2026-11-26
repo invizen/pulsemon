@@ -82,7 +82,9 @@ func respondWithJSON(w http.ResponseWriter, code int, payload any) {
 	// The status line is already written, so an Encode failure can't change
 	// it — log it so a payload that can't be marshalled to JSON surfaces as
 	// a visible error + truncated body instead of a silent empty response.
-	if err := json.NewEncoder(w).Encode(payload); err != nil {
+	// ErrBodyNotAllowed is the expected, per-request outcome for HEAD
+	// (net/http suppresses the body) — not an error worth a log line.
+	if err := json.NewEncoder(w).Encode(payload); err != nil && !errors.Is(err, http.ErrBodyNotAllowed) {
 		log.Printf("respondWithJSON: encode: %v", err)
 	}
 }
@@ -235,12 +237,18 @@ func (s *Server) authGate() http.Handler {
 		// probe writes) are documented in docs/DECISIONS.md → scale-ceiling
 		// and deferred — they only pay off at 1000s of sensors.
 		//
+		// HEAD is EXCLUDED: net/http answers HEAD with a bodyless writer
+		// (Write returns ErrBodyNotAllowed), so wrapping it just declares
+		// Content-Encoding: gzip on a body the client never gets and logs
+		// one ErrBodyNotAllowed per HEAD request in respondWithJSON.
+		//
 		// POST /api/update is EXCLUDED: handleUpdate ends in a synchronous
 		// performRestart that SIGTERMs this process before the deferred
 		// gzip Close can write the trailer — a truncated gzip stream breaks
 		// the client's decode (ERR_CONTENT_DECODING_FAILED) on the 202. The
 		// update responses are a few hundred bytes; compression buys nothing.
-		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/update" && acceptsGzip(r) {
+		if strings.HasPrefix(r.URL.Path, "/api/") && r.URL.Path != "/api/update" &&
+			r.Method != http.MethodHead && acceptsGzip(r) {
 			// The body now depends on Accept-Encoding: caches must not
 			// serve the gzip variant to an identity client (or vice versa).
 			w.Header().Add("Vary", "Accept-Encoding")
