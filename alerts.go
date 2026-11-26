@@ -369,6 +369,30 @@ func (pw *ProbeWorker) shouldAlertNow(c sensorConfig, oldStatus, newStatus strin
 	return alertableTransition(oldStatus, newStatus)
 }
 
+// finalRecoveryFromWarning reports whether a warning -> up transition is
+// the tail of an outage: the warning was entered from error (an alerted
+// partial recovery), so this tick sends the final "recovered" alert that
+// the silent warning -> up gate (alertableTransition) would otherwise
+// swallow — the chat's last word would stay "partial recovery" on a
+// sensor that is fully up. up -> warning -> up flapping stays silent: its
+// previous event was up -> warning. The check reads the durable events
+// log (the current warning -> up row is already committed by the caller,
+// so the row before it is the previous transition), which keeps the
+// distinction across a process restart between the two transitions.
+// History: docs/DECISIONS.md → final-recovery-after-partial-recovery.
+func (pw *ProbeWorker) finalRecoveryFromWarning(id, oldStatus, newStatus string) bool {
+	if oldStatus != "warning" || newStatus != "up" {
+		return false
+	}
+	var from, to string
+	err := pw.db.QueryRow(`SELECT from_status, to_status FROM events
+		WHERE sensor_id = ? ORDER BY ts DESC LIMIT 1 OFFSET 1`, id).Scan(&from, &to)
+	if err != nil {
+		return false // no prior event (fresh sensor, 24h-purged history): no evidence of an alerted outage
+	}
+	return from == "error" && to == "warning"
+}
+
 // shouldAlert applies the global alert routing rule from the SNAPSHOT:
 // "all", "tags" (any of the sensor's tags in the filter), or "sensors" (id
 // in the filter). Lock-free: the snapshot is swapped after each
@@ -1660,7 +1684,7 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 	// Single transport seam with postJSON (doWebhookPost): the shared
 	// hardened client, the capped drain, and the URL redaction live there.
 	// TestWebhook is a cold, operator-initiated path — no retry.
-	code, _, err := pw.doWebhookPost(ctx, url, mustJSON(body))
+	code, _, respBody, err := pw.doWebhookPost(ctx, url, mustJSON(body))
 	if err != nil {
 		return false, err.Error()
 	}
@@ -1668,7 +1692,15 @@ func (pw *ProbeWorker) TestWebhook(ctx context.Context, kind string) (bool, stri
 		return false, "endpoint redirected (refused to follow — possible misconfiguration)"
 	}
 	if code >= 300 {
-		return false, fmt.Sprintf("endpoint returned HTTP %d", code)
+		// Surface the provider's own diagnosis (the 400+ body's
+		// description — "chat not found", "migrate_to_chat_id"): the
+		// test button is where the operator verifies the config, and a
+		// bare status code tells them nothing to fix.
+		detail := fmt.Sprintf("endpoint returned HTTP %d", code)
+		if _, desc := webhookBodyDiag(respBody); desc != "" {
+			detail += ": " + desc
+		}
+		return false, detail
 	}
 	return true, "test alert sent via " + p.Label + " (HTTP " + http.StatusText(code) + ")"
 }
@@ -2051,30 +2083,37 @@ func (pw *ProbeWorker) retryAlert(try func() (retryable bool, retryAfter time.Du
 
 // doWebhookPost performs ONE webhook POST with the shared hardened client
 // (10s timeout, no redirects, SSRF-guarded dial — webhookClientFor) and
-// returns the response status + headers. It is the single transport seam for
-// both webhook writers: postJSON (alert delivery, retried) and TestWebhook
-// (the settings test button, single-shot). The caller passes a pre-marshaled
-// body (postJSON marshals once and reuses it across retries) and owns the
-// status classification — the two callers classify differently (retry policy
-// vs UI detail string). The returned error never contains the URL (it
-// carries the provider credential).
-func (pw *ProbeWorker) doWebhookPost(ctx context.Context, url string, body []byte) (int, http.Header, error) {
+// returns the response status, headers, and — on 400+ responses — the
+// first 4 KiB of the body (the provider's JSON error envelope). It is the
+// single transport seam for both webhook writers: postJSON (alert
+// delivery, retried) and TestWebhook (the settings test button,
+// single-shot). The caller passes a pre-marshaled body (postJSON marshals
+// once and reuses it across retries) and owns the status classification —
+// the two callers classify differently (retry policy vs UI detail
+// string). The returned error never contains the URL (it carries the
+// provider credential).
+func (pw *ProbeWorker) doWebhookPost(ctx context.Context, url string, body []byte) (int, http.Header, []byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, redactErr(err)
+		return 0, nil, nil, redactErr(err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := webhookClientFor(req.URL).Do(req)
 	if err != nil {
-		return 0, nil, redactErr(err)
+		return 0, nil, nil, redactErr(err)
 	}
 	defer resp.Body.Close()
-	// Drain (capped) before close so the transport can reuse the
-	// TLS connection for the next request to this endpoint:
-	// closing an unread body marks the conn non-reusable, so every
-	// alert paid a fresh handshake even to the same endpoint.
+	// 400+ bodies carry the provider's diagnosis (Telegram's JSON error
+	// envelope: parameters.retry_after on 429, description on 400): keep
+	// up to 4 KiB for the caller, then drain the rest (capped) so the
+	// transport can reuse the TLS connection — closing an unread body
+	// marks the conn non-reusable, so every alert paid a fresh handshake.
+	var respBody []byte
+	if resp.StatusCode >= 400 {
+		respBody, _ = io.ReadAll(io.LimitReader(resp.Body, 4<<10))
+	}
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	return resp.StatusCode, resp.Header, nil
+	return resp.StatusCode, resp.Header, respBody, nil
 }
 
 // postJSON delivers a JSON payload to a webhook with the shared hardened
@@ -2089,7 +2128,7 @@ func (pw *ProbeWorker) doWebhookPost(ctx context.Context, url string, body []byt
 func (pw *ProbeWorker) postJSON(url string, payload map[string]any) error {
 	body, _ := json.Marshal(payload)
 	err := pw.retryAlert(func() (bool, time.Duration, error) {
-		code, header, err := pw.doWebhookPost(pw.stopCtx, url, body)
+		code, header, respBody, err := pw.doWebhookPost(pw.stopCtx, url, body)
 		if err != nil {
 			return pw.stopCtx.Err() == nil, 0, err
 		}
@@ -2097,12 +2136,20 @@ func (pw *ProbeWorker) postJSON(url string, payload map[string]any) error {
 		case code >= 300 && code < 400:
 			return false, 0, errors.New("endpoint redirected (refused to follow — possible misconfiguration)")
 		case code == http.StatusTooManyRequests:
-			// Honor the provider's Retry-After.
-			return true, parseRetryAfter(header.Get("Retry-After"), time.Now()), fmt.Errorf("endpoint returned %d", code)
+			// Honor the provider's Retry-After: the HTTP header first,
+			// the JSON body's parameters.retry_after as fallback
+			// (Telegram sends the flood-wait in the body, not a header).
+			retryAfter := parseRetryAfter(header.Get("Retry-After"), time.Now())
+			if retryAfter == 0 {
+				if secs, _ := webhookBodyDiag(respBody); secs > 0 {
+					retryAfter = time.Duration(secs) * time.Second
+				}
+			}
+			return true, retryAfter, fmt.Errorf("endpoint returned %d", code)
 		case code >= 500:
 			return true, 0, fmt.Errorf("endpoint returned %d", code)
 		case code >= 300:
-			return false, 0, fmt.Errorf("endpoint returned %d", code)
+			return false, 0, webhookStatusErr(code, respBody)
 		}
 		return false, 0, nil
 	})
@@ -2110,6 +2157,44 @@ func (pw *ProbeWorker) postJSON(url string, payload map[string]any) error {
 		log.Printf("webhook: send failed: %v", err)
 	}
 	return err
+}
+
+// webhookBodyDiag extracts the diagnostics from a provider error body:
+// parameters.retry_after (Telegram's flood-wait seconds, sent in the JSON
+// body when no Retry-After header is) and a truncated description for
+// logs and the TestWebhook detail. Non-JSON or foreign shapes yield
+// (0, ""). The description is capped at 200 runes: it is provider prose
+// echoed into journald and the dashboard toast, not a secret (the
+// credential rides the URL), but a verbose body must not bloat them.
+func webhookBodyDiag(body []byte) (retryAfterSecs int, description string) {
+	if len(body) == 0 {
+		return 0, ""
+	}
+	var env struct {
+		Description string `json:"description"`
+		Parameters  struct {
+			RetryAfter int `json:"retry_after"`
+		} `json:"parameters"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		return 0, ""
+	}
+	d := env.Description
+	if utf8.RuneCountInString(d) > 200 {
+		d = string([]rune(d)[:200]) + "…"
+	}
+	return env.Parameters.RetryAfter, d
+}
+
+// webhookStatusErr renders the non-retryable 4xx classification with the
+// provider's own diagnosis (the body's description — "chat not found",
+// "migrate_to_chat_id") when present: a misconfigured Telegram chat used
+// to report only "endpoint returned 400", which told the operator nothing.
+func webhookStatusErr(code int, body []byte) error {
+	if _, desc := webhookBodyDiag(body); desc != "" {
+		return fmt.Errorf("endpoint returned %d: %s", code, desc)
+	}
+	return fmt.Errorf("endpoint returned %d", code)
 }
 
 // parseRetryAfter parses a Retry-After header value — integer seconds or an

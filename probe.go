@@ -1432,8 +1432,11 @@ func (pw *ProbeWorker) doProbe(ctx context.Context, c sensorConfig) {
 	pw.setAlertState(ctx, c.id, newStatus, time.Now().UTC())
 	// Warning-only flapping is dashboard-only; everything involving error
 	// alerts (into error, partial recovery error -> warning, full recovery
-	// error -> up).
-	if pw.shouldAlertNow(c, oldStatus, newStatus) {
+	// error -> up). Plus the final recovery when the warning was entered
+	// from error (error -> warning -> up): without it the silent
+	// warning -> up gate leaves the chat's last word at "partial
+	// recovery" on a sensor that is fully up.
+	if pw.shouldAlertNow(c, oldStatus, newStatus) || pw.finalRecoveryFromWarning(c.id, oldStatus, newStatus) {
 		pw.launchAlert(func() {
 			if pw.sendAlert(c.id, c.name, c.target, oldStatus, newStatus, rttMs) {
 				return
