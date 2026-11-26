@@ -254,8 +254,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=$BIN
-Environment=PULSEMON_DB=$PREFIX/data/pulsemon.db
+ExecStart=\"$BIN\"
+Environment=\"PULSEMON_DB=$PREFIX/data/pulsemon.db\"
 Environment=PULSEMON_ADDR=$PULSEMON_ADDR
 Restart=on-failure
 RestartSec=5
@@ -319,7 +319,7 @@ case "$PULSEMON_ADDR" in
   *)   HOST="localhost"; PULSEMON_ADDR=":$PULSEMON_ADDR" ;;
 esac
 PORT="${PULSEMON_ADDR##*:}"
-if curl -sf "http://$HOST:$PORT/api/healthz" >/dev/null 2>&1; then
+if curl -sf -g "http://$HOST:$PORT/api/healthz" >/dev/null 2>&1; then
   echo "pulsemon: healthy — open http://$HOST:$PORT"
   echo "pulsemon: fronting with a TLS-terminating reverse proxy (Caddy/nginx https->http)?"
   echo "       add PULSEMON_TRUSTED_PROXIES=<proxy-ip> or the dashboard 403s — README 'Behind a reverse proxy'"

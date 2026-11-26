@@ -125,3 +125,43 @@ func protoArgv(t *testing.T, block, url string) ([]string, string) {
 	}
 	return args, dir
 }
+
+// TestInstallUnitQuotesPaths (NIT-31): the systemd unit template is an
+// unquoted heredoc — ExecStart=/Environment= values containing a space
+// (e.g. $HOME with a space) must land in the unit QUOTED, or systemd's
+// ExecStart word-splitting breaks the service on any such install.
+func TestInstallUnitQuotesPaths(t *testing.T) {
+	src, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(src)
+	if !strings.Contains(s, `ExecStart=\"$BIN\"`) {
+		t.Fatal("install.sh: ExecStart must be double-quoted (paths with spaces break systemd word-splitting)")
+	}
+	if !strings.Contains(s, `Environment=\"PULSEMON_DB=$PREFIX/data/pulsemon.db\"`) {
+		t.Fatal("install.sh: the PULSEMON_DB Environment= line must be double-quoted (same space-in-path break)")
+	}
+}
+
+// TestInstallHealthcheckGloboff (NIT-31): the post-install curl healthcheck
+// must pass -g (--globoff) — a bracketed IPv6 host ([::1]:9299) is a curl
+// glob pattern, and without -g the healthcheck fails for every IPv6 bind.
+func TestInstallHealthcheckGloboff(t *testing.T) {
+	src, err := os.ReadFile("install.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, line := range strings.Split(string(src), "\n") {
+		if strings.Contains(line, "api/healthz") && strings.HasPrefix(strings.TrimSpace(line), "if curl") {
+			if !strings.Contains(line, "-g") {
+				t.Fatalf("healthcheck curl lacks -g (bracketed IPv6 hosts are curl globs): %s", line)
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("install.sh: the curl api/healthz healthcheck line was not found")
+	}
+}
