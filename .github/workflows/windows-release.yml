@@ -80,7 +80,19 @@ jobs:
           # validated against on the QA boxes, so building with it is reproducible.
           $isver = '6.7.3'
           $url = "https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-$isver.exe"
+          # Verify the downloaded installer BEFORE executing it: it is a
+          # third-party executable from the internet, and an unverified
+          # /SILENT execute is a supply-chain hole in an otherwise fully
+          # pinned pipeline (2026-11-25 external review MINOR-24). The
+          # hash is of the official is-6_7_3 release asset; re-resolve it
+          # (sha256sum on a fresh download) on any version bump.
+          $expectedSha256 = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
           Invoke-WebRequest -Uri $url -OutFile "innosetup-$isver.exe"
+          $actualSha256 = (Get-FileHash -Algorithm SHA256 "innosetup-$isver.exe").Hash.ToLower()
+          if ($actualSha256 -ne $expectedSha256) {
+            throw "innosetup-$isver.exe sha256 mismatch: got $actualSha256, want $expectedSha256 — refusing to execute an unverified installer"
+          }
+          Write-Host "Inno Setup $isver sha256 verified: $actualSha256"
           Start-Process -FilePath "innosetup-$isver.exe" -ArgumentList '/SILENT' -Wait
           $pinned = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
           if (-not (Test-Path $pinned)) { throw "pinned ISCC 6.7.3 not found after install: $pinned" }

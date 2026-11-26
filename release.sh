@@ -41,8 +41,8 @@ if [[ -n "$(git status --porcelain 2>/dev/null)" ]]; then
   git status --porcelain
   exit 1
 fi
-echo "pulsemon: go test -count=1 . (release fails on any failure) ..."
-go test -count=1 . || { echo "release.sh: tests failed — release aborted"; exit 1; }
+echo "pulsemon: go test -race -count=1 ./... (release fails on any failure) ..."
+go test -race -count=1 ./... || { echo "release.sh: tests failed — release aborted"; exit 1; }
 
 # --- 0b. vulnerability gate: fail the release on reachable vulns --------------
 # govulncheck scans the module graph and flags vulnerabilities that are

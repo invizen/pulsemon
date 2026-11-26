@@ -1,11 +1,12 @@
 name: CI
 
 # Linux test gate: go vet + the full -race suite. Before this workflow the
-# ONLY CI was the Windows release builder — nothing ran the tests, and
-# release.sh runs `go test -count=1 .` (no -race, single package). For code
-# this concurrent (probe worker, in-memory stats cache, per-sensor alert
-# gates, storm budget), a data race caught in CI is the whole point
-# (2026-10-23 external review F15).
+# ONLY CI was the Windows release builder, and release.sh's pre-build test
+# gate was thinner than CI's (2026-10-23 external review F15) — the release
+# script now runs the same `go test -race -count=1 ./...` (2026-11-25
+# MINOR-24). For code this concurrent (probe worker, in-memory stats
+# cache, per-sensor alert gates, storm budget), a data race caught in CI
+# is the whole point.
 #
 # Benchmarks are NOT run here (no -bench flag): BenchmarkPurgeOld and
 # BenchmarkComputeSensorStats (bench_test.go) are opt-in regression
@@ -47,20 +48,24 @@ jobs:
         # fatal with headroom for runner variance.
         run: go test -race -count=1 -timeout 25m ./...
 
-      # Frontend regression pins (web/test/frontend.test.mjs): the Go gate
+      # Frontend regression pins (web/test/*.test.mjs): the Go gate
       # above never sees web/, so a JS-only push (no Go build needed) would
       # otherwise ship with zero automated coverage. The pins load the REAL
       # app.js into a node:vm sandbox — no npm, no package.json, no
       # third-party action — so the trust chain gains nothing. Node 22
-      # matches the gate box (v22.23.5); the test file takes an explicit
-      # path because Node 22's --test rejects a directory argument.
+      # matches the gate box (v22.23.5); the test files take explicit
+      # paths because Node 22's --test rejects a directory argument.
+      # EVERY suite in web/test/ is listed (2026-11-25 external review
+      # MINOR-24: 3 of 4 suites were invisible to PRs) — a new .test.mjs
+      # that is not added here is untested in CI (pinned by
+      # TestCIRunsAllFrontendPins).
       - name: Set up Node
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
 
       - name: Frontend regression pins
-        run: node --test web/test/frontend.test.mjs
+        run: node --test web/test/frontend.test.mjs web/test/auth_reauth.test.mjs web/test/conn_banner.test.mjs web/test/poll_layout.test.mjs
 
       # Vulnerability scan of the module graph against the public OSV.dev
       # database (stdlib + deps). No third-party action: plain tool install,
@@ -68,7 +73,11 @@ jobs:
       # known-vuln hit fails the job — triage = bump the dep, or record an
       # accepted-risk entry in docs/DECISIONS.md and pin the ignore.
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        # Pinned, matching release.sh's GOVULNCHECK: @latest silently
+        # changes the scanner (and its database) between runs, so two
+        # "identical" CI runs can disagree (2026-11-25 external review
+        # MINOR-24). Bump deliberately in BOTH places.
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.0
 
       - name: govulncheck
         run: govulncheck ./...
