@@ -13,6 +13,12 @@ function syncThemeIcon() {
 function toggleTheme() {
   const light = document.documentElement.classList.toggle('light');
   localStorage.setItem('pulsemon_theme', light ? 'light' : 'dark');
+  // 2026-11-26 QA B5: blackout transitions for one frame — the cards'
+  // `transition` classes used to crossfade every card through dark over
+  // ~150 ms, so a toggle to light painted dark cards on a light page
+  // "before it settled".
+  document.documentElement.classList.add('theme-switching');
+  requestAnimationFrame(() => document.documentElement.classList.remove('theme-switching'));
   syncThemeIcon();
 }
 
@@ -41,7 +47,7 @@ const ACT = {
   setGraphRange, confirmClearHistory, setTag, openInspector, echoPing,
   togglePause, cloneSensor, confirmInlineDelete, removeFormTag, startUpdate,
   undismissUpdate, dismissUpdate, copyCmd, removeAuthUser, toggleScopeItem,
-  toggleProvider, testWebhook
+  toggleProvider, testWebhook, clearFilters
 };
 document.addEventListener('click', e => {
   const el = e.target.closest ? e.target.closest('[data-act]') : null;
@@ -339,6 +345,10 @@ async function refresh() {
 
 function fmtRtt(v) {
   if (v == null) return '—';
+  // 2026-11-26 QA QOL#5: sub-millisecond RTT (LAN gear reads 0.1–0.4 ms)
+  // used to round to "0 ms", which looks like missing data. A true 0
+  // (a measured zero) stays "0 ms".
+  if (v > 0 && v < 0.5) return '<1 ms';
   return Math.round(v) + ' ms';
 }
 
@@ -372,12 +382,55 @@ function certNote(s) {
   return '';
 }
 
+// Full cert note for the inspector modal (2026-11-26 QA QOL#9): cert state
+// is ALWAYS shown for HTTPS sensors, not only inside 30 days — a monitoring
+// tool should never hide cert expiry. Cards keep the compact certNote().
+function certFullNote(s) {
+  if (s.type !== 'http' || !s.cert_expiry) return '';
+  const d = new Date(s.cert_expiry);
+  const ms = d.getTime() - Date.now();
+  const dateStr = d.toLocaleDateString([], { year: 'numeric', month: '2-digit', day: '2-digit' });
+  if (ms < 0) return '<div class="text-[11px] font-mono text-bad flex items-center gap-1"><i class="ph-bold ph-shield-warning"></i> TLS cert expired ' + dateStr + ' (' + Math.max(1, Math.floor(-ms / 86400000)) + 'd ago)</div>';
+  const days = Math.ceil(ms / 86400000);
+  const cls = days <= 7 ? 'text-bad' : days <= 30 ? 'text-warn' : 'text-slate-400';
+  const icon = days <= 30 ? 'ph-bold ph-shield-warning' : 'ph ph-shield-check';
+  return '<div class="text-[11px] font-mono ' + cls + ' flex items-center gap-1"><i class="' + icon + '"></i> TLS cert expires ' + dateStr + ' (' + days + 'd)</div>';
+}
+
 function jitterOf(s) {
   const r = (s.stats && s.stats.recent || []).filter(x => x != null);
   if (r.length < 2) return null;
   let sum = 0;
   for (let i = 1; i < r.length; i++) sum += Math.abs(r[i-1] - r[i]);
   return sum / (r.length - 1);
+}
+
+// Favicon status dot (2026-11-26 QA QOL#2): re-rasterize the shipped favicon
+// with a red dot while any active sensor is in error. Re-draws only when the
+// error COUNT changes (render() calls this on every 5s poll).
+let _favBase = null, _favState = -1;
+function updateFavicon(errCount) {
+  if (errCount === _favState) return;
+  _favState = errCount;
+  const link = document.querySelector('link[rel="icon"][type="image/png"][sizes="32x32"]');
+  if (!link) return;
+  if (!_favBase) _favBase = link.href;
+  const img = new Image();
+  img.onload = () => {
+    if (_favState !== errCount) return; // stale draw; a newer count won
+    const c = document.createElement('canvas');
+    c.width = 32; c.height = 32;
+    const ctx = c.getContext('2d');
+    ctx.drawImage(img, 0, 0, 32, 32);
+    if (errCount > 0) {
+      ctx.fillStyle = '#f43f5e';
+      ctx.beginPath();
+      ctx.arc(24, 8, 7, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    link.href = c.toDataURL('image/png');
+  };
+  img.src = _favBase;
 }
 
 function statusMeta(s) {
@@ -432,6 +485,12 @@ function render() {
   $('c-up').textContent = up; $('c-warn').textContent = warn; $('c-error').textContent = err; $('c-paused').textContent = paused;
   $('m-up').textContent = up; $('m-warn').textContent = warn; $('m-error').textContent = err; $('m-paused').textContent = paused;
 
+  // 2026-11-26 QA QOL#2: the tab title + favicon carry fleet state, so a
+  // pinned tab shows trouble at a glance without bringing the window
+  // forward. (N ✕) prefix = active sensors in error.
+  document.title = (err > 0 ? '(' + err + ' ✕) ' : '') + 'pulsemon';
+  updateFavicon(err);
+
   const tags = ['ALL'].concat([...new Set(SENSORS.flatMap(s => s.tags || []))]);
   const on = 'bg-surface-700 text-white font-semibold border border-surface-600';
   const off = 'text-slate-400 hover:text-white bg-surface-950/60 border border-surface-800';
@@ -464,10 +523,17 @@ function render() {
     grid.innerHTML = ''; tableWrap.classList.add('hidden'); empty.classList.remove('hidden');
     $('empty-title').textContent = 'No sensors yet';
     $('empty-sub').textContent = 'Add your first sensor to start monitoring.';
+    $('empty-add-btn').classList.remove('hidden');
+    $('empty-clear-btn').classList.add('hidden');
   } else if (list.length === 0) {
     grid.innerHTML = ''; tableWrap.classList.add('hidden'); empty.classList.remove('hidden');
     $('empty-title').textContent = 'No sensors match your filter';
     $('empty-sub').textContent = 'Clear search query or active tag selections.';
+    // 2026-11-26 QA B2: "Add your first sensor" is misleading when sensors
+    // exist and a filter is hiding them — the actionable button is
+    // Clear filters.
+    $('empty-add-btn').classList.add('hidden');
+    $('empty-clear-btn').classList.remove('hidden');
   } else {
     empty.classList.add('hidden');
     if (viewMode === 'table') {
@@ -690,6 +756,15 @@ function setTag(t) {
   if (t === 'ALL') activeTags.clear();
   else if (activeTags.has(t)) activeTags.delete(t);
   else activeTags.add(t);
+  render();
+}
+
+// 2026-11-26 QA B2: the filtered empty state's actionable button.
+function clearFilters() {
+  searchQ = '';
+  activeTags.clear();
+  const q = $('q');
+  if (q) q.value = '';
   render();
 }
 
@@ -1807,16 +1882,29 @@ async function loadInspector() {
     if (g1) g1.className = 'px-2 py-0.5 rounded text-[11px] font-mono border ' + (graphRange === '1h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
     if (g2) g2.className = 'px-2 py-0.5 rounded text-[11px] font-mono border ' + (graphRange === '24h' ? 'border-ok/40 bg-ok/10 text-ok' : 'border-surface-800 text-slate-400');
 
-    $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime' : 'no data';
+    // 2026-11-26 QA QOL#10: label the uptime with the RANGE it covers —
+    // the number silently follows the graph-range selector, and the old
+    // bare "98.33% uptime" read like a fixed 24h figure.
+    $('insp-graph-up').textContent = g.total ? (g.uptime_pct >= 100 ? '100%' : g.uptime_pct.toFixed(2) + '%') + ' uptime (' + graphRange + ')' : 'no data';
     renderGraph($('insp-graph'), g);
 
     const st = s.stats;
     $('insp-rtt').textContent = st && st.rtt_last != null ? fmtRtt(st.rtt_last) : '—';
     const certEl = $('insp-cert');
-    const cert = certNote(s);
+    const cert = certFullNote(s); // 2026-11-26 QA QOL#9: always shown in the modal
     if (cert) { certEl.innerHTML = cert; certEl.classList.remove('hidden'); } else certEl.classList.add('hidden');
 
-    $('insp-minavgmax').textContent = (st && st.rtt_min != null) ? fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max) : '—';
+    // 2026-11-26 QA B3: compact "12 / 29 / 60 ms" — the old "12 ms / 29 ms
+    // / 60 ms" (164 px) did not fit the 128 px tile and truncated. Full
+    // form stays available in the tile's tooltip.
+    if (st && st.rtt_min != null) {
+      const mm = Math.round(st.rtt_min), aa = Math.round(st.rtt_avg), xx = Math.round(st.rtt_max);
+      $('insp-minavgmax').textContent = mm + ' / ' + aa + ' / ' + xx + ' ms';
+      $('insp-minavgmax').title = fmtRtt(st.rtt_min) + ' / ' + fmtRtt(st.rtt_avg) + ' / ' + fmtRtt(st.rtt_max);
+    } else {
+      $('insp-minavgmax').textContent = '—';
+      $('insp-minavgmax').title = '';
+    }
     $('insp-loss').textContent = st ? st.loss_pct.toFixed(1) + '%' : '—';
     $('insp-loss').className = 'text-[16px] font-bold mt-1 ' + (st && st.loss_pct > 0 ? 'text-warn' : 'text-ok');$('insp-losssub').textContent = st ? st.lost_count + ' / ' + st.total + ' dropped' : '';
     const j = jitterOf(s); $('insp-jitter').textContent = j != null ? '±' + fmtRtt(j) : '—';

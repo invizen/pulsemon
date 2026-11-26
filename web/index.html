@@ -192,6 +192,13 @@
     <button id="empty-add-btn" data-act="openSensorModal" class="mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-ok rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
       <i class="ph-bold ph-plus"></i> Add your first sensor
     </button>
+    <!-- 2026-11-26 QA B2: the FILTERED empty state's button (sensors exist,
+         a filter hides them) — "Add your first sensor" was misleading.
+         Visibility is toggled per branch in render(); the add button is
+         admin-gated, this one is not (clearing filters is a read op). -->
+    <button id="empty-clear-btn" data-act="clearFilters" class="hidden mt-4 px-3 py-1.5 text-[13px] font-mono bg-surface-800 hover:bg-surface-700 text-slate-200 rounded-md border border-surface-700 flex items-center gap-1.5 mx-auto">
+      <i class="ph-bold ph-funnel-simple"></i> Clear filters
+    </button>
   </div>
 
   <!-- ============ ACTIVITY FEED ============ -->

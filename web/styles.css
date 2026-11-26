@@ -42,6 +42,11 @@
     .glow-ok { box-shadow: 0 0 10px rgba(16, 185, 129, 0.45); }
     .glow-warn { box-shadow: 0 0 10px rgba(245, 158, 11, 0.45); }
     .glow-bad { box-shadow: 0 0 10px rgba(244, 63, 94, 0.55); }
+    /* 2026-11-26 QA B5: one-frame transition blackout during a theme toggle.
+       Without it, every card's `transition` class crossfades its colors
+       through the OLD theme for ~150 ms — a toggle to light painted dark
+       cards on the new light page "before it settled". */
+    html.theme-switching *, html.theme-switching *::before, html.theme-switching *::after { transition: none !important; }
     .light .glow-ok { box-shadow: 0 0 8px rgba(5, 150, 105, 0.35); }
     .light .glow-warn { box-shadow: 0 0 8px rgba(217, 119, 6, 0.35); }
     .light .glow-bad { box-shadow: 0 0 8px rgba(225, 29, 72, 0.4); }
