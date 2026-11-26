@@ -173,10 +173,8 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// dashboard's version pill is blank on auth-disabled installs.
 	if !s.auth.Enabled() {
 		hz["version"] = Version
-	} else if c, rerr := r.Cookie(authSessionName); rerr == nil {
-		if _, ok := s.auth.SessionUser(c.Value); ok {
-			hz["version"] = Version
-		}
+	} else if _, ok := s.sessionCookieFrom(r); ok {
+		hz["version"] = Version
 	}
 	// ICMP availability: the probe worker warms the shared engine at startup,
 	// so by the time healthz is reachable the outcome is known. Reporting it

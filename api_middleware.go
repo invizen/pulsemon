@@ -405,12 +405,15 @@ func (s *Server) authGate() http.Handler {
 		// endpoints are the Origin/Sec-Fetch-Site gate above.
 		// (mechanism verified, documented
 		// as by design.)
-		if c, err := r.Cookie(authSessionName); err == nil {
+		for _, tok := range sessionCookieValues(r) {
 			// ONE lock pass for the gate's session work: liveness, the
 			// TTL-cached owner re-check (I/O runs outside a.mu), the
 			// sliding expiry, and the sliding-cookie renewal decision.
-			// History: docs/DECISIONS.md → auth-lock-io-split.
-			if user, ok, due, pinSecure, renewAge := s.auth.SessionUserAndRenewal(c.Value, true); ok {
+			// A shadowing first cookie (sessionCookieValues) fails the
+			// lookup and the loop moves on to the valid one.
+			// History: docs/DECISIONS.md → auth-lock-io-split,
+			// session-cookie-shadowing.
+			if user, ok, due, pinSecure, renewAge := s.auth.SessionUserAndRenewal(tok, true); ok {
 				r = r.WithContext(context.WithValue(r.Context(), authUserCtxKeyVal, user))
 				// Sliding cookie: the login cookie carries a fixed
 				// Max-Age=authSessionTTL (7d), so without a re-issue
@@ -425,7 +428,7 @@ func (s *Server) authGate() http.Handler {
 				// 30-day absolute cap expires with the session, not a
 				// week past it.
 				if due {
-					s.setAuthCookieLifetime(w, r, c.Value, pinSecure, renewAge)
+					s.setAuthCookieLifetime(w, r, tok, pinSecure, renewAge)
 				}
 				s.mux.ServeHTTP(w, r)
 				return

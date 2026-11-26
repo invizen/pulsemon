@@ -43,26 +43,57 @@ func authUserFromContext(r *http.Request) string {
 	return ""
 }
 
+// sessionCookieValues returns every pulsemon_session cookie value on the
+// request, in the order the client sent them. Callers must iterate and
+// accept through the session store: r.Cookie() returns only the FIRST
+// same-name cookie, and RFC 6265 has no port isolation — a sibling app on
+// the same homelab IP that sets pulsemon_session with a LONGER Path
+// (/api) sorts ahead of ours (Path=/) on every /api/* request, so a
+// first-cookie read hands a stranger's value to the session lookup and
+// 401s a browser that holds a valid session (the login-loop DoS). Store
+// acceptance is the only discriminator cookie order cannot spoof.
+// History: docs/DECISIONS.md → session-cookie-shadowing.
+func sessionCookieValues(r *http.Request) []string {
+	var out []string
+	for _, c := range r.Cookies() {
+		if c.Name == authSessionName {
+			out = append(out, c.Value)
+		}
+	}
+	return out
+}
+
+// sessionCookieFrom is the single-token form of sessionCookieValues: the
+// first pulsemon_session value the session store accepts, in client send
+// order, and false when none is accepted.
+func (s *Server) sessionCookieFrom(r *http.Request) (string, bool) {
+	for _, tok := range sessionCookieValues(r) {
+		if _, ok := s.auth.SessionUser(tok); ok {
+			return tok, true
+		}
+	}
+	return "", false
+}
+
 // sessionFrom returns the username the request's session belongs to
 // ("" when there is no live session).
 //
 // The fast path reads the username authGate stashed in the request
 // context (one SessionUser lookup per request, not three). The cookie
 // fallback covers routes that bypass authGate (tests, /api/auth/status
-// which is gate-exempt).
+// which is gate-exempt) — and iterates ALL same-name cookies, accepting
+// through the store, so a shadowing first cookie (sessionCookieValues)
+// cannot hide a valid session.
 func (s *Server) sessionFrom(r *http.Request) string {
 	if u := authUserFromContext(r); u != "" {
 		return u
 	}
-	c, err := r.Cookie(authSessionName)
-	if err != nil {
-		return ""
+	for _, tok := range sessionCookieValues(r) {
+		if user, ok := s.auth.SessionUser(tok); ok {
+			return user
+		}
 	}
-	user, ok := s.auth.SessionUser(c.Value)
-	if !ok {
-		return ""
-	}
-	return user
+	return ""
 }
 
 func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
@@ -207,8 +238,13 @@ func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
-	if c, err := r.Cookie(authSessionName); err == nil {
-		s.auth.DropSession(c.Value)
+	// Drop every LIVE session token the request carries: a shadowing
+	// first cookie (sessionCookieValues) must not make a first-cookie
+	// read skip the operator's real token.
+	for _, tok := range sessionCookieValues(r) {
+		if _, ok := s.auth.SessionUser(tok); ok {
+			s.auth.DropSession(tok)
+		}
 	}
 	s.setAuthCookie(w, r, "", false)
 	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: s.auth.Enabled(), Authed: false, Bootstrapped: s.auth.Bootstrapped()})
@@ -558,9 +594,12 @@ func (s *Server) handleAuthUserPassword(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Keep the CALLER's live session across the change's
+	// dropUserSessionsExcept — resolved through the store so a
+	// shadowing first cookie can't name a stranger's value as keep.
 	keep := ""
-	if c, err := r.Cookie(authSessionName); err == nil {
-		keep = c.Value
+	if tok, ok := s.sessionCookieFrom(r); ok {
+		keep = tok
 	}
 	if err := s.auth.SetUserPassword(r.Context(), user, req.Password, keep); err != nil {
 		// Client gone while queued on bcryptSem:
