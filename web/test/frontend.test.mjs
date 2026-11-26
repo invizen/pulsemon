@@ -265,14 +265,17 @@ test('doLogin: re-login in the same tab re-resolves admin state (role switch)', 
   const app = await makeApp();
   const USERS = { adm: true, vie: false };
   let currentUser = null;
+  let usersCalls = 0;
   app.setFetch(async (url, opts) => {
     if (url === '/api/auth/status') return resp({ enabled: false, authed: false });
     if (url === '/api/auth/login' && opts && opts.method === 'POST') {
       const body = JSON.parse(opts.body);
       currentUser = body.username;
-      return resp({ enabled: true, authed: true, user: currentUser });
+      // is_admin rides the login response (2026-11-25 MINOR-25) — the
+      // /api/auth/users round-trip is gone.
+      return resp({ enabled: true, authed: true, user: currentUser, is_admin: USERS[currentUser] });
     }
-    if (url === '/api/auth/users') return resp([{ username: currentUser, is_admin: USERS[currentUser] }]);
+    if (url === '/api/auth/users') { usersCalls++; return resp([]); }
     if (url === '/api/sensors') return resp([]);
     if (url.startsWith('/api/events')) return resp([]);
     if (url === '/api/healthz') return resp({ version: '0.0.0-test' });
@@ -289,6 +292,8 @@ test('doLogin: re-login in the same tab re-resolves admin state (role switch)', 
   assert.equal(await app.call('doLogin', 'adm', 'pw-3'), true, 're-promotion login failed');
   assert.equal(app.get('meIsAdmin'), true,
     'admin re-login must show the admin surface again');
+  assert.equal(usersCalls, 0,
+    'the admin state must come from the login response — no /api/auth/users round-trip');
 });
 
 // ---------- F16d: update pill un-gated from meIsAdmin ----------

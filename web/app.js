@@ -82,22 +82,18 @@ function applyAdminVisibility() {
     if (el) el.classList.toggle('hidden', hide);
   }
 }
-async function refreshAdminState() {
+function refreshAdminState() {
   if (!(authState && authState.enabled && authState.authed)) {
     meIsAdmin = true;
     applyAdminVisibility();
     return;
   }
-  try {
-    const users = await api('/api/auth/users');
-    const me = (users || []).find(u => u.username === authState.user);
-    meIsAdmin = !!(me && me.is_admin);
-  } catch {
-    // Fail CLOSED (review 2026-11-17 m2): the server is the authority on
-    // admin-ness (requireAdmin 403s the same surface), so a failed fetch
-    // hides the admin UI until the next poll succeeds — never the reverse.
-    meIsAdmin = false;
-  }
+  // The server's own status/login response carries is_admin (2026-11-25
+  // external review MINOR-25): no /api/auth/users round-trip per page
+  // load, and no 403-fail-closed path for non-admins — the flag the
+  // server answered with IS the authority (requireAdmin 403s the same
+  // surface).
+  meIsAdmin = !!authState.is_admin;
   applyAdminVisibility();
   // Re-render: the per-sensor mutation buttons (edit/clone/delete/pause)
   // are built in cardHtml()/renderTable() from meIsAdmin, so the grid
@@ -107,6 +103,21 @@ async function refreshAdminState() {
 }
 
 function showAuthGate() {
+  // The gate must SANITIZE the dashboard it covers: a role switch (admin
+  // -> viewer) or a 401 with stale data leaves SENSORS (target
+  // credentials) and open admin modals in the DOM under the overlay — a
+  // viewer on a shared terminal sees them, and the modals stay open
+  // around the gate (2026-11-25 external review MINOR-25). Clear the
+  // in-memory state, close every modal, re-render the empty grid.
+  SENSORS = []; EVENTS = []; SETTINGS = {};
+  activeTags = new Set(); searchQ = ''; inspectId = null; formTagsCache = [];
+  meIsAdmin = true;
+  for (const id of ['settings-backdrop', 'alerts-backdrop', 'acc-modal', 'modal-backdrop', 'insp-backdrop']) {
+    const el = $(id);
+    if (el) el.classList.add('hidden');
+  }
+  applyAdminVisibility();
+  render();
   const gate = $('auth-gate');
   if (gate) { gate.classList.remove('hidden'); $('auth-username').focus(); }
 }
@@ -117,12 +128,25 @@ function hideAuthGate() {
 function authBlocking() { return authState && authState.enabled && !authState.authed; }
 
 async function checkAuth() {
+  let res;
   try {
-    const r = await fetch('/api/auth/status');
-    authState = r.ok ? await r.json() : { enabled: false, authed: !r.ok };
+    res = await fetch('/api/auth/status');
   } catch {
-    authState = { enabled: false, authed: false };
+    res = null; // network down — no evidence about the auth state
   }
+  if (res && res.ok) {
+    authState = await res.json();
+  } else if (authState === null) {
+    // First load with no status answer (a 5xx proxy blip, a network
+    // down): FAIL CLOSED — show the gate. The old code set
+    // { enabled: false, authed: !r.ok } on non-2xx, which UNLOCKED the
+    // dashboard on a 502 and dismissed the gate during proxy restarts
+    // (2026-11-25 external review MINOR-25).
+    authState = { enabled: true, authed: false };
+  }
+  // else: a non-2xx / network failure WITH a known prior state —
+  // preserve it. A blip is not evidence; the next 200 status (or a 401
+  // from a real API call) decides.
   if (authBlocking()) {
     showAuthGate();
     return false;

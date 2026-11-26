@@ -19,6 +19,11 @@ type authStatusPayload struct {
 	Enabled bool   `json:"enabled"`
 	Authed  bool   `json:"authed"`
 	User    string `json:"user,omitempty"`
+	// IsAdmin lets the UI gate the admin surface from the status/login
+	// response itself — no extra /api/auth/users round-trip per page load
+	// (2026-11-25 external review MINOR-25). The server is the authority;
+	// requireAdmin 403s the same surface.
+	IsAdmin bool `json:"is_admin,omitempty"`
 	// Bootstrapped distinguishes the two "off" states for the UI: a
 	// fresh install (no account has ever existed) offers the bootstrap
 	// button, an operator-disabled install (flag set) must show the CLI
@@ -106,6 +111,7 @@ func (s *Server) handleAuthStatus(w http.ResponseWriter, r *http.Request) {
 		Enabled:      s.auth.Enabled(),
 		Authed:       user != "",
 		User:         user,
+		IsAdmin:      user != "" && s.auth.IsAdmin(user),
 		Bootstrapped: s.auth.Bootstrapped(),
 	})
 }
@@ -228,7 +234,7 @@ func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
 	s.auth.loginSuccess(userKey, key)
 	s.auth.clearUserFail(userKey) // success resets the account's budget
 	s.setAuthCookie(w, r, tok, false)
-	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), Bootstrapped: true})
+	respondWithJSON(w, http.StatusOK, authStatusPayload{Enabled: true, Authed: true, User: strings.ToLower(req.Username), IsAdmin: s.auth.IsAdmin(strings.ToLower(req.Username)), Bootstrapped: true})
 }
 
 func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
