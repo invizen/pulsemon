@@ -435,7 +435,20 @@ func (s *Server) authGate() http.Handler {
 				// CookieRenewalDue-capped one: a renewal near the
 				// 30-day absolute cap expires with the session, not a
 				// week past it.
-				if due {
+				// Skip the renewal on logout/disable: both handlers end the
+				// session and clear the cookie, so a renewal Set-Cookie in
+				// the same response would ride ahead of the clear — two
+				// Set-Cookies for one name, and a re-issued token for a
+				// session about to die. Self-delete (DELETE
+				// /api/auth/users/<this user>) is the third session-ender:
+				// the handler clears the cookie after RemoveUser.
+				noRenew := r.URL.Path == "/api/auth/logout" || r.URL.Path == "/api/auth/disable"
+				if !noRenew && r.Method == http.MethodDelete {
+					if name, ok := strings.CutPrefix(r.URL.Path, "/api/auth/users/"); ok && strings.ToLower(name) == user {
+						noRenew = true
+					}
+				}
+				if due && !noRenew {
 					s.setAuthCookieLifetime(w, r, tok, pinSecure, renewAge)
 				}
 				s.mux.ServeHTTP(w, r)

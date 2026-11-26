@@ -654,6 +654,11 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	user := strings.ToLower(r.PathValue("username"))
+	// Self-delete: capture the caller BEFORE RemoveUser — the session
+	// is dropped from memory inside it, so the cookie clear below needs
+	// the name remembered now (the gate may have just renewed this
+	// cookie; a dead renewed token would keep riding every request).
+	caller := s.sessionFrom(r)
 	if err := s.auth.RemoveUser(r.Context(), user); err != nil {
 		// A name that doesn't exist is a 404 — the same policy as the
 		// password endpoint (unknown username → 404, not 403, so the
@@ -674,6 +679,9 @@ func (s *Server) handleAuthUserDelete(w http.ResponseWriter, r *http.Request) {
 		}
 		respondInternal(w, "delete user", err)
 		return
+	}
+	if caller == user {
+		s.setAuthCookie(w, r, "", false)
 	}
 	respondWithJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
