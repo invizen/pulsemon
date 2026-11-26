@@ -821,6 +821,17 @@ func (s *Server) handleSensorPing(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	// The pulse runs the sensor's OWN timeout — up to the 30000ms API cap —
+	// plus the history write, so a loss on a max-timeout sensor takes just
+	// over the 30s server WriteTimeout before respondWithJSON writes
+	// {"lost":true}: the browser sees a broken connection, not the
+	// diagnostic toast. Extend this connection's write deadline past the
+	// cap (the handleUpdate pattern; the gzip wrapper's Unwrap carries the
+	// deadline to the real connection).
+	// History: docs/DECISIONS.md → slow-handler-write-deadlines.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(40 * time.Second))
+	}
 	id := r.PathValue("id")
 
 	o, err := s.probeWorker.PingNow(r.Context(), id)

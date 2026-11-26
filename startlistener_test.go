@@ -148,7 +148,8 @@ func TestFix_m2_UnreadableTLSPairIsFatal(t *testing.T) {
 	// The cert check (and its fatal) is now SYNCHRONOUS in startListener
 	// (MAJOR-11), so the blocking certFatal stub parks startListener's own
 	// goroutine — run it detached and watch the channel from here.
-	go startListener(newHTTPServer(http.NewServeMux()), db, make(chan struct{}))
+	detachedSrv, _ := newHTTPServer(http.NewServeMux())
+	go startListener(detachedSrv, db, make(chan struct{}))
 
 	select {
 	case msg := <-fatals:
@@ -188,7 +189,8 @@ func TestFix_m2_PlaintextFallbackEnv(t *testing.T) {
 	}
 	defer db.Close()
 
-	startListener(newHTTPServer(http.NewServeMux()), db, make(chan struct{}))
+	boundSrv, _ := newHTTPServer(http.NewServeMux())
+	startListener(boundSrv, db, make(chan struct{}))
 
 	select {
 	case msg := <-binds:
@@ -328,7 +330,7 @@ func TestTLSServeAdvertisesHTTP2(t *testing.T) {
 	t.Setenv("PULSEMON_CERT", certPath)
 	t.Setenv("PULSEMON_KEY", keyPath)
 
-	srv := newHTTPServer(http.NewServeMux())
+	srv, _ := newHTTPServer(http.NewServeMux())
 	stop := make(chan struct{})
 	defer close(stop)
 	startListener(srv, db, stop)

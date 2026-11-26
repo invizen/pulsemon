@@ -100,7 +100,8 @@ func TestFix_M10a_StatusStaysConsistentWhenUpdateFails(t *testing.T) {
 	// up->warning->error transitions above launched alert deliveries, and an
 	// in-flight delivery holds a pool connection open past db.Close(), which
 	// leaves the SQLite -wal/-shm files behind and fails the TempDir cleanup
-	// (same shutdown order as main: StopAlerts -> DrainAlerts -> db.Close).
+	// (this test aborts-then-drains: it wants in-flight deliveries stopped,
+	// not landed — main's order is the reverse, see shutdownAlerts).
 	pw.DrainAlerts(5 * time.Second)
 }
 

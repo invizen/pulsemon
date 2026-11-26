@@ -13,6 +13,7 @@ import (
 	"pulsemon/internal/store"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 )
 
@@ -963,6 +964,14 @@ func (s *Server) handleSettingsTest(w http.ResponseWriter, r *http.Request) {
 		respondWithError(w, http.StatusBadRequest,
 			fmt.Sprintf("unknown alert provider %q (valid: %s)", req.Kind, strings.Join(valid, ", ")))
 		return
+	}
+	// A test against a hanging SMTP relay runs up to the SMTP transport
+	// budget (~15s), which plus the pre-flight reads can graze the 30s
+	// server WriteTimeout: extend this connection's write deadline the way
+	// handleUpdate does, so the response lands instead of a broken pipe.
+	// History: docs/DECISIONS.md → slow-handler-write-deadlines.
+	if rc := http.NewResponseController(w); rc != nil {
+		_ = rc.SetWriteDeadline(time.Now().Add(45 * time.Second))
 	}
 	ok, detail := s.probeWorker.TestWebhook(r.Context(), req.Kind)
 	respondWithJSON(w, http.StatusOK, map[string]any{

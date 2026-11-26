@@ -63,8 +63,9 @@ func TestDoProbeStatusAndEventCommitAtomically(t *testing.T) {
 	}
 
 	// Drain any alert goroutines BEFORE the DB closes (t.Cleanup): an in-flight
-	// delivery holds a pool connection open past db.Close() (same shutdown
-	// order as main: StopAlerts -> DrainAlerts -> db.Close). up->warning is
+	// delivery holds a pool connection open past db.Close() (this test
+	// aborts-then-drains: it wants in-flight deliveries stopped, not landed —
+	// main's order is the reverse, see shutdownAlerts). up->warning is
 	// dashboard-only (no alert), so this is normally a no-op.
 	pw.DrainAlerts(5 * time.Second)
 }

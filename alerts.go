@@ -1098,9 +1098,9 @@ func (pw *ProbeWorker) armStormFlushLocked(recovery bool, now time.Time) {
 	// path that already holds a launchAlert count (sendWebhook runs inside
 	// launchAlert), so this Add can never be the "Add called concurrently with
 	// Wait" case at counter 0. DrainAlerts JOINS a pending flush; the goroutine
-	// exits promptly on stopCtx, so shutdown is not delayed (the queued summary
-	// drops on shutdown — StopAlerts has aborted the network by then;
-	// unchanged, documented).
+	// exits promptly on stopCtx, so shutdown is not delayed (a flush due
+	// within main's shutdown pre-drain fires before stopCtx cancels; one due
+	// after it drops — see shutdownAlerts).
 	// History: docs/DECISIONS.md → alert-gate.
 	pw.alertWG.Add(1)
 	go func() {
@@ -1694,11 +1694,13 @@ func (pw *ProbeWorker) launchAlert(fn func()) {
 }
 
 // DrainAlerts waits for in-flight alert deliveries to finish, bounded by
-// timeout. It is called from main AFTER Run returns and BEFORE db.Close, so
-// an alert fired on the final probe tick is not killed mid-delivery.
-// main calls StopAlerts first, so a delivery stuck in a network blip is
-// aborted at its next read (stopCtx) instead of holding this drain for the
-// client's full 10s timeout — the timeout here is a backstop only.
+// timeout. It is called from main (via shutdownAlerts) AFTER Run returns
+// and BEFORE db.Close, so an alert fired on the final probe tick is not
+// killed mid-delivery. main uses it twice: a bounded pre-abort drain (so
+// fast final-tick deliveries LAND before stopCtx cancels) and a short
+// post-abort backstop (StopAlerts ends in-flight deliveries at their next
+// read, so a hung endpoint costs the backstop, not its full client
+// timeout).
 //
 // The waiter goroutine below is intentionally untracked: sync.WaitGroup has
 // no cancellable Wait, so it lingers past a timeout until alertWG drains —
@@ -1719,11 +1721,42 @@ func (pw *ProbeWorker) DrainAlerts(timeout time.Duration) {
 }
 
 // StopAlerts cancels stopCtx, aborting any in-flight webhook POST at its
-// next read. main calls it on shutdown, BEFORE DrainAlerts: without this,
-// a POST stuck in a network blip would keep its connection open until the
-// client's 10s timeout and hold process exit that long.
+// next read. main calls it in shutdownAlerts AFTER the pre-abort drain:
+// stopping first would cancel stopCtx under fast final-tick deliveries
+// (a recovery, an armed storm summary) that had not landed yet.
 func (pw *ProbeWorker) StopAlerts() {
 	pw.stopCancel()
+}
+
+// shutdownAlerts is main's shutdown sequence for the alert machinery:
+// let the final-tick deliveries LAND, then abort the rest. The order is
+// load-bearing: the last probe tick fires its alerts (a final-tick
+// recovery, an armed storm summary) as fire-and-forget goroutines that
+// outlive Run's return, and stopping BEFORE the drain cancelled stopCtx
+// under them — an aborted final-tick recovery (error -> up) is
+// permanently lost (alert_state already says "up", and no re-alert tick
+// comes for a sensor that is up), and the armed storm summary died with
+// the process. A bounded pre-drain gives the quick deliveries (a LAN
+// relay answers in milliseconds) their round-trip; StopAlerts then
+// aborts what is genuinely hung at its next read; the short cleanup drain
+// reaps the aborting jobs.
+// History: docs/DECISIONS.md → shutdown-alert-drain-first.
+var (
+	// shutdownPreDrain bounds the pre-abort drain: long enough for a fast
+	// final-tick delivery (LAN relay + SMTP round-trip), short enough that
+	// a genuinely hung endpoint costs at most this much shutdown time.
+	shutdownPreDrain = 3 * time.Second
+	// shutdownCleanupDrain is the post-abort backstop: StopAlerts ends
+	// every in-flight delivery at its next read, so a hung endpoint costs
+	// this, not its full client timeout.
+	shutdownCleanupDrain = 2 * time.Second
+)
+
+func shutdownAlerts(pw *ProbeWorker) {
+	pw.DrainAlerts(shutdownPreDrain)
+	pw.StopAlerts()
+	pw.DrainAlerts(shutdownCleanupDrain)
+	log.Println("Alert deliveries drained")
 }
 
 // sendAlert dispatches a state-transition alert to every active provider.

@@ -211,13 +211,21 @@ func tlsKeyPairOK(cert, key string) error {
 //
 // The server-level WriteTimeout (30s) bounds how long any handler may take
 // to write its response: a client that never reads would otherwise pin the
-// connection (and its goroutine) indefinitely. The one slow writer —
-// POST /api/update, which downloads + verifies + installs for up to ~60s —
-// extends its own connection's deadline to 90s via http.ResponseController
-// (see handleUpdate), so it is not cut off mid-install.
+// connection (and its goroutine) indefinitely. The slow writers — POST
+// /api/update (~60s download+install), a max-timeout (30s) sensor ping,
+// and a settings test against a hanging SMTP relay — each extend their
+// own connection's deadline via http.ResponseController, so they are not
+// cut off mid-work.
+//
+// The returned cancel func stops the server's BaseContext: runServer
+// calls it after srv.Shutdown's 5s drain so a handler that OUTLIVED the
+// drain (a 30s ping mid-probe) aborts its request context before the
+// deferred db.Close() instead of running into a closed DB.
 //
 // Factored out of runServer so a test can pin the exact values.
-func newHTTPServer(handler http.Handler) *http.Server {
+// History: docs/DECISIONS.md → slow-handler-write-deadlines.
+func newHTTPServer(handler http.Handler) (*http.Server, context.CancelFunc) {
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 	return &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
@@ -225,13 +233,19 @@ func newHTTPServer(handler http.Handler) *http.Server {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       120 * time.Second,
 		MaxHeaderBytes:    64 << 10,
-	}
+		// Per-request contexts derive from baseCtx, so baseCancel aborts
+		// every in-flight handler (their r.Context() cancels) — the
+		// shutdown's last word on a handler that outlived the drain.
+		// (Go 1.27+ BaseContext takes the net.Listener, not the conn.)
+		BaseContext: func(net.Listener) context.Context { return baseCtx },
+	}, baseCancel
 }
 
 // reexecBindDeadline bounds a re-exec child's bind retries. The parent's
-// shutdown is structurally bounded at 30s (the 10s probe-worker + 15s
-// alert-drain + 5s HTTP-drain backstops in runServer); 45s covers that
-// worst case with margin so a slow parent release never loses the race.
+// shutdown is structurally bounded at 20s (the 5s HTTP-drain + 10s
+// probe-worker + 3s alert pre-drain + 2s alert cleanup-drain backstops in
+// runServer); 45s covers that worst case with margin so a slow parent
+// release never loses the race.
 // A var (not const) so tests can shorten it.
 var reexecBindDeadline = 45 * time.Second
 
@@ -800,7 +814,7 @@ func runServer(stop <-chan struct{}) {
 	// authGate re-checks the enabled state (user count) per request: a
 	// host `pulsemon auth-user add/remove` must take effect on the very
 	// next request without a restart.
-	srv := newHTTPServer(server.authGate())
+	srv, baseCancel := newHTTPServer(server.authGate())
 	startListener(srv, db, stop)
 
 	<-stop
@@ -826,6 +840,11 @@ func runServer(stop <-chan struct{}) {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("Server shutdown error: %v", err)
 	}
+	// A handler that outlived the 5s drain (a 30s-timeout sensor ping
+	// mid-probe, a settings test on a hanging relay) would otherwise run
+	// into the deferred db.Close(); cancel the BaseContext so its request
+	// context aborts now.
+	baseCancel()
 	log.Println("Server exited")
 
 	// 2. Stop background probing so no new probe writes start, and wait for
@@ -843,18 +862,9 @@ func runServer(stop <-chan struct{}) {
 		log.Println("WARNING: probe worker did not stop in 10s; in-flight probes may be aborted")
 	}
 
-	// 3. Abort in-flight webhook POSTs. Without this, a delivery stuck in a
-	// network blip keeps its connection open until the client's 10s timeout
-	// and holds process exit that long; with stopCtx cancelled, it aborts at
-	// the next read instead.
-	pw.StopAlerts()
-
-	// 4. Drain in-flight alert deliveries BEFORE the deferred db.Close: an
-	// alert fired on the final probe tick is a fire-and-forget goroutine
-	// whose first act is a settings read — without this, Close() lands mid
-	// delivery and the alert dies. In-flight POSTs are already aborted by
-	// StopAlerts, so this drain is effectively immediate; the 15s is a
-	// backstop only.
-	pw.DrainAlerts(15 * time.Second)
-	log.Println("Alert deliveries drained")
+	// 3+4. Alert drain + abort: the final-tick deliveries get a bounded
+	// pre-abort drain to LAND, then StopAlerts aborts what is genuinely
+	// hung, then a short cleanup drain (see shutdownAlerts — the order is
+	// load-bearing: an aborted final-tick recovery is permanently lost).
+	shutdownAlerts(pw)
 }
