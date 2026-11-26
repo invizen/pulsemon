@@ -1742,12 +1742,32 @@ function renderGraph(el, data) {
   pts.forEach((p, i) => {
     if (p.avg == null) { cur = null; return; }
     const pt = x(i).toFixed(1) + ' ' + y(p.avg).toFixed(1);
-    if (cur) { cur.d += ' L' + pt; cur.last = i; }
-    else { cur = { first: i, last: i, d: 'M' + pt }; runs.push(cur); }
+    if (cur) { cur.d += ' L' + pt; cur.last = i; cur.lastY = p.avg; }
+    else {
+      cur = { first: i, last: i, firstY: p.avg, lastY: p.avg, d: 'M' + pt };
+      runs.push(cur);
+    }
+  });
+  // 2026-11-26: extend each run FLAT to the MIDPOINT between its end point
+  // and the adjacent all-lost bucket — a hairline seam around the red tick
+  // (the old break left a ~2-interval void; terminating at the tick left
+  // none). The 2026-10-24 no-bridging rule is preserved — the line never
+  // crosses or touches a null bucket. The extension is horizontal (last/
+  // first known RTT): it claims no value change, only "held until the drop."
+  const midX = (a, b) => (x(a) + x(b)) / 2;
+  runs.forEach(r => {
+    if (r.first > 0 && pts[r.first - 1].avg == null) {
+      r.d = 'M' + midX(r.first - 1, r.first).toFixed(1) + ' ' + y(r.firstY).toFixed(1) + ' L' + r.d.slice(1);
+      r.firstXpx = midX(r.first - 1, r.first);
+    } else { r.firstXpx = x(r.first); }
+    if (r.last < pts.length - 1 && pts[r.last + 1].avg == null) {
+      r.d += ' L' + midX(r.last, r.last + 1).toFixed(1) + ' ' + y(r.lastY).toFixed(1);
+      r.lastXpx = midX(r.last, r.last + 1);
+    } else { r.lastXpx = x(r.last); }
   });
   const path = runs.map(r => r.d).join(' ');
-  const area = runs.filter(r => r.last > r.first)
-    .map(r => r.d + ' L' + x(r.last).toFixed(1) + ' ' + (H - padB) + ' L' + x(r.first).toFixed(1) + ' ' + (H - padB) + ' Z')
+  const area = runs
+    .map(r => r.d + ' L' + r.lastXpx.toFixed(1) + ' ' + (H - padB) + ' L' + r.firstXpx.toFixed(1) + ' ' + (H - padB) + ' Z')
     .join(' ');
 
   const axis = [0, 0.5, 1].map(f => {
