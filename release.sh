@@ -25,7 +25,7 @@ PUBLISH=0
 # the tool (and its database) between runs, so two "identical" release runs
 # can disagree; a pinned version makes the gate reproducible. Bump this
 # deliberately, not as a drive-by.
-GOVULNCHECK="${GOVULNCHECK:-v1.1.0}"
+GOVULNCHECK="${GOVULNCHECK:-v1.10.0}"
 
 echo "pulsemon: releasing $VERSION (publish=$PUBLISH)"
 TMP="$(mktemp -d)"

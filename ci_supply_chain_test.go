@@ -51,7 +51,7 @@ func TestCIRunsAllFrontendPins(t *testing.T) {
 // TestCIPinsGovulncheck: CI must install a pinned govulncheck, never
 // @latest — an unpinned scanner changes its tool AND its database between
 // runs, so two "identical" CI runs can disagree (release.sh already pins
-// v1.1.0; CI now matches it).
+// a version; CI now matches it).
 func TestCIPinsGovulncheck(t *testing.T) {
 	ci := readSource(t, ".github/workflows/ci.yml")
 	if strings.Contains(ci, "govulncheck@latest") {

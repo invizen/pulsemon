@@ -65,7 +65,7 @@ jobs:
           node-version: 22
 
       - name: Frontend regression pins
-        run: node --test web/test/frontend.test.mjs web/test/auth_reauth.test.mjs web/test/conn_banner.test.mjs web/test/poll_layout.test.mjs
+        run: node --test web/test/frontend.test.mjs web/test/auth_reauth.test.mjs web/test/conn_banner.test.mjs web/test/poll_layout.test.mjs web/test/auth_gate.test.mjs
 
       # Vulnerability scan of the module graph against the public OSV.dev
       # database (stdlib + deps). No third-party action: plain tool install,
@@ -77,7 +77,7 @@ jobs:
         # changes the scanner (and its database) between runs, so two
         # "identical" CI runs can disagree (2026-11-25 external review
         # MINOR-24). Bump deliberately in BOTH places.
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.0
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.10.0
 
       - name: govulncheck
         run: govulncheck ./...
