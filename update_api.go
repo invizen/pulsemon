@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +231,16 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmp, err := downloadAsset(client, sel.assetURL)
+	// The executable is resolved BEFORE the download: the asset stages
+	// on the binary's own volume (no /tmp cross-device copy), and a
+	// missing binary is a reason to fail before spending the download.
+	exe, err := runningExecutable()
+	if err != nil {
+		respondInternal(w, "cannot locate running binary", err)
+		return
+	}
+
+	tmp, err := downloadAsset(client, sel.assetURL, filepath.Dir(exe))
 	if err != nil {
 		log.Printf("update: download: %v", err)
 		respondWithError(w, http.StatusBadGateway, "binary download failed; try again later")
@@ -254,11 +264,6 @@ func (s *Server) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	exe, err := runningExecutable()
-	if err != nil {
-		respondInternal(w, "cannot locate running binary", err)
-		return
-	}
 	// Safety copy of the data DB BEFORE the swap (VACUUM INTO, consistent
 	// while serving): the update watchdog compares the post-restart
 	// sensor count against this backup and restores it if the update lost

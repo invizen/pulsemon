@@ -72,7 +72,12 @@ func acquireUpdateLock() (*os.File, error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create update lock dir %s: %w", filepath.Dir(lockPath), err)
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	// 0600: the /tmp fallback lands in a world-writable dir, so the lock
+	// file must not be world-readable/writable (a local user could probe
+	// or tamper with a 0644 lock). The pre-creation race of /tmp itself
+	// is inherent to the fallback — the WARNING above already says the
+	// fallback only means anything with a shared TMPDIR.
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open update lock %s: %w", lockPath, err)
 	}

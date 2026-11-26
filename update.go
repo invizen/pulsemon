@@ -411,7 +411,10 @@ func runUpdate(args []string) int {
 		return handleRollbackRestart(exe, restart)
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{
+		Timeout:       30 * time.Second,
+		CheckRedirect: releaseCheckRedirect,
+	}
 
 	rel, err := fetchRelease(client, version)
 	if err != nil {
@@ -480,7 +483,7 @@ func runUpdate(args []string) int {
 	defer lockFile.Close()
 
 	uInfo("downloading " + rel.TagName + "...")
-	tmp, err := downloadAsset(client, assetURL)
+	tmp, err := downloadAsset(client, assetURL, filepath.Dir(exe))
 	if err != nil {
 		uErr("download: " + err.Error())
 		return 1
@@ -760,7 +763,7 @@ func verifySensorsIntactWatchdog(db *store.Store, prevBin, dstBin, bus string) {
 		args := append([]any{time.Now().Format(time.RFC3339)}, a...)
 		line := fmt.Sprintf("%s watchdog: "+format+"\n", args...)
 		f, err := os.OpenFile(filepath.Join(filepath.Dir(dbPath), "pulsemon-watchdog.log"),
-			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+			os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
 			return
 		}
@@ -1108,6 +1111,27 @@ func userAgent() string {
 	return "pulsemon-updater/" + Version
 }
 
+// releaseCheckRedirect is the updater client's redirect policy. The bare
+// http.DefaultTransport follows up to 10 redirects of ANY scheme and ANY
+// host, so a compromised GitHub asset (or a MITM that wins the initial
+// TLS handshake) could 302 the release download to http:// (cleartext) or
+// to an internal host — and the swap would proceed to install those bytes
+// before the signature check ever ran. Every redirect is re-validated:
+// it must stay on HTTPS and land on a GitHub release host. The initial
+// request is already pinned to api.github.com by the callers, so only the
+// hops after it reach here.
+func releaseCheckRedirect(req *http.Request, via []*http.Request) error {
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("refusing non-https redirect to %s", req.URL)
+	}
+	host := req.URL.Hostname()
+	switch host {
+	case "api.github.com", "github.com", "objects.githubusercontent.com", "codeload.github.com":
+		return nil
+	}
+	return fmt.Errorf("refusing redirect to non-GitHub host %s", host)
+}
+
 func fetchRelease(client *http.Client, version string) (*ghRelease, error) {
 	url := releaseBase + "/latest"
 	if version != "latest" {
@@ -1231,7 +1255,7 @@ func fetchChecksumSidecar(client *http.Client, url string) (string, error) {
 	return hexd, nil
 }
 
-func downloadAsset(client *http.Client, url string) (string, error) {
+func downloadAsset(client *http.Client, url, dir string) (string, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return "", err
@@ -1256,7 +1280,10 @@ func downloadAsset(client *http.Client, url string) (string, error) {
 	if ce := resp.Header.Get("Content-Encoding"); ce != "" && ce != "identity" {
 		return "", fmt.Errorf("unexpected Content-Encoding %q from release CDN (refusing to verify compressed bytes)", ce)
 	}
-	f, err := os.CreateTemp("", "pulsemon-update-*")
+	// Stage on the DESTINATION volume, not /tmp: a cross-device move would
+	// force a full up-to-512 MiB copy into the binary dir anyway (and a
+	// small /tmp — common on embedded boxes — could fill mid-download).
+	f, err := os.CreateTemp(dir, "pulsemon-update-*")
 	if err != nil {
 		return "", err
 	}
@@ -1361,6 +1388,16 @@ func installBinary(src, dst, wantSHA string) error {
 		tmp.Close()
 		return err
 	}
+	// F18c: restore the recorded ownership on the STAGED file, before the
+	// rename. A post-swap chown that fails leaves a LIVE binary with the
+	// wrong owner (the service may no longer be able to exec it); pre-swap
+	// the same failure just refuses the install with dst untouched.
+	if haveOwner {
+		if err := tmp.Chown(int(wantUID), int(wantGID)); err != nil {
+			tmp.Close()
+			return fmt.Errorf("chown staged binary to original owner (%d:%d): %w", wantUID, wantGID, err)
+		}
+	}
 	// F18b: make the staged binary durable BEFORE the rename.
 	// Without this, a crash between the copy and the rename can leave a
 	// truncated file that the rename then promotes over the good binary.
@@ -1407,11 +1444,6 @@ func installBinary(src, dst, wantSHA string) error {
 			uWarn("directory fsync after swap failed: " + serr.Error())
 		}
 		d.Close()
-	}
-	if haveOwner {
-		if err := os.Chown(dst, int(wantUID), int(wantGID)); err != nil {
-			uWarn("could not restore original ownership on " + dst + ": " + err.Error())
-		}
 	}
 	return nil
 }
