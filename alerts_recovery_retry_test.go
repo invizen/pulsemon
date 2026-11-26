@@ -129,11 +129,16 @@ func TestRecoveryRetryAbortedByStop(t *testing.T) {
 // drain, and a degraded provider must not be able to keep the queue full
 // past the scheduleRecoveryRetry deadline (recoveryRetryDelay) — a recovery
 // dropped at t=0 AND at t=recoveryRetryDelay is lost permanently.
-// Worst job = 3 webhook attempts at the shared client's 10s timeout + the
-// two fixed in-band delays + two Retry-After waits at the cap. With the
-// old 60s cap this was 150s/job: 8 jobs ≈ 20 min of drain, completions
-// 24/h vs a sustained error sensor's 1/min re-alert arrivals — saturation
-// guaranteed. Sabotage: maxAlertRetryAfter = 60s fails this test.
+// Worst job = 3 webhook attempts at the shared client's 10s timeout, OR 3
+// SMTP attempts at the 15s total transport budget (dial + conversation —
+// smtpConnDeadline), plus the in-band delays. Webhook delays are worsted
+// with the maxAlertRetryAfter cap (a 429 can ask for it); SMTP has no
+// Retry-After — its classification returns 0 — so the fixed delays bound it.
+// With the old 60s cap this was 150s/job: 8 jobs ≈ 20 min of drain,
+// completions 24/h vs a sustained error sensor's 1/min re-alert arrivals —
+// saturation guaranteed. Sabotage: maxAlertRetryAfter = 60s fails this test;
+// restoring a separate 10s dial + 15s session budget for SMTP (87s/job)
+// fails it too.
 func TestInFifoRetryBudgetUnderRecoveryRetryDelay(t *testing.T) {
 	const webhookAttempt = 10 * time.Second // webhook.go client Timeout
 	if len(alertRetryDelays) != 2 {
@@ -142,5 +147,9 @@ func TestInFifoRetryBudgetUnderRecoveryRetryDelay(t *testing.T) {
 	worst := 3*webhookAttempt + max(alertRetryDelays[0], maxAlertRetryAfter) + max(alertRetryDelays[1], maxAlertRetryAfter)
 	if worst >= recoveryRetryDelay {
 		t.Fatalf("worst in-band delivery job = %v >= recovery retry delay %v: a degraded provider can saturate the 8-slot FIFO past the retry window and permanently drop recovery alerts (docs/DECISIONS.md -> alert-retry-budget)", worst, recoveryRetryDelay)
+	}
+	worstSMTP := 3*smtpConnDeadline + alertRetryDelays[0] + alertRetryDelays[1]
+	if worstSMTP >= recoveryRetryDelay {
+		t.Fatalf("worst in-band SMTP delivery job = %v >= recovery retry delay %v: a degraded relay can saturate the 8-slot FIFO past the retry window and permanently drop recovery alerts (docs/DECISIONS.md -> alert-retry-budget)", worstSMTP, recoveryRetryDelay)
 	}
 }

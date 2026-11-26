@@ -1550,10 +1550,14 @@ func (pw *ProbeWorker) deliverOne(d dest, name, target, oldState, state string, 
 		}
 		err := pw.retryAlert(func() (bool, time.Duration, error) {
 			err := pw.sendSMTPWith(pw.stopCtx, *d.smtp, subject, body)
-			// A configuration gap (no host/sender/recipient) cannot succeed
-			// on retry. SMTP has no Retry-After: 0 keeps the fixed
-			// alertRetryDelays.
-			return err != nil && !errors.Is(err, errSMTPNotConfigured), 0, err
+			// A configuration gap and a permanent 5xx refusal (535 auth,
+			// 550, 554) cannot succeed on retry — a 535 re-hit is a
+			// fail2ban/lockout factory. SMTP has no Retry-After: 0 keeps
+			// the fixed alertRetryDelays.
+			if err != nil && (errors.Is(err, errSMTPNotConfigured) || smtpPermanent(err)) {
+				return false, 0, err
+			}
+			return err != nil, 0, err
 		})
 		if err != nil {
 			log.Printf("smtp alert to %s: %v", url, err)

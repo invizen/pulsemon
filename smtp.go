@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/mail"
 	"net/smtp"
+	"net/textproto"
 	"strconv"
 	"strings"
 	"time"
@@ -147,11 +148,13 @@ func smtpEnvelopeAddr(raw string) (string, error) {
 // providers use. Tests override it to reach an in-process server on loopback.
 var smtpDial = dialChecked
 
-// smtpConnDeadline caps the WHOLE SMTP conversation (greeting → QUIT) on one
-// absolute conn deadline — the SMTP equivalent of the webhook path's
-// http.Client 10s total-request timeout. A LAN relay completes the exchange
-// in well under a second; 15s is the tarpit bound. A var so tests can
-// shorten it.
+// smtpConnDeadline is the total per-attempt transport budget: dial AND the
+// whole conversation (greeting → QUIT) share one 15s deadline. The per-
+// attempt bound the alert-retry-budget invariant depends on: 3 attempts ×
+// 15s + the two in-band delays must stay under recoveryRetryDelay (60s),
+// pinned by TestInFifoRetryBudgetUnderRecoveryRetryDelay. A LAN relay
+// completes the exchange in well under a second; 15s is the tarpit bound.
+// A var so tests can shorten it.
 var smtpConnDeadline = 15 * time.Second
 
 // errSMTPNotConfigured is a sentinel for "the SMTP provider has no
@@ -159,6 +162,18 @@ var smtpConnDeadline = 15 * time.Second
 // succeed on retry. The retry loop classifies it with errors.Is, not a
 // string prefix, so the classification survives rewording.
 var errSMTPNotConfigured = errors.New("smtp: not configured")
+
+// smtpPermanent reports a permanent SMTP failure: a 5xx server reply
+// (535 auth failed, 550 mailbox unavailable, 554 transaction failed,
+// 501 syntax, ...). Retrying a 5xx cannot succeed and — for 535 —
+// re-hits the MTA's auth-failure counter (fail2ban / account lockout).
+// 4xx replies are transient by RFC, and transport errors (dial, TLS,
+// deadline) are retryable. net/smtp surfaces server replies as
+// *textproto.Error.
+func smtpPermanent(err error) bool {
+	var te *textproto.Error
+	return errors.As(err, &te) && te.Code >= 500
+}
 
 // sendSMTP delivers a plain-text alert email. Every phase is bounded,
 // matching the webhook deliveries:
@@ -258,22 +273,24 @@ func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject
 	case <-ctx.Done():
 		return ctx.Err()
 	}
-	// dialChecked's shared dialer has no per-dial timeout of its own; keep
-	// the 10-second dial bound the plain net.Dialer used to provide.
-	dctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// One absolute budget (smtpConnDeadline) covers dial AND the whole
+	// conversation: the per-attempt bound the alert-retry-budget invariant
+	// pins (3×15s + 2 in-band delays < recoveryRetryDelay). The conn
+	// deadline is the budget's deadline, and ctx cancellation (shutdown,
+	// abandoned test) closes the conn — the only way to abort a blocked
+	// net/smtp read.
+	budget, cancel := context.WithTimeout(ctx, smtpConnDeadline)
 	defer cancel()
-	conn, err := smtpDial(dctx, "tcp", addr)
+	conn, err := smtpDial(budget, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("smtp dial %s: %w", addr, err)
 	}
-	// Conversation bounds (see the sendSMTP doc): an absolute deadline caps
-	// every read/write through QUIT, and ctx cancellation closes the conn —
-	// the only way to abort a blocked net/smtp read.
-	if err := conn.SetDeadline(time.Now().Add(smtpConnDeadline)); err != nil {
+	deadline, _ := budget.Deadline()
+	if err := conn.SetDeadline(deadline); err != nil {
 		conn.Close()
 		return fmt.Errorf("smtp deadline %s: %w", addr, err)
 	}
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	stop := context.AfterFunc(budget, func() { _ = conn.Close() })
 	defer stop()
 
 	// Implicit TLS ("tls" mode, or "auto" on 465): handshake on the raw conn
@@ -281,7 +298,7 @@ func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject
 	implicitTLS := cfg.TLS == "tls" || (cfg.TLS == "auto" && cfg.Port == 465)
 	if implicitTLS {
 		tc := tls.Client(conn, &tls.Config{ServerName: cfg.Host})
-		if err := tc.HandshakeContext(ctx); err != nil {
+		if err := tc.HandshakeContext(budget); err != nil {
 			conn.Close()
 			return fmt.Errorf("smtp tls handshake: %w", err)
 		}
@@ -402,7 +419,11 @@ func (pw *ProbeWorker) sendSMTPWith(ctx context.Context, cfg smtpConfig, subject
 	if err := w.Close(); err != nil {
 		return fmt.Errorf("smtp end data: %w", err)
 	}
-	return c.Quit()
+	// w.Close() returned 250 OK: the MTA accepted the message, so a
+	// dropped QUIT must not fail the delivery — the retry loop would
+	// resend an already-accepted email (up to 3x duplicates).
+	_ = c.Quit()
+	return nil
 }
 
 // smtpSubject picks the email subject from the transition, mirroring the
