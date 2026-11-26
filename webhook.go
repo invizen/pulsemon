@@ -77,7 +77,7 @@ func dialCheckedCleartext(ctx context.Context, network, addr string) (net.Conn, 
 		if err := checkWebhookIP(ip, host); err != nil {
 			return nil, err
 		}
-		if !ip.IsPrivate() {
+		if !isPrivateOrAllowedCGNAT(ip) {
 			return nil, fmt.Errorf("cleartext http:// webhook target %q resolved to a public address (%s); use https://", host, ip)
 		}
 	}
@@ -267,8 +267,8 @@ func validateWebhookURLNoDNS(raw string) (string, string, error) {
 		if err := checkWebhookIP(ip, host); err != nil {
 			return "", "", err
 		}
-		if u.Scheme == "http" && !ip.IsPrivate() {
-			return "", "", fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+		if u.Scheme == "http" && !isPrivateOrAllowedCGNAT(ip) {
+			return "", "", fmt.Errorf("must be an https:// URL unless %q is a private RFC1918/ULA host (or CGNAT under PULSEMON_ALLOW_CGNAT)", host)
 		}
 		return host, u.Scheme, nil
 	}
@@ -309,7 +309,7 @@ func validateWebhookURL(raw string) error {
 		if scheme == "http" {
 			// Match the old failure shape: an http host whose privacy
 			// cannot be established is refused the same as a public one.
-			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+			return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918/ULA host (or CGNAT under PULSEMON_ALLOW_CGNAT)", host)
 		}
 		return fmt.Errorf("cannot resolve host %q: %v", host, err)
 	}
@@ -321,8 +321,8 @@ func validateWebhookURL(raw string) error {
 		// "resolved to a public address": a URL that saved clean but could
 		// never deliver. Save-time and dial-time gates must agree.
 		for _, ip := range ips {
-			if !ip.IsPrivate() {
-				return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918 host", host)
+			if !isPrivateOrAllowedCGNAT(ip) {
+				return fmt.Errorf("must be an https:// URL unless %q is a private RFC1918/ULA host (or CGNAT under PULSEMON_ALLOW_CGNAT)", host)
 			}
 		}
 	}
@@ -408,6 +408,31 @@ var allowCGNAT = parseCGNATOptOut()
 func parseCGNATOptOut() bool {
 	v := strings.ToLower(strings.TrimSpace(os.Getenv("PULSEMON_ALLOW_CGNAT")))
 	return v == "1" || v == "true" || v == "yes"
+}
+
+// cgnatCIDR is 100.64.0.0/10 (RFC 6598) — the one blockedSubnets entry the
+// PULSEMON_ALLOW_CGNAT opt-out relaxes.
+var cgnatCIDR = mustCIDR("100.64.0.0/10")
+
+// isPrivateOrAllowedCGNAT reports whether ip is RFC1918/ULA private, or —
+// under the operator's opt-out only — CGNAT (100.64.0.0/10). Every gate
+// that asks "is this address private enough" (cleartext webhook save +
+// dial, self-signed probe certs) must call this ONE helper: checkWebhookIP
+// already relaxes the CGNAT blocklist under the opt-out, so a gate that
+// asked only ip.IsPrivate() would refuse exactly the addresses the
+// operator just allowed.
+// History: docs/DECISIONS.md → cgnat-private-gate-sharing.
+func isPrivateOrAllowedCGNAT(ip net.IP) bool {
+	if ip.IsPrivate() {
+		return true
+	}
+	if !allowCGNAT {
+		return false
+	}
+	if v4 := ip.To4(); v4 != nil {
+		return cgnatCIDR.Contains(v4)
+	}
+	return false
 }
 
 func checkWebhookIP(ip net.IP, host string) error {

@@ -677,10 +677,13 @@ func verifyHTTPCert(presented []*x509.Certificate, host string, hasUserinfo bool
 
 // isPublicProbeIP reports whether host is an IP literal that is globally
 // routable — i.e. NOT loopback, RFC 1918, link-local, the 0.0.0.0/8
-// "this network" range, or IPv6 ULA (fc00::/7). An IPv4-mapped IPv6
-// address (::ffff:a.b.c.d) is judged as the embedded IPv4. Hostname
-// targets return false: self-signed acceptance is keyed on the
-// operator-controlled name (router.local), and the IP behind it is not
+// "this network" range, or IPv6 ULA (fc00::/7). CGNAT (100.64.0.0/10) is
+// public by default and NOT public under the PULSEMON_ALLOW_CGNAT opt-out
+// (the tailnet is the operator's extended LAN) — the same opt-out the
+// webhook cleartext gates share via isPrivateOrAllowedCGNAT. An
+// IPv4-mapped IPv6 address (::ffff:a.b.c.d) is judged as the embedded
+// IPv4. Hostname targets return false: self-signed acceptance is keyed on
+// the operator-controlled name (router.local), and the IP behind it is not
 // visible at cert-verify time (per-hop pins are a redirect-chain concern,
 // not a trust-store one).
 func isPublicProbeIP(host string) bool {
@@ -697,6 +700,8 @@ func isPublicProbeIP(host string) bool {
 			ip4[0] == 169 && ip4[1] == 254,                // link-local
 			ip4[0] == 0:                                   // 0.0.0.0/8
 			return false
+		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127: // 100.64.0.0/10 (CGNAT)
+			return !allowCGNAT // a tailnet is "private" under the opt-out
 		}
 		return true
 	}
