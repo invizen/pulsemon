@@ -12,7 +12,7 @@ On a fresh install (no account has ever existed), `POST /api/auth/users`
 is reachable by any LAN host — whoever wins the race owns the first
 account, and a DNS-rebinding page can win it remotely. Everything else is
 403 until an account exists (the bootstrap surface is locked down in
-`Server.authGate`, api.go).
+`Server.authGate`, api_middleware.go).
 **Mitigation:** set `PULSEMON_ALLOWED_HOSTS` — the bootstrap POST is then
 refused unless the request's Host header is allowlisted.
 **Why accepted:** a setup token or loopback-only bootstrap is worse UX
@@ -22,18 +22,23 @@ than the risk on a trusted homelab LAN.
 If the operator deletes all accounts, authentication is disabled and the
 whole dashboard (sensor CRUD, settings, TLS upload, history wipes, user
 management) is open to any LAN host.
-**Mitigation:** `PULSEMON_ALLOWED_HOSTS` gates every mutating request.
+**Mitigation:** `PULSEMON_ALLOWED_HOSTS` gates every /api/ request (reads
+and writes — the route-level requireHost, not just the sessionless
+mutating surface).
 **Why accepted:** the operator deliberately removed every account; the
 documented contract is an open dashboard. The one surface EXCLUDED from
 this contract is `POST /api/update` — see "Lifted" below.
 
-### Sensor targets with embedded credentials are returned verbatim
-`GET /api/sensors` returns `target` unmodified (the UI needs it for
-editing), so a target like `https://user:pass@host/health` is readable by
-anyone who can read the sensor list. Webhook URLs, by contrast, are
-masked (`webhookMasked`).
+### Sensor targets with embedded credentials: admin-visible, viewer-redacted
+`GET /api/sensors` returns `target` raw to ADMINS and auth-off installs
+(the UI needs it for editing), but NON-ADMIN sessions get the
+userinfo-stripped form (`viewerTarget`, api_sensors.go — reuses
+`alertTarget`'s last-'@' cut, parse-failure safe): a viewer account can
+never read the credentials an operator stored in an http target
+(`https://user:pass@host/health`). Webhook URLs are masked for everyone
+(`webhookMasked`).
 **Mitigation:** don't store credentials in sensor targets; if you must,
-keep authentication enabled.
+keep authentication enabled (the redaction stands with it).
 
 ### Telegram alert cards do not neutralize @username mentions (2026-10-30)
 The Discord card path neutralizes `@everyone`/`@here`
@@ -77,9 +82,11 @@ manual-pulse role model. Pinned by `TestNonAdminCannotMutateSensors`.
 trigger a download + binary swap + service restart; a compromised
 upstream release would auto-install). The 2026-10-24 review (M1) lifted
 the deferral: the endpoint is now 403 whenever authentication is
-disabled (`handleUpdate`, update_api.go; pinned by
-`TestUpdateRefusedWhenAuthDisabled`). The CLI (`pulsemon update`)
-remains the operator path.
+disabled — UNLESS the operator explicitly set `allow_unauth_update` in
+Settings → Authentication (a documented, default-off opt-in for
+auth-off installs that still want dashboard self-update; `handleUpdate`,
+update_api.go; pinned by `TestUpdateRefusedWhenAuthDisabled`). The CLI
+(`pulsemon update`) remains the operator path.
 
 ### Self-update authenticity (lifted 2026-10-29; manifest-bound 2026-11-05)
 `verifyDownloadedAsset` (update.go) checked the SHA-256 only — integrity,
