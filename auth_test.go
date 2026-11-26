@@ -1607,14 +1607,16 @@ func TestLoginThrottleUserFailsHardCapWipe(t *testing.T) {
 	}
 }
 
-// TestLoginUnknownUserDoesNotRecordUserFail (review 2026-11-10) drives the
-// real handler: a failed login for a name with NO account must not grow
-// userFails — the username is attacker-chosen (no validation on the login
-// path, up to the 1 MiB body limit), so counting unknown names let a small
-// IP pool rotate random usernames and OOM the monitor. A failure for an
-// EXISTING account is still recorded (finding #11's per-username lockout
-// is preserved).
-func TestLoginUnknownUserDoesNotRecordUserFail(t *testing.T) {
+// TestLoginUnknownUserRecordsUserFail (review 2026-11-10, INVERTED by
+// MINOR-22 / userfails-unknown-names, 2026-11-25) drives the real handler:
+// a failed login for a name with NO account now DOES grow userFails —
+// the old "unknown names don't count" contract was the username-
+// enumeration oracle (an existing name's multi-IP spray tripped the
+// per-username lockout while a phantom name's never did). Unknown and
+// known names must lock identically; the attacker-chosen key space is
+// bounded by sweepThrottle + the hard cap, not by account count.
+// History: docs/DECISIONS.md → userfails-bound, userfails-unknown-names.
+func TestLoginUnknownUserRecordsUserFail(t *testing.T) {
 	db := newTestDB(t)
 	srv := NewServer(db, NewProbeWorker(db))
 	if err := srv.auth.AddUser(context.Background(), "admin", "secretpw"); err != nil {
@@ -1630,7 +1632,8 @@ func TestLoginUnknownUserDoesNotRecordUserFail(t *testing.T) {
 	}
 
 	// Five unknown usernames from five fresh IPs (well under every
-	// per-IP budget): all 401, and NONE of them may land in userFails.
+	// per-IP budget): all 401, and EACH of them lands in userFails —
+	// identical accounting to a known name (the oracle is closed).
 	for i := 0; i < 5; i++ {
 		if code := login(fmt.Sprintf("nouser%d", i), fmt.Sprintf("10.5.5.%d", i+1)); code != http.StatusUnauthorized {
 			t.Fatalf("unknown-user login %d: got %d, want 401", i, code)
@@ -1639,12 +1642,12 @@ func TestLoginUnknownUserDoesNotRecordUserFail(t *testing.T) {
 	srv.auth.loginThrottle.Lock()
 	n := len(srv.auth.loginThrottle.userFails)
 	srv.auth.loginThrottle.Unlock()
-	if n != 0 {
-		t.Fatalf("userFails size = %d after 5 unknown-user failures, want 0 (no account → nothing to protect)", n)
+	if n != 5 {
+		t.Fatalf("userFails size = %d after 5 unknown-user failures, want 5 (unknown names must count — the userExists gate was the enumeration oracle)", n)
 	}
 
-	// An EXISTING account's failure IS recorded: the per-username lockout
-	// (finding #11) still works for real accounts.
+	// An EXISTING account's failure IS recorded the same way: the
+	// per-username lockout (finding #11) works for every name.
 	if code := login("admin", "10.6.6.1"); code != http.StatusUnauthorized {
 		t.Fatalf("known-user failure: got %d, want 401", code)
 	}
