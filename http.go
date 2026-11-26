@@ -133,6 +133,12 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) (net.IP, 
 	if err != nil {
 		return nil, fmt.Errorf("redirect target %q cannot be resolved: %v", host, err)
 	}
+	// An empty answer (no records, no error) is a resolved-to-nothing
+	// result — addrs[0] below would panic; refuse it like a lookup
+	// failure (fail-closed, same class as the error branch above).
+	if len(addrs) == 0 {
+		return nil, fmt.Errorf("redirect target %q resolved to no addresses", host)
+	}
 	for _, addr := range addrs {
 		if err := checkWebhookIP(addr.IP, host); err != nil {
 			return nil, err

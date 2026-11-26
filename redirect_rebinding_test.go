@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -325,3 +326,24 @@ func TestProbeHTTPCrossHostRedirectKeepsHostname(t *testing.T) {
 
 // TestValidVersionToken locks the fetchRelease URL-path guard: normal tags
 // (incl. pre-release) pass, traversal and whitespace/control junk fail.
+
+// TestRedirectGuardRefusesEmptyAnswer (NIT-29): LookupIPAddr may return an
+// empty slice WITHOUT an error (an empty DNS answer); the guard must refuse
+// it before indexing addrs[0] — the pre-fix shape panicked on that input.
+// Source-shape pin: the empty-answer check sits between the lookup and the
+// addrs[0] index (the path is untriggerable through the global resolver).
+func TestRedirectGuardRefusesEmptyAnswer(t *testing.T) {
+	fn, ok := funcBody(stripGoComments(readSource(t, "http.go")), "redirectTargetAllowed")
+	if !ok {
+		t.Fatal("redirectTargetAllowed not found in http.go")
+	}
+	lookupAt := strings.Index(fn, "LookupIPAddr(ctx, host)")
+	guardAt := strings.Index(fn, "len(addrs) == 0")
+	indexAt := strings.Index(fn, "addrs[0]")
+	if lookupAt < 0 || guardAt < 0 || indexAt < 0 {
+		t.Fatalf("markers: lookup=%d guard=%d index=%d", lookupAt, guardAt, indexAt)
+	}
+	if !(lookupAt < guardAt && guardAt < indexAt) {
+		t.Fatalf("empty-answer guard must sit between the lookup (%d) and addrs[0] (%d); guard at %d", lookupAt, indexAt, guardAt)
+	}
+}
