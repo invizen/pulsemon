@@ -21,6 +21,9 @@ import (
 // cert from that conn's ORIGINAL handshake — a renewed cert stays invisible
 // in the displayed expiry, and verifyHTTPCert judges the stale cert.
 // Plain-HTTP hops carry no cert data, so they may keep reusing pooled conns.
+// An https->http flip is NOT a pooling case: it is refused outright
+// (ErrUseLastResponse + the downgrade flag in the per-probe pins)
+// before the cleartext hop is dialed.
 func TestRedirectPolicyClosesEveryHTTPSHop(t *testing.T) {
 	mk := func(scheme, host string) *http.Request {
 		r, err := http.NewRequest(http.MethodGet, scheme+"://"+host+"/x", nil)
@@ -36,18 +39,26 @@ func TestRedirectPolicyClosesEveryHTTPSHop(t *testing.T) {
 		prevScheme string // the previous hop (via[len-1])
 		prevHost   string
 		wantClose  bool
+		wantErr    bool
 	}{
-		{"same-host https hop (the 2026-10-20 gap)", "https", "h.example:443", "https", "h.example:443", true},
-		{"cross-host https hop (N4 regression)", "https", "192.0.2.2:443", "https", "192.0.2.1:443", true},
-		{"http->https scheme flip (N4 regression)", "https", "h.example:443", "http", "h.example:80", true},
-		{"same-host http hop keeps pooling", "http", "h.example:80", "http", "h.example:80", false},
-		{"https->http flip keeps pooling (no cert data)", "http", "h.example:80", "https", "h.example:443", false},
+		{"same-host https hop (the 2026-10-20 gap)", "https", "h.example:443", "https", "h.example:443", true, false},
+		{"cross-host https hop (N4 regression)", "https", "192.0.2.2:443", "https", "192.0.2.1:443", true, false},
+		{"http->https scheme flip (N4 regression)", "https", "h.example:443", "http", "h.example:80", true, false},
+		{"same-host http hop keeps pooling", "http", "h.example:80", "http", "h.example:80", false, false},
+		{"https->http flip is refused (downgrade, never dialed)", "http", "h.example:80", "https", "h.example:443", false, true},
 	}
 	for _, tc := range cases {
 		req := mk(tc.scheme, tc.host)
 		req.Close = false
 		via := []*http.Request{mk(tc.prevScheme, tc.prevHost)}
-		if err := httpClient.CheckRedirect(req, via); err != nil {
+		err := httpClient.CheckRedirect(req, via)
+		if tc.wantErr {
+			if err != http.ErrUseLastResponse {
+				t.Fatalf("%s: CheckRedirect = %v, want ErrUseLastResponse (downgrade refused before the dial)", tc.name, err)
+			}
+			continue
+		}
+		if err != nil {
 			t.Fatalf("%s: CheckRedirect = %v, want nil (same-host cases short-circuit the target guard; IP literals need no DNS)", tc.name, err)
 		}
 		if req.Close != tc.wantClose {

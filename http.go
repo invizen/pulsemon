@@ -163,6 +163,11 @@ func redirectTargetAllowed(ctx context.Context, host, origHost string) (net.IP, 
 type redirectPins struct {
 	mu sync.Mutex
 	m  map[string]net.IP
+	// downgrade is set by CheckRedirect when an HTTPS target's redirect
+	// chain drops to plain HTTP: the hop is refused (ErrUseLastResponse,
+	// so the last 3xx response is returned) and probeHTTP reports the
+	// loss with errHTTPSDowngrade — the cleartext hop is never dialed.
+	downgrade bool
 }
 
 // pinsKey is the context key for *redirectPins.
@@ -366,12 +371,35 @@ var probeFreshTransport = func() *http.Transport {
 	return t
 }()
 
+// errHTTPSDowngrade is the loss reason for an HTTPS target whose redirect
+// chain drops to plain HTTP. CheckRedirect refuses the http hop BEFORE it
+// is dialed (a token in the URL's path/query must not go out in cleartext)
+// and records the refusal in the per-probe pins; probeHTTP reports it as
+// the loss Err with the last 3xx response's status + presented cert.
+var errHTTPSDowngrade = errors.New("https target redirected to plain http (TLS endpoint not healthy)")
+
 var httpClient = &http.Client{
 	Timeout: probeHTTPTimeout,
 	CheckRedirect: func(req *http.Request, via []*http.Request) error {
 		// via includes the original request, so len(via) is the number of
 		// requests already made; the next one would be the (len+1)th.
 		if len(via) > maxHTTPRedirects {
+			return http.ErrUseLastResponse
+		}
+		// An HTTPS target redirected to plain HTTP is a loss, and the
+		// http hop is refused BEFORE it is dialed: the target's URL token
+		// (path/query) must not go out in cleartext, and the round-trip
+		// is wasted. ErrUseLastResponse keeps the 3xx response (its
+		// status + cert stay on the card); the flag in the per-probe
+		// pins is how probeHTTP names the loss. The post-hoc check in
+		// probeHTTP is a backstop.
+		if len(via) > 0 && strings.EqualFold(via[0].URL.Scheme, "https") &&
+			strings.EqualFold(req.URL.Scheme, "http") {
+			if p, _ := req.Context().Value(pinsKey{}).(*redirectPins); p != nil {
+				p.mu.Lock()
+				p.downgrade = true
+				p.mu.Unlock()
+			}
 			return http.ErrUseLastResponse
 		}
 		origHost := ""
@@ -920,6 +948,26 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	}
 	resp.Body.Close()
 
+	// CheckRedirect's pre-dial downgrade refusal: the 3xx response is the
+	// terminal one (ErrUseLastResponse), the cleartext hop was never sent,
+	// and the loss is named with its status + presented cert intact.
+	if p, _ := ctx.Value(pinsKey{}).(*redirectPins); p != nil {
+		p.mu.Lock()
+		downgrade := p.downgrade
+		p.mu.Unlock()
+		if downgrade {
+			code := resp.StatusCode
+			return httpProbeResult{
+				Elapsed:    rtt,
+				Lost:       true,
+				Status:     &code,
+				IP:         ip,
+				CertExpiry: certExp,
+				Err:        errHTTPSDowngrade,
+			}
+		}
+	}
+
 	// A redirect chain that ENDS on plain HTTP after the configured target
 	// was HTTPS is a loss: the TLS endpoint is what
 	// we configured to watch, and a 301 to the http URL is exactly what
@@ -927,7 +975,9 @@ func probeHTTP(ctx context.Context, target string, timeout time.Duration) httpPr
 	// Following it and reading the http hop's 2xx used to report UP while
 	// the configured HTTPS endpoint was dead — the cert problem was
 	// masked. The 2xx belongs to the redirect target, not to the endpoint
-	// under watch.
+	// under watch. The PRIMARY gate is CheckRedirect (pre-dial — the
+	// cleartext hop is never sent); this check is the backstop for any
+	// path that lets an http hop complete.
 	if origScheme == "https" && resp.Request != nil &&
 		strings.EqualFold(resp.Request.URL.Scheme, "http") {
 		code := resp.StatusCode
